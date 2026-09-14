@@ -272,6 +272,40 @@ mod tests {
     }
 
     #[test]
+    fn tint_marks_only_pentagon_sites_positionally() {
+        // Positional (not just count) tint check: a center is tinted iff
+        // its cell is a pentagon; a corner is tinted iff it touches a
+        // pentagon. Count-only checks cannot catch a center/corner swap.
+        for n in 0..=2 {
+            let mesh = HexSphere::generate(n, 1.0);
+            let (vertices, _) = build_fill(&mesh);
+            let cells = mesh.cell_count();
+            for cell in 0..cells as u32 {
+                assert_eq!(
+                    vertices[cell as usize].tint,
+                    if mesh.is_pentagon(cell) { 1.0 } else { 0.0 },
+                    "N={n} center tint wrong for cell {cell}"
+                );
+            }
+            let mut touching = vec![false; mesh.corner_count()];
+            for cell in 0..cells as u32 {
+                if mesh.is_pentagon(cell) {
+                    for corner in mesh.cell_corner_ids(cell) {
+                        touching[corner as usize] = true;
+                    }
+                }
+            }
+            for corner in 0..mesh.corner_count() as u32 {
+                assert_eq!(
+                    vertices[cells + corner as usize].tint,
+                    if touching[corner as usize] { 1.0 } else { 0.0 },
+                    "N={n} corner tint wrong for corner {corner}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn short_hash_is_016x_prefix() {
         for hash in [0u64, 1, 11_459_543_604_394_007_386, u64::MAX] {
             let short = short_hash(hash);

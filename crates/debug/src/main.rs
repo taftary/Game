@@ -88,7 +88,12 @@ layout(push_constant) uniform PushConstants {
     float highlight;
 } pc;
 layout(location = 0) out vec3 v_normal;
-layout(location = 1) out float v_tint;
+// `flat`: tint is a per-cell flag. Fan triangles are (center, corner_i,
+// corner_i+1), and Vulkan's default provoking vertex is the first one —
+// so every triangle takes its cell center's tint and pentagon sites read
+// as crisp tinted faces instead of gradient blobs bleeding into
+// neighboring hexagons.
+layout(location = 1) flat out float v_tint;
 void main() {
     gl_Position = pc.mvp * vec4(position, 1.0);
     v_normal = normal;
@@ -97,7 +102,7 @@ void main() {
 
 const FILL_FRAG: &str = r"#version 450
 layout(location = 0) in vec3 v_normal;
-layout(location = 1) in float v_tint;
+layout(location = 1) flat in float v_tint;
 layout(location = 0) out vec4 f_color;
 void main() {
     vec3 n = normalize(v_normal);
