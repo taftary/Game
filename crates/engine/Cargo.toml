@@ -1,0 +1,11 @@
+[package]
+name = "planet_crafter_engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+test-internals = []
+
+[lib]
+name = "planet_crafter_engine"
+path = "src/lib.rs"

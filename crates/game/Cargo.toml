@@ -1,0 +1,11 @@
+[package]
+name = "planet-crafter-game"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+planet_crafter_engine.workspace = true
+
+[[bin]]
+name = "planet-crafter-game"
+path = "src/main.rs"

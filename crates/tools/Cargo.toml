@@ -1,0 +1,8 @@
+[package]
+name = "planet-crafter-tools"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "planet-crafter-tools"
+path = "src/main.rs"

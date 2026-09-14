@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/engine",
+    "crates/game",
+    "crates/tools",
+    "docs/examples",
+    "tests",
+]
+default-members = [
+    "crates/engine",
+    "crates/game",
+    "docs/examples",
+    "tests",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+planet_crafter_engine = { path = "crates/engine", version = "0.1.0" }

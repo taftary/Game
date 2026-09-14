@@ -1,0 +1,45 @@
+[package]
+name = "planet-crafter-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+autotests = false
+
+[lib]
+name = "planet_crafter_tests"
+path = "src/lib.rs"
+
+[dependencies]
+planet_crafter_engine = { workspace = true, features = ["test-internals"] }
+
+[[test]]
+name = "node"
+path = "node/main.rs"
+
+[[test]]
+name = "scene"
+path = "scene/main.rs"
+
+[[test]]
+name = "text"
+path = "text/main.rs"
+
+[[test]]
+name = "render"
+path = "render/main.rs"
+
+[[test]]
+name = "runtime"
+path = "runtime/main.rs"
+
+[[test]]
+name = "lod"
+path = "lod/main.rs"
+
+[[test]]
+name = "visibility"
+path = "visibility/main.rs"
+
+[[test]]
+name = "game"
+path = "game/main.rs"

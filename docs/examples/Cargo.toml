@@ -1,0 +1,15 @@
+[package]
+name = "planet-crafter-examples"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+planet_crafter_engine.workspace = true
+
+[features]
+gpu = []
+
+[[example]]
+name = "viewer"
+required-features = ["gpu"]
