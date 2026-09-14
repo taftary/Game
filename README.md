@@ -28,8 +28,8 @@ crates/
   engine/     - library crate game_engine (empty modules)
   game/       - game binary, empty fn main() {}
   tools/      - tooling binary, empty fn main() {} (not a default member)
-docs/
-  examples/   - example stubs; viewer is gated behind the gpu feature
+docs/         - docs of the project in md
+plans/        - features lifecycle: notion -> plan -> implement -> done -> update/issue (see plans/README.md)
 tests/        - consolidated test package; every target is empty
 assets/
   fonts/      - placeholder for bundled fonts
@@ -46,3 +46,19 @@ cargo check --example viewer --features gpu
 ```
 
 There is no CI; run the commands above locally before committing.
+
+## Feature lifecycle (plans/)
+
+Each feature lives in `plans/<feature-name>/` (kebab-case, unique). Full spec in
+[`plans/README.md`](plans/README.md); templates in `plans/_template/`.
+
+```text
+1. notion.md defines needs + Status + Definition of Done
+2. plan.md organizes features + todo list + DoD verification
+3. implement from plan.md only
+4. after done: update-YYYY-MM-DD-HHMM/ (UTC, own notion + plan)
+5. issues: issue-YYYY-MM-DD-HHMM-<slug>/ (UTC, specs -> report + plan)
+```
+
+Status everywhere: `draft -> planned -> in-progress -> in-review -> done`,
+plus `on-hold` / `cancelled`.
