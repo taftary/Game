@@ -37,7 +37,7 @@ DoD evidenced.
 |-------|----------------------------|--------|----------|
 | 1 | Profiles + toolchain pin; builds green | done | `cargo build --workspace` Finished (see §Evidence); `rust-toolchain.toml` present |
 | 2 | `hecs`/`tracing` wired; clippy/test clean | done | `cargo clippy --workspace --all-targets --all-features -- -D warnings` + `cargo test --workspace --all-targets` pass |
-| 3 | CI present and green | done | `.github/workflows/ci.yml`; every job's commands verified locally (see §Evidence); inaugural green run pending first push — unpushed by design, no commit/push without maintainer request |
+| 3 | CI present and green | done | `.github/workflows/ci.yml`; inaugural run green 2026-09-14 (5/5 jobs: gates × Win/Linux/mac, mobile guard, MSRV) — confirmed by maintainer after push of `757e7f3` |
 | 4 | Four ADRs written; log links them | done | `docs/decisions/ADR-001.md`, `ADR-007.md`, `ADR-008.md`, `ADR-009.md`; README checkboxes updated |
 | 5 | Docs updated; links resolve | done | `quality.md`, `stack.md`, `architecture.md`, milestones, README, techstack 0.2.0 |
 | 6 | Evidence recorded here | done | This table + §Evidence |
@@ -71,5 +71,6 @@ DoD evidenced.
   rustc 1.87. Per Constraints, documented the true floor (1.87) in
   `stack.md`/README/CI instead of downgrading; `cargo +1.87 check`
   passes clean.
-- CI: <workflow run URL after first push — all job commands verified
-  locally (gates on Windows; both mobile targets; MSRV 1.87)>.
+- CI: inaugural run green 2026-09-14 (all 5 jobs) after push of
+  `757e7f3`; every job's commands were additionally verified locally
+  (gates on Windows; both mobile targets; MSRV 1.87).
