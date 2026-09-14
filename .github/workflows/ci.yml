@@ -33,7 +33,9 @@ jobs:
       - name: run release entry
         run: cargo run --bin game
       - name: run debug entry
-        run: cargo run -p game_debug --bin game_debug
+        run: cargo run -p game_debug -- --headless
+      - name: run headless renderer smoke
+        run: cargo run -p game_tools -- --headless --tier low
 
   mobile-check:
     # Compile-guard only: no devices, no NDK/Xcode linking required

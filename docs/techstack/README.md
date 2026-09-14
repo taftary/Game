@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.2.1 (2026-09-14, ADR-007 amendment: Apple/MoltenVK renderer + packaging requirements)
+- **Version:** 0.4.0 (2026-09-14, plans/debug-sphere-viewer: Sphere Viewer debug screen — orbit camera, fill + wireframe + pentagon highlight, inputs panel, `--headless` CI gate, vendored DejaVu Sans)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

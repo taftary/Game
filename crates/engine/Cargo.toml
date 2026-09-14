@@ -5,6 +5,10 @@ edition.workspace = true
 
 [features]
 test-internals = []
+# Global allocator switch (ADR-009): default off so default builds and the
+# mobile compile-guard never build C code. A/B is one flag flip:
+# `--features game_engine/mimalloc`.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 vulkano.workspace = true
@@ -14,6 +18,7 @@ fontdue.workspace = true
 glam.workspace = true
 hecs.workspace = true
 tracing.workspace = true
+mimalloc = { version = "0.1", optional = true }
 
 [lib]
 name = "game_engine"

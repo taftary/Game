@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+fontdue.workspace = true
 game_engine.workspace = true
+glam.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+vulkano.workspace = true
+winit.workspace = true
 
 [lib]
 name = "game_debug"

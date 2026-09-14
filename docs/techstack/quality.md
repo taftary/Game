@@ -30,7 +30,8 @@ cargo build --workspace
 cargo test --workspace --all-targets
 cargo test --doc --workspace
 cargo run --bin game
-cargo run -p game_debug --bin game_debug   # non-default member, like game_tools
+cargo run -p game_debug -- --headless   # viewer check, GPU-free (debug-sphere-viewer)
+cargo run -p game_tools -- --headless --tier low   # renderer smoke, GPU-free (M1)
 ```
 
 Mobile compile-guard (CI always; local only if targets installed —

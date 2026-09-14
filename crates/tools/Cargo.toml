@@ -3,6 +3,18 @@ name = "game_tools"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Pass-through to the engine allocator switch (ADR-009): default off.
+mimalloc = ["game_engine/mimalloc"]
+
 [[bin]]
 name = "game_tools"
 path = "src/main.rs"
+
+[dependencies]
+game_engine.workspace = true
+glam.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+vulkano.workspace = true
+winit.workspace = true

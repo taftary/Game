@@ -28,7 +28,7 @@ Main dependencies (declared in workspace `Cargo.toml`, consumed by `crates/engin
   (required for consistent mobile rendering).
 - **Math:** `glam` everywhere (ADR to replace). f64 game coordinates converted to
   `glam` f32 render coordinates at the floating-origin boundary (see [`../game/journey.md`](../game/journey.md)).
-- **Allocator:** `mimalloc` default, validated in M1 behind a feature flag for A/B vs. system allocator (decided by ADR-009 in [`../decisions/`](../decisions/)).
+- **Allocator:** `mimalloc` default, wired in M1 behind the `game_engine/mimalloc` feature flag (default off; A/B vs. system allocator is one flag flip). On-device A/B numbers come from the M6 perf harness (decided by ADR-009 in [`../decisions/`](../decisions/)).
 - **Procedural noise:** `noise` (default). Replace only if it fails cross-platform determinism tests (owner: M5, see [`../milestones/`](../milestones/)).
 - **Serialization:** `serde` + `postcard` (default, `bincode` fallback) compact binary for saves (owner: ADR-004, see [`../decisions/`](../decisions/)).
 - **UI:** custom immediate-or-retained UI on top of the `vulkano` swapchain (v1);

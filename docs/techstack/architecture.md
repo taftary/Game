@@ -13,8 +13,9 @@ crates/
   engine/     - library crate game_engine (empty modules, src/lib.rs is empty)
   game/       - clean release game binary, empty fn main() {}
   tools/      - tooling binary, empty fn main() {} (not a default member)
-  debug/      - game_debug lib (fps/console/inspector screens) + game_debug
-                binary: runs the game with developer tools (not a default member)
+   debug/      - game_debug lib (Sphere Viewer + fps/console/inspector
+                 screens) + game_debug binary: windowed sphere viewer with
+                 developer tools (not a default member)
 docs/         - project docs (game overview + techstack/game/milestones/risks/decisions)
 plans/        - feature lifecycle: notion -> plan -> implement (see plans/README.md)
 tests/        - consolidated test package; every target is empty
@@ -36,18 +37,26 @@ Keep the existing workspace shape; grow inside it:
 crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, save
   src/
     lib.rs
-    render/      # vulkano device/swapchain, pipelines, planet/sky/atmosphere passes
+    render/      # vulkano boot (1.1 floor) + tiers + orbit camera +
+                 # seeded planet mesh + naga shaders (M1 renderer smoke)
     universe/    # seeds, galaxy/system/planet generation
+    hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons
     sim/         # colonies, robots, resources, tick
     assets/      # loading, caching, hot-reload (dev only)
     input/       # unified touch/mouse/keyboard/gamepad actions
     save/        # versioned save format
     core/        # math, units, time, RNG, error types
 crates/game/     # `game` binary: clean release entry — game states, camera journey, UI wiring
-crates/debug/    # `game_debug` lib (debug screens) + binary (non-default member):
-                 # runs the same game with developer tools and extra displays
+crates/debug/    # `game_debug` lib (Sphere Viewer screen: mesh/params/ui/
+                  # text/app modules + fps/console/inspector stubs) + binary
+                  # (non-default member): windowed viewer (orbit camera,
+                  # fill + wireframe + pentagon highlight, inputs panel,
+                  # --headless CI mode); developer screens never leak into
+                  # the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
-                 # planet preview / renderer smoke, save migrator, asset cooker
+                 # planet preview / renderer smoke (M1: seeded planet, orbit
+                 # camera, Low/Med/High tiers, --headless CI mode), save
+                 # migrator, asset cooker
 tests/           # consolidated integration tests
 assets/          # fonts, placeholder content, generated reference shots
 plans/           # per-feature notion -> plan -> implementation
@@ -60,6 +69,7 @@ plans/           # per-feature notion -> plan -> implementation
   never leak into the release binary.
 - `engine::sim` is headless-testable: no window, no GPU handle required.
 - `engine::universe` is pure + deterministic: same seed + version → byte-identical descriptors.
+- `engine::hexsphere` is pure + deterministic: same (N, radius, version) → bit-identical mesh (committed hash test).
 - `tools` may depend on `engine` with a `test-internals`-style feature, but `game` must not need dev-only features to run.
 - Platform code (`#[cfg(target_os = ...)]`) lives in `engine`, behind traits — `game` stays portable.
 
