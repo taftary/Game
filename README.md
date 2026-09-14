@@ -7,7 +7,14 @@ overview with links to stack, gates, milestones),
 
 ## Requirements
 
-- Rust toolchain (edition 2024, Rust 1.85+) via [rustup](https://rustup.rs).
+- Rust toolchain (edition 2024, Rust 1.87+) via [rustup](https://rustup.rs).
+  `rust-toolchain.toml` pins stable + `rustfmt`/`clippy`.
+- A Vulkan-capable GPU + driver. For validation layers in dev builds,
+  install the [Vulkan SDK](https://vulkan.lunarg.com/) (not needed to
+  build — only to run with layers enabled).
+- Mobile targets (`aarch64-linux-android`, `aarch64-apple-ios`) are
+  CI-checked; install them locally only if you touch platform code
+  (`rustup target add <target>`). Full device deploy arrives with M6.
 
 ## Quickstart
 

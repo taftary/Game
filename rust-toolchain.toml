@@ -1,0 +1,7 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Mobile targets are intentionally NOT listed here: contributors should
+# not pay for toolchains they never use. CI installs
+# aarch64-linux-android / aarch64-apple-ios explicitly for the mobile
+# compile-guard (see .github/workflows/ci.yml).

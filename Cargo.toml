@@ -20,7 +20,24 @@ version = "0.1.0"
 [workspace.dependencies]
 game_engine = { path = "crates/engine", version = "0.1.0" }
 vulkano = { version = "0.35", default-features = true }
-winit = { version = "0.30", default-features = true }
+winit = { version = "0.30", default-features = true, features = ["android-native-activity"] }
 naga = { version = "30", default-features = false, features = ["glsl-in", "spv-out", "wgsl-in"] }
 fontdue = { version = "0.9", default-features = true }
 glam = { version = "0.33", default-features = true }
+hecs = { version = "0.10", default-features = true }
+tracing = { version = "0.1", default-features = true }
+tracing-subscriber = { version = "0.3", default-features = true }
+
+# Perf-keyed profiles (see docs/techstack/quality.md budgets).
+# Release: smaller + faster mobile binaries; `thin` LTO keeps build
+# times sane — `fat` LTO is a pre-ship toggle (ADR to revisit).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Dev: keep heavy deps (vulkano, naga) usable at runtime without
+# paying full release build times on every iteration.
+[profile.dev.package."*"]
+opt-level = 1

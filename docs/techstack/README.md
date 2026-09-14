@@ -1,9 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.1.9 (2026-09-14, debug game crate: lib screens + runnable binary)
+- **Version:** 0.2.1 (2026-09-14, ADR-007 amendment: Apple/MoltenVK renderer + packaging requirements)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
-- **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` (see [`stack.md`](stack.md))
+- **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
 
 Locked for v1 unless an ADR (see [`../decisions/`](../decisions/)) overturns it.
 

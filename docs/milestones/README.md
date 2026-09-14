@@ -1,7 +1,7 @@
 # Milestones (suggested order; each is a `plans/` feature)
 
 1. **M0 — Scaffold repair (done 2026-09-14):** `docs/examples` removed from workspace; `viewer` example dropped, smoke moves to `tools`. Workspace must build green on Linux/Win/mac.
-2. **M1 — Renderer smoke + tiers:** `vulkano` boot in `tools` (Instance → Surface → swapchain), seeded sphere planet, Low/Med/High tiers, orbit camera.
+2. **M1 — Renderer smoke + tiers:** `vulkano` boot in `tools` (Instance → Surface → swapchain), seeded sphere planet, Low/Med/High tiers, orbit camera. Written against the Vulkan 1.1 device floor (ADR-007 in [`../decisions/`](../decisions/)); CI guards mobile compilation from here (see [`../techstack/quality.md`](../techstack/quality.md)).
 3. **M2 — Descent slice:** orbit → atmosphere → sky → soil state machine with fades + chunk streaming stub.
 4. **M3 — Surface walk:** character/rover controller + heightfield collision on one planet.
 5. **M4 — Colonies + robots core:** place 3 buildings, spawn robots, extract + haul loop, save/load.

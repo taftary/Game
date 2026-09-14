@@ -12,6 +12,8 @@ winit.workspace = true
 naga.workspace = true
 fontdue.workspace = true
 glam.workspace = true
+hecs.workspace = true
+tracing.workspace = true
 
 [lib]
 name = "game_engine"

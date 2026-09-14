@@ -1,7 +1,8 @@
 # Architecture (ground truth, 2026-09-14)
 
 Repo is an early Rust workspace scaffold: binaries run an empty `main`, tests
-are empty, and the five main deps ([`stack.md`](stack.md)) are declared but not
+are empty, and the engine deps ([`stack.md`](stack.md): `vulkano`, `winit`,
+`naga`, `fontdue`, `glam`, plus `hecs` + `tracing`) are declared but not
 yet used. Canonical layout (single-sourced here — root `README.md` points here, never copy it):
 
 ```text
@@ -21,7 +22,7 @@ assets/
   fonts/      - placeholder for bundled fonts
 ```
 
-Toolchain: Rust edition 2024, Rust 1.85+ via rustup.
+Toolchain: Rust edition 2024, Rust 1.87+ via rustup (`rust-toolchain.toml` pins stable).
 
 Workspace note (2026-09-14): `docs/examples` was removed; it is no longer a
 workspace member and there is no `viewer` example. Renderer smoke coverage moves

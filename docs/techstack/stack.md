@@ -5,12 +5,14 @@ Main dependencies (declared in workspace `Cargo.toml`, consumed by `crates/engin
 | Crate | Version (v1 lock) | Role |
 |---|---|---|
 | [`vulkano`](https://crates.io/crates/vulkano) | `0.35` (default features: `macros`, `x11`) | Safe Vulkan bindings: Instance → Device → Swapchain → command buffers, graphics/compute pipelines |
-| [`winit`](https://crates.io/crates/winit) | `0.30` stable (not `0.31-beta`) | Cross-platform windowing; provides `raw-window-handle 0.6` handles to `vulkano` Surfaces |
+| [`winit`](https://crates.io/crates/winit) | `0.30` stable (not `0.31-beta`) | Cross-platform windowing; provides `raw-window-handle 0.6` handles to `vulkano` Surfaces. `android-native-activity` enabled: winit's `default` features omit both Android activity impls, so a bare Android target check fails to compile without it (found by the CI mobile guard, 2026-09-14). `GameActivity` only by ADR (frame pacing / text input needs, M6+) |
 | [`naga`](https://crates.io/crates/naga) | `30` (`glsl-in`, `spv-out`, `wgsl-in`) | GLSL → SPIR-V shader compilation at runtime (pure Rust, no external `shaderc`) |
 | [`fontdue`](https://crates.io/crates/fontdue) | `0.9` | Font rasterization for UI text (pure Rust, no system font stack) |
 | [`glam`](https://crates.io/crates/glam) | `0.33` | SIMD-accelerated math (`Vec2/3/4`, `Mat4`, `Quat`) |
+| [`hecs`](https://crates.io/crates/hecs) | `0.10` | Entity/component storage for `engine::sim`; scheduling stays custom (decided by ADR-008, see [`../decisions/`](../decisions/)) |
+| [`tracing`](https://crates.io/crates/tracing) | `0.1` (+ `tracing-subscriber` `0.3` backend) | Engine spans/events; `fmt` layer on dev, logcat layer on Android (M6); feeds the `game_debug` console (decided by ADR-009) |
 
-- **Language:** Rust, edition 2024, 1.85+.
+- **Language:** Rust, edition 2024, 1.87+. Floor is set by locked `naga 30` (verified by the CI MSRV job against the committed `Cargo.lock`); bumping the floor needs no ADR, lowering it does.
 - **Renderer:** custom engine on `vulkano` + Vulkan directly (no Bevy, no `wgpu`, no Unity/Unreal/Godot).
 - **Graphics API:** Vulkan only in v1 code path.
   Vulkan on Windows / Linux / Android (phones, tablets, desktop);
@@ -26,6 +28,7 @@ Main dependencies (declared in workspace `Cargo.toml`, consumed by `crates/engin
   (required for consistent mobile rendering).
 - **Math:** `glam` everywhere (ADR to replace). f64 game coordinates converted to
   `glam` f32 render coordinates at the floating-origin boundary (see [`../game/journey.md`](../game/journey.md)).
+- **Allocator:** `mimalloc` default, validated in M1 behind a feature flag for A/B vs. system allocator (decided by ADR-009 in [`../decisions/`](../decisions/)).
 - **Procedural noise:** `noise` (default). Replace only if it fails cross-platform determinism tests (owner: M5, see [`../milestones/`](../milestones/)).
 - **Serialization:** `serde` + `postcard` (default, `bincode` fallback) compact binary for saves (owner: ADR-004, see [`../decisions/`](../decisions/)).
 - **UI:** custom immediate-or-retained UI on top of the `vulkano` swapchain (v1);

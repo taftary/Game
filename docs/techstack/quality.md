@@ -19,8 +19,9 @@ Thermal: sustained 15-min session must not throttle below Low-tier fps on refere
 
 # Testing and quality gates
 
-No CI — run these locally before every commit (canonical list, single-sourced
-here — `AGENTS.md` and `README.md` point here, never copy it):
+CI (`.github/workflows/ci.yml`) mirrors this list on every push/PR —
+this file stays the single source of truth; CI never adds its own
+gates. Run the local gates before every commit:
 
 ```text
 cargo fmt --check
@@ -30,6 +31,14 @@ cargo test --workspace --all-targets
 cargo test --doc --workspace
 cargo run --bin game
 cargo run -p game_debug --bin game_debug   # non-default member, like game_tools
+```
+
+Mobile compile-guard (CI always; local only if targets installed —
+`rustup target add aarch64-linux-android aarch64-apple-ios`):
+
+```text
+cargo check --workspace --target aarch64-linux-android
+cargo check --workspace --target aarch64-apple-ios
 ```
 
 Test policy:

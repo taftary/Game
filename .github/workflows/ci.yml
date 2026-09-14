@@ -1,0 +1,66 @@
+# CI mirrors the canonical gate list in docs/techstack/quality.md —
+# that file stays the single source of truth; this workflow never adds
+# its own gates. No releases, checks only.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace --all-targets
+      - name: doc tests
+        run: cargo test --doc --workspace
+      - name: run release entry
+        run: cargo run --bin game
+      - name: run debug entry
+        run: cargo run -p game_debug --bin game_debug
+
+  mobile-check:
+    # Compile-guard only: no devices, no NDK/Xcode linking required
+    # (`cargo check` never links). Deployment + on-device measurement
+    # stay M6; this job only guarantees mobile never silently rots.
+    name: mobile compile guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, aarch64-apple-ios
+      - name: check Android target
+        run: cargo check --workspace --target aarch64-linux-android
+      - name: check iOS target
+        run: cargo check --workspace --target aarch64-apple-ios
+
+  msrv:
+    # Validates the documented "Rust 1.87+" floor with the committed
+    # Cargo.lock. If a locked dep needs newer rustc, fix the docs
+    # (document the true MSRV), never downgrade deps for CI.
+    name: msrv (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.87.0
+      - name: check MSRV
+        run: cargo check --workspace
