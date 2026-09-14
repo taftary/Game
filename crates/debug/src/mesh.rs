@@ -204,7 +204,10 @@ mod tests {
         let mesh = HexSphere::generate(2, 1.0);
         let lines = build_wireframe(&mesh);
         let mut seen = BTreeSet::new();
-        for pair in lines.chunks_exact(2) {
+        // Indexed `step_by` pairs instead of `chunks_exact(2)`: clippy
+        // 1.98 pushes `as_chunks` (Rust 1.88+) but our floor is 1.87.
+        for i in (0..lines.len()).step_by(2) {
+            let pair = [lines[i], lines[i + 1]];
             // Match segments by quantized endpoints regardless of direction.
             let key = |p: [f32; 3]| (p.map(|c| (c * 1e6) as i32),);
             let (a, b) = (key(pair[0]), key(pair[1]));
@@ -258,7 +261,11 @@ mod tests {
                 ]
             };
             let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-            for tri in indices.chunks_exact(3) {
+            // Indexed `step_by` triples instead of `chunks_exact(3)`:
+            // clippy 1.98 pushes `as_chunks` (Rust 1.88+) but our floor
+            // is 1.87.
+            for i in (0..indices.len()).step_by(3) {
+                let tri = [indices[i], indices[i + 1], indices[i + 2]];
                 let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
                 let normal = cross(sub(b, a), sub(c, a));
                 let centroid = [
