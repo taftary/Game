@@ -12,7 +12,7 @@ there is no implemented behavior yet.
 ```sh
 cargo build --workspace
 cargo test --workspace --all-targets
-cargo run --bin planet-crafter-game
+cargo run --bin game
 ```
 
 All commands succeed immediately: binaries and examples run an empty
@@ -25,7 +25,7 @@ Cargo.toml    - workspace (engine, game, tools, examples, tests)
 Cargo.lock    - committed for reproducible builds
 .cargo/       - Windows main-thread stack reserve (16 MB)
 crates/
-  engine/     - library crate planet_crafter_engine (empty modules)
+  engine/     - library crate game_engine (empty modules)
   game/       - game binary, empty fn main() {}
   tools/      - tooling binary, empty fn main() {} (not a default member)
 docs/

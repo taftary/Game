@@ -3,30 +3,30 @@
 version = 4
 
 [[package]]
-name = "planet-crafter-examples"
+name = "game"
 version = "0.1.0"
 dependencies = [
- "planet_crafter_engine",
+ "game_engine",
 ]
 
 [[package]]
-name = "planet-crafter-game"
+name = "game_engine"
+version = "0.1.0"
+
+[[package]]
+name = "game_examples"
 version = "0.1.0"
 dependencies = [
- "planet_crafter_engine",
+ "game_engine",
 ]
 
 [[package]]
-name = "planet-crafter-tests"
+name = "game_tests"
 version = "0.1.0"
 dependencies = [
- "planet_crafter_engine",
+ "game_engine",
 ]
 
 [[package]]
-name = "planet-crafter-tools"
-version = "0.1.0"
-
-[[package]]
-name = "planet_crafter_engine"
+name = "game_tools"
 version = "0.1.0"

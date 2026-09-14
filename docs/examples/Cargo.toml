@@ -1,11 +1,11 @@
 [package]
-name = "planet-crafter-examples"
+name = "game_examples"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-planet_crafter_engine.workspace = true
+game_engine.workspace = true
 
 [features]
 gpu = []
@@ -13,3 +13,4 @@ gpu = []
 [[example]]
 name = "viewer"
 required-features = ["gpu"]
+

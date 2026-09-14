@@ -19,4 +19,4 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-planet_crafter_engine = { path = "crates/engine", version = "0.1.0" }
+game_engine = { path = "crates/engine", version = "0.1.0" }

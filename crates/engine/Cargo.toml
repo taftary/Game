@@ -1,5 +1,5 @@
 [package]
-name = "planet_crafter_engine"
+name = "game_engine"
 version.workspace = true
 edition.workspace = true
 
@@ -7,5 +7,5 @@ edition.workspace = true
 test-internals = []
 
 [lib]
-name = "planet_crafter_engine"
+name = "game_engine"
 path = "src/lib.rs"
