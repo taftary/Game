@@ -1,4 +1,4 @@
-# PlanetCrafter bundled fonts
+# Bundled fonts
 
-Target: JetBrains Mono (SIL OFL) is vendored here and embedded via
-`include_bytes!`. Current: Planned - no font file is vendored yet.
+Placeholder directory for fonts bundled with the game. No font file is
+vendored yet.
