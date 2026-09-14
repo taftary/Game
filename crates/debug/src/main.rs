@@ -50,7 +50,7 @@ use vulkano::pipeline::graphics::color_blend::{
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, DepthBiasState, RasterizationState};
+use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
@@ -79,7 +79,7 @@ use winit::window::{Window, WindowId};
 // Viewer GLSL (naga-compiled at runtime through `engine::render`).
 // ---------------------------------------------------------------------------
 
-const FILL_VERT: &str = r"#version 450
+const FILL_VERT: &str = r##"#version 450
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
 layout(location = 2) in float tint;
@@ -96,9 +96,14 @@ layout(location = 0) out vec3 v_normal;
 layout(location = 1) flat out float v_tint;
 void main() {
     gl_Position = pc.mvp * vec4(position, 1.0);
+    // The normal attribute is radial outward (position / radius) —
+    // pass it through. An earlier `-normal` hack lit the far side's
+    // inner faces, which were wrongly visible until the fill
+    // pipeline's front face matched the Y-down projection
+    // (issue-2026-09-14-2113).
     v_normal = normal;
     v_tint = tint * pc.highlight;
-}";
+}"##;
 
 const FILL_FRAG: &str = r"#version 450
 layout(location = 0) in vec3 v_normal;
@@ -114,14 +119,21 @@ void main() {
     f_color = vec4(base * (0.25 + 0.75 * diffuse), 1.0);
 }";
 
-const LINE_VERT: &str = r"#version 450
+const LINE_VERT: &str = r##"#version 450
 layout(location = 0) in vec3 position;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
+    float inflate;
 } pc;
 void main() {
-    gl_Position = pc.mvp * vec4(position, 1.0);
-}";
+    // Radial inflation: wireframe segments are exactly coplanar with the
+    // fill fans' corner-to-corner edges, so depth bias alone z-fights on
+    // real drivers -- the overlay vanished at grazing angles. A tiny
+    // world-space radial push keeps segments visibly above the fill at
+    // every subdivision (issue-2026-09-14-2020).
+    vec3 world = position * (1.0 + pc.inflate);
+    gl_Position = pc.mvp * vec4(world, 1.0);
+}"##;
 
 const LINE_FRAG: &str = r"#version 450
 layout(location = 0) out vec4 f_color;
@@ -197,12 +209,16 @@ struct FillPush {
     highlight: f32,
 }
 
-/// Line push constants: MVP only.
+/// Line push constants: MVP + radial wireframe inflation (68 B < 128 B).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct MvpData {
+struct LinePush {
     mvp: [[f32; 4]; 4],
+    inflate: f32,
 }
+
+/// Wireframe radial inflation factor (2e-4 of radius ≈ 0.2 mm at R=1).
+const LINE_INFLATE: f32 = 2e-4;
 
 /// UI push constants: pixel→NDC ortho + texture-enable flag.
 #[derive(BufferContents, Clone, Copy)]
@@ -218,6 +234,10 @@ const DEPTH_FORMAT: Format = Format::D16_UNORM;
 const MAX_UI_VERTS: u64 = 16384;
 /// UI raster size, px.
 const UI_PX: f32 = 16.0;
+/// Windowed default subdivisions (headless stays at the engine N=6 pin).
+const WINDOWED_SUBDIV: u32 = 4;
+/// Windowed default radius.
+const WINDOWED_RADIUS: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // UI theme.
@@ -708,6 +728,16 @@ fn build_fill_pipeline(
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
+                // `OrbitCamera::projection_matrix` outputs Y-down NDC
+                // (glam `vulkan::perspective`): the baked-in Y-flip
+                // mirrors triangle winding in framebuffer space, where
+                // Vulkan classifies front faces — so the mesh's
+                // CCW-outward fans (`fill_faces_point_outward`) land as
+                // CW. Clockwise front keeps the near-side outward faces
+                // and culls the far side; the CCW default culled the
+                // near side and rendered the sphere inside-out
+                // (issue-2026-09-14-2113).
+                front_face: FrontFace::Clockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -756,16 +786,9 @@ fn build_line_pipeline(
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::None,
-                // Wireframe segments are exactly coplanar with the fill
-                // fans' corner→corner edges: without bias the `Less`
-                // depth test below would fail on equal depths and the
-                // overlay would flicker out. A small constant pull is
-                // safe — nothing else lives near the shell.
-                depth_bias: Some(DepthBiasState {
-                    constant_factor: -4.0,
-                    clamp: 0.0,
-                    slope_factor: 0.0,
-                }),
+                // Coplanarity with the fill is handled by radial inflation
+                // in the line vertex shader (LINE_INFLATE), not depth bias
+                // — bias alone z-fought at grazing angles.
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -1072,7 +1095,15 @@ impl ViewerApp {
         )
         .expect("atlas sampler must create");
 
-        let debug = DebugApp::new();
+        // The windowed viewer opens at N=4: at the N=6 headless default
+        // cells are subpixel (faces and pentagon sites unreadable), which
+        // defeats the inspection goal of the default view. The `--headless`
+        // path stays N=6 to cross-check the committed engine mesh hash
+        // (update-2026-09-14-2008).
+        let debug = DebugApp::with_viewer(SphereViewerState::with_values(
+            WINDOWED_SUBDIV,
+            WINDOWED_RADIUS,
+        ));
         let viewer = &debug.viewer;
         tracing::info!(
             subdivisions = viewer.subdiv,
@@ -1605,7 +1636,14 @@ impl ViewerApp {
                         .expect("pipeline must bind")
                         .bind_vertex_buffers(0, self.line_vertices.clone())
                         .expect("vertex buffer must bind")
-                        .push_constants(rcx.line_pipeline.layout().clone(), 0, MvpData { mvp })
+                        .push_constants(
+                            rcx.line_pipeline.layout().clone(),
+                            0,
+                            LinePush {
+                                mvp,
+                                inflate: LINE_INFLATE,
+                            },
+                        )
                         .expect("line push constants must upload");
                     if !self.debug.viewer.lines.is_empty() {
                         // SAFETY: `vertex_count` equals the uploaded line

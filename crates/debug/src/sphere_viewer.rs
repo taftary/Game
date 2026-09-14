@@ -49,11 +49,24 @@ pub struct SphereViewerState {
 
 impl SphereViewerState {
     /// Default panel (N=6, R=1.0, both toggles on) with a built mesh.
+    /// This is also the headless default: N=6 matches the engine pin, so
+    /// the headless stats cross-check the committed mesh hash.
     pub fn new() -> Self {
+        SphereViewerState::with_values(DEFAULT_SUBDIVISIONS, DEFAULT_RADIUS)
+    }
+
+    /// Panel with explicit values (both toggles on) and a built mesh.
+    /// `subdivisions` is clamped to the 0–8 panel range by the slider;
+    /// `radius` must be `> 0` and finite (the generator panics otherwise).
+    pub fn with_values(subdivisions: u32, radius: f32) -> Self {
+        assert!(
+            radius.is_finite() && radius > 0.0,
+            "viewer radius must be positive and finite, got {radius}"
+        );
         let mut state = SphereViewerState {
-            subdiv_field: TextField::new(&DEFAULT_SUBDIVISIONS.to_string()),
-            radius_field: TextField::new(DEFAULT_RADIUS_TEXT),
-            subdiv_slider: Slider::new(MIN_SUBDIVISIONS, MAX_SUBDIVISIONS, DEFAULT_SUBDIVISIONS),
+            subdiv_field: TextField::new(&subdivisions.to_string()),
+            radius_field: TextField::new(&radius.to_string()),
+            subdiv_slider: Slider::new(MIN_SUBDIVISIONS, MAX_SUBDIVISIONS, subdivisions),
             wire_cb: Checkbox { checked: true },
             pent_cb: Checkbox { checked: true },
             subdiv: DEFAULT_SUBDIVISIONS,
@@ -73,7 +86,7 @@ impl SphereViewerState {
         };
         state
             .regenerate()
-            .expect("defaults are valid and must build");
+            .expect("constructed values are valid and must build");
         state
     }
 

@@ -68,10 +68,13 @@ impl OrbitCamera {
         )
     }
 
-    /// Drag-rotate: `dx`/`dy` are pixels; 0.01 rad/px.
+    /// Drag-rotate: `dx`/`dy` are window pixels (y down-positive);
+    /// 0.01 rad/px. Dragging up pitches the camera up toward the
+    /// sphere's top (FPS-style, non-inverted); dragging right yaws
+    /// with the drag.
     pub fn rotate(&mut self, dx: f32, dy: f32) {
         self.yaw += dx * 0.01;
-        self.pitch = (self.pitch + dy * 0.01).clamp(-MAX_PITCH, MAX_PITCH);
+        self.pitch = (self.pitch - dy * 0.01).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
     /// Scroll-zoom: positive `delta` moves closer (multiplicative).
@@ -140,9 +143,10 @@ mod tests {
     #[test]
     fn pitch_clamps_away_from_poles() {
         let mut camera = camera();
-        camera.rotate(0.0, 10_000.0);
+        // Drag up (negative window dy) pitches up, drag down pitches down.
+        camera.rotate(0.0, -10_000.0);
         assert_eq!(camera.pitch(), MAX_PITCH);
-        camera.rotate(0.0, -20_000.0);
+        camera.rotate(0.0, 20_000.0);
         assert_eq!(camera.pitch(), -MAX_PITCH);
     }
 

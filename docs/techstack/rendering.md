@@ -7,6 +7,17 @@
 - Dev builds enable Vulkan validation layers; the `tools` renderer smoke must boot on Windows/Linux and report Instance / adapter / driver.
 - Swapchain recreation (resize, orientation, backgrounding) is explicit; stale swapchain is never fatal.
 - No optional Vulkan extensions in gameplay-critical code; extras are tier-gated and probed at runtime.
+- Winding convention: `HexSphere` meshes are CCW-outward in world space,
+  but `OrbitCamera::projection_matrix` outputs Y-down NDC (glam
+  `vulkan::perspective`) and Vulkan classifies front faces in
+  framebuffer space — the projection's Y-flip mirrors winding, so
+  culling pipelines must use `FrontFace::Clockwise` with
+  `CullMode::Back`. Both windowed binaries (`game_debug` fill,
+  `game_tools` planet) follow it —
+  `plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`.
+- Orbit input convention (`OrbitCamera::rotate`, shared): drag up
+  pitches the camera toward the sphere's top (FPS-style non-inverted),
+  drag right yaws with the drag.
 
 ## Passes (v1)
 
@@ -66,11 +77,17 @@ the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).
 
 - Windowed: `winit` window + `vulkano` boot mirroring the tools smoke,
-  three viewer-owned pipelines (fill with highlight flag, `LineList`
-  wireframe with depth bias, UI textured quads), D16 depth attachment,
-  `fontdue` atlas from the vendored `assets/fonts/DejaVuSans.ttf`,
-  viewport-clipped 3D + full-window UI in one render pass, swapchain
-  recreation on resize, adapter + mesh stats logged at startup.
+  three viewer-owned pipelines (fill with highlight flag and `flat`
+  per-cell tint, translucent `LineList` wireframe with depth bias, UI
+  textured quads), D16 depth attachment, `fontdue` atlas from the
+  vendored `assets/fonts/DejaVuSans.ttf`, viewport-clipped 3D +
+  full-window UI in one render pass, swapchain recreation on resize,
+  adapter + mesh stats logged at startup. The windowed default opens at
+  N=4 (readable faces + pentagon sites; N=6 cells are subpixel —
+  `plans/debug-sphere-viewer/update-2026-09-14-2008`). The fill pipeline
+  follows the Backend winding convention (`FrontFace::Clockwise`) and
+  passes the radial outward normal through unflipped
+  (`plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`).
 - `--headless`: GPU-free viewer-mesh build (N=6, R=1.0) + stats print;
   runs in CI as `cargo run -p game_debug -- --headless`.
 - `engine::hexsphere` and the release `game` binary are untouched; all

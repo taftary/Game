@@ -35,7 +35,7 @@ use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
+use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
@@ -391,9 +391,15 @@ impl App {
                 input_assembly_state: Some(InputAssemblyState::default()),
                 viewport_state: Some(ViewportState::default()),
                 rasterization_state: Some(RasterizationState {
-                    // Convex planet + CCW dual-cell fans: backface culling
-                    // resolves visibility, no depth buffer in M1.
+                    // Convex planet: backface culling resolves
+                    // visibility, no depth buffer in M1. Front face is
+                    // Clockwise because the Y-down NDC of
+                    // `OrbitCamera::projection_matrix` mirrors the
+                    // CCW-outward fans in framebuffer space (same
+                    // convention as the debug viewer —
+                    // issue-2026-09-14-2113).
                     cull_mode: CullMode::Back,
+                    front_face: FrontFace::Clockwise,
                     ..Default::default()
                 }),
                 multisample_state: Some(MultisampleState::default()),

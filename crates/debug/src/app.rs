@@ -70,9 +70,14 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        App::with_viewer(SphereViewerState::new())
+    }
+
+    /// App with an explicit viewer state (e.g. the windowed default).
+    pub fn with_viewer(viewer: SphereViewerState) -> Self {
         App {
             screen: Screen::SphereViewer,
-            viewer: SphereViewerState::new(),
+            viewer,
             fps: FpsOverlay,
             console: LogConsole,
             inspector: StateInspector,
