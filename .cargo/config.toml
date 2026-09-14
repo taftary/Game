@@ -1,4 +1,4 @@
 # Windows MSVC: reserve 16 MB of main-thread stack. Required by vulkano's
-# runtime SPIR-V parser once the Vulkan viewer lands; harmless until then.
+# runtime SPIR-V handling once the tools renderer smoke lands (M1).
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "link-args=/STACK:16777216"]

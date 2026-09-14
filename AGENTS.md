@@ -6,38 +6,33 @@ file documents, update this file to match.
 
 ## Project overview
 
-Game is a freshly cleaned Rust workspace scaffold. The project is a blank slate to grow from.
+Game is a Rust workspace (procedural colony universe). Engine direction and
+milestones live in [`docs/`](docs/README.md) (`techstack/`, `game/`,
+`milestones/`, `risks/`, `decisions/`); per-feature work
+lives in [`plans/`](plans/README.md). This file is the entry point for
+day-to-day agent commands and workflow pointers — details stay where they
+belong, linked below.
 
 ## Commands
 
-```text
-cargo build --workspace
-cargo run --bin game
-cargo test --workspace --all-targets
-cargo test --doc --workspace
-cargo check --example viewer --features gpu
-```
+Local gates live in [`docs/techstack/quality.md`](docs/techstack/quality.md) — run them
+before committing. Test policy and perf budgets: same file.
 
 ## Feature lifecycle (plans/)
 
-Read [`plans/README.md`](plans/README.md) before creating or changing any
-feature. Agents must follow this cycle:
+Canonical spec: [`plans/README.md`](plans/README.md) — read it before creating
+or changing any feature and follow it verbatim.
 
-- Feature folder: `plans/<feature-name>/`, kebab-case only
-  (`^[a-z0-9]+(-[a-z0-9]+)*$`), unique. Copy empty templates from
-  `plans/_template/`; never invent file names.
-- Order: `notion.md` first (needs + `Status` + `Definition of Done`), then
-  `plan.md` (organized features + todo list + DoD verification). Implement
-  from `plan.md` only.
-- Status vocabulary everywhere (`notion.md`, update `notion.md`, issue
-  `specs.md`): `draft -> planned -> in-progress -> in-review -> done`, plus
-  `on-hold` / `cancelled` (require a reason). `done` only when every DoD
-  criterion is checked with evidence.
-- Updates after done: `update-YYYY-MM-DD-HHMM/` (UTC) under the feature, own
-  `notion.md` + `plan.md`, todos `UPD-YYYYMMDD-001`, ... Never edit the parent
-  in place; cross-link.
-- Issues: `issue-YYYY-MM-DD-HHMM-<slug>/` (UTC) under the feature,
-  `specs.md` (intake, holds `Status`) -> `report.md` (investigation) +
-  `plan.md` (fix, todos `ISS-YYYYMMDD-001`, ...). Never rewrite parents.
+## Docs maintenance
+
+Every feature or change must update the docs it affects and verify them:
+
+- `docs/` — update the part your change touches (`techstack/`, `game/`,
+  `milestones/`, `risks/`, `decisions/`); bump the Version line in
+  `docs/techstack/README.md`.
+- `plans/<feature>/` — keep `notion.md` / `plan.md` (and update/issue files)
+  in sync with what actually landed, including DoD evidence.
+- Verify: every link you touched resolves, no section contradicts another,
+  and anything this file documents still matches — otherwise update this file too.
 
 

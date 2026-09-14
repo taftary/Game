@@ -6,6 +6,13 @@ edition.workspace = true
 [features]
 test-internals = []
 
+[dependencies]
+vulkano.workspace = true
+winit.workspace = true
+naga.workspace = true
+fontdue.workspace = true
+glam.workspace = true
+
 [lib]
 name = "game_engine"
 path = "src/lib.rs"

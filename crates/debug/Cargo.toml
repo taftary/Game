@@ -1,0 +1,15 @@
+[package]
+name = "game_debug"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game_engine.workspace = true
+
+[lib]
+name = "game_debug"
+path = "src/lib.rs"
+
+[[bin]]
+name = "game_debug"
+path = "src/main.rs"
