@@ -6,9 +6,10 @@
 //! - Windowed (default): `winit` window + `vulkano` boot mirroring
 //!   `game_tools` (Instance → Surface → Device → Swapchain, Vulkan 1.1
 //!   cap), Sphere Viewer screen (orbit camera, filled dual-cell mesh,
-//!   wireframe overlay, pentagon highlight, inputs panel, read-only
-//!   stats) plus FPS/Console/Inspector placeholder screens, F1–F4/click
-//!   nav with preserved viewer state.
+//!   wireframe overlay, pentagon highlight, cell-chunk hover highlight +
+//!   click-to-pin with panel readout, inputs panel, read-only stats) plus
+//!   FPS/Console/Inspector placeholder screens, F1–F4/click nav with
+//!   preserved viewer state.
 //!
 //! All screen logic lives in the `game_debug` lib (window- and GPU-free);
 //! this binary owns the winit event loop, the three graphics pipelines
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 use game_debug::app::{App as DebugApp, Screen};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
+use game_debug::picking::{Ray, intersect_sphere, pick_cell, ray_from_cursor};
 use game_debug::sphere_viewer::{DebugMode, SphereViewerState, ViewFocus};
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
@@ -91,6 +93,8 @@ layout(push_constant) uniform PushConstants {
     float mode;
     float density;
     float seams_on;
+    float hover_cell;
+    float pin_cell;
 } pc;
 layout(location = 0) out vec3 v_normal;
 // `flat`: tint/seam/island are per-vertex flags. Fan triangles are
@@ -100,8 +104,18 @@ layout(location = 1) flat out float v_tint;
 layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out float v_seam;
 layout(location = 4) flat out float v_island;
+layout(location = 5) flat out float v_hover;
+layout(location = 6) flat out float v_pin;
 void main() {
     gl_Position = pc.mvp * vec4(position, 1.0);
+    // Hover/pin ride the provoking vertex like tint/seam/island: fan
+    // centers upload first in cell order, so gl_VertexIndex IS the chunk
+    // id there. Compared in float (vertex counts stay exactly
+    // representable in f32) — uint(negative) is UB in GLSL, and -1.0
+    // means "none", which can never match a real index.
+    float vid = float(gl_VertexIndex);
+    v_hover = (abs(vid - pc.hover_cell) < 0.5) ? 1.0 : 0.0;
+    v_pin = (abs(vid - pc.pin_cell) < 0.5) ? 1.0 : 0.0;
     // The normal attribute is radial outward (position / radius) —
     // pass it through. An earlier `-normal` hack lit the far side's
     // inner faces, which were wrongly visible until the fill
@@ -120,12 +134,16 @@ layout(location = 1) flat in float v_tint;
 layout(location = 2) in vec2 v_uv;
 layout(location = 3) flat in float v_seam;
 layout(location = 4) flat in float v_island;
+layout(location = 5) flat in float v_hover;
+layout(location = 6) flat in float v_pin;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     float highlight;
     float mode;
     float density;
     float seams_on;
+    float hover_cell;
+    float pin_cell;
 } pc;
 layout(location = 0) out vec4 f_color;
 float hash1(float n) {
@@ -198,6 +216,10 @@ void main() {
     if (pc.seams_on > 0.5 && v_seam > 0.5) {
         col = mix(col, vec3(1.0, 0.15, 0.15), 0.85);
     }
+    // Chunk hover/pin (cell-chunks): applied last so the highlight reads
+    // in every debug mode; the pin is the stronger, sticky selection.
+    col = mix(col, vec3(0.6, 0.95, 1.0), 0.45 * v_hover);
+    col = mix(col, vec3(0.6, 0.95, 1.0), 0.75 * v_pin);
     f_color = vec4(col, 1.0);
 }";
 
@@ -212,12 +234,16 @@ layout(push_constant) uniform PushConstants {
     float mode;
     float density;
     float seams_on;
+    float hover_cell;
+    float pin_cell;
 } pc;
 layout(location = 0) out vec3 v_normal;
 layout(location = 1) flat out float v_tint;
 layout(location = 2) out vec2 v_uv;
 layout(location = 3) flat out float v_seam;
 layout(location = 4) flat out float v_island;
+layout(location = 5) flat out float v_hover;
+layout(location = 6) flat out float v_pin;
 void main() {
     gl_Position = pc.mvp * vec4(uv_pos, 0.0, 1.0);
     v_normal = normal;
@@ -225,6 +251,10 @@ void main() {
     v_uv = uv_pos;
     v_seam = dbg.x;
     v_island = dbg.y;
+    // No chunk hover in the flat UV net (v1): the shared fragment shader
+    // still declares these inputs, so they must be written.
+    v_hover = 0.0;
+    v_pin = 0.0;
 }"##;
 
 const FLAT_LINE_VERT: &str = r##"#version 450
@@ -235,6 +265,10 @@ layout(push_constant) uniform PushConstants {
     float mode;
     float density;
     float seams_on;
+    // Unused here (no chunk hover on UV wireframe, v1) — declared so the
+    // shared FillPush block stays one size across all pipelines.
+    float hover_cell;
+    float pin_cell;
 } pc;
 void main() {
     gl_Position = pc.mvp * vec4(uv_pos, 0.0, 1.0);
@@ -364,7 +398,8 @@ struct UiVertex {
 }
 
 /// Fill push constants: MVP + pentagon-highlight flag + debug-mode id +
-/// checker density + seam overlay flag (80 B < 128 B floor).
+/// checker density + seam overlay flag + hovered/pinned chunk ids
+/// (−1.0 = none; 88 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct FillPush {
@@ -373,6 +408,8 @@ struct FillPush {
     mode: f32,
     density: f32,
     seams_on: f32,
+    hover_cell: f32,
+    pin_cell: f32,
 }
 
 /// Line push constants: MVP + radial wireframe inflation (68 B < 128 B).
@@ -400,6 +437,9 @@ const DEPTH_FORMAT: Format = Format::D16_UNORM;
 const MAX_UI_VERTS: u64 = 16384;
 /// UI raster size, px.
 const UI_PX: f32 = 16.0;
+/// Press-to-release travel (px) below which a left-button viewport gesture
+/// counts as a click (chunk pin) rather than an orbit drag.
+const CLICK_MAX_DRAG_PX: f32 = 4.0;
 /// Windowed default subdivisions (headless stays at the engine N=6 pin).
 const WINDOWED_SUBDIV: u32 = 4;
 /// Windowed default radius.
@@ -450,9 +490,27 @@ fn parse_args(argv: &[String]) -> Result<bool, String> {
 }
 
 /// GPU-free viewer check: build the default mesh through the lib, print
-/// stats, exit 0. Never touches `VulkanLibrary` or `EventLoop`.
+/// stats, run the pick self-test, exit 0. Never touches
+/// `VulkanLibrary` or `EventLoop`.
 fn run_headless() -> i32 {
     let viewer = SphereViewerState::new();
+    // Pick self-test (cell-chunks): aiming at cell 0's center from 5
+    // radii out must resolve chunk 0 — fails loudly on picking or
+    // mesh-ordering regressions.
+    let target =
+        glam::Vec3::from_array(viewer.mesh.cell_center(0)).normalize() * viewer.radius * 5.0;
+    let ray = Ray {
+        origin: target,
+        dir: -target.normalize(),
+    };
+    let hit = intersect_sphere(ray, viewer.radius).expect("pick self-test ray must hit");
+    let picked = pick_cell(&viewer.mesh, hit, None);
+    assert_eq!(
+        picked.index(),
+        0,
+        "pick self-test resolved chunk {}",
+        picked.index()
+    );
     let stats = &viewer.stats;
     let seams = viewer.fill_debug.seam.iter().filter(|&&s| s == 1.0).count();
     let mut islands = viewer.fill_debug.island.clone();
@@ -478,6 +536,7 @@ fn run_headless() -> i32 {
         viewer.focus,
         viewer.debug_mode,
     );
+    println!("pick_selftest=chunk{} ok", picked.index());
     0
 }
 
@@ -576,6 +635,8 @@ struct PanelPlan {
     pent_label: Rect,
     seam_label: Rect,
     uvwire_label: Rect,
+    chunk_header: Rect,
+    chunk_lines: [Rect; 4],
     stats_header: Rect,
     stat_lines: [Rect; 6],
 }
@@ -608,6 +669,13 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
     let pent_label = rows.next(lh, 4.0);
     let seam_label = rows.next(lh, 4.0);
     let uvwire_label = rows.next(lh, 4.0);
+    let chunk_header = rows.next(lh, 4.0);
+    let chunk_lines = [
+        rows.next(lh, 4.0),
+        rows.next(lh, 4.0),
+        rows.next(lh, 4.0),
+        rows.next(lh, 4.0),
+    ];
     let stats_header = rows.next(lh, 4.0);
     let stat_lines = [
         rows.next(lh, 4.0),
@@ -651,6 +719,8 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
         pent_label,
         seam_label,
         uvwire_label,
+        chunk_header,
+        chunk_lines,
         stats_header,
         stat_lines,
     }
@@ -879,6 +949,33 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
             label_row.y + lh - 4.0,
             C_TEXT,
         );
+    }
+
+    // Chunk hover/pin readout (cell-chunks): the pin wins over a
+    // fleeting hover; nothing selected shows em-dashes.
+    text_row(&mut items, plan.chunk_header, "CHUNK".to_owned(), C_DIM);
+    let shown = viewer.shown_chunk();
+    let chunk_line = match shown {
+        None => "chunk:     —".to_owned(),
+        Some(chunk) => format!("chunk:     {}", fmt_int(chunk.index() as usize)),
+    };
+    let (type_line, neigh_line) = match shown.and_then(|chunk| viewer.chunk_sides(chunk)) {
+        None => ("type:      —".to_owned(), "neighbors: —".to_owned()),
+        Some(5) => ("type:      pentagon".to_owned(), "neighbors: 5".to_owned()),
+        Some(6) => ("type:      hexagon".to_owned(), "neighbors: 6".to_owned()),
+        Some(_) => ("type:      ?".to_owned(), "neighbors: ?".to_owned()),
+    };
+    let state_line = match (viewer.pinned, viewer.hovered) {
+        (Some(_), _) => "state:     pinned".to_owned(),
+        (None, Some(_)) => "state:     hover".to_owned(),
+        (None, None) => "state:     —".to_owned(),
+    };
+    for (row, line) in plan
+        .chunk_lines
+        .iter()
+        .zip([chunk_line, type_line, neigh_line, state_line])
+    {
+        text_row(&mut items, *row, line, C_TEXT);
     }
 
     // Read-only stats.
@@ -1512,6 +1609,10 @@ struct ViewerApp {
     dragging_slider: bool,
     dragging_density: bool,
     last_cursor: Option<(f32, f32)>,
+    /// Cursor position at left-button press (main-viewport sphere presses
+    /// only): release within [`CLICK_MAX_DRAG_PX`] of it counts as a click
+    /// (chunk pin) rather than an orbit drag.
+    press_cursor: Option<(f32, f32)>,
     rcx: Option<RenderContext>,
 }
 
@@ -1637,6 +1738,7 @@ impl ViewerApp {
             dragging_slider: false,
             dragging_density: false,
             last_cursor: None,
+            press_cursor: None,
             rcx: None,
         }
     }
@@ -1657,6 +1759,37 @@ impl ViewerApp {
             gen_ms = format!("{:.1}", viewer.stats.gen_ms),
             "sphere viewer mesh regenerated",
         );
+    }
+
+    /// Recompute the hovered chunk from the current cursor: only when the
+    /// Sphere Viewer is active and the cursor sits inside a sphere-rendered
+    /// rect (main viewport with sphere focus, panel thumb with UV focus).
+    /// A miss (cursor over empty space, panel, or nav) clears the hover.
+    /// Hover feeds the fill highlight + panel CHUNK readout; it never
+    /// touches the mesh. Callers refresh after every cursor or camera move
+    /// so the highlight tracks within one frame.
+    fn update_hover(&mut self) {
+        let hovered = self
+            .last_cursor
+            .zip(self.rcx_window_size())
+            .filter(|_| self.debug.screen == Screen::SphereViewer)
+            .and_then(|((cx, cy), (w, h))| {
+                let layout = ui::layout(w, h);
+                let rect = match self.debug.viewer.focus {
+                    ViewFocus::SphereMain => layout.viewport,
+                    ViewFocus::UvMain => ui::uv_thumb_rect(layout.panel, 8.0),
+                };
+                if !rect.contains(cx, cy) || rect.w < 1.0 || rect.h < 1.0 {
+                    return None;
+                }
+                let aspect = rect.w / rect.h;
+                let view_proj = self.camera.projection_matrix(aspect) * self.camera.view_matrix();
+                let ray = ray_from_cursor((cx, cy), rect, view_proj);
+                let hit = intersect_sphere(ray, self.debug.viewer.radius)?;
+                let viewer = &self.debug.viewer;
+                Some(pick_cell(&viewer.mesh, hit, viewer.hovered))
+            });
+        self.debug.viewer.hovered = hovered;
     }
 
     /// (Re)build the atlas image + descriptor set when the atlas grew;
@@ -1871,6 +2004,9 @@ impl ApplicationHandler for ViewerApp {
                     self.camera.rotate(cursor.0 - last.0, cursor.1 - last.1);
                 }
                 self.last_cursor = Some(cursor);
+                // Hover tracks cursor AND camera moves (orbit drags change
+                // the cells under a static cursor).
+                self.update_hover();
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 if button != MouseButton::Left {
@@ -1878,9 +2014,27 @@ impl ApplicationHandler for ViewerApp {
                 }
                 let pressed = state == ElementState::Pressed;
                 if !pressed {
+                    // Release: a press that barely traveled counts as a
+                    // click — pin the hovered chunk. The release must still
+                    // land in the main sphere viewport, and pinning only
+                    // exists there (thumb clicks keep swap-view).
+                    let click = self.press_cursor.zip(self.last_cursor).is_some_and(
+                        |((px, py), (cx, cy))| (cx - px).hypot(cy - py) <= CLICK_MAX_DRAG_PX,
+                    );
                     self.dragging_orbit = false;
                     self.dragging_slider = false;
                     self.dragging_density = false;
+                    self.press_cursor = None;
+                    if click
+                        && self.debug.screen == Screen::SphereViewer
+                        && self.debug.viewer.focus == ViewFocus::SphereMain
+                        && let Some(chunk) = self.debug.viewer.hovered
+                        && self.last_cursor.zip(self.rcx_window_size()).is_some_and(
+                            |((cx, cy), (w, h))| ui::layout(w, h).viewport.contains(cx, cy),
+                        )
+                    {
+                        self.debug.viewer.toggle_pin(chunk);
+                    }
                     return;
                 }
                 let Some((cx, cy)) = self.last_cursor else {
@@ -1900,6 +2054,13 @@ impl ApplicationHandler for ViewerApp {
                 // Viewport drag starts an orbit.
                 if layout.viewport.contains(cx, cy) {
                     self.dragging_orbit = true;
+                    // A sphere-main press may end as a chunk-pin click
+                    // (decided on release by travel distance).
+                    if self.debug.screen == Screen::SphereViewer
+                        && self.debug.viewer.focus == ViewFocus::SphereMain
+                    {
+                        self.press_cursor = Some((cx, cy));
+                    }
                     return;
                 }
                 // Panel widgets (viewer screen only).
@@ -1947,6 +2108,9 @@ impl ApplicationHandler for ViewerApp {
                 if regenerated {
                     self.refresh_mesh();
                 }
+                // Panel clicks, focus swaps and rebuilds all change what
+                // sits under the cursor — refresh the hover.
+                self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let in_viewport = self
@@ -1959,6 +2123,7 @@ impl ApplicationHandler for ViewerApp {
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
                     };
                     self.camera.zoom(scroll);
+                    self.update_hover();
                 }
             }
             WindowEvent::KeyboardInput {
@@ -2039,6 +2204,7 @@ impl ApplicationHandler for ViewerApp {
                             let viewer = &self.debug.viewer;
                             if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
                                 self.debug.viewer.toggle_focus();
+                                self.update_hover();
                             } else if let Some(text) = text {
                                 let viewer = &mut self.debug.viewer;
                                 for ch in text.chars() {
@@ -2200,6 +2366,18 @@ impl ViewerApp {
                 0.0
             };
             let seams_on = if self.debug.viewer.seams { 1.0 } else { 0.0 };
+            let hover_cell = self
+                .debug
+                .viewer
+                .hovered
+                .map(|chunk| chunk.index() as f32)
+                .unwrap_or(-1.0);
+            let pin_cell = self
+                .debug
+                .viewer
+                .pinned
+                .map(|chunk| chunk.index() as f32)
+                .unwrap_or(-1.0);
             for (vp, show_sphere) in views {
                 if vp.w < 1.0 || vp.h < 1.0 {
                     continue;
@@ -2231,6 +2409,8 @@ impl ViewerApp {
                                 mode,
                                 density,
                                 seams_on,
+                                hover_cell,
+                                pin_cell,
                             },
                         )
                         .expect("fill push constants must upload");
@@ -2277,6 +2457,8 @@ impl ViewerApp {
                                 mode,
                                 density,
                                 seams_on,
+                                hover_cell,
+                                pin_cell,
                             },
                         )
                         .expect("flat push constants must upload");
@@ -2297,6 +2479,8 @@ impl ViewerApp {
                                     mode,
                                     density,
                                     seams_on,
+                                    hover_cell,
+                                    pin_cell,
                                 },
                             )
                             .expect("flat line push constants must upload");
@@ -2467,6 +2651,18 @@ mod tests {
     }
 
     #[test]
+    fn fill_push_constants_fit_vulkan_floor() {
+        // Vulkan 1.1 guarantees only 128 B of push constants; the fill
+        // block (MVP + flags + hover/pin ids) must stay under it on every
+        // tier, or pipeline creation fails on the floor devices.
+        let bytes = std::mem::size_of::<FillPush>();
+        assert!(
+            bytes <= 128,
+            "FillPush is {bytes} B, over the 128 B Vulkan 1.1 floor"
+        );
+    }
+
+    #[test]
     fn gnomonic_glsl_matches_engine() {
         use game_engine::render::glsl_const_block;
         // The checker face table is generated from the same base
@@ -2554,6 +2750,10 @@ mod tests {
             assert!(rects.wire_box.y < rects.pent_box.y);
             assert!(rects.pent_box.y < rects.seam_box.y);
             assert!(rects.seam_box.y < rects.uvwire_box.y);
+            assert!(rects.uvwire_box.y < plan.chunk_header.y);
+            assert!(plan.chunk_header.y < plan.chunk_lines[0].y);
+            assert!(plan.chunk_lines.windows(2).all(|w| w[0].y < w[1].y));
+            assert!(plan.chunk_lines[3].y < plan.stats_header.y);
             assert!(plan.uv_header.y < plan.density_label.y);
             assert!(plan.inputs_header.y < plan.subdiv_label.y);
             assert!(plan.subdiv_hint.y < plan.radius_label.y);
@@ -2586,6 +2786,9 @@ mod tests {
             "Seams",
             "UV wire",
             "UV DEBUG",
+            "CHUNK",
+            "chunk:",
+            "state:",
             "Swap view (U)",
             "Shader: Lit",
             "Checker density:",

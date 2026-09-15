@@ -9,3 +9,4 @@
 - [ ] ADR-007: reference devices per tier + device floor + perf harness — draft in [`ADR-007.md`](ADR-007.md), devices finalized by M6.
 - [x] ADR-008: ECS — adopt `hecs`, custom scheduling — [`ADR-008.md`](ADR-008.md).
 - [x] ADR-009: allocator default (`mimalloc`, validate M1) + `tracing` logging — [`ADR-009.md`](ADR-009.md).
+- [x] ADR-010: cell-chunk identity (chunk = dual cell index, grouping deferred to M2) — [`ADR-010.md`](ADR-010.md).

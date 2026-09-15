@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use game_engine::hexsphere::{DEFAULT_SUBDIVISIONS, HexSphere};
+use game_engine::hexsphere::{ChunkId, DEFAULT_SUBDIVISIONS, HexSphere};
 use game_engine::render::{FlatUnwrap, PlanetVertex};
 
 use crate::mesh::{
@@ -140,6 +140,9 @@ pub struct SphereViewerState {
     pub subdiv: u32,
     /// Last successfully applied radius.
     pub radius: f32,
+    /// Current mesh (hover picking reads centers/neighbors straight from
+    /// it; the binary never re-derives topology from the GPU buffers).
+    pub mesh: HexSphere,
     /// Wireframe overlay toggle (default on).
     pub wireframe: bool,
     /// Pentagon highlight toggle (default on).
@@ -159,6 +162,15 @@ pub struct SphereViewerState {
     pub lines: Vec<[f32; 3]>,
     /// Flat-view wireframe pairs in icosa-net UV space.
     pub uv_lines: Vec<[f32; 2]>,
+    /// Chunk under the cursor right now (set by the binary on cursor
+    /// moves over a sphere-rendered rect; `None` elsewhere).
+    pub hovered: Option<ChunkId>,
+    /// Click-pinned chunk: sticky highlight + info, survives mouse-leave
+    /// until toggled off or dropped by regeneration.
+    pub pinned: Option<ChunkId>,
+    /// Neighbor count per chunk, rebuilt on regenerate (5 = pentagon,
+    /// 6 = hexagon): the panel CHUNK section's type/neighbor source.
+    pub cell_sides: Vec<u8>,
     /// Read-only stats, refreshed after each regeneration.
     pub stats: ViewerStats,
 }
@@ -180,6 +192,9 @@ impl SphereViewerState {
             "viewer radius must be positive and finite, got {radius}"
         );
         let mut state = SphereViewerState {
+            // Placeholder mesh: replaced by `regenerate()` below before
+            // anyone can observe it (N=0 builds 12 cells in microseconds).
+            mesh: HexSphere::generate(0, 1.0),
             subdiv_field: TextField::new(&subdivisions.to_string()),
             radius_field: TextField::new(&radius.to_string()),
             subdiv_slider: Slider::new(MIN_SUBDIVISIONS, MAX_SUBDIVISIONS, subdivisions),
@@ -216,6 +231,9 @@ impl SphereViewerState {
                 source: Vec::new(),
             },
             lines: Vec::new(),
+            hovered: None,
+            pinned: None,
+            cell_sides: Vec::new(),
             stats: ViewerStats {
                 cells: 0,
                 corners: 0,
@@ -241,6 +259,9 @@ impl SphereViewerState {
         let flat = game_engine::render::build_flat_unwrap(&mesh);
         let lines = build_wireframe(&mesh);
         let uv_lines = game_engine::render::build_wireframe_uv_clipped(&mesh);
+        let cell_sides = (0..mesh.cell_count() as u32)
+            .map(|cell| mesh.cell_neighbor_count(cell) as u8)
+            .collect();
         let gen_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.subdiv = applied.subdivisions;
         self.radius = applied.radius;
@@ -250,7 +271,18 @@ impl SphereViewerState {
         self.flat = flat;
         self.lines = lines;
         self.uv_lines = uv_lines;
+        self.cell_sides = cell_sides;
+        // Fresh mesh, fresh pointing: hover never survives a rebuild,
+        // and pins survive only if the id still names a real chunk.
+        self.hovered = None;
+        if self
+            .pinned
+            .is_some_and(|pin| (pin.index() as usize) >= mesh.cell_count())
+        {
+            self.pinned = None;
+        }
         self.stats = viewer_stats(&mesh, gen_ms);
+        self.mesh = mesh;
         Ok(applied)
     }
 
@@ -290,6 +322,30 @@ impl SphereViewerState {
         self.focus = self.focus.toggle();
     }
 
+    /// Click routing for chunk pinning: clicking the pinned chunk unpins
+    /// it, clicking another chunk pins it instead (replacing the old pin).
+    pub fn toggle_pin(&mut self, chunk: ChunkId) {
+        self.pinned = if self.pinned == Some(chunk) {
+            None
+        } else {
+            Some(chunk)
+        };
+    }
+
+    /// Chunk selection shown in the panel CHUNK section and highlighted
+    /// in the viewport: the pin wins over a fleeting hover.
+    pub fn shown_chunk(&self) -> Option<ChunkId> {
+        self.pinned.or(self.hovered)
+    }
+
+    /// Neighbor count of a chunk (5 = pentagon, 6 = hexagon) from the
+    /// regenerate-time sidecar. `None` for ids outside the current mesh
+    /// (stale pins from a bigger mesh can never reach here — regenerate
+    /// drops them — but callers pass ids across meshes cheaply).
+    pub fn chunk_sides(&self, chunk: ChunkId) -> Option<u8> {
+        self.cell_sides.get(chunk.index() as usize).copied()
+    }
+
     /// Advance the debug shader visualization.
     pub fn cycle_debug_mode(&mut self) {
         self.debug_mode = self.debug_mode.cycle();
@@ -327,6 +383,10 @@ mod tests {
         assert_eq!(state.checker_density, DEFAULT_CHECKER_DENSITY);
         assert_eq!(state.fill_debug.seam.len(), state.fill_vertices.len());
         assert_eq!(state.fill_debug.island.len(), state.fill_vertices.len());
+        assert!(state.hovered.is_none() && state.pinned.is_none());
+        assert_eq!(state.cell_sides.len(), state.stats.cells);
+        assert_eq!(state.cell_sides.iter().filter(|&&s| s == 5).count(), 12);
+        assert!(state.cell_sides.iter().all(|&s| s == 5 || s == 6));
         assert_eq!(state.uv_lines.len() % 2, 0);
         assert!(state.uv_lines.len() >= state.lines.len());
         assert_eq!(state.flat.indices.len() % 3, 0);
@@ -406,6 +466,79 @@ mod tests {
         state.density_slider.value = 16;
         state.sync_density_from_slider();
         assert_eq!(state.checker_density, 16);
+    }
+
+    #[test]
+    fn pin_toggles_with_hover_precedence() {
+        let mut state = SphereViewerState::with_values(1, 1.0);
+        let a = HexSphere::generate(1, 1.0).chunk_id(5);
+        let b = HexSphere::generate(1, 1.0).chunk_id(7);
+        assert_eq!(state.shown_chunk(), None);
+        state.hovered = Some(a);
+        assert_eq!(state.shown_chunk(), Some(a));
+        state.toggle_pin(a);
+        assert_eq!(state.pinned, Some(a));
+        assert_eq!(state.shown_chunk(), Some(a));
+        // Pin wins over a different hover.
+        state.hovered = Some(b);
+        assert_eq!(state.shown_chunk(), Some(a));
+        // Clicking the pinned chunk unpins; another chunk replaces.
+        state.toggle_pin(a);
+        assert_eq!(state.pinned, None);
+        assert_eq!(state.shown_chunk(), Some(b));
+        state.toggle_pin(b);
+        assert_eq!(state.pinned, Some(b));
+    }
+
+    #[test]
+    fn regenerate_clears_hover_and_stale_pin() {
+        let mut state = SphereViewerState::new();
+        let mesh = HexSphere::generate(6, 1.0);
+        state.hovered = Some(mesh.chunk_id(11));
+        state.pinned = Some(mesh.chunk_id(40_000));
+        state.subdiv_field.text = "1".to_owned();
+        state.regenerate().unwrap();
+        assert_eq!(state.hovered, None);
+        assert_eq!(state.pinned, None);
+        assert_eq!(state.cell_sides.len(), 42);
+        // In-range pins survive a rebuild.
+        state.pinned = Some(mesh.chunk_id(5));
+        state.subdiv_field.text = "1".to_owned();
+        state.regenerate().unwrap();
+        assert_eq!(state.pinned.map(ChunkId::index), Some(5));
+    }
+
+    #[test]
+    fn chunk_sides_serves_panel_type_rows() {
+        let state = SphereViewerState::with_values(1, 1.0);
+        let mesh = HexSphere::generate(1, 1.0);
+        for cell in 0..mesh.cell_count() as u32 {
+            let chunk = mesh.chunk_id(cell);
+            let expected = if mesh.is_pentagon(cell) { 5 } else { 6 };
+            assert_eq!(state.chunk_sides(chunk), Some(expected), "cell {cell}");
+        }
+        // A chunk id from a bigger mesh is out of range here, never a panic.
+        let big = SphereViewerState::with_values(2, 1.0);
+        let stale = HexSphere::generate(2, 1.0).chunk_id(161);
+        assert!(big.chunk_sides(stale).is_some());
+        assert_eq!(state.chunk_sides(stale), None);
+    }
+
+    #[test]
+    fn fill_centers_match_mesh_order() {
+        // The hover/pin highlight reads `gl_VertexIndex` as the chunk id:
+        // fan centers must upload first, in cell order. If `build_fill`
+        // ever reorders vertices, the highlight (and the tint/seam/island
+        // varyings riding the same provoking vertex) breaks silently.
+        let state = SphereViewerState::with_values(2, 1.0);
+        assert_eq!(state.mesh.cell_count(), state.stats.cells);
+        for cell in 0..state.mesh.cell_count() as u32 {
+            assert_eq!(
+                state.fill_vertices[cell as usize].position,
+                state.mesh.cell_center(cell),
+                "center vertex {cell} moved"
+            );
+        }
     }
 
     #[test]

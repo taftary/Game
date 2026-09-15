@@ -38,6 +38,45 @@ const MISSING: u32 = u32::MAX;
 /// across platforms cannot flip the hash.
 const HASH_QUANTUM: f32 = 1_000_000.0;
 
+/// Stable identity of one cell-chunk: the dual cell's index.
+///
+/// 1 cell = 1 chunk (see `plans/cell-chunks`): pentagons and hexagons
+/// are both first-class chunks addressed by this id. The index space is
+/// the deterministic cell order pinned by the committed mesh hash, so a
+/// `ChunkId` is stable for a given `(subdivisions, radius,
+/// GEOMETRY_VERSION)` — the key M2 streaming and per-chunk surface
+/// layers will load against. Streaming groups/patches, if any, are built
+/// *from* these ids; chunk identity itself never re-numbers.
+///
+/// Construct only through [`HexSphere::chunk_id`]: the constructor is
+/// private so an id always names a real cell of its mesh.
+///
+/// ```
+/// use game_engine::hexsphere::HexSphere;
+///
+/// let body = HexSphere::generate(2, 1.0);
+/// let chunk = body.chunk_id(7);
+/// assert_eq!(chunk.index(), 7);
+/// assert!(body.chunk_id(6) < chunk);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChunkId(u32);
+
+impl ChunkId {
+    /// Cell index of this chunk (index into the cell buffers:
+    /// [`HexSphere::cell_center`], [`HexSphere::cell_neighbors`], …).
+    ///
+    /// ```
+    /// use game_engine::hexsphere::HexSphere;
+    ///
+    /// let body = HexSphere::generate(1, 2.0);
+    /// assert_eq!(body.chunk_id(3).index(), 3);
+    /// ```
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
 /// Hex-dominant geodesic dual mesh: 10·4^N+2 cells (all hexagons except
 /// exactly 12 pentagons), the base representation for a spherical body.
 ///
@@ -108,6 +147,42 @@ impl HexSphere {
     /// Number of cells (= primal vertices = 10·4^N+2).
     pub fn cell_count(&self) -> usize {
         self.positions.len()
+    }
+
+    /// Typed chunk identity of cell `cell`: 1 cell = 1 chunk (see
+    /// [`ChunkId`]). The returned id's [`ChunkId::index`] is `cell`
+    /// itself; the type marks it as the stable M2 streaming key.
+    ///
+    /// ```
+    /// use game_engine::hexsphere::HexSphere;
+    ///
+    /// let body = HexSphere::generate(2, 1.0);
+    /// assert_eq!(body.chunk_id(0).index(), 0);
+    /// assert_eq!(body.chunk_count(), body.cell_count());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cell` is out of range.
+    pub fn chunk_id(&self, cell: u32) -> ChunkId {
+        assert!(
+            (cell as usize) < self.positions.len(),
+            "hexsphere chunk {cell} out of range ({} cells)",
+            self.positions.len()
+        );
+        ChunkId(cell)
+    }
+
+    /// Number of chunks (= [`HexSphere::cell_count`]).
+    ///
+    /// ```
+    /// use game_engine::hexsphere::HexSphere;
+    ///
+    /// let body = HexSphere::generate(1, 1.0);
+    /// assert_eq!(body.chunk_count(), 10 * 4 + 2);
+    /// ```
+    pub fn chunk_count(&self) -> usize {
+        self.cell_count()
     }
 
     /// Number of corner vertices (= primal triangles = 20·4^N).
@@ -536,6 +611,44 @@ mod tests {
             assert_eq!(mesh.cell_count(), cells, "N={n}");
             assert_eq!(mesh.corner_count(), corners, "N={n}");
         }
+    }
+
+    #[test]
+    fn chunk_identity_matches_cells() {
+        for n in 0..=4 {
+            let mesh = HexSphere::generate(n, 1.0);
+            assert_eq!(mesh.chunk_count(), mesh.cell_count(), "N={n}");
+            for cell in 0..mesh.cell_count() as u32 {
+                let id = mesh.chunk_id(cell);
+                assert_eq!(id.index(), cell, "N={n}");
+                assert_eq!(id, mesh.chunk_id(cell), "N={n} cell {cell}");
+                if cell > 0 {
+                    assert!(mesh.chunk_id(cell - 1) < id, "N={n} cell {cell}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_ids_cover_all_neighbors() {
+        // Every neighbor link is addressable as a chunk id (streaming
+        // walks this graph; ids must name real cells on both ends).
+        let mesh = HexSphere::generate(3, 1.0);
+        for cell in 0..mesh.cell_count() as u32 {
+            let id = mesh.chunk_id(cell);
+            assert_eq!(id.index(), cell);
+            for neighbor in mesh.cell_neighbors(cell) {
+                assert!((neighbor as usize) < mesh.chunk_count());
+                let _ = mesh.chunk_id(neighbor);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn chunk_id_rejects_unknown_cell() {
+        let mesh = HexSphere::generate(1, 1.0);
+        let _ = mesh.chunk_id(mesh.cell_count() as u32);
     }
 
     #[test]

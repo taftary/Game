@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.5.4 (2026-09-15, plans/sphere-uv-debug issue round 3: cube-domain equiangular checker in `render::checker` — only squares everywhere, alternation across 8/12 edges with the forced faults confined to a 4-edge matching)
+- **Version:** 0.6.1 (2026-09-15, plans/cell-chunks issue-2026-09-15-1144-hover-y-inverted: hover NDC-y sign fix in `game_debug::picking::ray_from_cursor` — top pixel row is NDC y = +1 — plus project→cursor→pick roundtrip regression tests)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

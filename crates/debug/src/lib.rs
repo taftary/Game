@@ -14,6 +14,7 @@ pub mod fps;
 pub mod inspector;
 pub mod mesh;
 pub mod params;
+pub mod picking;
 pub mod sphere_viewer;
 pub mod text;
 pub mod ui;

@@ -10,7 +10,7 @@ Rules:
 
 - Generation version stamped in every save (`universe_version: u32`). Version bump = migration or new game; never silent drift.
 - `universe` crate functions are pure: `(seed, version, id) -> descriptor`. No wall-clock, no thread-ID-dependent iteration order in output.
-- Heavy surface detail generated lazily per chunk around the player, cached, evictable.
+- Heavy surface detail generated lazily per surface chunk around the player, cached, evictable. Surface chunks are groupings (defined in M2) of *cell-chunks* — the hexsphere cell identity (`ChunkId` = cell index, ADR-010 in [`../decisions/`](../decisions/)) — never a renumbering of them.
 - Fixed-point or quantized seeds for cross-platform determinism; float noise must be bit-stable or quantized after generation.
 - Content IDs (planet/system) are stable strings (`galaxy/seed:…/system:…/planet:…`), safe to store in saves and links.
 

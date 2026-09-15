@@ -40,7 +40,8 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     render/      # vulkano boot (1.1 floor) + tiers + orbit camera +
                  # seeded planet mesh + naga shaders (M1 renderer smoke)
     universe/    # seeds, galaxy/system/planet generation
-    hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons
+     hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
+                  # cell-chunk identity (`ChunkId` = cell index, ADR-010)
     sim/         # colonies, robots, resources, tick
     assets/      # loading, caching, hot-reload (dev only)
     input/       # unified touch/mouse/keyboard/gamepad actions
@@ -48,12 +49,14 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     core/        # math, units, time, RNG, error types
 crates/game/     # `game` binary: clean release entry — game states, camera journey, UI wiring
 crates/debug/    # `game_debug` lib (Sphere Viewer screen: mesh/params/ui/
-                  # text/app/sphere_viewer modules + fps/console/inspector stubs) + binary
-                  # (non-default member): windowed viewer (orbit camera,
-                  # fill + wireframe + pentagon highlight, UV preview thumb
-                  # with main↔thumb swap, 6 debug-shader modes, inputs panel,
-                  # --headless CI mode); developer screens never leak into
-                  # the release binary
+                   # text/app/sphere_viewer/picking modules + fps/console/inspector
+                   # stubs) + binary (non-default member): windowed viewer
+                   # (orbit camera, fill + wireframe + pentagon highlight,
+                   # cell-chunk hover highlight + click-to-pin with panel
+                   # readout, UV preview thumb with main↔thumb swap, 6
+                   # debug-shader modes, inputs panel, --headless CI mode
+                   # with pick self-test); developer screens never leak into
+                   # the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
                  # planet preview / renderer smoke (M1: seeded planet, orbit
                  # camera, Low/Med/High tiers, --headless CI mode), save
@@ -70,7 +73,7 @@ plans/           # per-feature notion -> plan -> implementation
   never leak into the release binary.
 - `engine::sim` is headless-testable: no window, no GPU handle required.
 - `engine::universe` is pure + deterministic: same seed + version → byte-identical descriptors.
-- `engine::hexsphere` is pure + deterministic: same (N, radius, version) → bit-identical mesh (committed hash test).
+- `engine::hexsphere` is pure + deterministic: same (N, radius, version) → bit-identical mesh (committed hash test). Chunk identity (`ChunkId` = cell index, ADR-010) is stable under the same triple — the key M2 streaming loads against.
 - `tools` may depend on `engine` with a `test-internals`-style feature, but `game` must not need dev-only features to run.
 - Platform code (`#[cfg(target_os = ...)]`) lives in `engine`, behind traits — `game` stays portable.
 
