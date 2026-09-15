@@ -39,6 +39,7 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     lib.rs
     render/      # vulkano boot (1.1 floor) + tiers + orbit camera +
                  # seeded planet mesh + naga shaders (M1 renderer smoke)
+                 # + icosa-net UV unwrap (uv) + flat chunk map (chunk_flat)
     universe/    # seeds, galaxy/system/planet generation
      hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
                   # cell-chunk identity (`ChunkId` = cell index, ADR-010)
@@ -53,10 +54,11 @@ crates/debug/    # `game_debug` lib (Sphere Viewer screen: mesh/params/ui/
                    # stubs) + binary (non-default member): windowed viewer
                    # (orbit camera, fill + wireframe + pentagon highlight,
                    # cell-chunk hover highlight + click-to-pin with panel
-                   # readout, UV preview thumb with main↔thumb swap, 6
-                   # debug-shader modes, inputs panel, --headless CI mode
-                   # with pick self-test); developer screens never leak into
-                   # the release binary
+                   # readout, UV preview thumb with 3-way focus cycle
+                   # (sphere ↔ UV net ↔ flat chunk map), 6 debug-shader
+                   # modes, inputs panel, --headless CI mode with pick +
+                   # flat-layout self-tests); developer screens never leak
+                   # into the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
                  # planet preview / renderer smoke (M1: seeded planet, orbit
                  # camera, Low/Med/High tiers, --headless CI mode), save

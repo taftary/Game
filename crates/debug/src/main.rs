@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use game_debug::app::{App as DebugApp, Screen};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
-use game_debug::picking::{Ray, intersect_sphere, pick_cell, ray_from_cursor};
+use game_debug::picking::{
+    Ray, flat_point_from_cursor, intersect_sphere, pick_cell, pick_flat_visible, ray_from_cursor,
+};
 use game_debug::sphere_viewer::{DebugMode, SphereViewerState, ViewFocus};
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
@@ -257,6 +259,43 @@ void main() {
     v_pin = 0.0;
 }"##;
 
+const CHUNK_FLAT_VERT: &str = r##"#version 450
+layout(location = 0) in vec2 pos;
+layout(location = 1) in float chunk_id;
+layout(location = 2) in float island;
+layout(location = 3) in float tint;
+layout(location = 4) in float seam;
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    float highlight;
+    float mode;
+    float density;
+    float seams_on;
+    float hover_cell;
+    float pin_cell;
+} pc;
+layout(location = 0) out vec3 v_normal;
+layout(location = 1) flat out float v_tint;
+layout(location = 2) out vec2 v_uv;
+layout(location = 3) flat out float v_seam;
+layout(location = 4) flat out float v_island;
+layout(location = 5) flat out float v_hover;
+layout(location = 6) flat out float v_pin;
+void main() {
+    gl_Position = pc.mvp * vec4(pos, 0.0, 1.0);
+    // The map faces the viewer: constant forward normal, so Lit shades
+    // every chunk evenly and the debug modes read like the UV net.
+    v_normal = vec3(0.0, 0.0, 1.0);
+    v_tint = tint * pc.highlight;
+    v_uv = pos;
+    v_seam = seam;
+    v_island = island;
+    // Per-chunk hover/pin: every fan vertex carries its cell id (float
+    // comparison — ids stay exactly representable in f32; -1.0 = none).
+    v_hover = (abs(chunk_id - pc.hover_cell) < 0.5) ? 1.0 : 0.0;
+    v_pin = (abs(chunk_id - pc.pin_cell) < 0.5) ? 1.0 : 0.0;
+}"##;
+
 const FLAT_LINE_VERT: &str = r##"#version 450
 layout(location = 0) in vec2 uv_pos;
 layout(push_constant) uniform PushConstants {
@@ -383,6 +422,23 @@ struct FlatVertex {
 struct FlatLineVertex {
     #[format(R32G32_SFLOAT)]
     uv_pos: [f32; 2],
+}
+
+/// Flat chunk-map fill vertex: 2D position plus per-chunk flags. Every
+/// vertex carries its cell id, so the whole polygon highlights.
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+struct ChunkFlatVertex {
+    #[format(R32G32_SFLOAT)]
+    pos: [f32; 2],
+    #[format(R32_SFLOAT)]
+    chunk_id: f32,
+    #[format(R32_SFLOAT)]
+    island: f32,
+    #[format(R32_SFLOAT)]
+    tint: f32,
+    #[format(R32_SFLOAT)]
+    seam: f32,
 }
 
 /// UI quad vertex: screen pixels + atlas UV + tint.
@@ -537,6 +593,40 @@ fn run_headless() -> i32 {
         viewer.debug_mode,
     );
     println!("pick_selftest=chunk{} ok", picked.index());
+    // Chunk-flat self-test: the north-pole view loads the fully-inside
+    // chunks in unit range (strict subset — partial rim cells are
+    // dropped); flat picking resolves a visible center.
+    assert!(!viewer.chunk_flat_cells.is_empty(), "hemisphere non-empty");
+    assert!(
+        viewer.chunk_flat_cells.len() < stats.cells,
+        "hemisphere is a strict subset"
+    );
+    assert!(
+        viewer
+            .chunk_flat_vertices
+            .iter()
+            .all(|v| (0.0..=1.0).contains(&v.position[0]) && (0.0..=1.0).contains(&v.position[1])),
+        "flat verts in unit range"
+    );
+    let first = viewer.chunk_flat_cells[0];
+    let flat_picked = pick_flat_visible(
+        &viewer.mesh,
+        &viewer.chunk_flat_cells,
+        &viewer.chunk_flat_centers,
+        viewer.chunk_flat_centers[0],
+    );
+    assert_eq!(
+        flat_picked.index(),
+        first,
+        "flat pick at a visible center must resolve it"
+    );
+    println!(
+        "chunk_flat_cells={} chunk_flat_verts={} chunk_flat_tris={} chunk_flat_pick=chunk{} ok",
+        viewer.chunk_flat_cells.len(),
+        viewer.chunk_flat_vertices.len(),
+        viewer.chunk_flat_indices.len() / 3,
+        flat_picked.index(),
+    );
     0
 }
 
@@ -1262,6 +1352,60 @@ fn build_flat_pipeline(
     .expect("flat graphics pipeline must create")
 }
 
+fn build_chunk_flat_pipeline(
+    device: &Arc<Device>,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs_module = compile_shader(
+        device,
+        ShaderKind::Vertex,
+        CHUNK_FLAT_VERT,
+        "chunk flat vertex",
+    );
+    let fs_module = compile_shader(device, ShaderKind::Fragment, FILL_FRAG, "flat fragment");
+    let vs = vs_module.entry_point("main").expect("vertex entry point");
+    let fs = fs_module.entry_point("main").expect("fragment entry point");
+    let vertex_input_state = ChunkFlatVertex::per_vertex()
+        .definition(&vs)
+        .expect("chunk flat vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                // Polygon winding is CCW in layout space but the y-down
+                // flat projection mirrors it: never cull.
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                // Coplanar polygons by construction: never write depth
+                // here or neighbors z-fight (same rule as the UV net).
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("chunk flat graphics pipeline must create")
+}
+
 fn build_flat_line_pipeline(
     device: &Arc<Device>,
     render_pass: &Arc<RenderPass>,
@@ -1479,6 +1623,70 @@ fn upload_flat_lines(
     .expect("flat wireframe vertex buffer upload must succeed")
 }
 
+fn upload_chunk_flat(
+    allocator: &Arc<StandardMemoryAllocator>,
+    viewer: &SphereViewerState,
+) -> (Subbuffer<[ChunkFlatVertex]>, Subbuffer<[u32]>) {
+    let vertices = Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        viewer.chunk_flat_vertices.iter().map(|v| ChunkFlatVertex {
+            pos: v.position,
+            chunk_id: v.chunk_id,
+            island: v.island,
+            tint: v.tint,
+            seam: v.seam,
+        }),
+    )
+    .expect("chunk flat vertex buffer upload must succeed");
+    let indices = Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        viewer.chunk_flat_indices.iter().copied(),
+    )
+    .expect("chunk flat index buffer upload must succeed");
+    (vertices, indices)
+}
+
+fn upload_chunk_flat_lines(
+    allocator: &Arc<StandardMemoryAllocator>,
+    viewer: &SphereViewerState,
+) -> Subbuffer<[FlatLineVertex]> {
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        viewer
+            .chunk_flat_wire
+            .iter()
+            .map(|pos| FlatLineVertex { uv_pos: *pos }),
+    )
+    .expect("chunk flat wireframe vertex buffer upload must succeed")
+}
+
 fn upload_lines(
     allocator: &Arc<StandardMemoryAllocator>,
     viewer: &SphereViewerState,
@@ -1603,6 +1811,9 @@ struct ViewerApp {
     flat_vertices: Subbuffer<[FlatVertex]>,
     flat_indices: Subbuffer<[u32]>,
     flat_lines: Subbuffer<[FlatLineVertex]>,
+    chunk_flat_vertices: Subbuffer<[ChunkFlatVertex]>,
+    chunk_flat_indices: Subbuffer<[u32]>,
+    chunk_flat_lines: Subbuffer<[FlatLineVertex]>,
     atlas_image: Option<Arc<Image>>,
     atlas_set: Option<Arc<DescriptorSet>>,
     dragging_orbit: bool,
@@ -1626,6 +1837,7 @@ struct RenderContext {
     line_pipeline: Arc<GraphicsPipeline>,
     flat_pipeline: Arc<GraphicsPipeline>,
     flat_line_pipeline: Arc<GraphicsPipeline>,
+    chunk_flat_pipeline: Arc<GraphicsPipeline>,
     ui_pipeline: Arc<GraphicsPipeline>,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
@@ -1714,6 +1926,9 @@ impl ViewerApp {
         let line_vertices = upload_lines(&memory_allocator, viewer);
         let (flat_vertices, flat_indices) = upload_flat(&memory_allocator, viewer);
         let flat_lines = upload_flat_lines(&memory_allocator, viewer);
+        let (chunk_flat_vertices, chunk_flat_indices) =
+            upload_chunk_flat(&memory_allocator, viewer);
+        let chunk_flat_lines = upload_chunk_flat_lines(&memory_allocator, viewer);
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),
             debug,
@@ -1732,6 +1947,9 @@ impl ViewerApp {
             flat_vertices,
             flat_indices,
             flat_lines,
+            chunk_flat_vertices,
+            chunk_flat_indices,
+            chunk_flat_lines,
             atlas_image: None,
             atlas_set: None,
             dragging_orbit: false,
@@ -1750,6 +1968,9 @@ impl ViewerApp {
         self.line_vertices = upload_lines(&self.memory_allocator, viewer);
         (self.flat_vertices, self.flat_indices) = upload_flat(&self.memory_allocator, viewer);
         self.flat_lines = upload_flat_lines(&self.memory_allocator, viewer);
+        (self.chunk_flat_vertices, self.chunk_flat_indices) =
+            upload_chunk_flat(&self.memory_allocator, viewer);
+        self.chunk_flat_lines = upload_chunk_flat_lines(&self.memory_allocator, viewer);
         self.camera = OrbitCamera::framing_planet(viewer.radius);
         tracing::info!(
             subdivisions = viewer.subdiv,
@@ -1761,13 +1982,28 @@ impl ViewerApp {
         );
     }
 
+    /// Re-upload the flat hemisphere GPU buffers after an arrow-key orbit
+    /// step (the lib state already reloaded the new half). Camera framing
+    /// is untouched — only the visible chunk set changes.
+    fn refresh_chunk_flat(&mut self) {
+        let viewer = &self.debug.viewer;
+        (self.chunk_flat_vertices, self.chunk_flat_indices) =
+            upload_chunk_flat(&self.memory_allocator, viewer);
+        self.chunk_flat_lines = upload_chunk_flat_lines(&self.memory_allocator, viewer);
+        tracing::info!(
+            cells = viewer.chunk_flat_cells.len(),
+            viewpoint = ?viewer.chunk_flat_viewpoint,
+            "chunk flat hemisphere reloaded",
+        );
+    }
+
     /// Recompute the hovered chunk from the current cursor: only when the
-    /// Sphere Viewer is active and the cursor sits inside a sphere-rendered
-    /// rect (main viewport with sphere focus, panel thumb with UV focus).
-    /// A miss (cursor over empty space, panel, or nav) clears the hover.
-    /// Hover feeds the fill highlight + panel CHUNK readout; it never
-    /// touches the mesh. Callers refresh after every cursor or camera move
-    /// so the highlight tracks within one frame.
+    /// Sphere Viewer is active and the cursor sits inside a chunk-rendered
+    /// rect (main viewport with sphere/chunk-flat focus, panel thumb with
+    /// UV focus). A miss (cursor over empty space, panel, or nav) clears
+    /// the hover. Hover feeds the fill highlight + panel CHUNK readout;
+    /// it never touches the mesh. Callers refresh after every cursor or
+    /// camera move so the highlight tracks within one frame.
     fn update_hover(&mut self) {
         let hovered = self
             .last_cursor
@@ -1775,19 +2011,39 @@ impl ViewerApp {
             .filter(|_| self.debug.screen == Screen::SphereViewer)
             .and_then(|((cx, cy), (w, h))| {
                 let layout = ui::layout(w, h);
-                let rect = match self.debug.viewer.focus {
-                    ViewFocus::SphereMain => layout.viewport,
-                    ViewFocus::UvMain => ui::uv_thumb_rect(layout.panel, 8.0),
-                };
-                if !rect.contains(cx, cy) || rect.w < 1.0 || rect.h < 1.0 {
-                    return None;
+                match self.debug.viewer.focus {
+                    ViewFocus::ChunkFlat => {
+                        let rect = layout.viewport;
+                        if !rect.contains(cx, cy) || rect.w < 1.0 || rect.h < 1.0 {
+                            return None;
+                        }
+                        let point = flat_point_from_cursor((cx, cy), rect)?;
+                        let viewer = &self.debug.viewer;
+                        Some(pick_flat_visible(
+                            &viewer.mesh,
+                            &viewer.chunk_flat_cells,
+                            &viewer.chunk_flat_centers,
+                            point,
+                        ))
+                    }
+                    _ => {
+                        let rect = match self.debug.viewer.focus {
+                            ViewFocus::SphereMain => layout.viewport,
+                            ViewFocus::UvMain => ui::uv_thumb_rect(layout.panel, 8.0),
+                            ViewFocus::ChunkFlat => unreachable!("flat branch above"),
+                        };
+                        if !rect.contains(cx, cy) || rect.w < 1.0 || rect.h < 1.0 {
+                            return None;
+                        }
+                        let aspect = rect.w / rect.h;
+                        let view_proj =
+                            self.camera.projection_matrix(aspect) * self.camera.view_matrix();
+                        let ray = ray_from_cursor((cx, cy), rect, view_proj);
+                        let hit = intersect_sphere(ray, self.debug.viewer.radius)?;
+                        let viewer = &self.debug.viewer;
+                        Some(pick_cell(&viewer.mesh, hit, viewer.hovered))
+                    }
                 }
-                let aspect = rect.w / rect.h;
-                let view_proj = self.camera.projection_matrix(aspect) * self.camera.view_matrix();
-                let ray = ray_from_cursor((cx, cy), rect, view_proj);
-                let hit = intersect_sphere(ray, self.debug.viewer.radius)?;
-                let viewer = &self.debug.viewer;
-                Some(pick_cell(&viewer.mesh, hit, viewer.hovered))
             });
         self.debug.viewer.hovered = hovered;
     }
@@ -1860,6 +2116,7 @@ impl ViewerApp {
             line: build_line_pipeline(&self.device, &render_pass),
             flat: build_flat_pipeline(&self.device, &render_pass),
             flat_line: build_flat_line_pipeline(&self.device, &render_pass),
+            chunk_flat: build_chunk_flat_pipeline(&self.device, &render_pass),
             ui: build_ui_pipeline(&self.device, &render_pass),
         };
         (render_pass, pipelines)
@@ -1871,6 +2128,7 @@ struct Pipelines {
     line: Arc<GraphicsPipeline>,
     flat: Arc<GraphicsPipeline>,
     flat_line: Arc<GraphicsPipeline>,
+    chunk_flat: Arc<GraphicsPipeline>,
     ui: Arc<GraphicsPipeline>,
 }
 
@@ -1949,6 +2207,7 @@ impl ApplicationHandler for ViewerApp {
             line_pipeline: pipelines.line,
             flat_pipeline: pipelines.flat,
             flat_line_pipeline: pipelines.flat_line,
+            chunk_flat_pipeline: pipelines.chunk_flat,
             ui_pipeline: pipelines.ui,
             recreate_swapchain: false,
             previous_frame_end: Some(sync::now(self.device.clone()).boxed()),
@@ -2027,7 +2286,10 @@ impl ApplicationHandler for ViewerApp {
                     self.press_cursor = None;
                     if click
                         && self.debug.screen == Screen::SphereViewer
-                        && self.debug.viewer.focus == ViewFocus::SphereMain
+                        && matches!(
+                            self.debug.viewer.focus,
+                            ViewFocus::SphereMain | ViewFocus::ChunkFlat
+                        )
                         && let Some(chunk) = self.debug.viewer.hovered
                         && self.last_cursor.zip(self.rcx_window_size()).is_some_and(
                             |((cx, cy), (w, h))| ui::layout(w, h).viewport.contains(cx, cy),
@@ -2054,10 +2316,14 @@ impl ApplicationHandler for ViewerApp {
                 // Viewport drag starts an orbit.
                 if layout.viewport.contains(cx, cy) {
                     self.dragging_orbit = true;
-                    // A sphere-main press may end as a chunk-pin click
-                    // (decided on release by travel distance).
+                    // A sphere-main or chunk-flat press may end as a
+                    // chunk-pin click (decided on release by travel
+                    // distance).
                     if self.debug.screen == Screen::SphereViewer
-                        && self.debug.viewer.focus == ViewFocus::SphereMain
+                        && matches!(
+                            self.debug.viewer.focus,
+                            ViewFocus::SphereMain | ViewFocus::ChunkFlat
+                        )
                     {
                         self.press_cursor = Some((cx, cy));
                     }
@@ -2194,6 +2460,35 @@ impl ApplicationHandler for ViewerApp {
                                     viewer.radius_field.insert_char(ch);
                                 }
                                 viewer.sync_slider_from_field();
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(
+                        KeyCode::ArrowLeft
+                        | KeyCode::ArrowRight
+                        | KeyCode::ArrowUp
+                        | KeyCode::ArrowDown,
+                    ) => {
+                        // Flat-map orbit: only when the chunk-flat view is
+                        // focused and no text field owns the keystrokes.
+                        // Each step yaws/pitches the viewpoint 5° and
+                        // reloads the hemisphere GPU buffers (unload +
+                        // load in one rebuild).
+                        if self.debug.screen == Screen::SphereViewer
+                            && self.debug.viewer.focus == ViewFocus::ChunkFlat
+                        {
+                            let viewer = &self.debug.viewer;
+                            if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
+                                const STEP: f32 = std::f32::consts::PI / 36.0;
+                                let (yaw, pitch) = match physical_key {
+                                    PhysicalKey::Code(KeyCode::ArrowLeft) => (STEP, 0.0),
+                                    PhysicalKey::Code(KeyCode::ArrowRight) => (-STEP, 0.0),
+                                    PhysicalKey::Code(KeyCode::ArrowUp) => (0.0, STEP),
+                                    _ => (0.0, -STEP),
+                                };
+                                self.debug.viewer.orbit_chunk_flat(yaw, pitch);
+                                self.refresh_chunk_flat();
+                                self.update_hover();
                             }
                         }
                     }
@@ -2349,14 +2644,20 @@ impl ViewerApp {
             .expect("render pass must begin");
 
         if viewer_screen {
-            // Dual views: the focused view fills the main viewport, the
-            // other renders into the panel-top thumb (same rect the UI
-            // frames and hit-tests). The viewport transform clips output
-            // to each rect, so no scissor state is needed.
-            let show_sphere_main = self.debug.viewer.focus == ViewFocus::SphereMain;
+            // Triple views: the focused view fills the main viewport, a
+            // secondary view renders into the panel-top thumb (same rect
+            // the UI frames and hit-tests). SphereMain pairs with the UV
+            // net thumb; both flat focuses pair with the 3D sphere thumb.
+            // The viewport transform clips output to each rect, so no
+            // scissor state is needed.
+            let focus = self.debug.viewer.focus;
+            let thumb_focus = match focus {
+                ViewFocus::SphereMain => ViewFocus::UvMain,
+                ViewFocus::UvMain | ViewFocus::ChunkFlat => ViewFocus::SphereMain,
+            };
             let views = [
-                (layout.viewport, show_sphere_main),
-                (ui::uv_thumb_rect(layout.panel, 8.0), !show_sphere_main),
+                (layout.viewport, focus),
+                (ui::uv_thumb_rect(layout.panel, 8.0), thumb_focus),
             ];
             let mode = self.debug.viewer.debug_mode.index() as f32;
             let density = self.debug.viewer.checker_density as f32;
@@ -2378,7 +2679,7 @@ impl ViewerApp {
                 .pinned
                 .map(|chunk| chunk.index() as f32)
                 .unwrap_or(-1.0);
-            for (vp, show_sphere) in views {
+            for (vp, view) in views {
                 if vp.w < 1.0 || vp.h < 1.0 {
                     continue;
                 }
@@ -2387,7 +2688,7 @@ impl ViewerApp {
                     extent: [vp.w, vp.h],
                     depth_range: 0.0..=1.0,
                 };
-                if show_sphere {
+                if view == ViewFocus::SphereMain {
                     let aspect = vp.w / vp.h;
                     let mvp = (self.camera.projection_matrix(aspect) * self.camera.view_matrix())
                         .to_cols_array_2d();
@@ -2436,6 +2737,62 @@ impl ViewerApp {
                         // no index buffer is bound for this `LineList` draw.
                         unsafe { builder.draw(self.debug.viewer.lines.len() as u32, 1, 0, 0) }
                             .expect("wireframe draw must record");
+                    }
+                } else if view == ViewFocus::ChunkFlat {
+                    let mvp = flat_mvp(vp);
+                    builder
+                        .set_viewport(0, [viewport].into_iter().collect())
+                        .expect("viewport must set")
+                        .bind_pipeline_graphics(rcx.chunk_flat_pipeline.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, self.chunk_flat_vertices.clone())
+                        .expect("vertex buffer must bind")
+                        .bind_index_buffer(self.chunk_flat_indices.clone())
+                        .expect("index buffer must bind")
+                        .push_constants(
+                            rcx.chunk_flat_pipeline.layout().clone(),
+                            0,
+                            FillPush {
+                                mvp,
+                                highlight,
+                                mode,
+                                density,
+                                seams_on,
+                                hover_cell,
+                                pin_cell,
+                            },
+                        )
+                        .expect("chunk flat push constants must upload");
+                    unsafe {
+                        builder.draw_indexed(self.chunk_flat_indices.len() as u32, 1, 0, 0, 0)
+                    }
+                    .expect("chunk flat draw must record");
+                    if self.debug.viewer.wire_on_uv && !self.debug.viewer.chunk_flat_wire.is_empty()
+                    {
+                        builder
+                            .bind_pipeline_graphics(rcx.flat_line_pipeline.clone())
+                            .expect("pipeline must bind")
+                            .bind_vertex_buffers(0, self.chunk_flat_lines.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                rcx.flat_line_pipeline.layout().clone(),
+                                0,
+                                FillPush {
+                                    mvp,
+                                    highlight,
+                                    mode,
+                                    density,
+                                    seams_on,
+                                    hover_cell,
+                                    pin_cell,
+                                },
+                            )
+                            .expect("chunk flat line push constants must upload");
+                        // SAFETY: same contract as the 3D wireframe draw.
+                        unsafe {
+                            builder.draw(self.debug.viewer.chunk_flat_wire.len() as u32, 1, 0, 0)
+                        }
+                        .expect("chunk flat wireframe draw must record");
                     }
                 } else {
                     let mvp = flat_mvp(vp);
@@ -2638,6 +2995,7 @@ mod tests {
             (ShaderKind::Vertex, FILL_VERT, "fill vert"),
             (ShaderKind::Fragment, FILL_FRAG, "fill frag"),
             (ShaderKind::Vertex, FLAT_VERT, "flat vert"),
+            (ShaderKind::Vertex, CHUNK_FLAT_VERT, "chunk flat vert"),
             (ShaderKind::Vertex, FLAT_LINE_VERT, "flat line vert"),
             (ShaderKind::Vertex, LINE_VERT, "line vert"),
             (ShaderKind::Fragment, LINE_FRAG, "line frag"),

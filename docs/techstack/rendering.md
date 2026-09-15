@@ -123,6 +123,23 @@ naga compile helper, 1.1-floor boot).
   it flows across the icosa seam overlay and both views agree.
   `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
   it, so the `game_tools` smoke is unaffected.
+- Flat chunk map (`plans/chunk-flat-view`, 2026-09-15):
+  `engine::render::chunk_flat` projects one hemisphere at a time onto
+  its tangent plane (Lambert azimuthal equal-area projection of true
+  cell corners, so neighbors share edges and every chunk keeps its
+  size; only fully-inside cells load — partial rim chunks are dropped;
+  island/seam sidecars reuse the `base_face_ids`
+  rule so coloring agrees with the UV net). The viewer gains a third
+  `ViewFocus::ChunkFlat` mode (focus cycles sphere → UV → chunk flat;
+  both flat focuses pair with the 3D sphere thumb) with a dedicated
+  `CHUNK_FLAT_VERT` pipeline reusing `FILL_FRAG` + `FillPush`. Arrow
+  keys orbit the hemisphere viewpoint 5° per step (Left/Right = yaw,
+  Up/Down = pitch) and reload the flat GPU buffers — chunks leaving
+  the half unload, entering chunks load. 2D CPU picking
+  (`pick_flat_visible` over the loaded set + `flat_point_from_cursor`
+  inverse) keeps hover highlight, click-pin and the CHUNK panel working
+  in flat. `--headless` prints a `chunk_flat_*` self-test line
+  (hemisphere coverage + antipodal reload + flat pick check).
 - `engine::hexsphere` topology and the release `game` binary are untouched; all
   UI code lives in `crates/debug` (first custom swapchain-UI consumer
   per [`stack.md`](stack.md)).

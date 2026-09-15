@@ -15,6 +15,7 @@
 pub mod boot;
 pub mod camera;
 pub mod checker;
+pub mod chunk_flat;
 pub mod planet;
 pub mod shaders;
 pub mod tier;
@@ -29,6 +30,7 @@ pub use checker::{
     CUBE_FACE_COUNT, CheckerTable, checker_local, checker_parity, checker_square, checker_table,
     glsl_const_block,
 };
+pub use chunk_flat::{orbit_viewpoint, project_to_tangent, tangent_basis, visible_hemisphere};
 pub use planet::{IndexedMesh, PlanetVertex, SeededPlanet};
 pub use shaders::{
     PLANET_FRAG, PLANET_VERT, ShaderCompileError, ShaderKind, compile_glsl_to_spirv,

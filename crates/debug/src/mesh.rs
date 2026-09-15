@@ -9,10 +9,10 @@
 //! (N ∈ {3,4,6}); the viewer slider needs arbitrary N, so the pattern is
 //! rebuilt here over the public `HexSphere` API. Engine stays untouched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use game_engine::hexsphere::HexSphere;
-use game_engine::render::PlanetVertex;
+use game_engine::hexsphere::{BASE_FACE_COUNT, HexSphere, base_face_ids};
+use game_engine::render::{PlanetVertex, project_to_tangent, visible_hemisphere};
 
 /// Debug-side seam/island data aligned with [`build_fill`] vertex order
 /// (centers then corners). Positions/uv live in [`PlanetVertex`]; this
@@ -135,6 +135,133 @@ pub fn build_wireframe(mesh: &HexSphere) -> Vec<[f32; 3]> {
     for (a, b) in edges {
         lines.push(mesh.corner_position(a));
         lines.push(mesh.corner_position(b));
+    }
+    lines
+}
+
+/// One hemisphere-map vertex: 2D position plus per-chunk flags. Every
+/// vertex of a cell's fan carries that cell's id, so the shader
+/// highlights the whole polygon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChunkFlatVertex {
+    /// 2D position in `[0, 1]²` (tangent plane normalized).
+    pub position: [f32; 2],
+    /// Owning cell id (hover/pin highlight source).
+    pub chunk_id: f32,
+    /// Territory id (0..20, island coloring).
+    pub island: f32,
+    /// 1.0 on pentagon cells, 0.0 on hexagons.
+    pub tint: f32,
+    /// 1.0 on territory-boundary chunks, 0.0 elsewhere (seam overlay).
+    pub seam: f32,
+}
+
+/// Filled hemisphere chunk map for `viewpoint`: one center + ring fan
+/// per fully-inside cell (Lambert equal-area projection of true cell
+/// corners, so neighbors share edges and every chunk keeps its size).
+/// Positions are normalized to `[0, 1]²`. Returns `(vertices, indices,
+/// cells, centers)` where `cells`/`centers` are the visible cell ids
+/// and their normalized centers (for picking).
+#[allow(clippy::type_complexity)]
+pub fn build_chunk_flat(
+    mesh: &HexSphere,
+    viewpoint: [f32; 3],
+) -> (Vec<ChunkFlatVertex>, Vec<u32>, Vec<u32>, Vec<[f32; 2]>) {
+    let cells = visible_hemisphere(mesh, viewpoint);
+    let face_ids = base_face_ids(mesh.subdivisions());
+    // Raw tangent coords per visible cell: center + corners. The
+    // Lambert map keeps the open hemisphere inside a finite disk, so no
+    // rim clamping is needed.
+    let mut raw_centers = Vec::with_capacity(cells.len());
+    let mut raw_rings: Vec<Vec<[f32; 2]>> = Vec::with_capacity(cells.len());
+    for &cell in &cells {
+        raw_centers.push(project_to_tangent(mesh.cell_center(cell), viewpoint));
+        let mut ring = Vec::new();
+        for corner in mesh.cell_corner_ids(cell) {
+            ring.push(project_to_tangent(mesh.corner_position(corner), viewpoint));
+        }
+        raw_rings.push(ring);
+    }
+    // Normalize everything with one transform.
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for p in raw_centers.iter().chain(raw_rings.iter().flatten()) {
+        for i in 0..2 {
+            lo[i] = lo[i].min(p[i]);
+            hi[i] = hi[i].max(p[i]);
+        }
+    }
+    let span = [(hi[0] - lo[0]).max(1e-6), (hi[1] - lo[1]).max(1e-6)];
+    let norm = |p: [f32; 2]| {
+        [
+            ((p[0] - lo[0]) / span[0]).clamp(0.0, 1.0),
+            ((p[1] - lo[1]) / span[1]).clamp(0.0, 1.0),
+        ]
+    };
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut centers = Vec::with_capacity(cells.len());
+    for (k, &cell) in cells.iter().enumerate() {
+        let center = norm(raw_centers[k]);
+        centers.push(center);
+        let ring: Vec<[f32; 2]> = raw_rings[k].iter().map(|&p| norm(p)).collect();
+        let mut incident = BTreeSet::new();
+        for corner in mesh.cell_corner_ids(cell) {
+            incident.insert(face_ids[corner as usize]);
+        }
+        let island = (*incident.iter().min().expect("cell ring is never empty")) as f32;
+        debug_assert!((island as usize) < BASE_FACE_COUNT);
+        let tint = if mesh.is_pentagon(cell) { 1.0 } else { 0.0 };
+        let seam = if incident.len() > 1 { 1.0 } else { 0.0 };
+        let base = vertices.len() as u32;
+        vertices.push(ChunkFlatVertex {
+            position: center,
+            chunk_id: cell as f32,
+            island,
+            tint,
+            seam,
+        });
+        for p in &ring {
+            vertices.push(ChunkFlatVertex {
+                position: *p,
+                chunk_id: cell as f32,
+                island,
+                tint,
+                seam,
+            });
+        }
+        for i in 0..ring.len() as u32 {
+            indices.extend_from_slice(&[
+                base,
+                base + 1 + i,
+                base + 1 + (i + 1) % ring.len() as u32,
+            ]);
+        }
+    }
+    (vertices, indices, cells, centers)
+}
+
+/// Hemisphere boundary wireframe: deduplicated projected polygon edges
+/// for the visible cells. Returns position pairs in `[0, 1]²`.
+pub fn build_chunk_flat_wireframe(mesh: &HexSphere, viewpoint: [f32; 3]) -> Vec<[f32; 2]> {
+    let (vertices, indices, _, _) = build_chunk_flat(mesh, viewpoint);
+    let pos = |i: u32| vertices[i as usize].position;
+    let key = |p: [f32; 2]| [(p[0] * 1e6) as i32, (p[1] * 1e6) as i32];
+    let mut edges: BTreeSet<([i32; 2], [i32; 2])> = BTreeSet::new();
+    let mut repr: BTreeMap<[i32; 2], [f32; 2]> = BTreeMap::new();
+    for i in (0..indices.len()).step_by(3) {
+        let tri = [indices[i], indices[i + 1], indices[i + 2]];
+        // Fan triangles share (center, ring[i]) spokes: only emit the
+        // outer rim edge (ring[i] → ring[i+1]).
+        let (a, b) = (pos(tri[1]), pos(tri[2]));
+        let (ka, kb) = (key(a), key(b));
+        repr.entry(ka).or_insert(a);
+        repr.entry(kb).or_insert(b);
+        edges.insert(if ka < kb { (ka, kb) } else { (kb, ka) });
+    }
+    let mut lines = Vec::with_capacity(edges.len() * 2);
+    for (ka, kb) in edges {
+        lines.push(repr[&ka]);
+        lines.push(repr[&kb]);
     }
     lines
 }
@@ -387,6 +514,118 @@ mod tests {
             assert_eq!(short.len(), 8, "{hash}");
             assert_eq!(short, &format!("{hash:016x}")[..8], "{hash}");
         }
+    }
+
+    #[test]
+    fn chunk_flat_hemisphere_covers_visible_cells() {
+        for n in 1..=2 {
+            let mesh = HexSphere::generate(n, 1.0);
+            let view = [0.0, 1.0, 0.0];
+            let (vertices, indices, cells, centers) = build_chunk_flat(&mesh, view);
+            let expected = game_engine::render::visible_hemisphere(&mesh, view);
+            assert_eq!(cells, expected, "N={n}");
+            assert_eq!(centers.len(), cells.len(), "N={n}");
+            // One center + ring fan per visible cell.
+            let ring_sum: usize = cells
+                .iter()
+                .map(|&cell| mesh.cell_corner_ids(cell).len())
+                .sum();
+            assert_eq!(vertices.len(), cells.len() + ring_sum, "N={n}");
+            assert_eq!(indices.len(), 3 * ring_sum, "N={n}");
+            // Fan centers match the picking centers; everything in range.
+            let mut k = 0;
+            for (slot, &cell) in cells.iter().enumerate() {
+                let ring = mesh.cell_corner_ids(cell).len();
+                assert_eq!(vertices[k].chunk_id, cell as f32, "N={n}");
+                assert_eq!(vertices[k].position, centers[slot], "N={n}");
+                for v in &vertices[k..k + 1 + ring] {
+                    assert_eq!(v.chunk_id, cell as f32, "N={n}");
+                    assert!((0.0..=1.0).contains(&v.position[0]), "N={n}");
+                    assert!((0.0..=1.0).contains(&v.position[1]), "N={n}");
+                }
+                k += 1 + ring;
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_flat_drops_partial_rim_cells() {
+        // Rim cells whose center is visible but some corner pokes over
+        // the horizon must not reach the buffers — no partial polygons.
+        let mesh = HexSphere::generate(2, 1.0);
+        let view = [0.0, 1.0, 0.0];
+        let (_, _, cells, _) = build_chunk_flat(&mesh, view);
+        let dot = |p: [f32; 3]| p[0] * view[0] + p[1] * view[1] + p[2] * view[2];
+        let mut partial = 0;
+        for cell in 0..mesh.cell_count() as u32 {
+            let center_inside = dot(mesh.cell_center(cell)) > 0.0;
+            let all_inside = mesh
+                .cell_corner_ids(cell)
+                .all(|corner| dot(mesh.corner_position(corner)) > 0.0);
+            if center_inside && !all_inside {
+                partial += 1;
+                assert!(
+                    !cells.contains(&cell),
+                    "partial rim cell {cell} leaked into the map"
+                );
+            }
+        }
+        assert!(partial > 0, "test needs a straddling rim cell");
+    }
+
+    #[test]
+    fn chunk_flat_orbit_loads_new_cells() {
+        // Orbiting halfway around the globe must unload the old half and
+        // load a mostly disjoint set (the streaming behavior).
+        let mesh = HexSphere::generate(2, 1.0);
+        let (_, _, north, _) = build_chunk_flat(&mesh, [0.0, 1.0, 0.0]);
+        let (_, _, south, _) = build_chunk_flat(&mesh, [0.0, -1.0, 0.0]);
+        // Rim cells differ per pole, so counts only agree roughly.
+        let (small, large) = (
+            north.len().min(south.len()) as f32,
+            north.len().max(south.len()) as f32,
+        );
+        assert!((large - small) / large < 0.1, "{small} vs {large}");
+        let shared = north.iter().filter(|c| south.contains(c)).count();
+        assert!(
+            shared as f32 * 4.0 < small,
+            "antipodal halves share {shared} of {small}"
+        );
+    }
+
+    #[test]
+    fn chunk_flat_wireframe_is_deduped() {
+        for n in 1..=2 {
+            let mesh = HexSphere::generate(n, 1.0);
+            let lines = build_chunk_flat_wireframe(&mesh, [0.0, 1.0, 0.0]);
+            assert_eq!(lines.len() % 2, 0, "N={n}");
+            assert!(!lines.is_empty(), "N={n}");
+            for p in &lines {
+                assert!((0.0..=1.0).contains(&p[0]), "N={n} {p:?}");
+                assert!((0.0..=1.0).contains(&p[1]), "N={n} {p:?}");
+            }
+            // No duplicate segments (quantized, direction-insensitive).
+            let key = |p: [f32; 2]| [(p[0] * 1e6) as i32, (p[1] * 1e6) as i32];
+            let mut seen = BTreeSet::new();
+            for i in (0..lines.len()).step_by(2) {
+                let (a, b) = (key(lines[i]), key(lines[i + 1]));
+                assert!(
+                    seen.insert(if a < b { (a, b) } else { (b, a) }),
+                    "N={n} dup"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_flat_builds_are_deterministic() {
+        let mesh = HexSphere::generate(2, 1.0);
+        let view = [0.0, 1.0, 0.0];
+        assert_eq!(build_chunk_flat(&mesh, view), build_chunk_flat(&mesh, view));
+        assert_eq!(
+            build_chunk_flat_wireframe(&mesh, view),
+            build_chunk_flat_wireframe(&mesh, view)
+        );
     }
 
     #[test]
