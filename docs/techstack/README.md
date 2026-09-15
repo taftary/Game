@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.6.3 (2026-09-15, plans/chunk-flat-view: flat map keeps equal chunk sizes via Lambert azimuthal equal-area projection and drops partial rim chunks — `visible_hemisphere` requires all corners inside)
+- **Version:** 0.6.5 (2026-09-15, plans/debug-player-view: interactive player overlay in the debug viewer — U toggles, WASD walks, P cycles cameras, flat map follows, VIEW presets snap the global camera; `game` modules exposed as a lib)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

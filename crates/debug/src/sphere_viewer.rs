@@ -13,6 +13,7 @@ use crate::mesh::{
     build_fill, build_fill_debug, build_wireframe, viewer_stats,
 };
 use crate::params::{self, MAX_SUBDIVISIONS, MIN_SUBDIVISIONS, ParamsError, ValidParams};
+use crate::player_view::PlayerViewState;
 use crate::ui::{Checkbox, Slider, TextField};
 
 /// Default radius shown in the panel.
@@ -189,6 +190,10 @@ pub struct SphereViewerState {
     /// Neighbor count per chunk, rebuilt on regenerate (5 = pentagon,
     /// 6 = hexagon): the panel CHUNK section's type/neighbor source.
     pub cell_sides: Vec<u8>,
+    /// Player overlay: keyboard-driven walker + player cameras + chunk
+    /// streaming. Reset to the applied radius on regenerate (keeping the
+    /// active flag); the binary renders through it while active.
+    pub player: PlayerViewState,
     /// Read-only stats, refreshed after each regeneration.
     pub stats: ViewerStats,
 }
@@ -258,6 +263,7 @@ impl SphereViewerState {
             hovered: None,
             pinned: None,
             cell_sides: Vec::new(),
+            player: PlayerViewState::new(radius),
             stats: ViewerStats {
                 cells: 0,
                 corners: 0,
@@ -306,9 +312,11 @@ impl SphereViewerState {
             self.pinned = None;
         }
         // Fresh mesh, fresh viewpoint: reset to the north pole, then
-        // load its hemisphere.
+        // load its hemisphere. The player restarts on the new planet
+        // (same mode) so streaming ids never go stale across meshes.
         self.stats = viewer_stats(&mesh, gen_ms);
         self.mesh = mesh;
+        self.player.reset(applied.radius);
         self.chunk_flat_viewpoint = [0.0, self.radius, 0.0];
         self.rebuild_chunk_flat();
         Ok(applied)
@@ -415,12 +423,13 @@ impl SphereViewerState {
         self.debug_mode = self.debug_mode.cycle();
     }
 
-    /// Preview thumb label for the current focus.
+    /// Preview thumb label for the current focus (`V` cycles focus;
+    /// `U` toggles player mode).
     pub fn thumb_label(&self) -> &'static str {
         match self.focus {
-            ViewFocus::SphereMain => "UV — click/U to expand",
-            ViewFocus::UvMain => "3D — click/U to restore",
-            ViewFocus::ChunkFlat => "3D — click/U to restore",
+            ViewFocus::SphereMain => "UV — click/V to expand",
+            ViewFocus::UvMain => "3D — click/V to restore",
+            ViewFocus::ChunkFlat => "3D — click/V to restore",
         }
     }
 }
@@ -637,13 +646,13 @@ mod tests {
     #[test]
     fn focus_toggles_both_ways_with_labels() {
         let mut state = SphereViewerState::new();
-        assert_eq!(state.thumb_label(), "UV — click/U to expand");
+        assert_eq!(state.thumb_label(), "UV — click/V to expand");
         state.toggle_focus();
         assert_eq!(state.focus, ViewFocus::UvMain);
-        assert_eq!(state.thumb_label(), "3D — click/U to restore");
+        assert_eq!(state.thumb_label(), "3D — click/V to restore");
         state.toggle_focus();
         assert_eq!(state.focus, ViewFocus::ChunkFlat);
-        assert_eq!(state.thumb_label(), "3D — click/U to restore");
+        assert_eq!(state.thumb_label(), "3D — click/V to restore");
         state.toggle_focus();
         assert_eq!(state.focus, ViewFocus::SphereMain);
     }

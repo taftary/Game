@@ -86,6 +86,18 @@ pub fn uv_thumb_rect(panel: Rect, pad: f32) -> Rect {
     }
 }
 
+/// Split a panel row into 4 equal buttons with `gap` between them
+/// (global camera presets). Degenerate widths clamp to zero.
+pub fn split_row_4(row: Rect, gap: f32) -> [Rect; 4] {
+    let w = ((row.w - 3.0 * gap) / 4.0).max(0.0);
+    std::array::from_fn(|i| Rect {
+        x: row.x + i as f32 * (w + gap),
+        y: row.y,
+        w,
+        h: row.h,
+    })
+}
+
 /// Map F1–F4 (as `1..=4`) to a nav index; anything else is `None`.
 pub fn nav_index_for_fkey(f: u8) -> Option<usize> {
     (1..=4).contains(&f).then(|| (f - 1) as usize)
@@ -329,6 +341,27 @@ mod tests {
         assert_eq!(thumb.h, UV_THUMB_H);
         assert!(thumb.contains(thumb.x + 10.0, thumb.y + 10.0));
         assert!(!thumb.contains(thumb.x - 1.0, thumb.y + 10.0));
+    }
+
+    #[test]
+    fn preset_row_splits_into_four_inside_buttons() {
+        let row = Rect {
+            x: 1020.0,
+            y: 600.0,
+            w: 244.0,
+            h: 24.0,
+        };
+        let buttons = split_row_4(row, 4.0);
+        assert_eq!(buttons.len(), 4);
+        for (i, b) in buttons.iter().enumerate() {
+            assert_eq!((b.y, b.h), (row.y, row.h));
+            assert!(b.x >= row.x && b.x + b.w <= row.x + row.w + 1e-3, "{b:?}");
+            if i > 0 {
+                assert!(b.x >= buttons[i - 1].x + buttons[i - 1].w);
+            }
+        }
+        let total = buttons.iter().map(|b| b.w).sum::<f32>() + 3.0 * 4.0;
+        assert!((total - row.w).abs() < 1e-3, "{total}");
     }
 
     #[test]

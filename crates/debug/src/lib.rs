@@ -15,6 +15,7 @@ pub mod inspector;
 pub mod mesh;
 pub mod params;
 pub mod picking;
+pub mod player_view;
 pub mod sphere_viewer;
 pub mod text;
 pub mod ui;

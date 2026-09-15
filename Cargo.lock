@@ -469,6 +469,7 @@ name = "game"
 version = "0.1.0"
 dependencies = [
  "game_engine",
+ "glam",
 ]
 
 [[package]]
@@ -476,6 +477,7 @@ name = "game_debug"
 version = "0.1.0"
 dependencies = [
  "fontdue",
+ "game",
  "game_engine",
  "glam",
  "tracing",

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 fontdue.workspace = true
+game.workspace = true
 game_engine.workspace = true
 glam.workspace = true
 tracing.workspace = true

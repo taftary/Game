@@ -19,19 +19,23 @@
 //! Usage: `game_debug [--headless]`.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use game::camera::CameraMode;
 use game_debug::app::{App as DebugApp, Screen};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{
     Ray, flat_point_from_cursor, intersect_sphere, pick_cell, pick_flat_visible, ray_from_cursor,
 };
+use game_debug::player_view::{MoveKeys, PlayerViewState};
 use game_debug::sphere_viewer::{DebugMode, SphereViewerState, ViewFocus};
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
 use game_engine::render::{
-    OrbitCamera, ShaderKind, compile_glsl_to_spirv, create_instance, device_score,
-    log_physical_device, required_device_extensions,
+    MAX_PITCH, OrbitCamera, ShaderKind, compile_glsl_to_spirv, create_instance, device_score,
+    log_physical_device, required_device_extensions, visible_hemisphere,
 };
+use glam::{Mat4, Vec3};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
@@ -519,6 +523,12 @@ const C_BTN_OFF: Color = [0.10, 0.10, 0.12, 1.0];
 const C_TRACK: Color = [0.13, 0.15, 0.20, 1.0];
 const C_KNOB: Color = [0.55, 0.65, 0.90, 1.0];
 const C_CHECK: Color = [0.45, 0.75, 0.45, 1.0];
+/// Player marker dot (sphere + flat map).
+const C_PLAYER: Color = [0.30, 1.00, 0.45, 1.0];
+/// Player marker size, pixels.
+const PLAYER_DOT: f32 = 10.0;
+/// Flat-map follow reload throttle while tracking the player.
+const FLAT_SYNC_MS: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // Args + headless.
@@ -627,6 +637,41 @@ fn run_headless() -> i32 {
         viewer.chunk_flat_indices.len() / 3,
         flat_picked.index(),
     );
+    // Player self-test (debug-player-view): walk east on the default
+    // mesh; longitude must rise, latitude hold, streaming settle on the
+    // walker's hemisphere.
+    let mut walk = PlayerViewState::new(viewer.radius);
+    walk.toggle();
+    walk.set_keys(MoveKeys {
+        east: true,
+        ..MoveKeys::default()
+    });
+    for _ in 0..20 {
+        let desired = visible_hemisphere(&viewer.mesh, walk.position().to_array());
+        walk.update(0.05, &desired);
+    }
+    // One zero-dt sync: the last move can rotate fresh rim cells into
+    // the hemisphere that no tick has streamed yet (the viewer closes
+    // the same one-frame lag on the next frame).
+    let desired = visible_hemisphere(&viewer.mesh, walk.position().to_array());
+    walk.update(0.0, &desired);
+    let (lon, lat) = walk.lon_lat_deg();
+    assert!(lon > 0.0, "east walk must raise longitude, got {lon}");
+    assert!(lat.abs() < 1.0, "east walk must hold latitude, got {lat}");
+    // The current hemisphere is fully loaded (the grace cache may hold
+    // the trail on top, so this is a subset check, not equality).
+    let desired = visible_hemisphere(&viewer.mesh, walk.position().to_array());
+    let loaded = walk.loaded();
+    assert!(
+        desired.iter().all(|cell| loaded.contains(cell)),
+        "hemisphere must be loaded: {} desired, {} have",
+        desired.len(),
+        loaded.len(),
+    );
+    println!(
+        "player_selftest=lon{lon:.2} lat{lat:.2} loaded{} ok",
+        walk.loaded_count(),
+    );
     0
 }
 
@@ -689,6 +734,100 @@ fn flat_mvp(vp: Rect) -> [[f32; 4]; 4] {
     ]
 }
 
+/// Global orbit-camera presets behind the panel VIEW buttons
+/// (and the `G`/`T`/`B`/`R` keys). They retarget the free orbit camera;
+/// the player cameras are untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalPreset {
+    Top,
+    Bottom,
+    Right,
+    Perspective,
+}
+
+impl GlobalPreset {
+    /// Panel buttons in draw/hit-test order.
+    const ALL: [(GlobalPreset, &'static str); 4] = [
+        (GlobalPreset::Top, "Top"),
+        (GlobalPreset::Bottom, "Bot"),
+        (GlobalPreset::Right, "Right"),
+        (GlobalPreset::Perspective, "Persp"),
+    ];
+
+    fn from_index(index: usize) -> Option<GlobalPreset> {
+        Self::ALL.get(index).map(|(preset, _)| *preset)
+    }
+}
+
+/// Snap the global orbit camera to `preset` at framing distance
+/// (3.2 R inside the `[1.6 R, 8 R]` smoke range).
+fn snap_global_camera(camera: &mut OrbitCamera, preset: GlobalPreset, radius: f32) {
+    let (yaw, pitch) = match preset {
+        GlobalPreset::Perspective => (0.0, 0.35),
+        GlobalPreset::Top => (0.0, MAX_PITCH),
+        GlobalPreset::Bottom => (0.0, -MAX_PITCH),
+        GlobalPreset::Right => (0.0, 0.0),
+    };
+    *camera = OrbitCamera::new(
+        Vec3::ZERO,
+        3.2 * radius,
+        yaw,
+        pitch,
+        1.6 * radius,
+        8.0 * radius,
+    );
+}
+
+/// Short panel label for a player camera mode.
+fn short_mode(mode: CameraMode) -> &'static str {
+    match mode {
+        CameraMode::Follow => "follow",
+        CameraMode::FirstPerson => "first",
+        CameraMode::ThirdPerson => "third",
+        CameraMode::Global => "global",
+    }
+}
+
+/// Project a world point through `view_proj` to y-down viewport pixels.
+/// `None` when behind the camera (`w <= 0`) or outside the rect — the
+/// player marker then hides instead of smearing across the screen.
+fn world_to_pixels(view_proj: Mat4, world: Vec3, rect: Rect) -> Option<(f32, f32)> {
+    if rect.w < 1.0 || rect.h < 1.0 {
+        return None;
+    }
+    let clip = view_proj * world.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = Vec3::new(clip.x, clip.y, clip.z) / clip.w;
+    if ndc.x.abs() > 1.0 || ndc.y.abs() > 1.0 {
+        return None;
+    }
+    Some((
+        rect.x + (ndc.x + 1.0) / 2.0 * rect.w,
+        rect.y + (1.0 - ndc.y) / 2.0 * rect.h,
+    ))
+}
+
+/// Map a `[0, 1]²` flat-map point to y-down viewport pixels (inverse of
+/// the aspect-fit [`flat_mvp`]: largest centered square). `None` on
+/// degenerate rects.
+fn flat_uv_to_pixels(rect: Rect, uv: [f32; 2]) -> Option<(f32, f32)> {
+    if rect.w < 1.0 || rect.h < 1.0 {
+        return None;
+    }
+    let aspect = rect.w / rect.h;
+    let (ndc_x, ndc_y) = if aspect >= 1.0 {
+        ((2.0 * uv[0] - 1.0) / aspect, 1.0 - 2.0 * uv[1])
+    } else {
+        (2.0 * uv[0] - 1.0, aspect - 2.0 * aspect * uv[1])
+    };
+    Some((
+        rect.x + (ndc_x + 1.0) / 2.0 * rect.w,
+        rect.y + (1.0 - ndc_y) / 2.0 * rect.h,
+    ))
+}
+
 /// Widget rects inside the inputs panel.
 struct PanelRects {
     thumb: Rect,
@@ -704,6 +843,8 @@ struct PanelRects {
     pent_box: Rect,
     seam_box: Rect,
     uvwire_box: Rect,
+    /// Global camera preset buttons (Top/Bot/Right/Persp order).
+    preset: [Rect; 4],
 }
 
 /// Full panel row plan: widget rects + label/text rows in draw order.
@@ -727,6 +868,9 @@ struct PanelPlan {
     uvwire_label: Rect,
     chunk_header: Rect,
     chunk_lines: [Rect; 4],
+    player_header: Rect,
+    player_lines: [Rect; 3],
+    view_header: Rect,
     stats_header: Rect,
     stat_lines: [Rect; 6],
 }
@@ -766,6 +910,10 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
     ];
+    let player_header = rows.next(lh, 4.0);
+    let player_lines = [rows.next(lh, 4.0), rows.next(lh, 4.0), rows.next(lh, 4.0)];
+    let view_header = rows.next(lh, 4.0);
+    let preset_row = rows.next(24.0, 6.0);
     let stats_header = rows.next(lh, 4.0);
     let stat_lines = [
         rows.next(lh, 4.0),
@@ -796,6 +944,7 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
             pent_box: check_box(pent_label),
             seam_box: check_box(seam_label),
             uvwire_box: check_box(uvwire_label),
+            preset: ui::split_row_4(preset_row, 4.0),
         },
         uv_header,
         density_label,
@@ -811,6 +960,9 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
         uvwire_label,
         chunk_header,
         chunk_lines,
+        player_header,
+        player_lines,
+        view_header,
         stats_header,
         stat_lines,
     }
@@ -898,7 +1050,7 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
     );
     items.solid(rects.swap_button, C_BTN);
     items.text(
-        "Swap view (U)".to_owned(),
+        "Swap view (V)".to_owned(),
         rects.swap_button.x + 12.0,
         rects.swap_button.y + 19.0,
         C_TEXT,
@@ -1066,6 +1218,40 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
         .zip([chunk_line, type_line, neigh_line, state_line])
     {
         text_row(&mut items, *row, line, C_TEXT);
+    }
+
+    // Player overlay readout: lon/lat in degrees, player camera mode,
+    // streamed chunk count. `U` toggles, `WASD`/arrows walk, `P` cycles.
+    text_row(&mut items, plan.player_header, "PLAYER".to_owned(), C_DIM);
+    let player = &viewer.player;
+    let (lon, lat) = player.lon_lat_deg();
+    let player_rows = if player.active {
+        [
+            format!("lon:      {lon:7.2} deg"),
+            format!("lat:      {lat:7.2} deg"),
+            format!(
+                "cam: {} +{}",
+                short_mode(player.mode()),
+                player.loaded_count()
+            ),
+        ]
+    } else {
+        [
+            "player:   off (U)".to_owned(),
+            "move:     WASD".to_owned(),
+            "cam:      P cycles".to_owned(),
+        ]
+    };
+    for (row, line) in plan.player_lines.iter().zip(player_rows) {
+        text_row(&mut items, *row, line, C_TEXT);
+    }
+
+    // Global camera presets: clickable buttons retargeting the free
+    // orbit camera (`G`/`T`/`B`/`R` do the same from the keyboard).
+    text_row(&mut items, plan.view_header, "VIEW".to_owned(), C_DIM);
+    for (rect, (_, label)) in plan.rects.preset.iter().zip(GlobalPreset::ALL) {
+        items.solid(*rect, C_BTN);
+        items.text(label.to_owned(), rect.x + 4.0, rect.y + 17.0, C_TEXT);
     }
 
     // Read-only stats.
@@ -1820,6 +2006,11 @@ struct ViewerApp {
     dragging_slider: bool,
     dragging_density: bool,
     last_cursor: Option<(f32, f32)>,
+    /// Last frame time: the player movement `dt` source (clamped).
+    last_frame: Option<Instant>,
+    /// Last flat-map follow rebuild: throttles hemisphere reloads while
+    /// the flat view tracks the player.
+    last_flat_sync: Option<Instant>,
     /// Cursor position at left-button press (main-viewport sphere presses
     /// only): release within [`CLICK_MAX_DRAG_PX`] of it counts as a click
     /// (chunk pin) rather than an orbit drag.
@@ -1956,6 +2147,8 @@ impl ViewerApp {
             dragging_slider: false,
             dragging_density: false,
             last_cursor: None,
+            last_frame: None,
+            last_flat_sync: None,
             press_cursor: None,
             rcx: None,
         }
@@ -2036,8 +2229,17 @@ impl ViewerApp {
                             return None;
                         }
                         let aspect = rect.w / rect.h;
-                        let view_proj =
-                            self.camera.projection_matrix(aspect) * self.camera.view_matrix();
+                        // Player mode picks through the player camera on
+                        // the main sphere view; the thumb keeps the free
+                        // orbit context.
+                        let player_view = self.debug.viewer.player.active
+                            && self.debug.viewer.focus == ViewFocus::SphereMain;
+                        let view_proj = if player_view {
+                            let player = &self.debug.viewer.player;
+                            player.projection_matrix(aspect) * player.view_matrix()
+                        } else {
+                            self.camera.projection_matrix(aspect) * self.camera.view_matrix()
+                        };
                         let ray = ray_from_cursor((cx, cy), rect, view_proj);
                         let hit = intersect_sphere(ray, self.debug.viewer.radius)?;
                         let viewer = &self.debug.viewer;
@@ -2260,7 +2462,14 @@ impl ApplicationHandler for ViewerApp {
                 } else if self.dragging_orbit
                     && let Some(last) = self.last_cursor
                 {
-                    self.camera.rotate(cursor.0 - last.0, cursor.1 - last.1);
+                    // Player mode orbits the follow camera instead of the
+                    // free global one (first/third person ignore rotation).
+                    let (dx, dy) = (cursor.0 - last.0, cursor.1 - last.1);
+                    if self.debug.viewer.player.active {
+                        self.debug.viewer.player.rotate_camera(dx, dy);
+                    } else {
+                        self.camera.rotate(dx, dy);
+                    }
                 }
                 self.last_cursor = Some(cursor);
                 // Hover tracks cursor AND camera moves (orbit drags change
@@ -2374,6 +2583,24 @@ impl ApplicationHandler for ViewerApp {
                 if regenerated {
                     self.refresh_mesh();
                 }
+                // Global camera presets: VIEW buttons retarget the free
+                // orbit camera (same as G/T/B/R).
+                let preset = {
+                    let viewer = &self.debug.viewer;
+                    let lh = self.atlas.line_height();
+                    let warn =
+                        parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
+                    panel_plan(layout.panel, lh, warn)
+                        .rects
+                        .preset
+                        .iter()
+                        .position(|rect| rect.contains(cx, cy))
+                        .and_then(GlobalPreset::from_index)
+                };
+                if let Some(preset) = preset {
+                    let radius = self.debug.viewer.radius;
+                    snap_global_camera(&mut self.camera, preset, radius);
+                }
                 // Panel clicks, focus swaps and rebuilds all change what
                 // sits under the cursor — refresh the hover.
                 self.update_hover();
@@ -2388,7 +2615,11 @@ impl ApplicationHandler for ViewerApp {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
                     };
-                    self.camera.zoom(scroll);
+                    if self.debug.viewer.player.active {
+                        self.debug.viewer.player.zoom_camera(scroll);
+                    } else {
+                        self.camera.zoom(scroll);
+                    }
                     self.update_hover();
                 }
             }
@@ -2402,6 +2633,54 @@ impl ApplicationHandler for ViewerApp {
                     },
                 ..
             } => {
+                // Player movement tracks press AND release so keys never
+                // stick; focused text fields keep every keystroke instead.
+                if self.debug.screen == Screen::SphereViewer
+                    && let PhysicalKey::Code(code) = physical_key
+                    && matches!(
+                        code,
+                        KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::ArrowUp
+                            | KeyCode::ArrowDown
+                            | KeyCode::ArrowLeft
+                            | KeyCode::ArrowRight
+                    )
+                {
+                    let viewer = &mut self.debug.viewer;
+                    let fields_free = !viewer.subdiv_field.focused && !viewer.radius_field.focused;
+                    if viewer.player.active && fields_free {
+                        let pressed = state == ElementState::Pressed;
+                        let mut keys = viewer.player.keys();
+                        match code {
+                            KeyCode::KeyW | KeyCode::ArrowUp => keys.north = pressed,
+                            KeyCode::KeyS | KeyCode::ArrowDown => keys.south = pressed,
+                            KeyCode::KeyA | KeyCode::ArrowLeft => keys.west = pressed,
+                            KeyCode::KeyD | KeyCode::ArrowRight => keys.east = pressed,
+                            _ => {}
+                        }
+                        viewer.player.set_keys(keys);
+                        return;
+                    }
+                    if state == ElementState::Released {
+                        // Not driving (player off or typing): still clear
+                        // a possibly stuck flag, then swallow the release
+                        // (releases had no handling before either).
+                        let viewer = &mut self.debug.viewer;
+                        let mut keys = viewer.player.keys();
+                        match code {
+                            KeyCode::KeyW | KeyCode::ArrowUp => keys.north = false,
+                            KeyCode::KeyS | KeyCode::ArrowDown => keys.south = false,
+                            KeyCode::KeyA | KeyCode::ArrowLeft => keys.west = false,
+                            KeyCode::KeyD | KeyCode::ArrowRight => keys.east = false,
+                            _ => {}
+                        }
+                        viewer.player.set_keys(keys);
+                        return;
+                    }
+                }
                 if state != ElementState::Pressed {
                     return;
                 }
@@ -2493,12 +2772,68 @@ impl ApplicationHandler for ViewerApp {
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyU) => {
-                        // Swap toggle — but never steal keystrokes from
-                        // focused fields (`u` is printable input there).
+                        // Player-mode toggle — but never steal keystrokes
+                        // from focused fields (`u` is printable input
+                        // there). Focus cycling moved to `V`.
+                        if self.debug.screen == Screen::SphereViewer {
+                            let viewer = &self.debug.viewer;
+                            if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
+                                self.debug.viewer.player.toggle();
+                                self.update_hover();
+                            } else if let Some(text) = text {
+                                let viewer = &mut self.debug.viewer;
+                                for ch in text.chars() {
+                                    viewer.subdiv_field.insert_char(ch);
+                                    viewer.radius_field.insert_char(ch);
+                                }
+                                viewer.sync_slider_from_field();
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyV) => {
+                        // Focus cycle (was `U`): swap main ↔ thumb view.
                         if self.debug.screen == Screen::SphereViewer {
                             let viewer = &self.debug.viewer;
                             if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
                                 self.debug.viewer.toggle_focus();
+                                self.update_hover();
+                            } else if let Some(text) = text {
+                                let viewer = &mut self.debug.viewer;
+                                for ch in text.chars() {
+                                    viewer.subdiv_field.insert_char(ch);
+                                    viewer.radius_field.insert_char(ch);
+                                }
+                                viewer.sync_slider_from_field();
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyP) => {
+                        // Player camera cycle (active player only).
+                        if self.debug.screen == Screen::SphereViewer {
+                            let viewer = &mut self.debug.viewer;
+                            if !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && viewer.player.active
+                            {
+                                self.debug.viewer.player.cycle_camera();
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(
+                        KeyCode::KeyG | KeyCode::KeyT | KeyCode::KeyB | KeyCode::KeyR,
+                    ) => {
+                        // Global camera presets (same as the VIEW buttons).
+                        if self.debug.screen == Screen::SphereViewer {
+                            let viewer = &self.debug.viewer;
+                            if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
+                                let preset = match physical_key {
+                                    PhysicalKey::Code(KeyCode::KeyT) => GlobalPreset::Top,
+                                    PhysicalKey::Code(KeyCode::KeyB) => GlobalPreset::Bottom,
+                                    PhysicalKey::Code(KeyCode::KeyR) => GlobalPreset::Right,
+                                    _ => GlobalPreset::Perspective,
+                                };
+                                let radius = self.debug.viewer.radius;
+                                snap_global_camera(&mut self.camera, preset, radius);
                                 self.update_hover();
                             } else if let Some(text) = text {
                                 let viewer = &mut self.debug.viewer;
@@ -2547,6 +2882,39 @@ impl ViewerApp {
         if win_w < 1.0 || win_h < 1.0 {
             return;
         }
+        // Player frame: walk by real `dt`, then stream the current
+        // hemisphere. The flat viewpoint tracks the walker (throttled
+        // reload); the desired set stays at most one sync behind.
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map(|last| (now - last).as_secs_f32())
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.25);
+        self.last_frame = Some(now);
+        let player_active =
+            self.debug.screen == Screen::SphereViewer && self.debug.viewer.player.active;
+        if player_active {
+            let desired = self.debug.viewer.chunk_flat_cells.clone();
+            self.debug.viewer.player.update(dt, &desired);
+            let position = self.debug.viewer.player.position();
+            let viewer = &self.debug.viewer;
+            let radius = viewer.radius;
+            let along = viewer.chunk_flat_viewpoint[0] * position.x
+                + viewer.chunk_flat_viewpoint[1] * position.y
+                + viewer.chunk_flat_viewpoint[2] * position.z;
+            let moved = along / radius / radius < 1.0 - 1e-6;
+            let due = self
+                .last_flat_sync
+                .is_none_or(|last| now - last >= Duration::from_millis(FLAT_SYNC_MS));
+            if moved && due {
+                let viewer = &mut self.debug.viewer;
+                viewer.chunk_flat_viewpoint = position.to_array();
+                viewer.rebuild_chunk_flat();
+                self.refresh_chunk_flat();
+                self.last_flat_sync = Some(now);
+            }
+        }
         {
             let rcx = self.rcx.as_mut().expect("render context must exist");
             rcx.previous_frame_end
@@ -2576,11 +2944,48 @@ impl ViewerApp {
 
         // Build frame UI (atlas insertions happen here) and sync the GPU
         // atlas before recording.
-        let items = if viewer_screen {
+        let mut items = if viewer_screen {
             build_viewer_ui(&mut self.atlas, &self.debug.viewer, layout)
         } else {
             build_placeholder_ui(&mut self.atlas, self.debug.screen, layout)
         };
+        // Player dots: the sphere dot projects the walker through the
+        // main-view matrices; the flat dot resolves the walker's chunk
+        // to its visible-center pixels (skipped while unloaded).
+        let mut sphere_marker: Option<(f32, f32)> = None;
+        if player_active && viewer_screen && self.debug.viewer.focus == ViewFocus::SphereMain {
+            let player = &self.debug.viewer.player;
+            let vp = layout.viewport;
+            let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
+            sphere_marker = world_to_pixels(main_vp, player.position(), vp);
+        }
+        let mut flat_marker: Option<(f32, f32)> = None;
+        if player_active && viewer_screen && self.debug.viewer.focus == ViewFocus::ChunkFlat {
+            let viewer = &self.debug.viewer;
+            let position = viewer.player.position();
+            let chunk = pick_cell(&viewer.mesh, position, None).index();
+            if let Some(slot) = viewer
+                .chunk_flat_cells
+                .iter()
+                .position(|&cell| cell == chunk)
+            {
+                flat_marker = flat_uv_to_pixels(layout.viewport, viewer.chunk_flat_centers[slot]);
+            }
+        }
+        if player_active {
+            for (mx, my) in sphere_marker.into_iter().chain(flat_marker) {
+                items.solid(
+                    Rect {
+                        x: mx - PLAYER_DOT / 2.0,
+                        y: my - PLAYER_DOT / 2.0,
+                        w: PLAYER_DOT,
+                        h: PLAYER_DOT,
+                    },
+                    C_PLAYER,
+                );
+                items.text("YOU".to_owned(), mx + PLAYER_DOT, my - 6.0, C_PLAYER);
+            }
+        }
         self.sync_atlas();
         let ui_verts = ui_items_to_vertices(&items, &mut self.atlas);
         assert!(
@@ -2690,8 +3095,15 @@ impl ViewerApp {
                 };
                 if view == ViewFocus::SphereMain {
                     let aspect = vp.w / vp.h;
-                    let mvp = (self.camera.projection_matrix(aspect) * self.camera.view_matrix())
-                        .to_cols_array_2d();
+                    // Player mode renders the main sphere through the
+                    // player camera; the thumb keeps the free orbit.
+                    let main_vp = if player_active && vp == layout.viewport {
+                        let player = &self.debug.viewer.player;
+                        player.projection_matrix(aspect) * player.view_matrix()
+                    } else {
+                        self.camera.projection_matrix(aspect) * self.camera.view_matrix()
+                    };
+                    let mvp = main_vp.to_cols_array_2d();
                     builder
                         .set_viewport(0, [viewport].into_iter().collect())
                         .expect("viewport must set")
@@ -3096,6 +3508,13 @@ mod tests {
                     "{rect:?}"
                 );
             }
+            for button in rects.preset {
+                assert!(button.x >= layout.panel.x, "{button:?}");
+                assert!(
+                    button.x + button.w <= layout.panel.x + layout.panel.w + 1e-3,
+                    "{button:?}"
+                );
+            }
             assert!(rects.thumb.y < rects.thumb_caption.y);
             assert!(rects.thumb_caption.y < rects.swap_button.y);
             assert!(rects.swap_button.y < rects.shader_button.y);
@@ -3111,6 +3530,13 @@ mod tests {
             assert!(rects.uvwire_box.y < plan.chunk_header.y);
             assert!(plan.chunk_header.y < plan.chunk_lines[0].y);
             assert!(plan.chunk_lines.windows(2).all(|w| w[0].y < w[1].y));
+            assert!(plan.chunk_lines[3].y < plan.player_header.y);
+            assert!(plan.player_header.y < plan.player_lines[0].y);
+            assert!(plan.player_lines.windows(2).all(|w| w[0].y < w[1].y));
+            assert!(plan.player_lines[2].y < plan.view_header.y);
+            assert!(plan.view_header.y < rects.preset[0].y);
+            assert!(rects.preset.windows(2).all(|w| w[0].x < w[1].x));
+            assert!(rects.preset[3].y < plan.stats_header.y);
             assert!(plan.chunk_lines[3].y < plan.stats_header.y);
             assert!(plan.uv_header.y < plan.density_label.y);
             assert!(plan.inputs_header.y < plan.subdiv_label.y);
@@ -3147,15 +3573,134 @@ mod tests {
             "CHUNK",
             "chunk:",
             "state:",
-            "Swap view (U)",
+            "Swap view (V)",
             "Shader: Lit",
             "Checker density:",
-            "click/U",
+            "click/V",
+            "PLAYER",
+            "off (U)",
+            "VIEW",
+            "Top",
+            "Bot",
+            "Right",
+            "Persp",
             "STATS",
             "cells:",
             "hash:",
             "view:",
         ] {
+            assert!(joined.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn global_presets_frame_the_planet() {
+        for (preset, _) in GlobalPreset::ALL {
+            let mut camera = OrbitCamera::framing_planet(2.0);
+            snap_global_camera(&mut camera, preset, 2.0);
+            let offset = camera.eye() - Vec3::ZERO;
+            // All presets sit at framing distance.
+            assert!((offset.length() - 6.4).abs() < 1e-4, "{preset:?}");
+            let up = offset.normalize();
+            match preset {
+                GlobalPreset::Top => assert!(up.y > 0.99, "{preset:?} {up:?}"),
+                GlobalPreset::Bottom => assert!(up.y < -0.99, "{preset:?} {up:?}"),
+                GlobalPreset::Right => {
+                    assert!(up.x > 0.99, "{preset:?} {up:?}");
+                }
+                GlobalPreset::Perspective => {
+                    assert!(up.y > 0.0 && up.x > 0.0, "{preset:?} {up:?}");
+                }
+            }
+        }
+        assert_eq!(GlobalPreset::from_index(0), Some(GlobalPreset::Top));
+        assert_eq!(GlobalPreset::from_index(3), Some(GlobalPreset::Perspective));
+        assert_eq!(GlobalPreset::from_index(4), None);
+    }
+
+    #[test]
+    fn world_to_pixels_centers_and_rejects() {
+        let rect = Rect {
+            x: 0.0,
+            y: 28.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        // Identity: origin maps to the rect center.
+        let at = world_to_pixels(Mat4::IDENTITY, Vec3::ZERO, rect).expect("center");
+        assert!((at.0 - 100.0).abs() < 1e-4 && (at.1 - 78.0).abs() < 1e-4);
+        // Outside NDC: no marker.
+        assert_eq!(
+            world_to_pixels(Mat4::IDENTITY, Vec3::new(2.0, 0.0, 0.0), rect),
+            None
+        );
+        // Behind the camera (w <= 0): no marker.
+        let proj = glam::camera::rh::proj::vulkan::perspective(1.0, 2.0, 0.1, 100.0);
+        assert_eq!(world_to_pixels(proj, Vec3::new(0.0, 0.0, 5.0), rect), None);
+        // In front: projects inside.
+        assert!(world_to_pixels(proj, Vec3::new(0.0, 0.0, -5.0), rect).is_some());
+        // Degenerate rect: no marker.
+        assert_eq!(
+            world_to_pixels(
+                Mat4::IDENTITY,
+                Vec3::ZERO,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn flat_uv_to_pixels_matches_flat_mvp() {
+        // Wide rect: center maps to center (mirrors flat_mvp test above).
+        let wide = Rect {
+            x: 0.0,
+            y: 28.0,
+            w: 1020.0,
+            h: 692.0,
+        };
+        let at = flat_uv_to_pixels(wide, [0.5, 0.5]).expect("center");
+        assert!((at.0 - 510.0).abs() < 1e-3 && (at.1 - 374.0).abs() < 1e-3);
+        let corner = flat_uv_to_pixels(wide, [0.0, 0.0]).expect("corner");
+        assert!((corner.0 - 164.0).abs() < 1.0 && (corner.1 - 28.0).abs() < 1e-3);
+        // Tall rect: fit by width instead.
+        let tall = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 800.0,
+        };
+        let at = flat_uv_to_pixels(tall, [0.5, 0.5]).expect("center");
+        assert!((at.0 - 200.0).abs() < 1e-3 && (at.1 - 400.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn viewer_ui_shows_player_readout_when_active() {
+        use game_debug::player_view::MoveKeys;
+
+        let mut atlas = GlyphAtlas::new(UI_PX);
+        let mut viewer = SphereViewerState::with_values(1, 1.0);
+        viewer.player.toggle();
+        viewer.player.set_keys(MoveKeys {
+            east: true,
+            ..MoveKeys::default()
+        });
+        let desired = viewer.chunk_flat_cells.clone();
+        viewer.player.update(0.05, &desired);
+        let layout = ui::layout(1280.0, 720.0);
+        let items = build_viewer_ui(&mut atlas, &viewer, layout);
+        let joined = items
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in ["PLAYER", "lon:", "lat:", "cam: follow"] {
             assert!(joined.contains(needle), "missing {needle}");
         }
     }

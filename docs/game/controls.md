@@ -10,6 +10,24 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
 - All actions rebindable on desktop; touch layout has large targets (≥44pt).
 - Future XR poses map to the same actions; no v1 XR code.
 
+## Surface walk (player-sphere-movement, implemented in `game`)
+
+- Move: WASD / arrows / left stick → tangent-plane intent (W = north,
+  D = east); diagonal input is speed-capped, never faster than full tilt.
+- Camera: one key/stick-button cycles Follow → First-person →
+  Third-person → Global orbit → Follow (`CameraMode::cycle`); wheel/pinch
+  zooms the orbit modes.
+- Chunks: the flat map recenters on the player every tick; the player
+  hemisphere loads immediately, the trail behind unloads after a grace
+  delay — same hemisphere rule as the debug flat view.
+- Headless demo: `cargo run -p game` runs a scripted 20 Hz walk through
+  all four modes (interactive `winit` binding deferred).
+- Debug viewer (`cargo run -p game_debug`, Sphere Viewer screen):
+  `U` toggles player mode, `WASD`/arrows walk the player on the sphere,
+  `P` cycles Follow → First-person → Third-person, `V` cycles main/thumb
+  focus, `G`/`T`/`B`/`R` snap the global camera to
+  Perspective/Top/Bottom/Right (same as the panel VIEW buttons).
+
 ## Audio / UI
 
 - Audio: ambient pad + UI + hazard stingers; full music/sfx pass is stretch. Mix buses with mute; no audio-codec crash on any target.

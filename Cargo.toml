@@ -18,6 +18,7 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+game = { path = "crates/game", version = "0.1.0" }
 game_engine = { path = "crates/engine", version = "0.1.0" }
 vulkano = { version = "0.35", default-features = true }
 winit = { version = "0.30", default-features = true, features = ["android-native-activity"] }

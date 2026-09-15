@@ -5,6 +5,11 @@ edition.workspace = true
 
 [dependencies]
 game_engine.workspace = true
+glam.workspace = true
+
+[lib]
+name = "game"
+path = "src/lib.rs"
 
 [[bin]]
 name = "game"
