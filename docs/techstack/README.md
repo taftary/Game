@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.4.2 (2026-09-14, plans/debug-sphere-viewer: fix inside-out fill rendering — `FrontFace::Clockwise` for the Y-down projection, outward normals restored — and non-inverted vertical orbit in the shared `OrbitCamera`)
+- **Version:** 0.5.4 (2026-09-15, plans/sphere-uv-debug issue round 3: cube-domain equiangular checker in `render::checker` — only squares everywhere, alternation across 8/12 edges with the forced faults confined to a 4-edge matching)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

@@ -88,8 +88,41 @@ naga compile helper, 1.1-floor boot).
   follows the Backend winding convention (`FrontFace::Clockwise`) and
   passes the radial outward normal through unflipped
   (`plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`).
-- `--headless`: GPU-free viewer-mesh build (N=6, R=1.0) + stats print;
+- `--headless`: GPU-free viewer-mesh build (N=6, R=1.0) + stats print,
+  including `uv_islands`/`uv_seam_verts` from the icosa-net unwrap;
   runs in CI as `cargo run -p game_debug -- --headless`.
-- `engine::hexsphere` and the release `game` binary are untouched; all
+- UV inspection (`plans/sphere-uv-debug`, 2026-09-15): `engine::render::uv`
+  lays the 20 base faces out as the classic 5-10-5 triangle strip
+  (closed-form absolute slots, one rooted tree walk assigning the forced
+  icosa neighbor per slot — pairwise SAT-tested overlap-free); every
+  `PlanetVertex` carries `uv`, the debug sidecar adds seam/island flags. The viewer shows a panel-top UV preview
+  thumb — click, `U` or `Swap view` flips it with the main viewport (both
+  cameras preserved) — and six fragment-shader modes (Lit, Normal, Tint,
+  Gnomonic Checker with density slider, Seams+Islands, LonLat) shared by
+  the 3D and flat pipelines (`1`–`6` select, flat view is aspect-fit so the
+  checker never lies). The flat view uses proper seam duplication
+  (update-2026-09-15-0730): seam cells (dual centers on base edges/vertices)
+  emit one fan per incident island from expanded buffers
+  (`render::uv::FlatUnwrap`), so every flat triangle stays inside one
+  island — no cross-net stretch — and the UV wireframe clips at island
+  boundaries; the 3D view keeps the single-UV honest-stretch look.
+  Checker mode uses a cube-domain mapping
+  (`plans/sphere-uv-debug/issue-2026-09-15-0817-3d-checker-gnomonic`):
+  an icosahedral square grid provably cannot be globally consistent
+  (60° vertex holonomy vs 90° grid symmetry — it always shows triangles
+  at the 12 vertices and mismatched seams), so the checker runs on the
+  Bourke cubemap instead: the fragment shader selects the cube face by
+  major axis, projects gnomonically, and remaps to equal angles
+  (equiangular cubemap) before tiling — only squares, evenly
+  distributed. Per-face axes and color flips
+  (`engine::render::checker`, drift-guarded against the shader literals)
+  are search-assigned so the grid alternates across 8 of the 12 cube
+  edges at every density 2–32; the topologically forced same-color
+  faults (odd 3-cycles at cube vertices) are confined to a perfect
+  matching of 4 edges. The checker is a pure function of direction, so
+  it flows across the icosa seam overlay and both views agree.
+  `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
+  it, so the `game_tools` smoke is unaffected.
+- `engine::hexsphere` topology and the release `game` binary are untouched; all
   UI code lives in `crates/debug` (first custom swapchain-UI consumer
   per [`stack.md`](stack.md)).

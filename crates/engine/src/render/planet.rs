@@ -12,9 +12,10 @@ use vulkano::pipeline::graphics::vertex_input::Vertex;
 use super::tier::QualityTier;
 use crate::hexsphere::HexSphere;
 
-/// Single planet vertex: position on the sphere, radial normal, and a
+/// Single planet vertex: position on the sphere, radial normal, a
 /// pentagon flag consumed by the smoke fragment shader (pentagons tinted
-/// gold so the 12 Euler-forced sites are visible).
+/// gold so the 12 Euler-forced sites are visible), and icosa-net texture
+/// coordinates (`uv`, see [`super::uv`]) for debug texturing.
 ///
 /// `#[repr(C)]` + `BufferContents`/`Vertex` make this directly uploadable
 /// to a GPU vertex buffer.
@@ -27,6 +28,8 @@ pub struct PlanetVertex {
     pub normal: [f32; 3],
     #[format(R32_SFLOAT)]
     pub tint: f32,
+    #[format(R32G32_SFLOAT)]
+    pub uv: [f32; 2],
 }
 
 /// Indexed planet mesh: fan-triangulated dual cells, ready for GPU upload.
@@ -111,12 +114,14 @@ impl SeededPlanet {
         }
 
         let mut vertices = Vec::with_capacity(cells as usize + mesh.corner_count());
+        let uvs = super::uv::build_debug_uv(mesh);
         for cell in 0..cells {
             let center = mesh.cell_center(cell);
             vertices.push(PlanetVertex {
                 position: center,
                 normal: normalize(center, radius),
                 tint: if mesh.is_pentagon(cell) { 1.0 } else { 0.0 },
+                uv: uvs.uv[cell as usize],
             });
         }
         for corner in 0..mesh.corner_count() as u32 {
@@ -125,6 +130,7 @@ impl SeededPlanet {
                 position,
                 normal: normalize(position, radius),
                 tint: corner_tint[corner as usize],
+                uv: uvs.uv[cells as usize + corner as usize],
             });
         }
 
@@ -214,6 +220,27 @@ mod tests {
             .filter(|vertex| vertex.tint == 1.0)
             .count();
         assert_eq!(tinted, 12 * (1 + 5));
+    }
+
+    #[test]
+    fn uvs_cover_all_islands_in_unit_range() {
+        for tier in QualityTier::all() {
+            let planet = SeededPlanet::generate(42, tier, 1.0);
+            let indexed = planet.to_indexed_mesh();
+            assert_eq!(
+                indexed.vertices.len(),
+                planet.mesh().cell_count() + planet.mesh().corner_count(),
+                "{tier:?}"
+            );
+            for vertex in &indexed.vertices {
+                assert!((0.0..=1.0).contains(&vertex.uv[0]), "{tier:?} {vertex:?}");
+                assert!((0.0..=1.0).contains(&vertex.uv[1]), "{tier:?} {vertex:?}");
+                assert!(vertex.uv.iter().all(|c| c.is_finite()), "{tier:?}");
+            }
+            // UVs vary across the mesh (not a zero-fill).
+            let first = indexed.vertices[0].uv;
+            assert!(indexed.vertices.iter().any(|v| v.uv != first), "{tier:?}");
+        }
     }
 
     #[test]

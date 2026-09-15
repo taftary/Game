@@ -48,9 +48,10 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     core/        # math, units, time, RNG, error types
 crates/game/     # `game` binary: clean release entry — game states, camera journey, UI wiring
 crates/debug/    # `game_debug` lib (Sphere Viewer screen: mesh/params/ui/
-                  # text/app modules + fps/console/inspector stubs) + binary
+                  # text/app/sphere_viewer modules + fps/console/inspector stubs) + binary
                   # (non-default member): windowed viewer (orbit camera,
-                  # fill + wireframe + pentagon highlight, inputs panel,
+                  # fill + wireframe + pentagon highlight, UV preview thumb
+                  # with main↔thumb swap, 6 debug-shader modes, inputs panel,
                   # --headless CI mode); developer screens never leak into
                   # the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,

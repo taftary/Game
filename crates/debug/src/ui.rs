@@ -10,6 +10,8 @@
 pub const NAV_H: f32 = 28.0;
 /// Inputs panel width, pixels.
 pub const PANEL_W: f32 = 260.0;
+/// UV preview thumb height, pixels (width = panel minus padding).
+pub const UV_THUMB_H: f32 = 144.0;
 /// Nav button width, pixels.
 pub const NAV_BTN_W: f32 = 140.0;
 /// Screen-space rect, y-down pixels.
@@ -69,6 +71,18 @@ pub fn nav_button(nav: Rect, index: usize) -> Rect {
         y: nav.y,
         w: NAV_BTN_W,
         h: nav.h,
+    }
+}
+
+/// UV preview thumb rect at the top of the inputs panel: full panel
+/// width minus `pad` on each side, [`UV_THUMB_H`] tall. Click swaps
+/// main ↔ thumb (see `ViewFocus`).
+pub fn uv_thumb_rect(panel: Rect, pad: f32) -> Rect {
+    Rect {
+        x: panel.x + pad,
+        y: panel.y + pad,
+        w: (panel.w - 2.0 * pad).max(0.0),
+        h: UV_THUMB_H,
     }
 }
 
@@ -303,6 +317,18 @@ mod tests {
         s.drag_to(track, 200.0);
         assert_eq!(s.value, 4);
         assert!((s.knob_x(track) - 200.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn uv_thumb_docks_panel_top() {
+        let l = layout(1280.0, 720.0);
+        let thumb = uv_thumb_rect(l.panel, 8.0);
+        assert_eq!(thumb.x, l.panel.x + 8.0);
+        assert_eq!(thumb.y, l.panel.y + 8.0);
+        assert_eq!(thumb.w, PANEL_W - 16.0);
+        assert_eq!(thumb.h, UV_THUMB_H);
+        assert!(thumb.contains(thumb.x + 10.0, thumb.y + 10.0));
+        assert!(!thumb.contains(thumb.x - 1.0, thumb.y + 10.0));
     }
 
     #[test]

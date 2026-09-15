@@ -14,6 +14,17 @@ use std::collections::BTreeSet;
 use game_engine::hexsphere::HexSphere;
 use game_engine::render::PlanetVertex;
 
+/// Debug-side seam/island data aligned with [`build_fill`] vertex order
+/// (centers then corners). Positions/uv live in [`PlanetVertex`]; this
+/// sidecar feeds the debug-only shader varyings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FillDebug {
+    /// 1.0 on island-cut vertices, 0.0 elsewhere.
+    pub seam: Vec<f32>,
+    /// Island id per vertex (0..20).
+    pub island: Vec<f32>,
+}
+
 /// Read-only stats shown in the inputs panel after each regeneration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewerStats {
@@ -35,10 +46,12 @@ pub fn short_hash(hash: u64) -> String {
 }
 
 /// Build the filled dual-cell mesh: cell centers first, then corners;
-/// one closed fan per cell. Returns `(vertices, indices)`.
+/// one closed fan per cell. Returns `(vertices, indices)`. UVs come from
+/// the engine icosa-net unwrap, so debug and release buffers agree.
 pub fn build_fill(mesh: &HexSphere) -> (Vec<PlanetVertex>, Vec<u32>) {
     let cells = mesh.cell_count() as u32;
     let radius = mesh.radius();
+    let uvs = game_engine::render::build_debug_uv(mesh);
 
     let mut corner_tint = vec![0.0f32; mesh.corner_count()];
     for cell in 0..cells {
@@ -56,6 +69,7 @@ pub fn build_fill(mesh: &HexSphere) -> (Vec<PlanetVertex>, Vec<u32>) {
             position: center,
             normal: radial_normal(center, radius),
             tint: if mesh.is_pentagon(cell) { 1.0 } else { 0.0 },
+            uv: uvs.uv[cell as usize],
         });
     }
     for corner in 0..mesh.corner_count() as u32 {
@@ -64,6 +78,7 @@ pub fn build_fill(mesh: &HexSphere) -> (Vec<PlanetVertex>, Vec<u32>) {
             position,
             normal: radial_normal(position, radius),
             tint: corner_tint[corner as usize],
+            uv: uvs.uv[cells as usize + corner as usize],
         });
     }
 
@@ -79,6 +94,20 @@ pub fn build_fill(mesh: &HexSphere) -> (Vec<PlanetVertex>, Vec<u32>) {
     }
 
     (vertices, indices)
+}
+
+/// Build the debug-only seam/island sidecar aligned with [`build_fill`]
+/// vertex order. Consumed by the 6-mode debug fragment shader.
+pub fn build_fill_debug(mesh: &HexSphere) -> FillDebug {
+    let uvs = game_engine::render::build_debug_uv(mesh);
+    FillDebug {
+        seam: uvs
+            .seam
+            .iter()
+            .map(|&s| if s { 1.0 } else { 0.0 })
+            .collect(),
+        island: uvs.island.iter().map(|&i| i as f32).collect(),
+    }
 }
 
 /// Expected triangle count: 6 per hexagon, 5 per pentagon.
@@ -217,6 +246,26 @@ mod tests {
     }
 
     #[test]
+    fn wireframe_uv_matches_wireframe_topology() {
+        // Flat wireframe now lives in the engine clipper
+        // (`render::build_wireframe_uv_clipped`, tested there): same-island
+        // edges keep both corner endpoints, cross-island edges split at
+        // each side's island boundary. Debug only asserts the shared raw
+        // edge topology source stays aligned.
+        for n in 0..=2 {
+            let mesh = HexSphere::generate(n, 1.0);
+            let lines3 = build_wireframe(&mesh);
+            let lines2 = game_engine::render::build_wireframe_uv_clipped(&mesh);
+            assert_eq!(lines2.len() % 2, 0, "N={n}");
+            assert!(lines2.len() >= lines3.len(), "N={n}");
+            for uv in &lines2 {
+                assert!((0.0..=1.0).contains(&uv[0]), "N={n} {uv:?}");
+                assert!((0.0..=1.0).contains(&uv[1]), "N={n} {uv:?}");
+            }
+        }
+    }
+
+    #[test]
     fn builds_are_deterministic() {
         let a = HexSphere::generate(2, 1.0);
         let b = HexSphere::generate(2, 1.0);
@@ -237,6 +286,25 @@ mod tests {
         let (vertices, indices) = build_fill(&mesh);
         assert_eq!(vertices, engine.vertices);
         assert_eq!(indices, engine.indices);
+    }
+
+    #[test]
+    fn fill_carries_unit_range_uvs_with_sidecar() {
+        let mesh = HexSphere::generate(2, 1.0);
+        let (vertices, _) = build_fill(&mesh);
+        let debug = build_fill_debug(&mesh);
+        assert_eq!(debug.seam.len(), vertices.len());
+        assert_eq!(debug.island.len(), vertices.len());
+        for v in &vertices {
+            assert!((0.0..=1.0).contains(&v.uv[0]), "{v:?}");
+            assert!((0.0..=1.0).contains(&v.uv[1]), "{v:?}");
+        }
+        assert!(debug.seam.iter().all(|&s| s == 0.0 || s == 1.0));
+        assert!(
+            debug.island.iter().all(|&i| (0.0..20.0).contains(&i)),
+            "islands are base-face ids"
+        );
+        assert!(debug.seam.contains(&1.0), "some seam verts");
     }
 
     #[test]

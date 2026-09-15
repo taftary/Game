@@ -248,6 +248,65 @@ impl HexSphere {
     }
 }
 
+/// Number of base icosahedron faces: every UV island map has 20 islands.
+pub const BASE_FACE_COUNT: usize = 20;
+
+/// Base icosahedron faces (CCW outward), independent of radius or
+/// subdivision level. Index `k` is the island id used by
+/// [`crate::render::uv`] and [`base_face_ids`].
+pub fn base_faces() -> Vec<[u32; 3]> {
+    icosahedron(1.0).1
+}
+
+/// Base icosahedron vertices on the unit sphere, in the same indexing as
+/// [`base_faces`]. Barycentric UV lookups project relaxed mesh points
+/// against these unit triangles (scale-invariant).
+pub fn base_vertices() -> Vec<[f32; 3]> {
+    icosahedron(1.0).0.iter().map(Vec3::to_array).collect()
+}
+
+/// Base-face id per final primal face after `subdivisions` levels:
+/// `result[f]` is the island of primal face `f` (dual corner `f`).
+///
+/// Tracks ancestry through the same split order as [`subdivide`] (each
+/// child inherits its parent id; shared-edge midpoint dedup is identical),
+/// so ids stay aligned with [`HexSphere`] corner buffers. Deterministic:
+/// ordered edge map, fixed child order.
+pub fn base_face_ids(subdivisions: u32) -> Vec<u32> {
+    let (mut verts, mut faces) = icosahedron(1.0);
+    let mut ids: Vec<u32> = (0..faces.len() as u32).collect();
+    for _ in 0..subdivisions {
+        let mut midpoints: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+        let mut midpoint = |a: u32, b: u32, verts: &mut Vec<Vec3>| -> u32 {
+            let key = (a.min(b), a.max(b));
+            *midpoints.entry(key).or_insert_with(|| {
+                let m = ((verts[a as usize] + verts[b as usize]) * 0.5).normalize();
+                verts.push(m);
+                verts.len() as u32 - 1
+            })
+        };
+        let mut next = Vec::with_capacity(faces.len() * 4);
+        let mut next_ids = Vec::with_capacity(ids.len() * 4);
+        for (face, &id) in faces.iter().zip(ids.iter()) {
+            let &[a, b, c] = face;
+            let mab = midpoint(a, b, &mut verts);
+            let mbc = midpoint(b, c, &mut verts);
+            let mca = midpoint(c, a, &mut verts);
+            next.push([a, mab, mca]);
+            next.push([b, mbc, mab]);
+            next.push([c, mca, mbc]);
+            next.push([mab, mbc, mca]);
+            next_ids.extend_from_slice(&[id, id, id, id]);
+        }
+        faces = next;
+        ids = next_ids;
+        for v in verts.iter_mut() {
+            *v = v.normalize();
+        }
+    }
+    ids
+}
+
 /// Quantizes a position to fixed-point millionths of the radius.
 fn quantize(point: [f32; 3], scale: f32) -> [i32; 3] {
     [
@@ -626,5 +685,40 @@ mod tests {
     #[should_panic(expected = "radius must be positive")]
     fn rejects_non_positive_radius() {
         HexSphere::generate(2, 0.0);
+    }
+
+    #[test]
+    fn base_tables_cover_twenty_faces() {
+        assert_eq!(BASE_FACE_COUNT, 20);
+        let faces = base_faces();
+        let verts = base_vertices();
+        assert_eq!(faces.len(), 20);
+        assert_eq!(verts.len(), 12);
+        for face in &faces {
+            for &v in face {
+                assert!((v as usize) < verts.len(), "face {face:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn base_face_ids_align_with_corners() {
+        for n in 0..=4 {
+            let mesh = HexSphere::generate(n, 1.0);
+            let ids = base_face_ids(n);
+            assert_eq!(ids.len(), mesh.corner_count(), "N={n}");
+            assert!(ids.iter().all(|&id| (id as usize) < BASE_FACE_COUNT));
+            // Every island owns at least one corner.
+            let mut seen = [false; BASE_FACE_COUNT];
+            for &id in &ids {
+                seen[id as usize] = true;
+            }
+            assert!(seen.iter().all(|&s| s), "N={n}");
+        }
+    }
+
+    #[test]
+    fn base_face_ids_are_deterministic() {
+        assert_eq!(base_face_ids(3), base_face_ids(3));
     }
 }
