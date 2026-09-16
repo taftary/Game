@@ -1,8 +1,11 @@
 # Game — what PlanetCrafter is (detailed)
 
-Seamless procedural universe: zoom from **galaxy → system → planet globe →
-orbit**, descend **orbit → atmosphere → sky → soil**, land, explore varied
-planets, and build robot-operated colonies — then launch and travel onward.
+Seamless procedural universe: zoom from **Universe → Galactic → Stellar
+System → Planetary System → Orbital Expanse**, descend **Atmospheric
+boundary → Terrain & Human Dimension**, land, explore varied planets,
+and build robot-operated colonies — then launch and travel onward. The
+**Subterranean Domain** below the surface is the documented post-v1
+floor ([`journey.md`](journey.md)).
 
 ## Core loop
 
@@ -12,7 +15,9 @@ with cargo, and jump to the next world.
 
 ## Pillars
 
-- **Seamless scale journey** — one continuous camera path from cosmic to ground.
+- **Seamless scale journey** — one continuous camera path from cosmos to
+  ground (8 levels, [`journey.md`](journey.md)), with the subterranean
+  domain as the post-v1 floor.
 - **Planet variety** — composition, atmosphere, terrain, and resources differ
   per deterministic seed.
 - **Colonies + robots** — building is the progression sink; robots work, you direct.

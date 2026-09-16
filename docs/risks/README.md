@@ -7,3 +7,4 @@
 5. Vulkan on older Android / Apple (MoltenVK) devices — mitigation: explicit device allowlist, tier gating, graceful "unsupported" screen; GLES fallback only by ADR, never silent.
 6. Save migration churn — mitigation: version stamp from day one, migrator in `tools`.
 7. VR scope creep — mitigation: VR is design-constraint only until M8 audit passes.
+8. Surface↔underground transition is unexplored — mitigation: markers-only in v1, shallow-first geometry post-v1 (see [`../game/journey.md`](../game/journey.md) Level 8).

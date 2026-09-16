@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.8.0 (2026-09-16, debug UI reorganization: `plans/debug-ui-reorganize` — sphere-only viewer + UV Net screen, contextual inputs, tools window with live FPS; flat view removed)
+- **Version:** 0.9.0 (2026-09-16, scale hierarchy: `plans/scale-hierarchy` — `journey.md` adopts the canonical 8-level cosmic-to-subterranean table + drill-down diagram + Level 8 deep-dive; satellite docs synced)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

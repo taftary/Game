@@ -18,6 +18,10 @@
 - Story campaign, voice acting, complex NPCs.
 - Modding API.
 - Consoles.
+- Traversable universe layer above the galaxy (Level 1 is backdrop only).
+- Landable moons (Level 4 companions are visual-only in v1).
+- Subterranean geometry of any kind (caves stay surface markers —
+  [`journey.md`](journey.md) Level 8).
 
 ## VR future-proofing (no implementation in v1)
 

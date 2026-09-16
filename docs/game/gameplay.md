@@ -31,6 +31,8 @@ Travel flow: [`journey.md`](journey.md).
 ## Exploration
 
 - POIs per planet (wrecks, vents, caves-as-markers, resource fields).
+  Caves/vents are surface markers only in v1 — no underground geometry
+  (see [`journey.md`](journey.md) Level 8 deep-dive).
 - Scan → reveal loop; codex-lite entries stored in save.
 - Hazards gate progression (suit upgrades are data, not new mechanics, in v1).
 
