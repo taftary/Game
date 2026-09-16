@@ -14,6 +14,11 @@
 
 ## Users / Stakeholders
 
+## Roles
+
+Author: PO. UX consulted (required if player-facing): yes / no / n-a.
+ARCHITECT consulted (required if cross-module): yes / no / n-a.
+
 ## Functional requirements
 
 ## Non-functional requirements

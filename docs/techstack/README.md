@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.6.9 (2026-09-16, camera & screen-space conventions now written down and binding in [`rendering.md`](rendering.md) — NDC +1 = top row, un-flipped projection, ENU player frame, winding/picking/marker rules — plus the `issue-2026-09-16-0851-3d-view-y-flipped` record; AGENTS.md gained a Rendering invariants pointer)
+- **Version:** 0.7.0 (2026-09-16, role system: [`../roles/`](../roles/) profiles for PO/UX/ARCHITECT/TECHLEAD/DEV/ANALYST/SECURITY + Role gates in `plans/README.md` + sign-off rows in `plans/_template/` + Roles pointer in AGENTS.md)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

@@ -27,6 +27,26 @@ plans/
       plan.md              # added after investigation
 ```
 
+## Role gates
+
+Profiles: [`../docs/roles/`](../docs/roles/) — PO, UX, ARCHITECT, TECHLEAD,
+DEV, ANALYST, SECURITY. Agents read the matching profile before acting as
+that role. Gates are documented (agents self-enforce); nothing here is scripted.
+
+| Step | Required sign-off |
+|---|---|
+| `notion.md` `draft → planned` | PO (author); UX consulted if player-facing |
+| `plan.md` → implementation | ARCHITECT (breakdown) + TECHLEAD (todos) |
+| todos `in-progress → in-review` | DEV (gates green + evidence) → ANALYST (audit) |
+| `in-review → done` | ANALYST (DoD verified) + SECURITY (review) |
+| update `notion.md` / `plan.md` | same as feature, scoped to the delta |
+| issue `specs.md` → investigate | PO (priority) |
+| issue `report.md` → fix plan | TECHLEAD (+ ARCHITECT if invariant touch) |
+| issue fix → `done` | ANALYST + SECURITY |
+
+DEV never self-approves DoD; ANALYST never implements; SECURITY `blocker`
+stops `done` until re-reviewed.
+
 ## Rules
 
 ### 1. Feature folder

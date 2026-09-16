@@ -23,6 +23,13 @@ before committing. Test policy and perf budgets: same file.
 Canonical spec: [`plans/README.md`](plans/README.md) — read it before creating
 or changing any feature and follow it verbatim.
 
+## Roles
+
+Lifecycle roles live in [`docs/roles/`](docs/roles/) (PO, UX, ARCHITECT,
+TECHLEAD, DEV, ANALYST, SECURITY); gates in [`plans/README.md`](plans/README.md)
+§ *Role gates*. Before acting as a role, read its profile in `docs/roles/`
+and fill the `Roles` / sign-off rows in the `plans/_template/` file you touch.
+
 ## Rendering invariants (read before touching cameras/projection/picking)
 
 Binding contract, detailed in

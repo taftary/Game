@@ -8,6 +8,11 @@ Parent feature: [`../notion.md`](../notion.md)
 
 ## Reason for update
 
+## Roles
+
+Author: PO. Consulted (ARCHITECT / TECHLEAD / UX / ANALYST / SECURITY —
+list those affected by the delta):
+
 ## Scope
 
 ### In-scope

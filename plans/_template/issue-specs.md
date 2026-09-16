@@ -6,6 +6,10 @@ Parent feature: [`../../notion.md`](../../notion.md)
 
 `draft`
 
+## Roles
+
+Reported by (role): · Priority set by PO: _(pending)_
+
 ## Observed vs Expected
 
 ## Reproduction steps
