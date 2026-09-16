@@ -3472,6 +3472,23 @@ impl ViewerApp {
         );
     }
 
+    /// Route typed text into whichever field holds focus (seed field on
+    /// the galaxy screen, subdiv/radius on the sphere screen). Every
+    /// `TextField::insert_char` guards on its own `focused` flag, so
+    /// pushing to all three is safe — only the focused one accepts.
+    /// Without this, the shortcut arms below (digits, U, R, E, Q, F,
+    /// T, G/B) swallow keystrokes meant for the seed field: digits are
+    /// the whole u64 seed alphabet, so typing a seed appears to do
+    /// nothing.
+    fn type_into_focused_fields(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.debug.galaxy.seed_field.insert_char(ch);
+            self.debug.viewer.subdiv_field.insert_char(ch);
+            self.debug.viewer.radius_field.insert_char(ch);
+        }
+        self.debug.viewer.sync_slider_from_field();
+    }
+
     /// Load a full universe for `seed` (UMAP-016 seed plumbing, shared by
     /// the `--seed` flag, the panel Load button, Enter, and `R`):
     /// galaxy + buffers, journey reset, system back to star 0, screen
@@ -4284,12 +4301,7 @@ impl ViewerApp {
                                 self.debug.viewer.debug_mode = mode;
                             }
                         } else if let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyU) => {
@@ -4304,23 +4316,21 @@ impl ViewerApp {
                             self.debug.viewer.player.toggle();
                             self.update_hover();
                         } else if let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyP) => {
                         // Player camera cycle (active player only).
-                        let viewer = &mut self.debug.viewer;
+                        // A focused field keeps the keystroke instead.
+                        let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.galaxy.seed_field.focused
                             && viewer.player.active
                         {
                             self.debug.viewer.player.cycle_camera();
+                        } else if let Some(text) = text {
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyR) => {
@@ -4341,12 +4351,7 @@ impl ViewerApp {
                                 self.update_hover();
                             }
                         } else if let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyE) => {
@@ -4416,12 +4421,7 @@ impl ViewerApp {
                                     .notify("Arm a travel offer first [T]".to_owned());
                             }
                         } else if !fields_free && let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyQ) => {
@@ -4452,12 +4452,7 @@ impl ViewerApp {
                                 self.debug.fx.notify("Galaxy map".to_owned());
                             }
                         } else if !fields_free && let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyF) => {
@@ -4481,12 +4476,7 @@ impl ViewerApp {
                                 None => self.debug.fx.notify("Focus cleared".to_owned()),
                             }
                         } else if !fields_free && let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyT) => {
@@ -4527,12 +4517,7 @@ impl ViewerApp {
                             snap_global_camera(&mut self.camera, GlobalPreset::Top, radius);
                             self.update_hover();
                         } else if !fields_free && let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::Home) => {
@@ -4575,12 +4560,7 @@ impl ViewerApp {
                             snap_global_camera(&mut self.camera, preset, radius);
                             self.update_hover();
                         } else if let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                     _ => {
@@ -4594,12 +4574,7 @@ impl ViewerApp {
                                 }
                             }
                         } else if let Some(text) = text {
-                            let viewer = &mut self.debug.viewer;
-                            for ch in text.chars() {
-                                viewer.subdiv_field.insert_char(ch);
-                                viewer.radius_field.insert_char(ch);
-                            }
-                            viewer.sync_slider_from_field();
+                            self.type_into_focused_fields(&text);
                         }
                     }
                 }
