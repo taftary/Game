@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.6.5 (2026-09-15, plans/debug-player-view: interactive player overlay in the debug viewer — U toggles, WASD walks, P cycles cameras, flat map follows, VIEW presets snap the global camera; `game` modules exposed as a lib)
+- **Version:** 0.6.6 (2026-09-15, debug viewer panel UX: left view dock (VIEW / UV DEBUG / OVERLAYS) + right data dock (INPUTS / SELECTION / STATS) with section bars, 2×2 camera preset grid, non-viewer screens reclaim full width)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

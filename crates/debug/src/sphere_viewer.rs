@@ -49,6 +49,15 @@ impl ViewFocus {
             ViewFocus::ChunkFlat => ViewFocus::SphereMain,
         }
     }
+
+    /// Short label for the left-dock focus readout.
+    pub fn title(self) -> &'static str {
+        match self {
+            ViewFocus::SphereMain => "3D sphere",
+            ViewFocus::UvMain => "UV net",
+            ViewFocus::ChunkFlat => "chunk flat",
+        }
+    }
 }
 
 /// Debug fragment-shader visualization (panel selector, cycles on click).

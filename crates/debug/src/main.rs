@@ -523,6 +523,18 @@ const C_BTN_OFF: Color = [0.10, 0.10, 0.12, 1.0];
 const C_TRACK: Color = [0.13, 0.15, 0.20, 1.0];
 const C_KNOB: Color = [0.55, 0.65, 0.90, 1.0];
 const C_CHECK: Color = [0.45, 0.75, 0.45, 1.0];
+/// Section header bar behind VIEW / INPUTS / SELECTION / STATS titles.
+const C_SECTION_BG: Color = [0.11, 0.13, 0.19, 1.0];
+/// Screen-aware layout: the Sphere Viewer gets the left view dock +
+/// center viewport + right data dock; every other screen reclaims the
+/// full width so viewer inputs stay attached to the viewer screen.
+fn app_layout(screen: Screen, win_w: f32, win_h: f32) -> Layout {
+    if screen == Screen::SphereViewer {
+        ui::layout_viewer(win_w, win_h)
+    } else {
+        ui::layout_full(win_w, win_h)
+    }
+}
 /// Player marker dot (sphere + flat map).
 const C_PLAYER: Color = [0.30, 1.00, 0.45, 1.0];
 /// Player marker size, pixels.
@@ -828,68 +840,126 @@ fn flat_uv_to_pixels(rect: Rect, uv: [f32; 2]) -> Option<(f32, f32)> {
     ))
 }
 
-/// Widget rects inside the inputs panel.
-struct PanelRects {
+/// Widget rects inside the left view dock (preview + view controls).
+/// Only built for the Sphere Viewer screen.
+struct LeftRects {
     thumb: Rect,
     thumb_caption: Rect,
     swap_button: Rect,
     shader_button: Rect,
     density_track: Rect,
-    subdiv_field: Rect,
-    subdiv_track: Rect,
-    radius_field: Rect,
-    regen_button: Rect,
     wire_box: Rect,
     pent_box: Rect,
     seam_box: Rect,
     uvwire_box: Rect,
-    /// Global camera preset buttons (Top/Bot/Right/Persp order).
-    preset: [Rect; 4],
+    /// Global camera presets as a 2×2 grid: [Top, Bottom] / [Right, Persp].
+    preset_grid: [[Rect; 2]; 2],
 }
 
-/// Full panel row plan: widget rects + label/text rows in draw order.
-/// Built with a single cursor, so hit-testing and drawing always agree.
-/// The UV thumb comes first so it matches [`ui::uv_thumb_rect`]
-/// (rows start at `panel.y + pad`); `warn` reserves the extra above-N=6
-/// warning row.
-struct PanelPlan {
-    rects: PanelRects,
+/// Left dock row plan: widget rects + label rows in draw order. Built
+/// with a single cursor so hit-testing and drawing always agree. The
+/// UV thumb comes first so it matches [`ui::uv_thumb_rect`].
+struct LeftPlan {
+    rects: LeftRects,
+    view_header: Rect,
+    focus_line: Rect,
     uv_header: Rect,
     density_label: Rect,
+    preset_header: Rect,
+    overlay_header: Rect,
+    wire_label: Rect,
+    pent_label: Rect,
+    seam_label: Rect,
+    uvwire_label: Rect,
+}
+
+fn left_panel_plan(left: Rect, lh: f32, _focus: ViewFocus) -> LeftPlan {
+    let mut rows = ui::PanelRows::new(left, 8.0);
+    let view_header = rows.next(lh + 6.0, 4.0);
+    let thumb = rows.next(ui::UV_THUMB_H, 4.0);
+    debug_assert_eq!(
+        thumb,
+        ui::view_thumb_rect(left, 8.0, lh),
+        "thumb must match the shared hit-test rect"
+    );
+    let thumb_caption = rows.next(lh, 4.0);
+    let swap_button = rows.next(28.0, 4.0);
+    let focus_line = rows.next(lh, 6.0);
+    let preset_header = rows.next(lh, 4.0);
+    let preset_row_top = rows.next(28.0, 6.0);
+    let preset_row_bot = rows.next(28.0, 6.0);
+    let uv_header = rows.next(lh + 6.0, 4.0);
+    let shader_button = rows.next(28.0, 4.0);
+    let density_label = rows.next(lh, 4.0);
+    let density_track = rows.next(20.0, 6.0);
+    let overlay_header = rows.next(lh + 6.0, 4.0);
+    let wire_label = rows.next(lh, 4.0);
+    let pent_label = rows.next(lh, 4.0);
+    let seam_label = rows.next(lh, 4.0);
+    let uvwire_label = rows.next(lh, 4.0);
+    let check_box = |row: Rect| Rect {
+        x: row.x,
+        y: row.y + (lh - 16.0) / 2.0,
+        w: 16.0,
+        h: 16.0,
+    };
+    let top = ui::split_row_2(preset_row_top, 6.0);
+    let bot = ui::split_row_2(preset_row_bot, 6.0);
+    LeftPlan {
+        rects: LeftRects {
+            thumb,
+            thumb_caption,
+            swap_button,
+            shader_button,
+            density_track,
+            wire_box: check_box(wire_label),
+            pent_box: check_box(pent_label),
+            seam_box: check_box(seam_label),
+            uvwire_box: check_box(uvwire_label),
+            preset_grid: [[top[0], top[1]], [bot[0], bot[1]]],
+        },
+        view_header,
+        focus_line,
+        uv_header,
+        density_label,
+        preset_header,
+        overlay_header,
+        wire_label,
+        pent_label,
+        seam_label,
+        uvwire_label,
+    }
+}
+
+/// Widget rects inside the right data dock (params + selection + stats).
+/// Only built for the Sphere Viewer screen.
+struct RightRects {
+    subdiv_field: Rect,
+    subdiv_track: Rect,
+    radius_field: Rect,
+    regen_button: Rect,
+}
+
+/// Right dock row plan: widget rects + label/text rows in draw order.
+/// `warn` reserves the extra above-N=6 warning row.
+struct RightPlan {
+    rects: RightRects,
     inputs_header: Rect,
     subdiv_label: Rect,
     subdiv_hint: Rect,
     warn_line: Option<Rect>,
     radius_label: Rect,
     radius_hint: Rect,
-    wire_label: Rect,
-    pent_label: Rect,
-    seam_label: Rect,
-    uvwire_label: Rect,
-    chunk_header: Rect,
+    selection_header: Rect,
     chunk_lines: [Rect; 4],
-    player_header: Rect,
     player_lines: [Rect; 3],
-    view_header: Rect,
     stats_header: Rect,
     stat_lines: [Rect; 6],
 }
 
-fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
+fn right_panel_plan(panel: Rect, lh: f32, warn: bool) -> RightPlan {
     let mut rows = ui::PanelRows::new(panel, 8.0);
-    let thumb = rows.next(ui::UV_THUMB_H, 4.0);
-    debug_assert_eq!(
-        thumb,
-        ui::uv_thumb_rect(panel, 8.0),
-        "thumb must match the shared hit-test rect"
-    );
-    let thumb_caption = rows.next(lh, 4.0);
-    let swap_button = rows.next(28.0, 6.0);
-    let uv_header = rows.next(lh, 4.0);
-    let shader_button = rows.next(28.0, 4.0);
-    let density_label = rows.next(lh, 4.0);
-    let density_track = rows.next(20.0, 6.0);
-    let inputs_header = rows.next(lh, 4.0);
+    let inputs_header = rows.next(lh + 6.0, 4.0);
     let subdiv_label = rows.next(lh, 4.0);
     let subdiv_field = rows.next(24.0, 4.0);
     let subdiv_track = rows.next(20.0, 4.0);
@@ -899,22 +969,15 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
     let radius_field = rows.next(24.0, 4.0);
     let radius_hint = rows.next(lh, 4.0);
     let regen_button = rows.next(28.0, 6.0);
-    let wire_label = rows.next(lh, 4.0);
-    let pent_label = rows.next(lh, 4.0);
-    let seam_label = rows.next(lh, 4.0);
-    let uvwire_label = rows.next(lh, 4.0);
-    let chunk_header = rows.next(lh, 4.0);
+    let selection_header = rows.next(lh + 6.0, 4.0);
     let chunk_lines = [
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
     ];
-    let player_header = rows.next(lh, 4.0);
     let player_lines = [rows.next(lh, 4.0), rows.next(lh, 4.0), rows.next(lh, 4.0)];
-    let view_header = rows.next(lh, 4.0);
-    let preset_row = rows.next(24.0, 6.0);
-    let stats_header = rows.next(lh, 4.0);
+    let stats_header = rows.next(lh + 6.0, 4.0);
     let stat_lines = [
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
@@ -923,46 +986,22 @@ fn panel_plan(panel: Rect, lh: f32, warn: bool) -> PanelPlan {
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
     ];
-    let check_box = |row: Rect| Rect {
-        x: row.x,
-        y: row.y + (lh - 16.0) / 2.0,
-        w: 16.0,
-        h: 16.0,
-    };
-    PanelPlan {
-        rects: PanelRects {
-            thumb,
-            thumb_caption,
-            swap_button,
-            shader_button,
-            density_track,
+    RightPlan {
+        rects: RightRects {
             subdiv_field,
             subdiv_track,
             radius_field,
             regen_button,
-            wire_box: check_box(wire_label),
-            pent_box: check_box(pent_label),
-            seam_box: check_box(seam_label),
-            uvwire_box: check_box(uvwire_label),
-            preset: ui::split_row_4(preset_row, 4.0),
         },
-        uv_header,
-        density_label,
         inputs_header,
         subdiv_label,
         subdiv_hint,
         warn_line,
         radius_label,
         radius_hint,
-        wire_label,
-        pent_label,
-        seam_label,
-        uvwire_label,
-        chunk_header,
+        selection_header,
         chunk_lines,
-        player_header,
         player_lines,
-        view_header,
         stats_header,
         stat_lines,
     }
@@ -1015,48 +1054,87 @@ fn build_nav(items: &mut UiItems, layout: Layout, active: Screen, lh: f32) {
     }
 }
 
-/// Sphere Viewer panel (3D draws separately).
+/// Sphere Viewer UI: left view dock + right data dock (3D draws
+/// separately). Each dock groups its widgets under section bars so
+/// view controls, params, selection and stats stay visually separate
+/// instead of one long undifferentiated column.
 fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: Layout) -> UiItems {
     let lh = atlas.line_height();
     let mut items = UiItems::default();
     build_nav(&mut items, layout, Screen::SphereViewer, lh);
 
     let warn = parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
-    let plan = panel_plan(layout.panel, lh, warn);
-    let rects = &plan.rects;
+    let left_plan = left_panel_plan(layout.left, lh, viewer.focus);
+    let right_plan = right_panel_plan(layout.panel, lh, warn);
+    items.solid(layout.left, C_PANEL_BG);
     items.solid(layout.panel, C_PANEL_BG);
 
     let text_row = |items: &mut UiItems, row: Rect, text: String, color: Color| {
         items.text(text, row.x, row.y + lh - 4.0, color);
     };
+    let section = |items: &mut UiItems, row: Rect, title: &str| {
+        items.solid(row, C_SECTION_BG);
+        items.text(title.to_owned(), row.x + 6.0, row.y + row.h - 5.0, C_TEXT);
+    };
 
+    // ---- Left dock: VIEW ----
+    let lrects = &left_plan.rects;
+    section(&mut items, left_plan.view_header, "VIEW");
     // UV preview thumb: the flat/3D view lives in the GPU pass (drawn
     // into this rect); the UI only frames it and captions the swap.
-    items.solid(rects.thumb, C_FIELD_BG);
+    items.solid(lrects.thumb, C_FIELD_BG);
     items.solid(
         Rect {
-            x: rects.thumb.x - 1.0,
-            y: rects.thumb.y - 1.0,
-            w: rects.thumb.w + 2.0,
+            x: lrects.thumb.x - 1.0,
+            y: lrects.thumb.y - 1.0,
+            w: lrects.thumb.w + 2.0,
             h: 1.0,
         },
         C_TRACK,
     );
     text_row(
         &mut items,
-        rects.thumb_caption,
+        lrects.thumb_caption,
         viewer.thumb_label().to_owned(),
         C_DIM,
     );
-    items.solid(rects.swap_button, C_BTN);
+    items.solid(lrects.swap_button, C_BTN);
     items.text(
         "Swap view (V)".to_owned(),
-        rects.swap_button.x + 12.0,
-        rects.swap_button.y + 19.0,
+        lrects.swap_button.x + 12.0,
+        lrects.swap_button.y + 19.0,
         C_TEXT,
     );
-    text_row(&mut items, plan.uv_header, "UV DEBUG".to_owned(), C_DIM);
-    items.solid(rects.shader_button, C_BTN);
+    text_row(
+        &mut items,
+        left_plan.focus_line,
+        format!("main: {}", viewer.focus.title()),
+        C_DIM,
+    );
+    // Global camera presets as a 2×2 grid: bigger hit targets than the
+    // old 4-in-a-row strip (`G`/`T`/`B`/`R` do the same).
+    text_row(
+        &mut items,
+        left_plan.preset_header,
+        "Camera presets".to_owned(),
+        C_DIM,
+    );
+    let preset_labels = [GlobalPreset::ALL[0].1, GlobalPreset::ALL[1].1];
+    let preset_labels_bot = [GlobalPreset::ALL[2].1, GlobalPreset::ALL[3].1];
+    for (row, labels) in lrects
+        .preset_grid
+        .iter()
+        .zip([preset_labels, preset_labels_bot])
+    {
+        for (rect, label) in row.iter().zip(labels) {
+            items.solid(*rect, C_BTN);
+            items.text(label.to_owned(), rect.x + 8.0, rect.y + 19.0, C_TEXT);
+        }
+    }
+
+    // ---- Left dock: UV DEBUG ----
+    section(&mut items, left_plan.uv_header, "UV DEBUG");
+    items.solid(lrects.shader_button, C_BTN);
     items.text(
         format!(
             "Shader: {} ({}/{})",
@@ -1064,111 +1142,46 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
             viewer.debug_mode.index() + 1,
             DebugMode::ALL.len(),
         ),
-        rects.shader_button.x + 12.0,
-        rects.shader_button.y + 19.0,
+        lrects.shader_button.x + 12.0,
+        lrects.shader_button.y + 19.0,
         C_TEXT,
     );
     text_row(
         &mut items,
-        plan.density_label,
+        left_plan.density_label,
         format!("Checker density: {}", viewer.checker_density),
         C_DIM,
     );
-    items.solid(rects.density_track, C_TRACK);
+    items.solid(lrects.density_track, C_TRACK);
     items.solid(
         Rect {
-            x: viewer.density_slider.knob_x(rects.density_track) - 5.0,
-            y: rects.density_track.y + 1.0,
+            x: viewer.density_slider.knob_x(lrects.density_track) - 5.0,
+            y: lrects.density_track.y + 1.0,
             w: 10.0,
-            h: rects.density_track.h - 2.0,
+            h: lrects.density_track.h - 2.0,
         },
         C_KNOB,
     );
-    text_row(&mut items, plan.inputs_header, "INPUTS".to_owned(), C_DIM);
-    text_row(
-        &mut items,
-        plan.subdiv_label,
-        "Subdivisions".to_owned(),
-        C_DIM,
-    );
 
-    // Subdivisions field + slider + live cost hint.
-    items.solid(rects.subdiv_field, C_FIELD_BG);
-    items.text(
-        viewer.subdiv_field.text.clone(),
-        rects.subdiv_field.x + 6.0,
-        rects.subdiv_field.y + 17.0,
-        C_TEXT,
-    );
-    items.solid(rects.subdiv_track, C_TRACK);
-    items.solid(
-        Rect {
-            x: viewer.subdiv_slider.knob_x(rects.subdiv_track) - 5.0,
-            y: rects.subdiv_track.y + 1.0,
-            w: 10.0,
-            h: rects.subdiv_track.h - 2.0,
-        },
-        C_KNOB,
-    );
-    match parse_subdivisions(&viewer.subdiv_field.text) {
-        Ok(n) => text_row(
-            &mut items,
-            plan.subdiv_hint,
-            format!("→ {} cells", fmt_int(cell_count_hint(n))),
-            C_DIM,
-        ),
-        Err(error) => text_row(&mut items, plan.subdiv_hint, error.hint().to_owned(), C_ERR),
-    }
-    if let Some(warn_row) = plan.warn_line {
-        text_row(
-            &mut items,
-            warn_row,
-            "above N=6: seconds per regen".to_owned(),
-            C_WARN,
-        );
-    }
-    text_row(&mut items, plan.radius_label, "Radius".to_owned(), C_DIM);
-
-    // Radius field + validation hint.
-    items.solid(rects.radius_field, C_FIELD_BG);
-    items.text(
-        viewer.radius_field.text.clone(),
-        rects.radius_field.x + 6.0,
-        rects.radius_field.y + 17.0,
-        C_TEXT,
-    );
-    if let Err(error) = parse_radius(&viewer.radius_field.text) {
-        text_row(&mut items, plan.radius_hint, error.hint().to_owned(), C_ERR);
-    }
-
-    // Regenerate (dimmed while invalid; clicks ignored then).
-    let ok = viewer.can_regenerate();
-    items.solid(rects.regen_button, if ok { C_BTN } else { C_BTN_OFF });
-    items.text(
-        "Regenerate".to_owned(),
-        rects.regen_button.x + 12.0,
-        rects.regen_button.y + 19.0,
-        if ok { C_TEXT } else { C_DIM },
-    );
-
-    // Display toggles.
+    // ---- Left dock: OVERLAYS ----
+    section(&mut items, left_plan.overlay_header, "OVERLAYS");
     for (box_rect, label_row, label, checked) in [
         (
-            rects.wire_box,
-            plan.wire_label,
+            lrects.wire_box,
+            left_plan.wire_label,
             "Wireframe",
             viewer.wireframe,
         ),
         (
-            rects.pent_box,
-            plan.pent_label,
+            lrects.pent_box,
+            left_plan.pent_label,
             "Pentagons",
             viewer.pentagons,
         ),
-        (rects.seam_box, plan.seam_label, "Seams", viewer.seams),
+        (lrects.seam_box, left_plan.seam_label, "Seams", viewer.seams),
         (
-            rects.uvwire_box,
-            plan.uvwire_label,
+            lrects.uvwire_box,
+            left_plan.uvwire_label,
             "UV wire",
             viewer.wire_on_uv,
         ),
@@ -1193,9 +1206,101 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
         );
     }
 
+    // ---- Right dock: INPUTS ----
+    let rrects = &right_plan.rects;
+    section(&mut items, right_plan.inputs_header, "INPUTS");
+    text_row(
+        &mut items,
+        right_plan.subdiv_label,
+        "Subdivisions (0-8)".to_owned(),
+        C_DIM,
+    );
+
+    // Subdivisions field + slider + live cost hint.
+    items.solid(rrects.subdiv_field, C_FIELD_BG);
+    items.text(
+        viewer.subdiv_field.text.clone(),
+        rrects.subdiv_field.x + 6.0,
+        rrects.subdiv_field.y + 17.0,
+        C_TEXT,
+    );
+    items.solid(rrects.subdiv_track, C_TRACK);
+    items.solid(
+        Rect {
+            x: viewer.subdiv_slider.knob_x(rrects.subdiv_track) - 5.0,
+            y: rrects.subdiv_track.y + 1.0,
+            w: 10.0,
+            h: rrects.subdiv_track.h - 2.0,
+        },
+        C_KNOB,
+    );
+    match parse_subdivisions(&viewer.subdiv_field.text) {
+        Ok(n) => text_row(
+            &mut items,
+            right_plan.subdiv_hint,
+            format!("→ {} cells", fmt_int(cell_count_hint(n))),
+            C_DIM,
+        ),
+        Err(error) => text_row(
+            &mut items,
+            right_plan.subdiv_hint,
+            error.hint().to_owned(),
+            C_ERR,
+        ),
+    }
+    if let Some(warn_row) = right_plan.warn_line {
+        text_row(
+            &mut items,
+            warn_row,
+            "above N=6: seconds per regen".to_owned(),
+            C_WARN,
+        );
+    }
+    text_row(
+        &mut items,
+        right_plan.radius_label,
+        "Radius (> 0)".to_owned(),
+        C_DIM,
+    );
+
+    // Radius field + validation hint.
+    items.solid(rrects.radius_field, C_FIELD_BG);
+    items.text(
+        viewer.radius_field.text.clone(),
+        rrects.radius_field.x + 6.0,
+        rrects.radius_field.y + 17.0,
+        C_TEXT,
+    );
+    if let Err(error) = parse_radius(&viewer.radius_field.text) {
+        text_row(
+            &mut items,
+            right_plan.radius_hint,
+            error.hint().to_owned(),
+            C_ERR,
+        );
+    } else {
+        text_row(
+            &mut items,
+            right_plan.radius_hint,
+            "Enter = defocus".to_owned(),
+            C_DIM,
+        );
+    }
+
+    // Regenerate (dimmed while invalid; clicks ignored then).
+    let ok = viewer.can_regenerate();
+    items.solid(rrects.regen_button, if ok { C_BTN } else { C_BTN_OFF });
+    items.text(
+        "Regenerate".to_owned(),
+        rrects.regen_button.x + 12.0,
+        rrects.regen_button.y + 19.0,
+        if ok { C_TEXT } else { C_DIM },
+    );
+
+    // ---- Right dock: SELECTION (chunk + player readouts) ----
+    section(&mut items, right_plan.selection_header, "SELECTION");
     // Chunk hover/pin readout (cell-chunks): the pin wins over a
     // fleeting hover; nothing selected shows em-dashes.
-    text_row(&mut items, plan.chunk_header, "CHUNK".to_owned(), C_DIM);
     let shown = viewer.shown_chunk();
     let chunk_line = match shown {
         None => "chunk:     —".to_owned(),
@@ -1212,17 +1317,8 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
         (None, Some(_)) => "state:     hover".to_owned(),
         (None, None) => "state:     —".to_owned(),
     };
-    for (row, line) in plan
-        .chunk_lines
-        .iter()
-        .zip([chunk_line, type_line, neigh_line, state_line])
-    {
-        text_row(&mut items, *row, line, C_TEXT);
-    }
-
     // Player overlay readout: lon/lat in degrees, player camera mode,
     // streamed chunk count. `U` toggles, `WASD`/arrows walk, `P` cycles.
-    text_row(&mut items, plan.player_header, "PLAYER".to_owned(), C_DIM);
     let player = &viewer.player;
     let (lon, lat) = player.lon_lat_deg();
     let player_rows = if player.active {
@@ -1242,22 +1338,23 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
             "cam:      P cycles".to_owned(),
         ]
     };
-    for (row, line) in plan.player_lines.iter().zip(player_rows) {
+    for (row, line) in right_plan
+        .chunk_lines
+        .iter()
+        .chain(right_plan.player_lines.iter())
+        .zip(
+            [chunk_line, type_line, neigh_line, state_line]
+                .into_iter()
+                .chain(player_rows),
+        )
+    {
         text_row(&mut items, *row, line, C_TEXT);
     }
 
-    // Global camera presets: clickable buttons retargeting the free
-    // orbit camera (`G`/`T`/`B`/`R` do the same from the keyboard).
-    text_row(&mut items, plan.view_header, "VIEW".to_owned(), C_DIM);
-    for (rect, (_, label)) in plan.rects.preset.iter().zip(GlobalPreset::ALL) {
-        items.solid(*rect, C_BTN);
-        items.text(label.to_owned(), rect.x + 4.0, rect.y + 17.0, C_TEXT);
-    }
-
-    // Read-only stats.
-    text_row(&mut items, plan.stats_header, "STATS".to_owned(), C_DIM);
+    // ---- Right dock: STATS (read-only) ----
+    section(&mut items, right_plan.stats_header, "STATS");
     let stats = &viewer.stats;
-    for (row, line) in plan.stat_lines.iter().zip([
+    for (row, line) in right_plan.stat_lines.iter().zip([
         format!("cells:     {}", fmt_int(stats.cells)),
         format!("corners:    {}", fmt_int(stats.corners)),
         format!("pentagons:  {}", stats.pentagons),
@@ -2203,7 +2300,7 @@ impl ViewerApp {
             .zip(self.rcx_window_size())
             .filter(|_| self.debug.screen == Screen::SphereViewer)
             .and_then(|((cx, cy), (w, h))| {
-                let layout = ui::layout(w, h);
+                let layout = app_layout(self.debug.screen, w, h);
                 match self.debug.viewer.focus {
                     ViewFocus::ChunkFlat => {
                         let rect = layout.viewport;
@@ -2220,9 +2317,10 @@ impl ViewerApp {
                         ))
                     }
                     _ => {
+                        let lh = self.atlas.line_height();
                         let rect = match self.debug.viewer.focus {
                             ViewFocus::SphereMain => layout.viewport,
-                            ViewFocus::UvMain => ui::uv_thumb_rect(layout.panel, 8.0),
+                            ViewFocus::UvMain => ui::view_thumb_rect(layout.left, 8.0, lh),
                             ViewFocus::ChunkFlat => unreachable!("flat branch above"),
                         };
                         if !rect.contains(cx, cy) || rect.w < 1.0 || rect.h < 1.0 {
@@ -2440,9 +2538,8 @@ impl ApplicationHandler for ViewerApp {
                         let lh = self.atlas.line_height();
                         let warn =
                             parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
-                        let track = panel_plan(ui::layout(w, h).panel, lh, warn)
-                            .rects
-                            .subdiv_track;
+                        let layout = app_layout(self.debug.screen, w, h);
+                        let track = right_panel_plan(layout.panel, lh, warn).rects.subdiv_track;
                         viewer.subdiv_slider.drag_to(track, cursor.0);
                         viewer.sync_field_from_slider();
                     }
@@ -2451,9 +2548,8 @@ impl ApplicationHandler for ViewerApp {
                     if let Some((w, h)) = size {
                         let viewer = &mut self.debug.viewer;
                         let lh = self.atlas.line_height();
-                        let warn =
-                            parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
-                        let track = panel_plan(ui::layout(w, h).panel, lh, warn)
+                        let layout = app_layout(self.debug.screen, w, h);
+                        let track = left_panel_plan(layout.left, lh, viewer.focus)
                             .rects
                             .density_track;
                         viewer.density_slider.drag_to(track, cursor.0);
@@ -2501,7 +2597,11 @@ impl ApplicationHandler for ViewerApp {
                         )
                         && let Some(chunk) = self.debug.viewer.hovered
                         && self.last_cursor.zip(self.rcx_window_size()).is_some_and(
-                            |((cx, cy), (w, h))| ui::layout(w, h).viewport.contains(cx, cy),
+                            |((cx, cy), (w, h))| {
+                                app_layout(self.debug.screen, w, h)
+                                    .viewport
+                                    .contains(cx, cy)
+                            },
                         )
                     {
                         self.debug.viewer.toggle_pin(chunk);
@@ -2514,7 +2614,7 @@ impl ApplicationHandler for ViewerApp {
                 let Some((w, h)) = self.rcx_window_size() else {
                     return;
                 };
-                let layout = ui::layout(w, h);
+                let layout = app_layout(self.debug.screen, w, h);
                 // Nav bar first.
                 for (i, screen) in Screen::ALL.iter().enumerate() {
                     if ui::nav_button(layout.nav, i).contains(cx, cy) {
@@ -2547,53 +2647,56 @@ impl ApplicationHandler for ViewerApp {
                     let lh = self.atlas.line_height();
                     let warn =
                         parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
-                    let rects = panel_plan(layout.panel, lh, warn).rects;
+                    let left = left_panel_plan(layout.left, lh, viewer.focus);
+                    let right = right_panel_plan(layout.panel, lh, warn);
+                    let lrects = &left.rects;
+                    let rrects = &right.rects;
                     // UV thumb + caption + swap button all flip main ↔ thumb.
-                    if rects.thumb.contains(cx, cy)
-                        || rects.thumb_caption.contains(cx, cy)
-                        || rects.swap_button.contains(cx, cy)
+                    if lrects.thumb.contains(cx, cy)
+                        || lrects.thumb_caption.contains(cx, cy)
+                        || lrects.swap_button.contains(cx, cy)
                     {
                         viewer.toggle_focus();
                     }
-                    if rects.shader_button.contains(cx, cy) {
+                    if lrects.shader_button.contains(cx, cy) {
                         viewer.cycle_debug_mode();
                     }
-                    viewer.subdiv_field.click(rects.subdiv_field, cx, cy);
-                    viewer.radius_field.click(rects.radius_field, cx, cy);
-                    if rects.subdiv_track.contains(cx, cy) {
+                    viewer.subdiv_field.click(rrects.subdiv_field, cx, cy);
+                    viewer.radius_field.click(rrects.radius_field, cx, cy);
+                    if rrects.subdiv_track.contains(cx, cy) {
                         self.dragging_slider = true;
-                        viewer.subdiv_slider.drag_to(rects.subdiv_track, cx);
+                        viewer.subdiv_slider.drag_to(rrects.subdiv_track, cx);
                         viewer.sync_field_from_slider();
                     }
-                    if rects.density_track.contains(cx, cy) {
+                    if lrects.density_track.contains(cx, cy) {
                         self.dragging_density = true;
-                        viewer.density_slider.drag_to(rects.density_track, cx);
+                        viewer.density_slider.drag_to(lrects.density_track, cx);
                         viewer.sync_density_from_slider();
                     }
                     let regenerated = viewer.can_regenerate()
-                        && rects.regen_button.contains(cx, cy)
+                        && rrects.regen_button.contains(cx, cy)
                         && viewer.regenerate().is_ok();
-                    viewer.wire_cb.click(rects.wire_box, cx, cy);
-                    viewer.pent_cb.click(rects.pent_box, cx, cy);
-                    viewer.seam_cb.click(rects.seam_box, cx, cy);
-                    viewer.uvwire_cb.click(rects.uvwire_box, cx, cy);
+                    viewer.wire_cb.click(lrects.wire_box, cx, cy);
+                    viewer.pent_cb.click(lrects.pent_box, cx, cy);
+                    viewer.seam_cb.click(lrects.seam_box, cx, cy);
+                    viewer.uvwire_cb.click(lrects.uvwire_box, cx, cy);
                     viewer.sync_toggles();
                     regenerated
                 };
                 if regenerated {
                     self.refresh_mesh();
                 }
-                // Global camera presets: VIEW buttons retarget the free
-                // orbit camera (same as G/T/B/R).
+                // Global camera presets: 2×2 VIEW grid retargets the free
+                // orbit camera (same as G/T/B/R). Grid order is
+                // [[Top, Bot], [Right, Persp]] matching `GlobalPreset::ALL`.
                 let preset = {
                     let viewer = &self.debug.viewer;
                     let lh = self.atlas.line_height();
-                    let warn =
-                        parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
-                    panel_plan(layout.panel, lh, warn)
+                    let grid = left_panel_plan(layout.left, lh, viewer.focus)
                         .rects
-                        .preset
-                        .iter()
+                        .preset_grid;
+                    grid.iter()
+                        .flatten()
                         .position(|rect| rect.contains(cx, cy))
                         .and_then(GlobalPreset::from_index)
                 };
@@ -2606,10 +2709,13 @@ impl ApplicationHandler for ViewerApp {
                 self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let in_viewport = self
-                    .last_cursor
-                    .zip(self.rcx_window_size())
-                    .is_some_and(|((cx, cy), (w, h))| ui::layout(w, h).viewport.contains(cx, cy));
+                let in_viewport = self.last_cursor.zip(self.rcx_window_size()).is_some_and(
+                    |((cx, cy), (w, h))| {
+                        app_layout(self.debug.screen, w, h)
+                            .viewport
+                            .contains(cx, cy)
+                    },
+                );
                 if in_viewport {
                     let scroll = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
@@ -2939,7 +3045,7 @@ impl ViewerApp {
             }
         }
 
-        let layout = ui::layout(win_w, win_h);
+        let layout = app_layout(self.debug.screen, win_w, win_h);
         let viewer_screen = self.debug.screen == Screen::SphereViewer;
 
         // Build frame UI (atlas insertions happen here) and sync the GPU
@@ -3050,7 +3156,7 @@ impl ViewerApp {
 
         if viewer_screen {
             // Triple views: the focused view fills the main viewport, a
-            // secondary view renders into the panel-top thumb (same rect
+            // secondary view renders into the left-dock thumb (same rect
             // the UI frames and hit-tests). SphereMain pairs with the UV
             // net thumb; both flat focuses pair with the 3D sphere thumb.
             // The viewport transform clips output to each rect, so no
@@ -3060,10 +3166,8 @@ impl ViewerApp {
                 ViewFocus::SphereMain => ViewFocus::UvMain,
                 ViewFocus::UvMain | ViewFocus::ChunkFlat => ViewFocus::SphereMain,
             };
-            let views = [
-                (layout.viewport, focus),
-                (ui::uv_thumb_rect(layout.panel, 8.0), thumb_focus),
-            ];
+            let thumb_rect = ui::view_thumb_rect(layout.left, 8.0, self.atlas.line_height());
+            let views = [(layout.viewport, focus), (thumb_rect, thumb_focus)];
             let mode = self.debug.viewer.debug_mode.index() as f32;
             let density = self.debug.viewer.checker_density as f32;
             let highlight = if self.debug.viewer.pentagons {
@@ -3479,28 +3583,39 @@ mod tests {
     }
 
     #[test]
-    fn panel_plan_stays_inside_and_ordered() {
+    fn panel_plans_stay_inside_and_ordered() {
         for warn in [false, true] {
             let layout = ui::layout(1280.0, 720.0);
-            let plan = panel_plan(layout.panel, 19.0, warn);
-            assert_eq!(plan.warn_line.is_some(), warn);
-            let rects = &plan.rects;
+            let left = left_panel_plan(layout.left, 19.0, ViewFocus::SphereMain);
+            let right = right_panel_plan(layout.panel, 19.0, warn);
+            assert_eq!(right.warn_line.is_some(), warn);
             // Thumb is the shared hit-test rect by construction.
-            assert_eq!(rects.thumb, ui::uv_thumb_rect(layout.panel, 8.0));
+            assert_eq!(
+                left.rects.thumb,
+                ui::view_thumb_rect(layout.left, 8.0, 19.0)
+            );
             for rect in [
-                rects.thumb,
-                rects.thumb_caption,
-                rects.swap_button,
-                rects.shader_button,
-                rects.density_track,
-                rects.subdiv_field,
-                rects.subdiv_track,
-                rects.radius_field,
-                rects.regen_button,
-                rects.wire_box,
-                rects.pent_box,
-                rects.seam_box,
-                rects.uvwire_box,
+                left.rects.thumb,
+                left.rects.thumb_caption,
+                left.rects.swap_button,
+                left.rects.shader_button,
+                left.rects.density_track,
+                left.rects.wire_box,
+                left.rects.pent_box,
+                left.rects.seam_box,
+                left.rects.uvwire_box,
+            ] {
+                assert!(rect.x >= layout.left.x, "{rect:?}");
+                assert!(
+                    rect.x + rect.w <= layout.left.x + layout.left.w + 1e-3,
+                    "{rect:?}"
+                );
+            }
+            for rect in [
+                right.rects.subdiv_field,
+                right.rects.subdiv_track,
+                right.rects.radius_field,
+                right.rects.regen_button,
             ] {
                 assert!(rect.x >= layout.panel.x, "{rect:?}");
                 assert!(
@@ -3508,41 +3623,41 @@ mod tests {
                     "{rect:?}"
                 );
             }
-            for button in rects.preset {
-                assert!(button.x >= layout.panel.x, "{button:?}");
-                assert!(
-                    button.x + button.w <= layout.panel.x + layout.panel.w + 1e-3,
-                    "{button:?}"
-                );
+            for row in left.rects.preset_grid {
+                for button in row {
+                    assert!(button.x >= layout.left.x, "{button:?}");
+                    assert!(
+                        button.x + button.w <= layout.left.x + layout.left.w + 1e-3,
+                        "{button:?}"
+                    );
+                }
             }
-            assert!(rects.thumb.y < rects.thumb_caption.y);
-            assert!(rects.thumb_caption.y < rects.swap_button.y);
-            assert!(rects.swap_button.y < rects.shader_button.y);
-            assert!(rects.shader_button.y < rects.density_track.y);
-            assert!(rects.density_track.y < rects.subdiv_field.y);
-            assert!(rects.subdiv_field.y < rects.subdiv_track.y);
-            assert!(rects.subdiv_track.y < rects.radius_field.y);
-            assert!(rects.radius_field.y < rects.regen_button.y);
-            assert!(rects.regen_button.y < rects.wire_box.y);
-            assert!(rects.wire_box.y < rects.pent_box.y);
-            assert!(rects.pent_box.y < rects.seam_box.y);
-            assert!(rects.seam_box.y < rects.uvwire_box.y);
-            assert!(rects.uvwire_box.y < plan.chunk_header.y);
-            assert!(plan.chunk_header.y < plan.chunk_lines[0].y);
-            assert!(plan.chunk_lines.windows(2).all(|w| w[0].y < w[1].y));
-            assert!(plan.chunk_lines[3].y < plan.player_header.y);
-            assert!(plan.player_header.y < plan.player_lines[0].y);
-            assert!(plan.player_lines.windows(2).all(|w| w[0].y < w[1].y));
-            assert!(plan.player_lines[2].y < plan.view_header.y);
-            assert!(plan.view_header.y < rects.preset[0].y);
-            assert!(rects.preset.windows(2).all(|w| w[0].x < w[1].x));
-            assert!(rects.preset[3].y < plan.stats_header.y);
-            assert!(plan.chunk_lines[3].y < plan.stats_header.y);
-            assert!(plan.uv_header.y < plan.density_label.y);
-            assert!(plan.inputs_header.y < plan.subdiv_label.y);
-            assert!(plan.subdiv_hint.y < plan.radius_label.y);
-            assert!(plan.radius_hint.y < plan.stats_header.y);
-            assert!(plan.stat_lines.windows(2).all(|w| w[0].y < w[1].y));
+            // Left dock flows top-down: view → presets → shader → overlays.
+            assert!(left.rects.thumb.y < left.rects.thumb_caption.y);
+            assert!(left.rects.thumb_caption.y < left.rects.swap_button.y);
+            assert!(left.rects.swap_button.y < left.rects.shader_button.y);
+            assert!(left.rects.shader_button.y < left.rects.density_track.y);
+            assert!(left.rects.density_track.y < left.rects.wire_box.y);
+            assert!(left.rects.wire_box.y < left.rects.pent_box.y);
+            assert!(left.rects.pent_box.y < left.rects.seam_box.y);
+            assert!(left.rects.seam_box.y < left.rects.uvwire_box.y);
+            assert!(left.view_header.y < left.rects.thumb.y);
+            assert!(left.uv_header.y < left.rects.shader_button.y);
+            assert!(left.overlay_header.y < left.rects.wire_box.y);
+            // Preset grid: top row above bottom row, left column left of right.
+            assert!(left.rects.preset_grid[0][0].y < left.rects.preset_grid[1][0].y);
+            assert!(left.rects.preset_grid[0][0].x < left.rects.preset_grid[0][1].x);
+            // Right dock flows top-down: inputs → selection → stats.
+            assert!(right.rects.subdiv_field.y < right.rects.subdiv_track.y);
+            assert!(right.rects.subdiv_track.y < right.rects.radius_field.y);
+            assert!(right.rects.radius_field.y < right.rects.regen_button.y);
+            assert!(right.inputs_header.y < right.subdiv_label.y);
+            assert!(right.subdiv_hint.y < right.radius_label.y);
+            assert!(right.chunk_lines.windows(2).all(|w| w[0].y < w[1].y));
+            assert!(right.player_lines.windows(2).all(|w| w[0].y < w[1].y));
+            assert!(right.chunk_lines[3].y < right.player_lines[0].y);
+            assert!(right.stat_lines.windows(2).all(|w| w[0].y < w[1].y));
+            assert!(right.player_lines[2].y < right.stats_header.y);
         }
     }
 
@@ -3570,15 +3685,15 @@ mod tests {
             "Seams",
             "UV wire",
             "UV DEBUG",
-            "CHUNK",
+            "SELECTION",
             "chunk:",
             "state:",
             "Swap view (V)",
             "Shader: Lit",
             "Checker density:",
             "click/V",
-            "PLAYER",
             "off (U)",
+            "OVERLAYS",
             "VIEW",
             "Top",
             "Bot",
@@ -3700,7 +3815,7 @@ mod tests {
             .map(|t| t.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        for needle in ["PLAYER", "lon:", "lat:", "cam: follow"] {
+        for needle in ["SELECTION", "lon:", "lat:", "cam: follow"] {
             assert!(joined.contains(needle), "missing {needle}");
         }
     }

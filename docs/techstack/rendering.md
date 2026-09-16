@@ -121,8 +121,17 @@ naga compile helper, 1.1-floor boot).
   faults (odd 3-cycles at cube vertices) are confined to a perfect
   matching of 4 edges. The checker is a pure function of direction, so
   it flows across the icosa seam overlay and both views agree.
-  `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
-  it, so the `game_tools` smoke is unaffected.
+   `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
+   it, so the `game_tools` smoke is unaffected.
+- Panel UX (`plans/debug-sphere-viewer/notion.md` wireframe): the viewer
+  uses a left view dock (VIEW section with preview thumb + swap + focus
+  readout + 2×2 camera presets, UV DEBUG section with shader selector +
+  checker density, OVERLAYS section with the four display toggles) and a
+  right data dock (INPUTS with subdivisions/radius + Regenerate,
+  SELECTION merging the chunk + player readouts, read-only STATS), each
+  group under its own section bar. FPS/Console/Inspector screens reclaim
+  the full width (no docks) so viewer inputs only appear on the viewer
+  screen.
 - Flat chunk map (`plans/chunk-flat-view`, 2026-09-15):
   `engine::render::chunk_flat` projects one hemisphere at a time onto
   its tangent plane (Lambert azimuthal equal-area projection of true

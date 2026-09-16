@@ -68,33 +68,32 @@ All of the below lives in `crates/debug` (`game_debug` lib + binary).
   time; switching away and back preserves Sphere Viewer state (mesh +
   camera).
 - Placeholder screens: centered title + "not implemented yet" text.
-- Sphere Viewer layout: 3D viewport (left, majority of the window) + docked
-  inputs panel (right):
+- Sphere Viewer layout: left view dock (VIEW / UV DEBUG / OVERLAYS) +
+  center 3D viewport (majority of the window) + right data dock
+  (INPUTS / SELECTION / STATS). Non-viewer screens reclaim the full
+  width (no docks) so viewer inputs stay attached to the viewer
+  screen only:
 
   ```text
   +----------------------------------------------------------------------+
   | [Sphere Viewer] [FPS] [Console] [Inspector]          <- nav menu     |
-  +------------------------------------------------------------+---------+
-  |                                                            | INPUTS  |
-  |                                                            |---------|
-  |                                                            | Subdiv  |
-  |                     3D viewport                            | [ 6   ] |
-  |                 orbit camera + current                     | -> 40,962 cells |
-  |                  HexSphere mesh                            |         |
-  |                                                            | Radius  |
-  |                                                            | [ 1.0 ] |
-  |                                                            |         |
-  |                                                            | [Regenerate] |
-  |                                                            | [x] Wireframe  |
-  |                                                            | [x] Pentagons|
-  |                                                            |---------|
-  |                                                            | STATS   |
-  |                                                            | cells:     40,962 |
-  |                                                            | corners:   81,920 |
-  |                                                            | pentagons:     12 |
-  |                                                            | hash:   a1b2c3d4  |
-  |                                                            | gen:       240 ms |
-  +------------------------------------------------------------+---------+
+  +--------- +-----------------------------------------------+-----------+
+  | VIEW     |                                               | INPUTS    |
+  | [thumb]  |                                               | Subdiv    |
+  | Swap (V) |                 3D viewport                     | [ 6   ]   |
+  | main: 3D |             orbit camera + current              | -> 40,962 |
+  | presets  |              HexSphere mesh                     | Radius    |
+  | [Top][Bot]                                             | [ 1.0 ]   |
+  | [Right][Persp]                                           | [Regenerate] |
+  |--------- |                                               |-----------|
+  | UV DEBUG |                                               | SELECTION |
+  | Shader.. |                                               | chunk: .. |
+  | density  |                                               | player:.. |
+  |--------- |                                               |-----------|
+  | OVERLAYS |                                               | STATS     |
+  | [x] Wire |                                               | cells: .. |
+  | [x] Pent |                                               | hash: ..  |
+  +----------+-----------------------------------------------+-----------+
   ```
 
 - Viewport: orbit camera (drag to rotate, scroll to zoom); renders the

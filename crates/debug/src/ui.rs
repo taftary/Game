@@ -3,14 +3,19 @@
 //! computes rects and mutates them through explicit events, so every
 //! behavior is unit-testable without a window.
 //!
-//! Layout mirrors the notion wireframe: a top nav bar, a 3D viewport
-//! (left) and a docked inputs panel (right).
+//! Layout: a top nav bar, a center 3D viewport, a left view dock (VIEW:
+//! preview thumb, focus presets, shader + overlays) and a right data
+//! dock (INPUTS / SELECTION / STATS). Non-viewer screens use the full
+//! width content area (no docks) so inputs only ever appear on their
+//! attached screen.
 
 /// Top nav bar height, pixels.
 pub const NAV_H: f32 = 28.0;
-/// Inputs panel width, pixels.
+/// Right data dock width, pixels (INPUTS / SELECTION / STATS).
 pub const PANEL_W: f32 = 260.0;
-/// UV preview thumb height, pixels (width = panel minus padding).
+/// Left view dock width, pixels (VIEW: preview, presets, shader).
+pub const LEFT_PANEL_W: f32 = 220.0;
+/// UV preview thumb height, pixels (width = dock minus padding).
 pub const UV_THUMB_H: f32 = 144.0;
 /// Nav button width, pixels.
 pub const NAV_BTN_W: f32 = 140.0;
@@ -29,36 +34,89 @@ impl Rect {
     }
 }
 
-/// Top-level window regions.
+/// Top-level window regions: nav bar, left view dock, center
+/// viewport, right data dock (`panel`). For non-viewer screens both
+/// docks collapse to zero width (see [`layout_full`]) so the content
+/// area reclaims the full window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     pub nav: Rect,
+    pub left: Rect,
     pub viewport: Rect,
     pub panel: Rect,
 }
 
-/// Split a window into nav bar, viewport and panel. Degenerate sizes
-/// clamp to zero — never negative.
+/// Split a window into nav bar + left dock + viewport + right dock
+/// (Sphere Viewer layout). Degenerate sizes clamp to zero — never
+/// negative.
 pub fn layout(win_w: f32, win_h: f32) -> Layout {
+    layout_viewer(win_w, win_h)
+}
+
+/// Sphere Viewer layout: left view dock + center viewport + right
+/// data dock.
+pub fn layout_viewer(win_w: f32, win_h: f32) -> Layout {
     let nav_h = NAV_H.min(win_h.max(0.0));
-    let panel_w = PANEL_W.min(win_w.max(0.0));
+    let w = win_w.max(0.0);
+    let left_w = LEFT_PANEL_W.min(w);
+    let right_w = PANEL_W.min((w - left_w).max(0.0));
     Layout {
         nav: Rect {
             x: 0.0,
             y: 0.0,
-            w: win_w.max(0.0),
+            w,
             h: nav_h,
+        },
+        left: Rect {
+            x: 0.0,
+            y: nav_h,
+            w: left_w,
+            h: (win_h - nav_h).max(0.0),
+        },
+        viewport: Rect {
+            x: left_w,
+            y: nav_h,
+            w: (w - left_w - right_w).max(0.0),
+            h: (win_h - nav_h).max(0.0),
+        },
+        panel: Rect {
+            x: (w - right_w).max(0.0),
+            y: nav_h,
+            w: right_w,
+            h: (win_h - nav_h).max(0.0),
+        },
+    }
+}
+
+/// Full-width layout for non-viewer screens: both docks collapse so
+/// the content area (reported as `viewport`) fills the window. This
+/// keeps viewer inputs attached to the viewer screen only.
+pub fn layout_full(win_w: f32, win_h: f32) -> Layout {
+    let nav_h = NAV_H.min(win_h.max(0.0));
+    let w = win_w.max(0.0);
+    Layout {
+        nav: Rect {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h: nav_h,
+        },
+        left: Rect {
+            x: 0.0,
+            y: nav_h,
+            w: 0.0,
+            h: (win_h - nav_h).max(0.0),
         },
         viewport: Rect {
             x: 0.0,
             y: nav_h,
-            w: (win_w - panel_w).max(0.0),
+            w,
             h: (win_h - nav_h).max(0.0),
         },
         panel: Rect {
-            x: (win_w - panel_w).max(0.0),
+            x: w,
             y: nav_h,
-            w: panel_w,
+            w: 0.0,
             h: (win_h - nav_h).max(0.0),
         },
     }
@@ -74,7 +132,7 @@ pub fn nav_button(nav: Rect, index: usize) -> Rect {
     }
 }
 
-/// UV preview thumb rect at the top of the inputs panel: full panel
+/// UV preview thumb rect at the top of the left view dock: full dock
 /// width minus `pad` on each side, [`UV_THUMB_H`] tall. Click swaps
 /// main ↔ thumb (see `ViewFocus`).
 pub fn uv_thumb_rect(panel: Rect, pad: f32) -> Rect {
@@ -84,6 +142,33 @@ pub fn uv_thumb_rect(panel: Rect, pad: f32) -> Rect {
         w: (panel.w - 2.0 * pad).max(0.0),
         h: UV_THUMB_H,
     }
+}
+
+/// Thumb rect below the VIEW section header at the top of the left
+/// dock: section bar (`lh + 6` tall) + 4px gap, then the thumb full
+/// dock width minus `pad` on each side, [`UV_THUMB_H`] tall. This is
+/// the single source of truth for the preview thumb — the left plan,
+/// the GPU thumb viewport and the hover hit-test must all use it so
+/// drawing and clicking always agree.
+pub fn view_thumb_rect(dock: Rect, pad: f32, lh: f32) -> Rect {
+    Rect {
+        x: dock.x + pad,
+        y: dock.y + pad + (lh + 6.0) + 4.0,
+        w: (dock.w - 2.0 * pad).max(0.0),
+        h: UV_THUMB_H,
+    }
+}
+
+/// Split a row into 2 equal buttons with `gap` between them (2×2
+/// camera preset grid). Degenerate widths clamp to zero.
+pub fn split_row_2(row: Rect, gap: f32) -> [Rect; 2] {
+    let w = ((row.w - gap) / 2.0).max(0.0);
+    std::array::from_fn(|i| Rect {
+        x: row.x + i as f32 * (w + gap),
+        y: row.y,
+        w,
+        h: row.h,
+    })
 }
 
 /// Split a panel row into 4 equal buttons with `gap` between them
@@ -230,11 +315,20 @@ mod tests {
             }
         );
         assert_eq!(
-            l.viewport,
+            l.left,
             Rect {
                 x: 0.0,
                 y: NAV_H,
-                w: 1280.0 - PANEL_W,
+                w: LEFT_PANEL_W,
+                h: 720.0 - NAV_H
+            }
+        );
+        assert_eq!(
+            l.viewport,
+            Rect {
+                x: LEFT_PANEL_W,
+                y: NAV_H,
+                w: 1280.0 - LEFT_PANEL_W - PANEL_W,
                 h: 720.0 - NAV_H
             }
         );
@@ -252,8 +346,25 @@ mod tests {
     #[test]
     fn layout_never_goes_negative() {
         let l = layout(100.0, 10.0);
+        assert!(l.left.w >= 0.0 && l.left.h >= 0.0);
         assert!(l.viewport.w >= 0.0 && l.viewport.h >= 0.0);
         assert!(l.panel.w >= 0.0 && l.panel.h >= 0.0);
+    }
+
+    #[test]
+    fn layout_full_reclaims_docks() {
+        let l = layout_full(1280.0, 720.0);
+        assert_eq!(l.left.w, 0.0);
+        assert_eq!(l.panel.w, 0.0);
+        assert_eq!(
+            l.viewport,
+            Rect {
+                x: 0.0,
+                y: NAV_H,
+                w: 1280.0,
+                h: 720.0 - NAV_H
+            }
+        );
     }
 
     #[test]
@@ -334,13 +445,41 @@ mod tests {
     #[test]
     fn uv_thumb_docks_panel_top() {
         let l = layout(1280.0, 720.0);
-        let thumb = uv_thumb_rect(l.panel, 8.0);
-        assert_eq!(thumb.x, l.panel.x + 8.0);
-        assert_eq!(thumb.y, l.panel.y + 8.0);
-        assert_eq!(thumb.w, PANEL_W - 16.0);
+        let thumb = uv_thumb_rect(l.left, 8.0);
+        assert_eq!(thumb.x, l.left.x + 8.0);
+        assert_eq!(thumb.y, l.left.y + 8.0);
+        assert_eq!(thumb.w, LEFT_PANEL_W - 16.0);
         assert_eq!(thumb.h, UV_THUMB_H);
         assert!(thumb.contains(thumb.x + 10.0, thumb.y + 10.0));
         assert!(!thumb.contains(thumb.x - 1.0, thumb.y + 10.0));
+    }
+
+    #[test]
+    fn view_thumb_sits_below_section_header() {
+        let l = layout(1280.0, 720.0);
+        let lh = 19.0;
+        let thumb = view_thumb_rect(l.left, 8.0, lh);
+        assert_eq!(thumb.x, l.left.x + 8.0);
+        assert_eq!(thumb.y, l.left.y + 8.0 + (lh + 6.0) + 4.0);
+        assert_eq!(thumb.w, LEFT_PANEL_W - 16.0);
+        assert_eq!(thumb.h, UV_THUMB_H);
+        assert!(thumb.contains(thumb.x + 10.0, thumb.y + 10.0));
+        assert!(!thumb.contains(thumb.x - 1.0, thumb.y + 10.0));
+    }
+
+    #[test]
+    fn preset_grid_splits_rows_into_two() {
+        let row = Rect {
+            x: 8.0,
+            y: 300.0,
+            w: 204.0,
+            h: 28.0,
+        };
+        let buttons = split_row_2(row, 6.0);
+        assert_eq!(buttons.len(), 2);
+        let total = buttons.iter().map(|b| b.w).sum::<f32>() + 6.0;
+        assert!((total - row.w).abs() < 1e-3, "{total}");
+        assert!(buttons[1].x >= buttons[0].x + buttons[0].w);
     }
 
     #[test]
