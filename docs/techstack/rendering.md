@@ -7,17 +7,68 @@
 - Dev builds enable Vulkan validation layers; the `tools` renderer smoke must boot on Windows/Linux and report Instance / adapter / driver.
 - Swapchain recreation (resize, orientation, backgrounding) is explicit; stale swapchain is never fatal.
 - No optional Vulkan extensions in gameplay-critical code; extras are tier-gated and probed at runtime.
-- Winding convention: `HexSphere` meshes are CCW-outward in world space,
-  but `OrbitCamera::projection_matrix` outputs Y-down NDC (glam
-  `vulkan::perspective`) and Vulkan classifies front faces in
-  framebuffer space — the projection's Y-flip mirrors winding, so
-  culling pipelines must use `FrontFace::Clockwise` with
-  `CullMode::Back`. Both windowed binaries (`game_debug` fill,
-  `game_tools` planet) follow it —
-  `plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`.
+- Winding convention: `HexSphere` meshes are CCW-outward in world
+  space, and the projection is framebuffer-true (no Y-flip — see the
+  conventions section below), so culling pipelines use
+  `FrontFace::CounterClockwise` with `CullMode::Back`. Both windowed
+  binaries (`game_debug` fill, `game_tools` planet) follow it —
+  `plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`
+  (historical `Clockwise` compensation, superseded by
+  `plans/debug-player-view/issue-2026-09-16-0851-3d-view-y-flipped`).
 - Orbit input convention (`OrbitCamera::rotate`, shared): drag up
   pitches the camera toward the sphere's top (FPS-style non-inverted),
   drag right yaws with the drag.
+
+## Camera & screen-space conventions (binding)
+
+These rules are the contract every camera/projection/picking/marker
+change must preserve. Each is pinned by named tests; breaking one
+fails the suite. History: three bugs (`issue-2026-09-14-2113`,
+`issue-2026-09-15-1144`, `issue-2026-09-16-0851`) came from this
+convention existing nowhere in writing.
+
+1. **Framebuffer:** NDC `+1` = **top** row, `-1` = bottom (y-down
+   pixels). Proven by the upright UI (`ortho_matrix` maps pixel row 0
+   to NDC +1) and by flat hover (`flat_point_from_cursor` ↔ `flat_mvp`).
+2. **Projection:** `OrbitCamera::projection_matrix` (shared by global
+   and player cameras, both binaries) is glam
+   `directx::perspective` — right-handed, Z ∈ [0, 1], **no Y-flip**.
+   Never `vulkan::perspective` (it bakes `yy = −h` and mirrored every
+   3D view vertically). Never hand-rolled Y-negations either.
+3. **Winding follows the projection:** un-flipped projection ⇒
+   `FrontFace::CounterClockwise` + `CullMode::Back`. Flip either the
+   projection or the front-face, never both, never neither.
+4. **World/tangent frame:** `game::player` maps lon/lat to world as a
+   true **ENU** frame (`east × north == up`; `z = −R·cos(lat)·sin(lon)`).
+   Headings are compass bearings (0 = north, + toward east, clockwise
+   seen from above), and turn input must steer toward the avatar's own
+   right (`facing × up` is screen-right in FirstPerson).
+5. **Camera defaults:** Follow opens **south of a north-facing player,
+   looking north** (thrust walks up-screen, east right-screen).
+   FirstPerson looks along the heading with up = surface normal; the
+   player marker is hidden there by design (screen-up IS the heading).
+6. **Picking (inverse path):** `ray_from_cursor` unprojects with
+   `ndc = (2u−1, 1−2v)`; the flat map uses `flat_point_from_cursor`
+   (exact inverse of `flat_mvp`). Any new unproject must use the same
+   signs.
+7. **Markers (forward path):** world → pixels goes only through
+   `world_to_pixels` (3D) and `flat_uv_to_pixels` (flat). Extra flat
+   points (player marker, arrow tip) must project with the stored
+   `chunk_flat_norm` (`chunk_flat_normalize`) — the same affine the
+   buffers were built with — never a re-derived or snapped mapping.
+8. **Flat viewpoint:** the map opens on the player at regenerate and
+   re-anchors only near the rim (`FLAT_RECENTER_DOT`); walking inside
+   the hemisphere never rebuilds it.
+
+Pinning tests: `projection_uses_vulkan_ndc` (engine),
+`tangent_frame_is_east_north_up` + `turn_right_rotates_toward_own_right`
+(player frame), `fill_faces_point_outward` (mesh),
+`ortho_maps_corners` + `flat_mvp_centers_unit_square` (UI/flat MVPs),
+`ray_from_cursor` round-trips (picking),
+`follow_marker_arrow_visible_and_oriented` +
+`first_person_hides_marker_and_looks_along_heading` +
+`flat_marker_spawns_centered` (markers),
+`defaults_build_high_tier_stats` (viewpoint-on-player).
 
 ## Passes (v1)
 
@@ -83,11 +134,13 @@ naga compile helper, 1.1-floor boot).
   vendored `assets/fonts/DejaVuSans.ttf`, viewport-clipped 3D +
   full-window UI in one render pass, swapchain recreation on resize,
   adapter + mesh stats logged at startup. The windowed default opens at
-  N=4 (readable faces + pentagon sites; N=6 cells are subpixel —
-  `plans/debug-sphere-viewer/update-2026-09-14-2008`). The fill pipeline
-  follows the Backend winding convention (`FrontFace::Clockwise`) and
-  passes the radial outward normal through unflipped
-  (`plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`).
+   N=4 (readable faces + pentagon sites; N=6 cells are subpixel —
+   `plans/debug-sphere-viewer/update-2026-09-14-2008`). The fill pipeline
+   follows the Backend winding convention (`FrontFace::CounterClockwise`)
+   and passes the radial outward normal through unflipped
+   (`plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`,
+   projection un-flipped in
+   `plans/debug-player-view/issue-2026-09-16-0851-3d-view-y-flipped`).
 - `--headless`: GPU-free viewer-mesh build (N=6, R=1.0) + stats print,
   including `uv_islands`/`uv_seam_verts` from the icosa-net unwrap;
   runs in CI as `cargo run -p game_debug -- --headless`.
@@ -142,13 +195,18 @@ naga compile helper, 1.1-floor boot).
   `ViewFocus::ChunkFlat` mode (focus cycles sphere → UV → chunk flat;
   both flat focuses pair with the 3D sphere thumb) with a dedicated
   `CHUNK_FLAT_VERT` pipeline reusing `FILL_FRAG` + `FillPush`. Arrow
-  keys orbit the hemisphere viewpoint 5° per step (Left/Right = yaw,
-  Up/Down = pitch) and reload the flat GPU buffers — chunks leaving
-  the half unload, entering chunks load. 2D CPU picking
-  (`pick_flat_visible` over the loaded set + `flat_point_from_cursor`
-  inverse) keeps hover highlight, click-pin and the CHUNK panel working
-  in flat. `--headless` prints a `chunk_flat_*` self-test line
-  (hemisphere coverage + antipodal reload + flat pick check).
+   keys orbit the hemisphere viewpoint 5° per step (Left/Right = yaw,
+   Up/Down = pitch) and reload the flat GPU buffers — chunks leaving
+   the half unload, entering chunks load. 2D CPU picking
+   (`pick_flat_visible` over the loaded set + `flat_point_from_cursor`
+   inverse) keeps hover highlight, click-pin and the CHUNK panel working
+   in flat. `--headless` prints a `chunk_flat_*` self-test line
+   (hemisphere coverage + antipodal reload + flat pick check). In
+   player mode the viewpoint opens on the player, stays fixed while the
+   player walks inside the hemisphere, and re-anchors only near the rim
+   (`FLAT_RECENTER_DOT`); the marker uses the exact projection through
+   the stored normalization, so movement is continuous (amendment
+   2026-09-16 in `plans/chunk-flat-view/plan.md`).
 - `engine::hexsphere` topology and the release `game` binary are untouched; all
   UI code lives in `crates/debug` (first custom swapchain-UI consumer
   per [`stack.md`](stack.md)).

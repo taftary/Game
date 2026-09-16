@@ -2,6 +2,9 @@
 
 Parent update notion: [`notion.md`](notion.md)
 
+Follow-up issue (camera flip + arrow visibility):
+[`../issue-2026-09-16-0851-3d-view-y-flipped/specs.md`](../issue-2026-09-16-0851-3d-view-y-flipped/specs.md).
+
 ## Feature delta breakdown
 
 1. `crates/debug/src/main.rs` — `UiTri` alias + `UiItems::tri` +

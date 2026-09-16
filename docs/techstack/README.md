@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.6.8 (2026-09-16, 3D projection un-flipped: `OrbitCamera::projection_matrix` now outputs framebuffer-true NDC (+1 = top row, matching the UI ortho and flat-map MVP) instead of glam's Y-flipped `vulkan::perspective`; player tangent frame made true ENU so turn input steers toward the avatar's own right; follow camera opens south of the player looking north)
+- **Version:** 0.6.9 (2026-09-16, camera & screen-space conventions now written down and binding in [`rendering.md`](rendering.md) — NDC +1 = top row, un-flipped projection, ENU player frame, winding/picking/marker rules — plus the `issue-2026-09-16-0851-3d-view-y-flipped` record; AGENTS.md gained a Rendering invariants pointer)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
