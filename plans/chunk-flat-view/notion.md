@@ -2,10 +2,9 @@
 
 ## Status
 
-`in-progress` (plan: [`plan.md`](plan.md) — base feature implemented;
-reopened 2026-09-16 for the continuous-player-marker amendment:
-exact-projection marker, rim-only re-anchor, streaming decouple;
-see Phase 5. Awaiting windowed visual confirmation in the viewer.)
+`cancelled` (removed by `../debug-ui-reorganize/notion.md`: the visual
+flat view is deleted; engine-side `render::chunk_flat` stays for player
+streaming).
 
 Parent updates driving this amendment:
 [`../player-sphere-movement/update-2026-09-16-0736/notion.md`](../player-sphere-movement/update-2026-09-16-0736/notion.md),

@@ -21,8 +21,8 @@ pub struct Ray {
 /// Unproject a cursor position (y-down pixels, same space as [`Rect`])
 /// into a world-space ray.
 ///
-/// `viewport` is the rect the sphere fills (main viewport or thumb —
-/// the caller hit-tests the cursor first); `view_proj` is
+/// `viewport` is the rect the sphere fills (the main viewport — the
+/// caller hit-tests the cursor first); `view_proj` is
 /// `projection * view` built with the exact matrices the renderer draws
 /// with (Vulkan NDC: z ∈ [0, 1]). Degenerate inputs (zero-size rect,
 /// singular matrix) yield a zero-direction ray that
@@ -135,67 +135,6 @@ pub fn pick_cell(mesh: &HexSphere, point: Vec3, hint: Option<ChunkId>) -> ChunkI
     mesh.chunk_id(best)
 }
 
-/// Nearest *visible* chunk to a flat-map `point` (in `[0, 1]²`
-/// hemisphere space): minimizes squared 2D distance to the visible
-/// centers. `cells`/`centers` are the aligned visible set from the mesh
-/// builder. Full scan over the half (~20k cheap 2D ops at N=6 — well
-/// within the one-frame hover budget); strict `>` keeps the lowest cell
-/// id on exact ties, bit-for-bit repeatable.
-///
-/// # Panics
-///
-/// Panics if the visible set is empty or misaligned (caller invariant).
-pub fn pick_flat_visible(
-    mesh: &HexSphere,
-    cells: &[u32],
-    centers: &[[f32; 2]],
-    point: [f32; 2],
-) -> ChunkId {
-    assert!(!cells.is_empty(), "flat pick needs a non-empty visible set");
-    assert_eq!(cells.len(), centers.len(), "cells/centers must align");
-    let score = |slot: usize| {
-        let p = centers[slot];
-        let (dx, dy) = (p[0] - point[0], p[1] - point[1]);
-        -(dx * dx + dy * dy)
-    };
-    let mut best = 0;
-    for slot in 1..cells.len() {
-        if score(slot) > score(best) {
-            best = slot;
-        }
-    }
-    mesh.chunk_id(cells[best])
-}
-
-/// Inverse of the aspect-fit `flat_mvp` used by the viewer binary: maps
-/// a y-down cursor pixel back to `[0, 1]²` layout space. Returns `None`
-/// when the cursor is outside the rect, the rect is degenerate, or the
-/// point falls outside the letterboxed map square.
-pub fn flat_point_from_cursor(cursor: (f32, f32), viewport: Rect) -> Option<[f32; 2]> {
-    if viewport.w < 1.0 || viewport.h < 1.0 {
-        return None;
-    }
-    if !viewport.contains(cursor.0, cursor.1) {
-        return None;
-    }
-    // Cursor → Vulkan NDC (y-down pixels: top row = +1, as rendered).
-    let ndc_x = 2.0 * (cursor.0 - viewport.x) / viewport.w - 1.0;
-    let ndc_y = 1.0 - 2.0 * (cursor.1 - viewport.y) / viewport.h;
-    let aspect = viewport.w / viewport.h;
-    // Inverse of `flat_mvp`: NDC = (sx·u + tx, sy·v + ty).
-    let (sx, tx, sy, ty) = if aspect >= 1.0 {
-        (2.0 / aspect, -1.0 / aspect, -2.0, 1.0)
-    } else {
-        (2.0, -1.0, -2.0 * aspect, aspect)
-    };
-    let (u, v) = ((ndc_x - tx) / sx, (ndc_y - ty) / sy);
-    if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
-        Some([u, v])
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,9 +233,9 @@ mod tests {
     fn projected_cells_cursor_roundtrip_to_self() {
         // Full cursor→ray→hit→pick loop for every camera-facing cell
         // (regression for issue-2026-09-15-1144-hover-y-inverted: the old
-        // NDC-y sign mirrored every off-axis pick top↔bottom). Covered on
-        // the main viewport rect and a thumb-like rect — both consumer
-        // rects of `ray_from_cursor`.
+        // NDC-y sign mirrored every off-axis pick top↔bottom). Covered
+        // on the main viewport rect and a smaller rect — both consumer
+        // shapes of `ray_from_cursor`.
         use game_engine::render::OrbitCamera;
         let mesh = HexSphere::generate(3, 1.0);
         let camera = OrbitCamera::framing_planet(1.0);
@@ -485,64 +424,6 @@ mod tests {
         };
         let ray = ray_from_cursor((0.0, 0.0), flat, view_proj);
         assert_eq!(intersect_sphere(ray, 1.0), None);
-    }
-
-    #[test]
-    fn flat_pick_at_centers_returns_self() {
-        use crate::mesh::build_chunk_flat;
-        for n in 1..=2 {
-            let mesh = HexSphere::generate(n, 1.0);
-            let (_, _, cells, centers, _) = build_chunk_flat(&mesh, [0.0, 1.0, 0.0]);
-            for (slot, &cell) in cells.iter().enumerate() {
-                assert_eq!(
-                    pick_flat_visible(&mesh, &cells, &centers, centers[slot]).index(),
-                    cell,
-                    "N={n}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn flat_cursor_inverse_roundtrips_map_points() {
-        let rect = Rect {
-            x: 100.0,
-            y: 50.0,
-            w: 800.0,
-            h: 600.0,
-        };
-        // Map interior points survive cursor → layout → cursor
-        // (exact corners sit on the exclusive rect edge, so inset them).
-        for (u, v) in [(0.001, 0.001), (0.999, 0.999), (0.5, 0.5), (0.25, 0.75)] {
-            // Forward: layout → cursor through `flat_mvp` conventions
-            // (aspect ≥ 1 branch: NDC = (2u−1)/aspect … mirrored here).
-            let aspect = rect.w / rect.h;
-            let (ndc_x, ndc_y) = if aspect >= 1.0 {
-                ((2.0 * u - 1.0) / aspect, 1.0 - 2.0 * v)
-            } else {
-                (2.0 * u - 1.0, aspect - 2.0 * aspect * v)
-            };
-            let cursor = (
-                rect.x + (ndc_x + 1.0) / 2.0 * rect.w,
-                rect.y + (1.0 - ndc_y) / 2.0 * rect.h,
-            );
-            let back = flat_point_from_cursor(cursor, rect).expect("must invert");
-            assert!((back[0] - u).abs() < 1e-5 && (back[1] - v).abs() < 1e-5);
-        }
-        // Outside the rect: no pick.
-        assert_eq!(flat_point_from_cursor((0.0, 0.0), rect), None);
-        assert_eq!(
-            flat_point_from_cursor(
-                (0.0, 0.0),
-                Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: 0.0,
-                    h: 0.0
-                }
-            ),
-            None
-        );
     }
 
     #[test]

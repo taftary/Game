@@ -6,12 +6,10 @@
 use std::time::Instant;
 
 use game_engine::hexsphere::{ChunkId, DEFAULT_SUBDIVISIONS, HexSphere};
-use game_engine::render::{FlatUnwrap, PlanetVertex, orbit_viewpoint, project_to_tangent};
+use game_engine::render::{FlatUnwrap, PlanetVertex};
 
 use crate::mesh::{
-    ChunkFlatNorm, ChunkFlatVertex, FillDebug, ViewerStats, build_chunk_flat,
-    build_chunk_flat_wireframe, build_fill, build_fill_debug, build_wireframe,
-    chunk_flat_normalize, viewer_stats,
+    FillDebug, ViewerStats, build_fill, build_fill_debug, build_wireframe, viewer_stats,
 };
 use crate::params::{self, MAX_SUBDIVISIONS, MIN_SUBDIVISIONS, ParamsError, ValidParams};
 use crate::player_view::PlayerViewState;
@@ -27,39 +25,6 @@ pub const DEFAULT_CHECKER_DENSITY: u32 = 8;
 pub const MIN_CHECKER_DENSITY: u32 = 2;
 /// Checker density slider range.
 pub const MAX_CHECKER_DENSITY: u32 = 32;
-
-/// Which view fills the main viewport; a secondary view renders in the
-/// panel-top preview thumb. Click, `U` and the Swap button cycle it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ViewFocus {
-    /// 3D sphere main, UV net in the thumb.
-    #[default]
-    SphereMain,
-    /// UV net main, 3D sphere in the thumb.
-    UvMain,
-    /// Flat chunk map main, 3D sphere in the thumb.
-    ChunkFlat,
-}
-
-impl ViewFocus {
-    /// Cycle main focus: sphere → UV net → chunk flat → sphere.
-    pub fn toggle(self) -> Self {
-        match self {
-            ViewFocus::SphereMain => ViewFocus::UvMain,
-            ViewFocus::UvMain => ViewFocus::ChunkFlat,
-            ViewFocus::ChunkFlat => ViewFocus::SphereMain,
-        }
-    }
-
-    /// Short label for the left-dock focus readout.
-    pub fn title(self) -> &'static str {
-        match self {
-            ViewFocus::SphereMain => "3D sphere",
-            ViewFocus::UvMain => "UV net",
-            ViewFocus::ChunkFlat => "chunk flat",
-        }
-    }
-}
 
 /// Debug fragment-shader visualization (panel selector, cycles on click).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -141,8 +106,6 @@ pub struct SphereViewerState {
     pub uvwire_cb: Checkbox,
     /// Checker density slider (synced to [`SphereViewerState::checker_density`]).
     pub density_slider: Slider,
-    /// Which view fills the main viewport (default sphere).
-    pub focus: ViewFocus,
     /// Active debug shader visualization (default lit).
     pub debug_mode: DebugMode,
     /// Checker tiling for [`DebugMode::Checker`] (default 8).
@@ -177,25 +140,6 @@ pub struct SphereViewerState {
     pub lines: Vec<[f32; 3]>,
     /// Flat-view wireframe pairs in icosa-net UV space.
     pub uv_lines: Vec<[f32; 2]>,
-    /// Hemisphere viewpoint for the flat chunk map: a point on the
-    /// sphere (length == radius). Arrow keys orbit it; the flat view
-    /// shows the gnomonic projection of its half.
-    pub chunk_flat_viewpoint: [f32; 3],
-    /// Visible cell ids in the current hemisphere (picking map).
-    pub chunk_flat_cells: Vec<u32>,
-    /// Normalized `[0, 1]²` centers aligned with `chunk_flat_cells`.
-    pub chunk_flat_centers: Vec<[f32; 2]>,
-    /// Raw-tangent → `[0, 1]²` normalization of the current flat
-    /// buffers (stored at every rebuild): the binary projects the exact
-    /// player position through it, so the marker glides continuously
-    /// instead of snapping cell-center to cell-center.
-    pub chunk_flat_norm: ChunkFlatNorm,
-    /// Flat chunk-map fill vertices (cell-by-cell fans).
-    pub chunk_flat_vertices: Vec<ChunkFlatVertex>,
-    /// Flat chunk-map index buffer (triangle list).
-    pub chunk_flat_indices: Vec<u32>,
-    /// Flat chunk-map boundary wireframe pairs.
-    pub chunk_flat_wire: Vec<[f32; 2]>,
     /// Chunk under the cursor right now (set by the binary on cursor
     /// moves over a sphere-rendered rect; `None` elsewhere).
     pub hovered: Option<ChunkId>,
@@ -245,7 +189,6 @@ impl SphereViewerState {
                 MAX_CHECKER_DENSITY,
                 DEFAULT_CHECKER_DENSITY,
             ),
-            focus: ViewFocus::SphereMain,
             debug_mode: DebugMode::Lit,
             checker_density: DEFAULT_CHECKER_DENSITY,
             seams: true,
@@ -256,18 +199,11 @@ impl SphereViewerState {
             pentagons: true,
             fill_vertices: Vec::new(),
             fill_indices: Vec::new(),
-            uv_lines: Vec::new(),
             fill_debug: FillDebug {
                 seam: Vec::new(),
                 island: Vec::new(),
             },
-            chunk_flat_viewpoint: [0.0, 1.0, 0.0],
-            chunk_flat_cells: Vec::new(),
-            chunk_flat_centers: Vec::new(),
-            chunk_flat_norm: ([0.0; 2], [1.0; 2]),
-            chunk_flat_vertices: Vec::new(),
-            chunk_flat_indices: Vec::new(),
-            chunk_flat_wire: Vec::new(),
+            uv_lines: Vec::new(),
             flat: FlatUnwrap {
                 uv: Vec::new(),
                 island: Vec::new(),
@@ -327,65 +263,12 @@ impl SphereViewerState {
         {
             self.pinned = None;
         }
-        // Fresh mesh, fresh viewpoint: open the flat map on the
-        // restarted player (same mode) so the exact marker starts
-        // centered with no first-frame re-anchor jump, and streaming
-        // ids never go stale across meshes.
+        // Fresh mesh, fresh player: streaming ids never go stale
+        // across meshes.
         self.stats = viewer_stats(&mesh, gen_ms);
         self.mesh = mesh;
         self.player.reset(applied.radius);
-        self.chunk_flat_viewpoint = self.player.position().to_array();
-        self.rebuild_chunk_flat();
         Ok(applied)
-    }
-
-    /// Rebuild the flat hemisphere buffers for the current viewpoint:
-    /// unloads the old half, loads the new one. Called by
-    /// [`SphereViewerState::regenerate`], every arrow-key orbit step,
-    /// and the player-mode rim re-anchor (the viewpoint only moves
-    /// there; walking inside the hemisphere never rebuilds).
-    pub fn rebuild_chunk_flat(&mut self) {
-        let (vertices, indices, cells, centers, norm) =
-            build_chunk_flat(&self.mesh, self.chunk_flat_viewpoint);
-        self.chunk_flat_vertices = vertices;
-        self.chunk_flat_indices = indices;
-        self.chunk_flat_cells = cells;
-        self.chunk_flat_centers = centers;
-        self.chunk_flat_norm = norm;
-        self.chunk_flat_wire = build_chunk_flat_wireframe(&self.mesh, self.chunk_flat_viewpoint);
-        // Hover never survives a load/unload cycle. Pins are chunk
-        // identities, not loaded state: they survive even when the
-        // pinned chunk is outside the current half (the flat highlight
-        // simply has nothing to mark until it loads again).
-        self.hovered = None;
-    }
-
-    /// Arrow-key orbit of the flat-map viewpoint: `yaw` turns around
-    /// world Y (Left/Right), `pitch` around the local tangent-right
-    /// axis (Up/Down). Reloads the hemisphere buffers.
-    pub fn orbit_chunk_flat(&mut self, yaw: f32, pitch: f32) {
-        self.chunk_flat_viewpoint = orbit_viewpoint(self.chunk_flat_viewpoint, yaw, pitch);
-        // Keep the viewpoint exactly on the sphere (f32 drift).
-        let len = (self.chunk_flat_viewpoint[0] * self.chunk_flat_viewpoint[0]
-            + self.chunk_flat_viewpoint[1] * self.chunk_flat_viewpoint[1]
-            + self.chunk_flat_viewpoint[2] * self.chunk_flat_viewpoint[2])
-            .sqrt()
-            .max(1e-6);
-        let scale = self.radius / len;
-        for v in self.chunk_flat_viewpoint.iter_mut() {
-            *v *= scale;
-        }
-        self.rebuild_chunk_flat();
-    }
-
-    /// Exact player position in normalized flat UV: the true position
-    /// through the same projection + normalization as the buffers — no
-    /// cell-center snap, so the marker moves continuously like the
-    /// sphere view. Clamped to `[0, 1]²` at the hemisphere rim.
-    pub fn player_flat_uv(&self) -> [f32; 2] {
-        let raw = project_to_tangent(self.player.position().to_array(), self.chunk_flat_viewpoint);
-        let (lo, span) = self.chunk_flat_norm;
-        chunk_flat_normalize(raw, lo, span)
     }
 
     /// Current field texts: Regenerate enabled only when both validate.
@@ -419,11 +302,6 @@ impl SphereViewerState {
         self.checker_density = self.density_slider.value;
     }
 
-    /// Flip which view fills the main viewport.
-    pub fn toggle_focus(&mut self) {
-        self.focus = self.focus.toggle();
-    }
-
     /// Click routing for chunk pinning: clicking the pinned chunk unpins
     /// it, clicking another chunk pins it instead (replacing the old pin).
     pub fn toggle_pin(&mut self, chunk: ChunkId) {
@@ -452,16 +330,6 @@ impl SphereViewerState {
     pub fn cycle_debug_mode(&mut self) {
         self.debug_mode = self.debug_mode.cycle();
     }
-
-    /// Preview thumb label for the current focus (`V` cycles focus;
-    /// `U` toggles player mode).
-    pub fn thumb_label(&self) -> &'static str {
-        match self.focus {
-            ViewFocus::SphereMain => "UV — click/V to expand",
-            ViewFocus::UvMain => "3D — click/V to restore",
-            ViewFocus::ChunkFlat => "3D — click/V to restore",
-        }
-    }
 }
 
 impl Default for SphereViewerState {
@@ -482,7 +350,6 @@ mod tests {
         assert_eq!(state.radius, 1.0);
         assert!(state.wireframe && state.pentagons);
         assert!(state.seams && state.wire_on_uv);
-        assert_eq!(state.focus, ViewFocus::SphereMain);
         assert_eq!(state.debug_mode, DebugMode::Lit);
         assert_eq!(state.checker_density, DEFAULT_CHECKER_DENSITY);
         assert_eq!(state.fill_debug.seam.len(), state.fill_vertices.len());
@@ -496,16 +363,6 @@ mod tests {
         assert_eq!(state.flat.indices.len() % 3, 0);
         assert!(state.flat.uv.len() >= state.fill_vertices.len());
         assert_eq!(state.flat.source.len(), state.flat.uv.len());
-        // The flat map opens on the player (no first-frame re-anchor).
-        assert_eq!(
-            state.chunk_flat_viewpoint,
-            state.player.position().to_array()
-        );
-        assert_eq!(state.chunk_flat_cells.len(), state.chunk_flat_centers.len());
-        assert!(!state.chunk_flat_cells.is_empty());
-        assert!(state.chunk_flat_cells.len() < state.stats.cells);
-        assert_eq!(state.chunk_flat_indices.len() % 3, 0);
-        assert_eq!(state.chunk_flat_wire.len() % 2, 0);
         assert_eq!(state.stats.cells, 40962);
         assert_eq!(state.stats.corners, 81920);
         assert_eq!(state.stats.pentagons, 12);
@@ -653,42 +510,6 @@ mod tests {
                 "center vertex {cell} moved"
             );
         }
-    }
-
-    #[test]
-    fn orbit_reloads_a_new_hemisphere() {
-        let mut state = SphereViewerState::with_values(2, 1.0);
-        let before = state.chunk_flat_cells.clone();
-        // Pitch PI flips north pole to south pole (yawing the pole
-        // around Y is a no-op — same trap as rotating the pole itself).
-        state.orbit_chunk_flat(0.0, std::f32::consts::PI);
-        // Viewpoint stays on the sphere.
-        let len = (state.chunk_flat_viewpoint[0] * state.chunk_flat_viewpoint[0]
-            + state.chunk_flat_viewpoint[1] * state.chunk_flat_viewpoint[1]
-            + state.chunk_flat_viewpoint[2] * state.chunk_flat_viewpoint[2])
-            .sqrt();
-        assert!((len - 1.0).abs() < 1e-5);
-        // Half-turn loads the far half: mostly disjoint cells.
-        let shared = before
-            .iter()
-            .filter(|c| state.chunk_flat_cells.contains(c))
-            .count();
-        assert!(shared * 4 < before.len(), "shared {shared}");
-        assert_eq!(state.hovered, None);
-    }
-
-    #[test]
-    fn focus_toggles_both_ways_with_labels() {
-        let mut state = SphereViewerState::new();
-        assert_eq!(state.thumb_label(), "UV — click/V to expand");
-        state.toggle_focus();
-        assert_eq!(state.focus, ViewFocus::UvMain);
-        assert_eq!(state.thumb_label(), "3D — click/V to restore");
-        state.toggle_focus();
-        assert_eq!(state.focus, ViewFocus::ChunkFlat);
-        assert_eq!(state.thumb_label(), "3D — click/V to restore");
-        state.toggle_focus();
-        assert_eq!(state.focus, ViewFocus::SphereMain);
     }
 
     #[test]

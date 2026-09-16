@@ -23,19 +23,19 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   so stopping no longer snaps the view to north.
 - Chunks: the desired set is the player's own hemisphere, refreshed on
   a 100 ms throttle; the trail behind unloads after a grace delay.
-  The flat map viewpoint stays fixed while the player walks inside its
-  hemisphere and re-anchors on the player only near the rim (~70°),
-  so marker movement is continuous and never interrupted.
 - Headless demo: `cargo run -p game` runs a scripted 20 Hz walk
   (straight leg, curving leg, turn-in-place leg, idle) through all four
   modes, logging lon/lat/heading (interactive `winit` binding deferred).
-- Debug viewer (`cargo run -p game_debug`, Sphere Viewer screen):
-  `U` toggles player mode, `WASD`/arrows drive thrust/turn on the
-  sphere, `P` cycles Follow → First-person → Third-person, `V` cycles
-  main/thumb focus, `G`/`T`/`B`/`R` snap the global camera to
-  Perspective/Top/Bottom/Right (same as the panel VIEW buttons).
-  The player marker is a center dot plus a heading arrow (both views);
-  the PLAYER panel row shows `cam / loaded / heading`.
+- Debug viewer (`cargo run -p game_debug`, two windows): viewer window
+  `F1` = Sphere Viewer, `F2` = UV Net, `F3` reopens the tools window
+  (FPS / Console / Inspector tabs on window-local `1/2/3`); `U`
+  toggles player mode, `WASD`/arrows drive thrust/turn on the sphere,
+  `P` cycles Follow → First-person → Third-person, `1`–`6` select the
+  debug-shader mode, `G`/`T`/`B`/`R` snap the global camera to
+  Perspective/Top/Bottom/Right (sphere screen only, same as the panel
+  VIEW buttons). The player marker is a center dot plus a heading
+  arrow on the sphere; the SELECTION panel shows `lon / lat /
+  cam + loaded / heading` plus the walk keys while the player is on.
 
 ## Audio / UI
 

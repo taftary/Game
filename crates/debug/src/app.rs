@@ -1,66 +1,90 @@
-//! App shell: screen navigation + owned screen state. Switching screens
-//! only flips [`App::screen`]; the [`SphereViewerState`] (mesh + camera
-//! inputs + panel texts) is never reset, so viewer state survives
-//! switching by construction.
+//! App shell: per-window screen navigation + owned screen state.
+//! Switching screens only flips the screen field; the
+//! [`SphereViewerState`] (mesh + camera inputs + panel texts) is never
+//! reset, so viewer state survives switching by construction.
+//!
+//! Two OS windows, one screen enum each: [`MainScreen`] (sphere / UV
+//! net, `F1`/`F2`) on the viewer window, [`ToolsScreen`] (FPS / console
+//! / inspector, window-local `1/2/3`) on the tools window.
 
 use crate::sphere_viewer::SphereViewerState;
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
 
-/// Debug screens in nav-bar order.
+/// Viewer-window screens in nav-bar order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Screen {
+pub enum MainScreen {
     SphereViewer,
-    Fps,
-    Console,
-    Inspector,
+    UvNet,
 }
 
-impl Screen {
+impl MainScreen {
     /// Nav-bar order; index doubles as the F-key number minus one.
-    pub const ALL: [Screen; 4] = [
-        Screen::SphereViewer,
-        Screen::Fps,
-        Screen::Console,
-        Screen::Inspector,
-    ];
+    pub const ALL: [MainScreen; 2] = [MainScreen::SphereViewer, MainScreen::UvNet];
 
     pub fn index(self) -> usize {
         match self {
-            Screen::SphereViewer => 0,
-            Screen::Fps => 1,
-            Screen::Console => 2,
-            Screen::Inspector => 3,
+            MainScreen::SphereViewer => 0,
+            MainScreen::UvNet => 1,
         }
     }
 
-    pub fn from_index(index: usize) -> Option<Screen> {
-        Screen::ALL.get(index).copied()
+    pub fn from_index(index: usize) -> Option<MainScreen> {
+        MainScreen::ALL.get(index).copied()
     }
 
     /// Nav-bar label.
     pub fn title(self) -> &'static str {
         match self {
-            Screen::SphereViewer => "Sphere Viewer",
-            Screen::Fps => "FPS",
-            Screen::Console => "Console",
-            Screen::Inspector => "Inspector",
+            MainScreen::SphereViewer => "Sphere Viewer",
+            MainScreen::UvNet => "UV Net",
+        }
+    }
+}
+
+/// Tools-window screens in nav-bar order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolsScreen {
+    Fps,
+    Console,
+    Inspector,
+}
+
+impl ToolsScreen {
+    /// Nav-bar order; index doubles as the digit key minus one.
+    pub const ALL: [ToolsScreen; 3] = [
+        ToolsScreen::Fps,
+        ToolsScreen::Console,
+        ToolsScreen::Inspector,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            ToolsScreen::Fps => 0,
+            ToolsScreen::Console => 1,
+            ToolsScreen::Inspector => 2,
         }
     }
 
-    /// Placeholder body for the not-yet-implemented screens.
-    pub fn placeholder_body(self) -> Option<&'static str> {
+    pub fn from_index(index: usize) -> Option<ToolsScreen> {
+        ToolsScreen::ALL.get(index).copied()
+    }
+
+    /// Nav-bar label.
+    pub fn title(self) -> &'static str {
         match self {
-            Screen::SphereViewer => None,
-            Screen::Fps | Screen::Console | Screen::Inspector => Some("not implemented yet"),
+            ToolsScreen::Fps => "FPS",
+            ToolsScreen::Console => "Console",
+            ToolsScreen::Inspector => "Inspector",
         }
     }
 }
 
 /// Whole debug-tool state.
 pub struct App {
-    pub screen: Screen,
+    pub main_screen: MainScreen,
+    pub tools_screen: ToolsScreen,
     pub viewer: SphereViewerState,
-    /// Backing state for the FPS placeholder (records nothing yet).
+    /// Frame-health recorder (fed once per event-loop iteration).
     pub fps: FpsOverlay,
     /// Backing state for the console placeholder (captures nothing yet).
     pub console: LogConsole,
@@ -76,24 +100,41 @@ impl App {
     /// App with an explicit viewer state (e.g. the windowed default).
     pub fn with_viewer(viewer: SphereViewerState) -> Self {
         App {
-            screen: Screen::SphereViewer,
+            main_screen: MainScreen::SphereViewer,
+            tools_screen: ToolsScreen::Fps,
             viewer,
-            fps: FpsOverlay,
+            fps: FpsOverlay::new(),
             console: LogConsole,
             inspector: StateInspector,
         }
     }
 
-    /// Switch screens; viewer state is preserved (field never touched).
-    pub fn select(&mut self, screen: Screen) {
-        self.screen = screen;
+    /// Switch viewer screens; viewer state is preserved (field never touched).
+    pub fn select_main(&mut self, screen: MainScreen) {
+        self.main_screen = screen;
     }
 
-    /// F1–F4 routing (`f` is 1–4); returns false for other keys.
-    pub fn select_by_fkey(&mut self, f: u8) -> bool {
-        match crate::ui::nav_index_for_fkey(f).and_then(Screen::from_index) {
+    /// Switch tools screens.
+    pub fn select_tools(&mut self, screen: ToolsScreen) {
+        self.tools_screen = screen;
+    }
+
+    /// F1–F2 routing (`f` is 1–2); returns false for other keys.
+    pub fn select_main_by_fkey(&mut self, f: u8) -> bool {
+        match crate::ui::nav_index_for_fkey(f).and_then(MainScreen::from_index) {
             Some(screen) => {
-                self.select(screen);
+                self.select_main(screen);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `1`–`3` routing (`d` is 1–3); returns false for other keys.
+    pub fn select_tools_by_digit(&mut self, d: u8) -> bool {
+        match crate::ui::nav_index_for_digit(d).and_then(ToolsScreen::from_index) {
+            Some(screen) => {
+                self.select_tools(screen);
                 true
             }
             None => false,
@@ -112,21 +153,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nav_order_matches_fkeys() {
-        assert_eq!(Screen::ALL.len(), 4);
-        for (i, screen) in Screen::ALL.iter().enumerate() {
+    fn main_nav_order_matches_fkeys() {
+        assert_eq!(MainScreen::ALL.len(), 2);
+        for (i, screen) in MainScreen::ALL.iter().enumerate() {
             assert_eq!(screen.index(), i);
-            assert_eq!(Screen::from_index(i), Some(*screen));
+            assert_eq!(MainScreen::from_index(i), Some(*screen));
         }
-        assert_eq!(Screen::from_index(4), None);
+        assert_eq!(MainScreen::from_index(2), None);
     }
 
     #[test]
-    fn only_viewer_is_functional() {
-        assert_eq!(Screen::SphereViewer.placeholder_body(), None);
-        for screen in [Screen::Fps, Screen::Console, Screen::Inspector] {
-            assert_eq!(screen.placeholder_body(), Some("not implemented yet"));
+    fn tools_nav_order_matches_digits() {
+        assert_eq!(ToolsScreen::ALL.len(), 3);
+        for (i, screen) in ToolsScreen::ALL.iter().enumerate() {
+            assert_eq!(screen.index(), i);
+            assert_eq!(ToolsScreen::from_index(i), Some(*screen));
         }
+        assert_eq!(ToolsScreen::from_index(3), None);
     }
 
     #[test]
@@ -134,26 +177,44 @@ mod tests {
         let mut app = App::new();
         app.viewer.subdiv_field.text = "4".to_owned();
         app.viewer.wireframe = false;
-        app.select(Screen::Console);
-        assert_eq!(app.screen, Screen::Console);
-        app.select(Screen::SphereViewer);
+        app.select_main(MainScreen::UvNet);
+        assert_eq!(app.main_screen, MainScreen::UvNet);
+        app.select_main(MainScreen::SphereViewer);
         assert_eq!(app.viewer.subdiv_field.text, "4");
         assert!(!app.viewer.wireframe);
+        app.select_tools(ToolsScreen::Console);
+        assert_eq!(app.tools_screen, ToolsScreen::Console);
+        app.select_tools(ToolsScreen::Fps);
+        assert_eq!(app.viewer.subdiv_field.text, "4");
     }
 
     #[test]
     fn fkey_routing() {
         let mut app = App::new();
-        assert!(app.select_by_fkey(3));
-        assert_eq!(app.screen, Screen::Console);
-        assert!(app.select_by_fkey(1));
-        assert_eq!(app.screen, Screen::SphereViewer);
-        assert!(!app.select_by_fkey(9));
-        assert_eq!(app.screen, Screen::SphereViewer);
+        assert!(app.select_main_by_fkey(2));
+        assert_eq!(app.main_screen, MainScreen::UvNet);
+        assert!(app.select_main_by_fkey(1));
+        assert_eq!(app.main_screen, MainScreen::SphereViewer);
+        assert!(!app.select_main_by_fkey(3));
+        assert_eq!(app.main_screen, MainScreen::SphereViewer);
     }
 
     #[test]
-    fn starts_on_viewer() {
-        assert_eq!(App::new().screen, Screen::SphereViewer);
+    fn digit_routing() {
+        let mut app = App::new();
+        assert!(app.select_tools_by_digit(2));
+        assert_eq!(app.tools_screen, ToolsScreen::Console);
+        assert!(app.select_tools_by_digit(3));
+        assert_eq!(app.tools_screen, ToolsScreen::Inspector);
+        assert!(app.select_tools_by_digit(1));
+        assert_eq!(app.tools_screen, ToolsScreen::Fps);
+        assert!(!app.select_tools_by_digit(4));
+        assert_eq!(app.tools_screen, ToolsScreen::Fps);
+    }
+
+    #[test]
+    fn starts_on_viewer_and_fps() {
+        assert_eq!(App::new().main_screen, MainScreen::SphereViewer);
+        assert_eq!(App::new().tools_screen, ToolsScreen::Fps);
     }
 }

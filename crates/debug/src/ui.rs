@@ -3,20 +3,17 @@
 //! computes rects and mutates them through explicit events, so every
 //! behavior is unit-testable without a window.
 //!
-//! Layout: a top nav bar, a center 3D viewport, a left view dock (VIEW:
-//! preview thumb, focus presets, shader + overlays) and a right data
-//! dock (INPUTS / SELECTION / STATS). Non-viewer screens use the full
-//! width content area (no docks) so inputs only ever appear on their
-//! attached screen.
+//! Layout: a top nav bar, a center viewport, a left dock (per-screen
+//! controls) and a right data dock (INPUTS / SELECTION / STATS).
+//! The tools window uses the full width content area (no docks) so
+//! viewer inputs only ever appear on the viewer window.
 
 /// Top nav bar height, pixels.
 pub const NAV_H: f32 = 28.0;
 /// Right data dock width, pixels (INPUTS / SELECTION / STATS).
 pub const PANEL_W: f32 = 260.0;
-/// Left view dock width, pixels (VIEW: preview, presets, shader).
+/// Left view dock width, pixels (per-screen controls + shader).
 pub const LEFT_PANEL_W: f32 = 220.0;
-/// UV preview thumb height, pixels (width = dock minus padding).
-pub const UV_THUMB_H: f32 = 144.0;
 /// Nav button width, pixels.
 pub const NAV_BTN_W: f32 = 140.0;
 /// Screen-space rect, y-down pixels.
@@ -34,10 +31,10 @@ impl Rect {
     }
 }
 
-/// Top-level window regions: nav bar, left view dock, center
-/// viewport, right data dock (`panel`). For non-viewer screens both
-/// docks collapse to zero width (see [`layout_full`]) so the content
-/// area reclaims the full window.
+/// Top-level window regions: nav bar, left dock, center
+/// viewport, right data dock (`panel`). The tools window collapses both
+/// docks to zero width (see [`layout_full`]) so the content area
+/// reclaims the full window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     pub nav: Rect,
@@ -47,14 +44,14 @@ pub struct Layout {
 }
 
 /// Split a window into nav bar + left dock + viewport + right dock
-/// (Sphere Viewer layout). Degenerate sizes clamp to zero — never
+/// (viewer-window layout). Degenerate sizes clamp to zero — never
 /// negative.
 pub fn layout(win_w: f32, win_h: f32) -> Layout {
     layout_viewer(win_w, win_h)
 }
 
-/// Sphere Viewer layout: left view dock + center viewport + right
-/// data dock.
+/// Sphere Viewer / UV Net layout: left dock + center viewport +
+/// right data dock.
 pub fn layout_viewer(win_w: f32, win_h: f32) -> Layout {
     let nav_h = NAV_H.min(win_h.max(0.0));
     let w = win_w.max(0.0);
@@ -88,9 +85,9 @@ pub fn layout_viewer(win_w: f32, win_h: f32) -> Layout {
     }
 }
 
-/// Full-width layout for non-viewer screens: both docks collapse so
+/// Full-width layout for the tools window: both docks collapse so
 /// the content area (reported as `viewport`) fills the window. This
-/// keeps viewer inputs attached to the viewer screen only.
+/// keeps viewer inputs attached to the viewer window only.
 pub fn layout_full(win_w: f32, win_h: f32) -> Layout {
     let nav_h = NAV_H.min(win_h.max(0.0));
     let w = win_w.max(0.0);
@@ -132,33 +129,6 @@ pub fn nav_button(nav: Rect, index: usize) -> Rect {
     }
 }
 
-/// UV preview thumb rect at the top of the left view dock: full dock
-/// width minus `pad` on each side, [`UV_THUMB_H`] tall. Click swaps
-/// main ↔ thumb (see `ViewFocus`).
-pub fn uv_thumb_rect(panel: Rect, pad: f32) -> Rect {
-    Rect {
-        x: panel.x + pad,
-        y: panel.y + pad,
-        w: (panel.w - 2.0 * pad).max(0.0),
-        h: UV_THUMB_H,
-    }
-}
-
-/// Thumb rect below the VIEW section header at the top of the left
-/// dock: section bar (`lh + 6` tall) + 4px gap, then the thumb full
-/// dock width minus `pad` on each side, [`UV_THUMB_H`] tall. This is
-/// the single source of truth for the preview thumb — the left plan,
-/// the GPU thumb viewport and the hover hit-test must all use it so
-/// drawing and clicking always agree.
-pub fn view_thumb_rect(dock: Rect, pad: f32, lh: f32) -> Rect {
-    Rect {
-        x: dock.x + pad,
-        y: dock.y + pad + (lh + 6.0) + 4.0,
-        w: (dock.w - 2.0 * pad).max(0.0),
-        h: UV_THUMB_H,
-    }
-}
-
 /// Split a row into 2 equal buttons with `gap` between them (2×2
 /// camera preset grid). Degenerate widths clamp to zero.
 pub fn split_row_2(row: Rect, gap: f32) -> [Rect; 2] {
@@ -183,9 +153,16 @@ pub fn split_row_4(row: Rect, gap: f32) -> [Rect; 4] {
     })
 }
 
-/// Map F1–F4 (as `1..=4`) to a nav index; anything else is `None`.
+/// Map F1–F2 (as `1..=2`) to a viewer-window nav index; anything else
+/// is `None`.
 pub fn nav_index_for_fkey(f: u8) -> Option<usize> {
-    (1..=4).contains(&f).then(|| (f - 1) as usize)
+    (1..=2).contains(&f).then(|| (f - 1) as usize)
+}
+
+/// Map `1`–`3` digit keys (as `1..=3`) to a tools-window nav index;
+/// anything else is `None`.
+pub fn nav_index_for_digit(d: u8) -> Option<usize> {
+    (1..=3).contains(&d).then(|| (d - 1) as usize)
 }
 
 /// Vertical cursor handing out panel rows.
@@ -382,9 +359,17 @@ mod tests {
     #[test]
     fn fkeys_map_to_nav() {
         assert_eq!(nav_index_for_fkey(1), Some(0));
-        assert_eq!(nav_index_for_fkey(4), Some(3));
+        assert_eq!(nav_index_for_fkey(2), Some(1));
         assert_eq!(nav_index_for_fkey(0), None);
-        assert_eq!(nav_index_for_fkey(5), None);
+        assert_eq!(nav_index_for_fkey(3), None);
+    }
+
+    #[test]
+    fn digits_map_to_tools_nav() {
+        assert_eq!(nav_index_for_digit(1), Some(0));
+        assert_eq!(nav_index_for_digit(3), Some(2));
+        assert_eq!(nav_index_for_digit(0), None);
+        assert_eq!(nav_index_for_digit(4), None);
     }
 
     #[test]
@@ -440,31 +425,6 @@ mod tests {
         s.drag_to(track, 200.0);
         assert_eq!(s.value, 4);
         assert!((s.knob_x(track) - 200.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn uv_thumb_docks_panel_top() {
-        let l = layout(1280.0, 720.0);
-        let thumb = uv_thumb_rect(l.left, 8.0);
-        assert_eq!(thumb.x, l.left.x + 8.0);
-        assert_eq!(thumb.y, l.left.y + 8.0);
-        assert_eq!(thumb.w, LEFT_PANEL_W - 16.0);
-        assert_eq!(thumb.h, UV_THUMB_H);
-        assert!(thumb.contains(thumb.x + 10.0, thumb.y + 10.0));
-        assert!(!thumb.contains(thumb.x - 1.0, thumb.y + 10.0));
-    }
-
-    #[test]
-    fn view_thumb_sits_below_section_header() {
-        let l = layout(1280.0, 720.0);
-        let lh = 19.0;
-        let thumb = view_thumb_rect(l.left, 8.0, lh);
-        assert_eq!(thumb.x, l.left.x + 8.0);
-        assert_eq!(thumb.y, l.left.y + 8.0 + (lh + 6.0) + 4.0);
-        assert_eq!(thumb.w, LEFT_PANEL_W - 16.0);
-        assert_eq!(thumb.h, UV_THUMB_H);
-        assert!(thumb.contains(thumb.x + 10.0, thumb.y + 10.0));
-        assert!(!thumb.contains(thumb.x - 1.0, thumb.y + 10.0));
     }
 
     #[test]

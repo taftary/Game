@@ -46,11 +46,10 @@ existing nowhere (`issue-2026-09-14-2113`, `issue-2026-09-15-1144`,
   `CullMode::Back`; flip projection or front-face, never both.
 - The player world frame is true ENU (`east × north == up`); headings
   are compass bearings; turn input steers toward the avatar's own right.
-- Picking uses `ndc = (2u−1, 1−2v)`; markers use only
-  `world_to_pixels` / `flat_uv_to_pixels`; flat extras go through the
-  stored `chunk_flat_norm`.
+- Picking uses `ndc = (2u−1, 1−2v)` on the sphere viewport; the
+  player marker uses only `world_to_pixels`.
 - Follow opens south of the player looking north; FirstPerson hides
-  the marker by design; the flat map re-anchors only near the rim.
+  the marker by design.
 
 ## Docs maintenance
 

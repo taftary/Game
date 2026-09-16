@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.7.0 (2026-09-16, role system: [`../roles/`](../roles/) profiles for PO/UX/ARCHITECT/TECHLEAD/DEV/ANALYST/SECURITY + Role gates in `plans/README.md` + sign-off rows in `plans/_template/` + Roles pointer in AGENTS.md)
+- **Version:** 0.8.0 (2026-09-16, debug UI reorganization: `plans/debug-ui-reorganize` — sphere-only viewer + UV Net screen, contextual inputs, tools window with live FPS; flat view removed)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
