@@ -2,7 +2,9 @@
 
 ## Status
 
-`draft`
+`in-review` (plan: [`plan.md`](plan.md) — all UMAP todos implemented,
+full gate list green incl. both mobile compile-guards; needs ANALYST DoD
+audit + SECURITY review, plus a manual windowed run for DoD 3–6)
 
 ## Context
 
@@ -101,7 +103,7 @@ ARCHITECT consulted (required if cross-module): yes — `engine::universe` + `ga
 
 ## Definition of Done
 
-- [ ] Descriptor determinism: same seed + version → byte-identical Galaxy/System/Planet descriptor hashes across repeated runs on x86 and ARM (quantized outputs).
+- [ ] Descriptor determinism: same seed + version → byte-identical Galaxy/System/Planet descriptor hashes across repeated runs on x86-64, outputs quantized per [`risks/`](../../docs/risks/README.md) #2 for cross-platform stability; ARM runtime hash verification lands with M6 mobile hardening or the first ARM device run.
 - [ ] Journey regression: fixed-step scripted traversal `GalaxyMap → SystemMap → Orbit → back` yields the expected state hash in automated tests.
 - [ ] Windowed galaxy map: full-extent zoom in/out with no jitter or pop; star selection by click.
 - [ ] End-to-end travel in the windowed viewer: pick star → system → planet → orbit arrival, every layer swap faded, no loading screen.

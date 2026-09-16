@@ -205,3 +205,15 @@ naga compile helper, 1.1-floor boot).
 - `engine::hexsphere` topology and the release `game` binary are untouched; all
   UI code lives in `crates/debug` (first custom swapchain-UI consumer
   per [`stack.md`](stack.md)).
+- Universe maps (`plans/universe-maps`, 2026-09-16): a `PointList` map
+  pipeline (one static buffer, per-vertex color/size/kind, circular
+  `gl_PointCoord` mask, alpha blend, no depth write) draws the Galaxy
+  Map (L1 backdrop + nebula impostors + 25k star points) and the System
+  Map star/planets (orbit rings ride the existing line pipeline with a
+  map-space MVP); pan/zoom ride push constants, never the buffers. The
+  map cameras share the screen-space conventions (east/right, north/up,
+  NDC +1 = top). `FillPush` grew an arrival tint (`tint_rgb` right after
+  the MVP so `repr(C)` and std430 pack identically, 104 B total — still
+  under the 128 B floor): the orbit arrival re-lights the Lit planet
+  with the target's atmosphere color and tints the clear color, all
+  descriptor-driven, no per-type shader branches.

@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.10.0 (2026-09-16, roadmap re-sequence ADR-011: M5 universe maps executes ahead of M2–M4; `plans/universe-maps` notion drafted; landing-site selection moved M5 → M2)
+- **Version:** 0.11.0 (2026-09-16, M5 universe maps implemented: `engine::universe` stages 1–2 + `engine::core` RNG/quantization, `game` journey top segment + timed transit, `game_debug` Galaxy/System map screens + orbit arrival binding)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

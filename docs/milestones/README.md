@@ -12,7 +12,7 @@
 
 Each milestone gets `plans/<name>/notion.md` (needs + Status + DoD) then `plan.md` per `plans/README.md`. No implementation from notion alone.
 
-*Next step: start M5 content (universe maps: galaxy/system maps + travel + planet types) via `plans/universe-maps/` notion → plan — re-sequenced ahead of M2–M4 by ADR-011 in [`../decisions/`](../decisions/). Milestone numbers are labels, not sequence: execution order is M0, M1, M5, M2, M3, M4, M6, M7, M8. The `debug-sphere-viewer` (implemented 2026-09-14, `plans/debug-sphere-viewer`) consumes `engine::render` (orbit camera + planet triangulation).*
+*Next step: implement M5 content (universe maps: galaxy/system maps + travel + planet types) per `plans/universe-maps/plan.md` (notion `planned` 2026-09-16, ARCHITECT + TECHLEAD signed) — re-sequenced ahead of M2–M4 by ADR-011 in [`../decisions/`](../decisions/). Milestone numbers are labels, not sequence: execution order is M0, M1, M5, M2, M3, M4, M6, M7, M8. The `debug-sphere-viewer` (implemented 2026-09-14, `plans/debug-sphere-viewer`) consumes `engine::render` (orbit camera + planet triangulation).*
 
 Post-v1 candidates (unscheduled, no milestone number): subterranean
 geometry ([`journey.md`](../game/journey.md) L8), traversable universe

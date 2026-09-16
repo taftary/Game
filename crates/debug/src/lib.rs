@@ -13,11 +13,14 @@
 pub mod app;
 pub mod console;
 pub mod fps;
+pub mod fx;
+pub mod galaxy_map;
 pub mod inspector;
 pub mod mesh;
 pub mod params;
 pub mod picking;
 pub mod player_view;
 pub mod sphere_viewer;
+pub mod system_map;
 pub mod text;
 pub mod ui;

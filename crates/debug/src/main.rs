@@ -25,12 +25,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use game::camera::CameraMode;
+use game::journey::{Journey, JourneyEvent, Layer};
+use game::transit::{SIM_DT_SECS, Transit, plan_cost};
 use game_debug::app::{App as DebugApp, MainScreen, ToolsScreen};
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
+use game_debug::galaxy_map::{
+    DEFAULT_GALAXY_SEED, GalaxyMapView, MIN_VIEW_RADIUS_LY, spectral_color,
+};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, ray_from_cursor};
 use game_debug::player_view::{MoveKeys, PlayerViewState};
 use game_debug::sphere_viewer::{DebugMode, SphereViewerState};
+use game_debug::system_map::{SystemMapView, arrival_for, orbit_ring_points, planet_slot};
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
 use game_engine::render::{
@@ -97,6 +103,8 @@ layout(location = 3) in vec2 uv;
 layout(location = 4) in vec2 dbg;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
+    vec3 tint_rgb;
+    float use_tint;
     float highlight;
     float mode;
     float density;
@@ -114,6 +122,8 @@ layout(location = 3) flat out float v_seam;
 layout(location = 4) flat out float v_island;
 layout(location = 5) flat out float v_hover;
 layout(location = 6) flat out float v_pin;
+layout(location = 7) flat out vec3 v_tint_rgb;
+layout(location = 8) flat out float v_use_tint;
 void main() {
     gl_Position = pc.mvp * vec4(position, 1.0);
     // Hover/pin ride the provoking vertex like tint/seam/island: fan
@@ -124,6 +134,9 @@ void main() {
     float vid = float(gl_VertexIndex);
     v_hover = (abs(vid - pc.hover_cell) < 0.5) ? 1.0 : 0.0;
     v_pin = (abs(vid - pc.pin_cell) < 0.5) ? 1.0 : 0.0;
+    // Orbit arrival tint (uniform push — one value for the whole mesh).
+    v_tint_rgb = pc.tint_rgb;
+    v_use_tint = pc.use_tint;
     // The normal attribute is radial outward (position / radius) —
     // pass it through. An earlier `-normal` hack lit the far side's
     // inner faces, which were wrongly visible until the fill
@@ -144,8 +157,12 @@ layout(location = 3) flat in float v_seam;
 layout(location = 4) flat in float v_island;
 layout(location = 5) flat in float v_hover;
 layout(location = 6) flat in float v_pin;
+layout(location = 7) flat in vec3 v_tint_rgb;
+layout(location = 8) flat in float v_use_tint;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
+    vec3 tint_rgb;
+    float use_tint;
     float highlight;
     float mode;
     float density;
@@ -219,6 +236,10 @@ void main() {
         vec3 hex_color = vec3(0.25, 0.45, 0.75);
         vec3 pent_color = vec3(1.0, 0.8, 0.2);
         vec3 base = mix(hex_color, pent_color, v_tint);
+        // Orbit arrival tint (universe-maps): the target's atmosphere
+        // color re-lights the bare mesh — one uniform value read off the
+        // descriptor, no per-type branches anywhere.
+        base = mix(base, v_tint_rgb, v_use_tint);
         col = base * (0.25 + 0.75 * diffuse);
     }
     if (pc.seams_on > 0.5 && v_seam > 0.5) {
@@ -238,6 +259,8 @@ layout(location = 2) in float tint;
 layout(location = 3) in vec2 dbg;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
+    vec3 tint_rgb;
+    float use_tint;
     float highlight;
     float mode;
     float density;
@@ -252,6 +275,8 @@ layout(location = 3) flat out float v_seam;
 layout(location = 4) flat out float v_island;
 layout(location = 5) flat out float v_hover;
 layout(location = 6) flat out float v_pin;
+layout(location = 7) flat out vec3 v_tint_rgb;
+layout(location = 8) flat out float v_use_tint;
 void main() {
     gl_Position = pc.mvp * vec4(uv_pos, 0.0, 1.0);
     v_normal = normal;
@@ -263,6 +288,9 @@ void main() {
     // still declares these inputs, so they must be written.
     v_hover = 0.0;
     v_pin = 0.0;
+    // Same arrival tint as the 3D fill: the UV net shows the same planet.
+    v_tint_rgb = pc.tint_rgb;
+    v_use_tint = pc.use_tint;
 }"##;
 
 const FLAT_LINE_VERT: &str = r##"#version 450
@@ -340,6 +368,41 @@ void main() {
     f_color = vec4(v_color.rgb, v_color.a * a);
 }";
 
+// Galaxy-map point sprites (universe-maps): one static buffer, one draw.
+// Stars use pixel sizes (`kind` 0); nebula impostors use world-ly sizes
+// (`kind` 1) scaled by `pplx` push (pixels per ly at current zoom), so a
+// single upload serves every zoom level. Circular mask via gl_PointCoord;
+// sizes clamp to 256 px (documented debug-viewer cap).
+const MAP_VERT: &str = r"#version 450
+layout(location = 0) in vec2 map_pos;
+layout(location = 1) in vec3 color;
+layout(location = 2) in vec3 misc;
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    float pplx;
+} pc;
+layout(location = 0) out vec3 v_color;
+layout(location = 1) out float v_alpha;
+void main() {
+    gl_Position = pc.mvp * vec4(map_pos.x, map_pos.y, 0.0, 1.0);
+    float px = (misc.z < 0.5) ? misc.x : misc.x * pc.pplx;
+    gl_PointSize = clamp(px, 1.0, 256.0);
+    v_color = color;
+    v_alpha = misc.y;
+}";
+
+const MAP_FRAG: &str = r"#version 450
+layout(location = 0) in vec3 v_color;
+layout(location = 1) in float v_alpha;
+layout(location = 0) out vec4 f_color;
+void main() {
+    vec2 d = gl_PointCoord - vec2(0.5);
+    if (dot(d, d) > 0.25) {
+        discard;
+    }
+    f_color = vec4(v_color, v_alpha);
+}";
+
 // ---------------------------------------------------------------------------
 // GPU types (bin-local, mirroring the `game_tools` `MvpData` pattern).
 // ---------------------------------------------------------------------------
@@ -405,13 +468,17 @@ struct UiVertex {
     color: [f32; 4],
 }
 
-/// Fill push constants: MVP + pentagon-highlight flag + debug-mode id +
-/// checker density + seam overlay flag + hovered/pinned chunk ids
-/// (−1.0 = none; 88 B < 128 B Vulkan 1.1 floor).
+/// Fill push constants: MVP + arrival tint (RGB first: `mat4` ends at a
+/// 16 B boundary so the `vec3` packs identically in Rust `repr(C)` and
+/// GLSL std430) + pentagon-highlight flag + debug-mode id + checker
+/// density + seam overlay flag + hovered/pinned chunk ids (−1.0 = none;
+/// 104 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct FillPush {
     mvp: [[f32; 4]; 4],
+    tint_rgb: [f32; 3],
+    use_tint: f32,
     highlight: f32,
     mode: f32,
     density: f32,
@@ -437,6 +504,29 @@ const LINE_INFLATE: f32 = 2e-4;
 struct UiPush {
     ortho: [[f32; 4]; 4],
     use_tex: f32,
+}
+
+/// Galaxy-map point vertex: map-space (x, z) in compressed ly + tint +
+/// (size, alpha, kind). `kind` 0 = pixel size (stars, backdrop);
+/// `kind` 1 = world-ly size scaled by `MapPush::pplx` (nebulae).
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+struct MapVertex {
+    #[format(R32G32_SFLOAT)]
+    map_pos: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    color: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    misc: [f32; 3],
+}
+
+/// Map push constants: map-space ortho MVP + pixels-per-ly for
+/// world-sized sprites (68 B < 128 B Vulkan 1.1 floor).
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct MapPush {
+    mvp: [[f32; 4]; 4],
+    pplx: f32,
 }
 
 /// Depth format shared by the render pass and the depth image.
@@ -483,7 +573,10 @@ const C_FPS_HITCH: Color = [1.00, 0.35, 0.30, 1.0];
 /// the viewer window.
 fn app_layout(screen: MainScreen, win_w: f32, win_h: f32) -> Layout {
     match screen {
-        MainScreen::SphereViewer | MainScreen::UvNet => ui::layout_viewer(win_w, win_h),
+        MainScreen::SphereViewer
+        | MainScreen::UvNet
+        | MainScreen::GalaxyMap
+        | MainScreen::SystemMap => ui::layout_viewer(win_w, win_h),
     }
 }
 /// Player marker dot (sphere view).
@@ -498,15 +591,39 @@ const STREAM_SYNC_MS: u64 = 100;
 // ---------------------------------------------------------------------------
 
 fn usage() -> &'static str {
-    "usage: game_debug [--headless]"
+    "usage: game_debug [--headless] [--seed N]"
 }
 
-fn parse_args(argv: &[String]) -> Result<bool, String> {
+/// Parsed CLI: `--headless` runs the GPU-free checks; `--seed N`
+/// opens the viewer (and seeds the headless map checks) on universe N.
+#[derive(Debug)]
+struct CliArgs {
+    headless: bool,
+    seed: Option<u64>,
+}
+
+fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
     let mut headless = false;
-    for arg in argv.iter().skip(1) {
+    let mut seed = None;
+    let mut rest = argv.iter().skip(1);
+    while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--headless" => headless = true,
             "--help" | "-h" => return Err(usage().to_owned()),
+            "--seed" => match rest.next() {
+                Some(value) => match value.parse::<u64>() {
+                    Ok(n) => seed = Some(n),
+                    Err(_) => {
+                        return Err(format!(
+                            "--seed needs a u64 seed, got {value:?}\n{usage}",
+                            usage = usage()
+                        ));
+                    }
+                },
+                None => {
+                    return Err(format!("--seed needs a value\n{usage}", usage = usage()));
+                }
+            },
             other => {
                 return Err(format!(
                     "unknown argument {other:?}\n{usage}",
@@ -515,13 +632,14 @@ fn parse_args(argv: &[String]) -> Result<bool, String> {
             }
         }
     }
-    Ok(headless)
+    Ok(CliArgs { headless, seed })
 }
 
 /// GPU-free viewer check: build the default mesh through the lib, print
 /// stats, run the pick self-test, exit 0. Never touches
-/// `VulkanLibrary` or `EventLoop`.
-fn run_headless() -> i32 {
+/// `VulkanLibrary` or `EventLoop`. `seed` overrides the universe the
+/// map checks run on (`--seed N`).
+fn run_headless(seed: Option<u64>) -> i32 {
     let viewer = SphereViewerState::new();
     // Pick self-test (cell-chunks): aiming at cell 0's center from 5
     // radii out must resolve chunk 0 — fails loudly on picking or
@@ -607,6 +725,71 @@ fn run_headless() -> i32 {
     println!(
         "player_selftest=lon{lon:.2} lat{lat:.2} loaded{} ok",
         walk.loaded_count(),
+    );
+    // Galaxy-map self-test (universe-maps): default seed builds the v1
+    // star count; projecting star 0 and picking it resolves star 0;
+    // zoom clamps hold. GPU-free like the rest of this path.
+    let mut map = GalaxyMapView::new(seed.unwrap_or(DEFAULT_GALAXY_SEED));
+    assert_eq!(
+        map.galaxy.stars.len(),
+        game_engine::universe::DEFAULT_STAR_COUNT as usize,
+        "galaxy must build the v1 default star count"
+    );
+    let vp = (0.0, 0.0, 800.0, 600.0);
+    let star = &map.galaxy.stars[0];
+    let (sx, sy) = map
+        .camera
+        .map_to_screen(star.position_ly[0], star.position_ly[2], vp);
+    assert_eq!(
+        map.select_at((sx, sy), vp),
+        Some(0),
+        "project-then-pick must resolve star 0"
+    );
+    map.camera.zoom_by(0.0);
+    assert_eq!(map.camera.view_radius, MIN_VIEW_RADIUS_LY);
+    println!(
+        "galaxy_seed={} galaxy_stars={} galaxy_hash={:016x} pick_selftest=star0 ok",
+        map.seed,
+        map.galaxy.stars.len(),
+        game_engine::universe::galaxy_hash(&map.galaxy),
+    );
+    // System-map self-test (universe-maps): load star 0's system,
+    // project planet 0 and pick it, toggle the L4 focus, drive the
+    // journey drill-down GalaxyMap → SystemMap. GPU-free.
+    let star0 = map.galaxy.stars[0].clone();
+    let mut system = SystemMapView::new(map.seed, &star0);
+    let (px, pz) = game_debug::system_map::planet_slot(system.system.planets[0].orbit_radius_au, 0);
+    let (sx, sy) = system.camera.map_to_screen(px, pz, vp);
+    assert_eq!(system.select_at((sx, sy), vp), Some(0));
+    system.toggle_focus();
+    assert_eq!(system.focus, Some(0));
+    system.toggle_focus();
+    assert_eq!(system.focus, None);
+    let mut journey = Journey::new(map.seed);
+    journey.update(JourneyEvent::SelectStar(0));
+    let fx = journey.update(JourneyEvent::EnterSystem);
+    assert_eq!(journey.active_layer(), Layer::System);
+    assert_eq!(fx.len(), 3);
+    println!(
+        "system_star=0 planets={} system_hash={:016x} focus_toggle=ok journey=System ok",
+        system.system.planets.len(),
+        game_engine::universe::system_hash(&system.system),
+    );
+    // Transit self-test (universe-maps): fixed-step countdown reaches
+    // ready exactly at duration; cancel-before-commit drops it.
+    let mut transit = game::transit::Transit::begin(0, 0);
+    for _ in 0..game::transit::TRANSIT_TICKS {
+        assert!(!transit.ready());
+        transit.tick();
+    }
+    assert!(transit.ready());
+    transit.cancel();
+    let cost = game::transit::plan_cost(system.system.planets[0].orbit_radius_au);
+    println!(
+        "transit_ticks={} fuel={:.1} energy={:.1} ok",
+        game::transit::TRANSIT_TICKS,
+        cost.fuel,
+        cost.energy,
     );
     0
 }
@@ -1323,6 +1506,590 @@ fn build_uv_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: Layou
     items
 }
 
+/// Galaxy Map UI (universe-maps): left dock (map info + selection
+/// readout + hints) + selection ring overlay in the viewport.
+/// `build_right_dock` stays sphere-specific; the map's right dock shows
+/// the selected star.
+struct GalaxyLeftRects {
+    field: Rect,
+    load: Rect,
+}
+
+struct GalaxyLeftPlan {
+    header: Rect,
+    seed_row: Rect,
+    stats_row: Rect,
+    cam_row: Rect,
+    cam_header: Rect,
+    hints: [Rect; 4],
+    seed_header: Rect,
+    rects: GalaxyLeftRects,
+}
+
+/// Left-dock row layout for the galaxy screen, derived from
+/// (`left`, `lh`) alone — the UI builder and the click router share
+/// this, so hit rects match drawn widgets by construction.
+fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
+    let mut y = left.y + 8.0;
+    let row = |y: &mut f32| {
+        let rect = Rect {
+            x: left.x + 8.0,
+            y: *y,
+            w: (left.w - 16.0).max(0.0),
+            h: lh,
+        };
+        *y += lh + 4.0;
+        rect
+    };
+    let bar = |y: &mut f32| {
+        let rect = Rect {
+            x: left.x,
+            y: *y,
+            w: left.w,
+            h: lh + 8.0,
+        };
+        *y += lh + 12.0;
+        rect
+    };
+    let header = bar(&mut y);
+    let seed_row = row(&mut y);
+    let stats_row = row(&mut y);
+    let cam_row = row(&mut y);
+    y += 4.0;
+    let cam_header = bar(&mut y);
+    let hints = [row(&mut y), row(&mut y), row(&mut y), row(&mut y)];
+    y += 4.0;
+    let seed_header = bar(&mut y);
+    let field_w = ((left.w - 16.0) * 0.62).max(0.0);
+    let field = Rect {
+        x: left.x + 8.0,
+        y,
+        w: field_w,
+        h: lh + 6.0,
+    };
+    let load = Rect {
+        x: field.x + field.w + 6.0,
+        y,
+        w: (left.x + left.w - 8.0 - (field.x + field.w + 6.0)).max(0.0),
+        h: lh + 6.0,
+    };
+    GalaxyLeftPlan {
+        header,
+        seed_row,
+        stats_row,
+        cam_row,
+        cam_header,
+        hints,
+        seed_header,
+        rects: GalaxyLeftRects { field, load },
+    }
+}
+
+fn build_galaxy_ui(atlas: &mut GlyphAtlas, galaxy: &GalaxyMapView, layout: Layout) -> UiItems {
+    let lh = atlas.line_height();
+    let mut items = UiItems::default();
+    build_nav(
+        &mut items,
+        layout,
+        &MainScreen::ALL.map(|s| s.title()),
+        MainScreen::GalaxyMap.index(),
+        lh,
+    );
+
+    // ---- Left dock: MAP ----
+    items.solid(layout.left, C_PANEL_BG);
+    let plan = galaxy_left_plan(layout.left, lh);
+    section_bar(&mut items, plan.header, "GALAXY MAP");
+    text_row(
+        &mut items,
+        lh,
+        plan.seed_row,
+        format!("seed {}", galaxy.seed),
+        C_TEXT,
+    );
+    text_row(
+        &mut items,
+        lh,
+        plan.stats_row,
+        format!(
+            "{} stars · {} nebulae",
+            galaxy.galaxy.stars.len(),
+            galaxy.nebulae.len()
+        ),
+        C_DIM,
+    );
+    text_row(
+        &mut items,
+        lh,
+        plan.cam_row,
+        format!(
+            "center {:+.0},{:+.0} R {:.0} ly",
+            galaxy.camera.center_x, galaxy.camera.center_z, galaxy.camera.view_radius
+        ),
+        C_DIM,
+    );
+    section_bar(&mut items, plan.cam_header, "CAMERA");
+    for (rect, hint) in plan.hints.iter().zip([
+        "wheel: zoom (log)",
+        "drag: pan",
+        "click: select star",
+        "R: re-roll seed",
+    ]) {
+        text_row(&mut items, lh, *rect, hint.to_owned(), C_DIM);
+    }
+    // ---- Left dock: SEED (runtime plumbing, UMAP-016) ----
+    section_bar(&mut items, plan.seed_header, "SEED");
+    items.solid(plan.rects.field, C_FIELD_BG);
+    text_row(
+        &mut items,
+        lh,
+        plan.rects.field,
+        galaxy.seed_field.text.clone(),
+        C_TEXT,
+    );
+    let load_ok = galaxy.seed_field.text.parse::<u64>().is_ok();
+    items.solid(plan.rects.load, if load_ok { C_BTN } else { C_BTN_OFF });
+    items.text(
+        "Load".to_owned(),
+        plan.rects.load.x + 8.0,
+        plan.rects.load.y + lh - 2.0,
+        if load_ok { C_TEXT } else { C_DIM },
+    );
+
+    // ---- Right dock: SELECTION ----
+    items.solid(layout.panel, C_PANEL_BG);
+    let mut py = layout.panel.y + 8.0;
+    let prow = |py: &mut f32| {
+        let rect = Rect {
+            x: layout.panel.x + 8.0,
+            y: *py,
+            w: (layout.panel.w - 16.0).max(0.0),
+            h: lh,
+        };
+        *py += lh + 4.0;
+        rect
+    };
+    section_bar(
+        &mut items,
+        Rect {
+            x: layout.panel.x,
+            y: layout.panel.y,
+            w: layout.panel.w,
+            h: lh + 8.0,
+        },
+        "SELECTION",
+    );
+    py += lh + 12.0;
+    match galaxy
+        .selected
+        .and_then(|i| galaxy.galaxy.stars.get(i as usize))
+    {
+        Some(star) => {
+            text_row(
+                &mut items,
+                lh,
+                prow(&mut py),
+                format!("star {} · {:?}", star.star_index, star.spectral_class),
+                C_TEXT,
+            );
+            text_row(
+                &mut items,
+                lh,
+                prow(&mut py),
+                format!(
+                    "pos {:+.0},{:+.0},{:+.0} ly",
+                    star.position_ly[0], star.position_ly[1], star.position_ly[2]
+                ),
+                C_DIM,
+            );
+            text_row(
+                &mut items,
+                lh,
+                prow(&mut py),
+                format!("companions {}", star.companion_count),
+                C_DIM,
+            );
+        }
+        None => {
+            text_row(
+                &mut items,
+                lh,
+                prow(&mut py),
+                "click a star".to_owned(),
+                C_DIM,
+            );
+        }
+    }
+
+    // ---- Viewport: selection ring around the picked star ----
+    if let Some(star) = galaxy
+        .selected
+        .and_then(|i| galaxy.galaxy.stars.get(i as usize))
+    {
+        let vp = layout.viewport;
+        let (sx, sy) = galaxy.camera.map_to_screen(
+            star.position_ly[0],
+            star.position_ly[2],
+            (vp.x, vp.y, vp.w, vp.h),
+        );
+        // Ring as four thin rects (matches the panel aesthetic).
+        // Clamped into the viewport.
+        let r = 7.0;
+        let x0 = sx.clamp(vp.x, vp.x + vp.w);
+        let y0 = sy.clamp(vp.y, vp.y + vp.h);
+        for rect in [
+            Rect {
+                x: x0 - r,
+                y: y0 - r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: x0 - r,
+                y: y0 + r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: x0 - r,
+                y: y0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+            Rect {
+                x: x0 + r,
+                y: y0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+        ] {
+            items.solid(rect, C_KNOB);
+        }
+    }
+    items
+}
+
+/// System Map UI (universe-maps): left dock (system info + camera +
+/// journey layer + hints) + selection/focus ring overlays in the
+/// viewport. Right dock shows the selected planet, or the travel offer
+/// while one is armed.
+fn build_system_ui(
+    atlas: &mut GlyphAtlas,
+    system: &SystemMapView,
+    journey: &game::journey::Journey,
+    layout: Layout,
+) -> UiItems {
+    let lh = atlas.line_height();
+    let mut items = UiItems::default();
+    build_nav(
+        &mut items,
+        layout,
+        &MainScreen::ALL.map(|s| s.title()),
+        MainScreen::SystemMap.index(),
+        lh,
+    );
+
+    // ---- Left dock: SYSTEM ----
+    items.solid(layout.left, C_PANEL_BG);
+    let mut y = layout.left.y + 8.0;
+    let row = |y: &mut f32| {
+        let rect = Rect {
+            x: layout.left.x + 8.0,
+            y: *y,
+            w: (layout.left.w - 16.0).max(0.0),
+            h: lh,
+        };
+        *y += lh + 4.0;
+        rect
+    };
+    section_bar(
+        &mut items,
+        Rect {
+            x: layout.left.x,
+            y: layout.left.y,
+            w: layout.left.w,
+            h: lh + 8.0,
+        },
+        "SYSTEM MAP",
+    );
+    y += lh + 12.0;
+    let star = &system.system.star;
+    text_row(
+        &mut items,
+        lh,
+        row(&mut y),
+        format!("star {} · {:?}", star.star_index, star.spectral_class),
+        C_TEXT,
+    );
+    text_row(
+        &mut items,
+        lh,
+        row(&mut y),
+        format!(
+            "{} planets · seed {}",
+            system.system.planets.len(),
+            system.seed
+        ),
+        C_DIM,
+    );
+    text_row(
+        &mut items,
+        lh,
+        row(&mut y),
+        format!(
+            "center {:+.2},{:+.2} R {:.2} AU",
+            system.camera.center_x, system.camera.center_z, system.camera.view_radius
+        ),
+        C_DIM,
+    );
+    text_row(
+        &mut items,
+        lh,
+        row(&mut y),
+        format!("journey: {:?}", journey.active_layer()),
+        C_DIM,
+    );
+    if let Some(focus) = system.focus {
+        text_row(
+            &mut items,
+            lh,
+            row(&mut y),
+            format!("FOCUS planet {focus} (L4)"),
+            C_CHECK,
+        );
+    }
+    y += 4.0;
+    section_bar(
+        &mut items,
+        Rect {
+            x: layout.left.x,
+            y,
+            w: layout.left.w,
+            h: lh + 8.0,
+        },
+        "TRAVEL",
+    );
+    y += lh + 12.0;
+    for hint in [
+        "wheel: zoom (log)",
+        "drag: pan",
+        "click: select planet",
+        "F: focus planet (L4)",
+        "T: offer / cancel",
+        "E: begin transit",
+        "Q: back to galaxy",
+    ] {
+        text_row(&mut items, lh, row(&mut y), hint.to_owned(), C_DIM);
+    }
+
+    // ---- Right dock: SELECTION / travel offer ----
+    items.solid(layout.panel, C_PANEL_BG);
+    let mut py = layout.panel.y + 8.0;
+    let prow = |py: &mut f32| {
+        let rect = Rect {
+            x: layout.panel.x + 8.0,
+            y: *py,
+            w: (layout.panel.w - 16.0).max(0.0),
+            h: lh,
+        };
+        *py += lh + 4.0;
+        rect
+    };
+    section_bar(
+        &mut items,
+        Rect {
+            x: layout.panel.x,
+            y: layout.panel.y,
+            w: layout.panel.w,
+            h: lh + 8.0,
+        },
+        "SELECTION",
+    );
+    py += lh + 12.0;
+    if let Some(offer) = system.travel_offer {
+        text_row(
+            &mut items,
+            lh,
+            prow(&mut py),
+            format!("TRAVEL OFFER - planet {offer}"),
+            C_TEXT,
+        );
+        // Deferred cost hook (UMAP-019): computed off the target orbit,
+        // displayed, never deducted — the M4 resource model consumes it.
+        let orbit = system
+            .system
+            .planets
+            .get(offer as usize)
+            .map(|p| p.orbit_radius_au)
+            .unwrap_or(0.0);
+        let cost = plan_cost(orbit);
+        text_row(
+            &mut items,
+            lh,
+            prow(&mut py),
+            format!(
+                "fuel {:.1} · energy {:.1} (deferred M4)",
+                cost.fuel, cost.energy
+            ),
+            C_DIM,
+        );
+        match system.transit.as_ref() {
+            Some(transit) => {
+                let secs = transit.remaining_ticks() as f32 * SIM_DT_SECS;
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!("TRANSIT {secs:.1}s · [T] cancel"),
+                    C_TEXT,
+                );
+                let bar = Rect {
+                    x: layout.panel.x + 8.0,
+                    y: py,
+                    w: (layout.panel.w - 16.0).max(0.0),
+                    h: 8.0,
+                };
+                items.solid(bar, C_TRACK);
+                items.solid(
+                    Rect {
+                        w: bar.w * transit.progress(),
+                        ..bar
+                    },
+                    C_KNOB,
+                );
+            }
+            None => {
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    "[E] begin · [T] withdraw".to_owned(),
+                    C_DIM,
+                );
+            }
+        }
+    } else {
+        match system
+            .selected
+            .and_then(|i| system.system.planets.get(i as usize))
+        {
+            Some(planet) => {
+                let d = &planet.descriptor;
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!("planet {} · {:?}", d.id.planet_index(), d.planet_type),
+                    C_TEXT,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!(
+                        "orbit {:.2} AU · R {:.1} km",
+                        planet.orbit_radius_au, d.radius_km
+                    ),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!(
+                        "g {:.2} · atm {:.2} · moons {}",
+                        d.gravity_g, d.atmosphere.density, d.companion_count
+                    ),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!(
+                        "E {:.1} M {:.1} W {:.1} O {:.1} R {:.1}",
+                        d.resource_bias.energy,
+                        d.resource_bias.metal,
+                        d.resource_bias.water_ice,
+                        d.resource_bias.organics,
+                        d.resource_bias.rare
+                    ),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    "[T] travel offer".to_owned(),
+                    C_DIM,
+                );
+            }
+            None => {
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    "click a planet".to_owned(),
+                    C_DIM,
+                );
+            }
+        }
+    }
+
+    // ---- Viewport: selection + focus rings ----
+    let vp = layout.viewport;
+    let mut ring = |planet_index: u32, color: Color| {
+        let planet = &system.system.planets[planet_index as usize];
+        let (px, pz) = planet_slot(planet.orbit_radius_au, planet_index);
+        let (sx, sy) = system
+            .camera
+            .map_to_screen(px, pz, (vp.x, vp.y, vp.w, vp.h));
+        let r = 9.0;
+        let x0 = sx.clamp(vp.x, vp.x + vp.w);
+        let y0 = sy.clamp(vp.y, vp.y + vp.h);
+        for rect in [
+            Rect {
+                x: x0 - r,
+                y: y0 - r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: x0 - r,
+                y: y0 + r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: x0 - r,
+                y: y0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+            Rect {
+                x: x0 + r,
+                y: y0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+        ] {
+            items.solid(rect, color);
+        }
+    };
+    if let Some(selected) = system.selected
+        && system.system.planets.get(selected as usize).is_some()
+    {
+        ring(selected, C_KNOB);
+    }
+    if let Some(focus) = system.focus
+        && Some(focus) != system.selected
+        && system.system.planets.get(focus as usize).is_some()
+    {
+        ring(focus, C_CHECK);
+    }
+    items
+}
+
 /// Right data dock shared by both viewer screens: INPUTS holds mesh
 /// params, SELECTION holds chunk + player, STATS is read-only. The
 /// player block shrinks to a single "off" line when the player is off,
@@ -1682,6 +2449,8 @@ struct ShaderSet {
     flat_line_vert: Arc<ShaderModule>,
     ui_vert: Arc<ShaderModule>,
     ui_frag: Arc<ShaderModule>,
+    map_vert: Arc<ShaderModule>,
+    map_frag: Arc<ShaderModule>,
 }
 
 impl ShaderSet {
@@ -1700,6 +2469,8 @@ impl ShaderSet {
             ),
             ui_vert: compile_shader(device, ShaderKind::Vertex, UI_VERT, "ui vertex"),
             ui_frag: compile_shader(device, ShaderKind::Fragment, UI_FRAG, "ui fragment"),
+            map_vert: compile_shader(device, ShaderKind::Vertex, MAP_VERT, "map vertex"),
+            map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
         }
     }
 }
@@ -1986,6 +2757,65 @@ fn build_ui_pipeline(
     .expect("ui graphics pipeline must create")
 }
 
+/// Galaxy-map point pipeline (universe-maps): `PointList`, alpha blend
+/// for nebula impostors, no depth write (the map is one flat layer;
+/// draw order decides overdraw, same rule as the flat fill).
+fn build_map_pipeline(
+    device: &Arc<Device>,
+    shaders: &ShaderSet,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs = shaders
+        .map_vert
+        .entry_point("main")
+        .expect("vertex entry point");
+    let fs = shaders
+        .map_frag
+        .entry_point("main")
+        .expect("fragment entry point");
+    let vertex_input_state = MapVertex::per_vertex()
+        .definition(&vs)
+        .expect("map vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::PointList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(AttachmentBlend::alpha()),
+                    ..Default::default()
+                },
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("map graphics pipeline must create")
+}
+
 fn upload_fill(
     allocator: &Arc<StandardMemoryAllocator>,
     viewer: &SphereViewerState,
@@ -2125,6 +2955,134 @@ fn upload_lines(
     .expect("wireframe vertex buffer upload must succeed")
 }
 
+/// Upload the galaxy-map point buffer (universe-maps): L1 backdrop
+/// sprites, nebula impostors, then stars — upload order is draw order
+/// for the alpha-blended point draw. One upload per regeneration; zoom
+/// and pan ride the MVP push constants, never the buffer.
+fn upload_map(
+    allocator: &Arc<StandardMemoryAllocator>,
+    map: &GalaxyMapView,
+) -> Subbuffer<[MapVertex]> {
+    let backdrop = map.backdrop.iter().map(|sprite| MapVertex {
+        map_pos: [sprite.x as f32, sprite.z as f32],
+        color: [
+            0.55 * sprite.brightness,
+            0.60 * sprite.brightness,
+            0.75 * sprite.brightness,
+        ],
+        misc: [1.5, 1.0, 0.0],
+    });
+    let nebulae = map.nebulae.iter().map(|sprite| MapVertex {
+        map_pos: [sprite.x as f32, sprite.z as f32],
+        color: sprite.tint,
+        misc: [sprite.radius as f32, sprite.alpha, 1.0],
+    });
+    let stars = map.galaxy.stars.iter().map(|star| {
+        let size =
+            match star.spectral_class {
+                game_engine::universe::SpectralClass::O
+                | game_engine::universe::SpectralClass::B => 3.0,
+                game_engine::universe::SpectralClass::A
+                | game_engine::universe::SpectralClass::F => 2.5,
+                _ => 2.0,
+            };
+        MapVertex {
+            map_pos: [star.position_ly[0] as f32, star.position_ly[2] as f32],
+            color: spectral_color(star.spectral_class),
+            misc: [size, 1.0, 0.0],
+        }
+    });
+    // `Buffer::from_iter` needs an `ExactSizeIterator`: chained maps are
+    // not, so materialize once per regeneration (not per frame).
+    let verts: Vec<MapVertex> = backdrop.chain(nebulae).chain(stars).collect();
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("galaxy map vertex buffer upload must succeed")
+}
+
+/// Upload the system-map point buffer (universe-maps): the central star
+/// then the planets at their golden-angle slots, tinted by spectral
+/// class / atmosphere color straight off the descriptors. One upload
+/// per system load; focus and pan ride push constants.
+fn upload_system_points(
+    allocator: &Arc<StandardMemoryAllocator>,
+    system: &SystemMapView,
+) -> Subbuffer<[MapVertex]> {
+    let star = std::iter::once(MapVertex {
+        map_pos: [0.0, 0.0],
+        color: spectral_color(system.system.star.spectral_class),
+        misc: [9.0, 1.0, 0.0],
+    });
+    let planets = system.system.planets.iter().enumerate().map(|(i, planet)| {
+        let (px, pz) = planet_slot(planet.orbit_radius_au, i as u32);
+        MapVertex {
+            map_pos: [px as f32, pz as f32],
+            color: planet.descriptor.atmosphere.color,
+            misc: [3.0 + planet.descriptor.radius_km * 0.4, 1.0, 0.0],
+        }
+    });
+    let verts: Vec<MapVertex> = star.chain(planets).collect();
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("system map vertex buffer upload must succeed")
+}
+
+/// Upload the system-map orbit rings as line segments (universe-maps):
+/// each ring tessellates into segment pairs for the `LineList` pipeline.
+fn upload_system_lines(
+    allocator: &Arc<StandardMemoryAllocator>,
+    system: &SystemMapView,
+) -> Subbuffer<[LineVertex]> {
+    let mut verts = Vec::new();
+    for planet in &system.system.planets {
+        let ring = orbit_ring_points(planet.orbit_radius_au);
+        for pair in ring.windows(2) {
+            verts.push(LineVertex {
+                position: [pair[0].0, pair[0].1, 0.0],
+            });
+            verts.push(LineVertex {
+                position: [pair[1].0, pair[1].1, 0.0],
+            });
+        }
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("system map wireframe buffer upload must succeed")
+}
+
 fn create_depth_view(allocator: &Arc<StandardMemoryAllocator>, extent: [u32; 2]) -> Arc<ImageView> {
     let image = Image::new(
         allocator.clone(),
@@ -2228,6 +3186,12 @@ struct ViewerApp {
     flat_vertices: Subbuffer<[FlatVertex]>,
     flat_indices: Subbuffer<[u32]>,
     flat_lines: Subbuffer<[FlatLineVertex]>,
+    map_vertices: Subbuffer<[MapVertex]>,
+    system_points: Subbuffer<[MapVertex]>,
+    system_lines: Subbuffer<[LineVertex]>,
+    /// Partial sim-step accumulator for the transit countdown
+    /// (fixed-step consumption of the frame dt).
+    transit_acc: f32,
     atlas_image: Option<Arc<Image>>,
     dragging_orbit: bool,
     dragging_slider: bool,
@@ -2284,7 +3248,7 @@ impl WindowContext {
 }
 
 impl ViewerApp {
-    fn new(event_loop: &EventLoop<()>) -> Self {
+    fn new(event_loop: &EventLoop<()>, seed: Option<u64>) -> Self {
         let library = VulkanLibrary::new().expect("Vulkan loader must be present");
         let required_extensions = Surface::required_extensions(event_loop)
             .expect("surface extensions must query cleanly");
@@ -2350,10 +3314,20 @@ impl ViewerApp {
         // defeats the inspection goal of the default view. The `--headless`
         // path stays N=6 to cross-check the committed engine mesh hash
         // (update-2026-09-14-2008).
-        let debug = DebugApp::with_viewer(SphereViewerState::with_values(
+        let mut debug = DebugApp::with_viewer(SphereViewerState::with_values(
             WINDOWED_SUBDIV,
             WINDOWED_RADIUS,
         ));
+        // `--seed N` opens the viewer on universe N (galaxy + journey +
+        // system star 0, Galaxy Map screen) instead of the default seed.
+        if let Some(seed) = seed {
+            debug.galaxy.regenerate(seed);
+            debug.journey = Journey::new(seed);
+            let star0 = debug.galaxy.galaxy.stars[0].clone();
+            debug.system.load(seed, &star0);
+            debug.select_main(MainScreen::GalaxyMap);
+            debug.fx.notify(format!("Seed {seed} · --seed flag"));
+        }
         let viewer = &debug.viewer;
         tracing::info!(
             subdivisions = viewer.subdiv,
@@ -2366,6 +3340,9 @@ impl ViewerApp {
         let line_vertices = upload_lines(&memory_allocator, viewer);
         let (flat_vertices, flat_indices) = upload_flat(&memory_allocator, viewer);
         let flat_lines = upload_flat_lines(&memory_allocator, viewer);
+        let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
+        let system_points = upload_system_points(&memory_allocator, &debug.system);
+        let system_lines = upload_system_lines(&memory_allocator, &debug.system);
         // Shader modules compile once here; each window builds its own
         // pipelines from them (see `build_pipelines`).
         let shaders = ShaderSet::compile(&device);
@@ -2388,6 +3365,10 @@ impl ViewerApp {
             flat_vertices,
             flat_indices,
             flat_lines,
+            map_vertices,
+            system_points,
+            system_lines,
+            transit_acc: 0.0,
             atlas_image: None,
             dragging_orbit: false,
             dragging_slider: false,
@@ -2418,6 +3399,51 @@ impl ViewerApp {
             gen_ms = format!("{:.1}", viewer.stats.gen_ms),
             "sphere viewer mesh regenerated",
         );
+    }
+
+    /// Rebuild the galaxy-map point buffer after a seed re-roll (the
+    /// camera resets inside the view state; nothing else changes).
+    fn refresh_map(&mut self) {
+        self.map_vertices = upload_map(&self.memory_allocator, &self.debug.galaxy);
+        tracing::info!(
+            seed = self.debug.galaxy.seed,
+            stars = self.debug.galaxy.galaxy.stars.len(),
+            "galaxy map regenerated",
+        );
+    }
+
+    /// Rebuild the system-map buffers after a system load (rings +
+    /// points are static per system; focus and pan ride push constants).
+    fn refresh_system(&mut self) {
+        self.system_points = upload_system_points(&self.memory_allocator, &self.debug.system);
+        self.system_lines = upload_system_lines(&self.memory_allocator, &self.debug.system);
+        tracing::info!(
+            seed = self.debug.system.seed,
+            star = self.debug.system.system.id.star_index(),
+            planets = self.debug.system.system.planets.len(),
+            "system map loaded",
+        );
+    }
+
+    /// Load a full universe for `seed` (UMAP-016 seed plumbing, shared by
+    /// the `--seed` flag, the panel Load button, Enter, and `R`):
+    /// galaxy + buffers, journey reset, system back to star 0, screen
+    /// back to the Galaxy Map.
+    fn load_galaxy_seed(&mut self, seed: u64) {
+        self.debug.galaxy.regenerate(seed);
+        self.debug.journey = Journey::new(seed);
+        let star0 = self.debug.galaxy.galaxy.stars[0].clone();
+        self.debug.system.load(seed, &star0);
+        self.transit_acc = 0.0;
+        self.refresh_map();
+        self.refresh_system();
+        self.debug.select_main(MainScreen::GalaxyMap);
+        self.debug.fx.trigger_fade();
+        self.debug.fx.notify(format!(
+            "Seed {seed} · {} stars",
+            self.debug.galaxy.galaxy.stars.len()
+        ));
+        tracing::info!(seed, "universe seed loaded");
     }
 
     /// Recompute the hovered chunk from the current cursor: only on the
@@ -2533,6 +3559,7 @@ impl ViewerApp {
             flat: build_flat_pipeline(&self.device, &self.shaders, &render_pass),
             flat_line: build_flat_line_pipeline(&self.device, &self.shaders, &render_pass),
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
+            map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
         };
         (render_pass, pipelines)
     }
@@ -2544,6 +3571,7 @@ struct Pipelines {
     flat: Arc<GraphicsPipeline>,
     flat_line: Arc<GraphicsPipeline>,
     ui: Arc<GraphicsPipeline>,
+    map: Arc<GraphicsPipeline>,
 }
 
 fn window_size_dependent_setup(
@@ -2743,6 +3771,8 @@ impl ViewerApp {
                             MainScreen::UvNet => {
                                 uv_left_plan(layout.left, lh, checker).rects.density_track
                             }
+                            // No density slider on the map screens.
+                            MainScreen::GalaxyMap | MainScreen::SystemMap => None,
                         };
                         if let Some(track) = track {
                             viewer.density_slider.drag_to(track, cursor.0);
@@ -2752,11 +3782,34 @@ impl ViewerApp {
                 } else if self.dragging_orbit {
                     let last = self.main.as_ref().and_then(|ctx| ctx.last_cursor);
                     if let Some(last) = last {
-                        // Player mode orbits the follow camera instead of
-                        // the free global one (first/third person ignore
-                        // rotation).
                         let (dx, dy) = (cursor.0 - last.0, cursor.1 - last.1);
-                        if self.debug.viewer.player.active {
+                        if screen == MainScreen::GalaxyMap || screen == MainScreen::SystemMap {
+                            // Map pan: content follows the cursor —
+                            // the inverse of `map_to_screen` (screen +dx
+                            // is map −x; screen +dy, with north up, is
+                            // map +z).
+                            if let Some(ctx) = self.main.as_ref() {
+                                let (w, h) = ctx.size();
+                                let layout = app_layout(screen, w, h);
+                                let vp = layout.viewport;
+                                if screen == MainScreen::GalaxyMap {
+                                    let lpp = self.debug.galaxy.camera.ly_per_pixel(vp.w, vp.h);
+                                    self.debug
+                                        .galaxy
+                                        .camera
+                                        .pan_by(-dx as f64 * lpp, dy as f64 * lpp);
+                                } else {
+                                    let app = self.debug.system.camera.au_per_pixel(vp.w, vp.h);
+                                    self.debug
+                                        .system
+                                        .camera
+                                        .pan_by(-dx as f64 * app, dy as f64 * app);
+                                }
+                            }
+                        } else if self.debug.viewer.player.active {
+                            // Player mode orbits the follow camera instead
+                            // of the free global one (first/third person
+                            // ignore rotation).
                             self.debug.viewer.player.rotate_camera(dx, dy);
                         } else {
                             self.camera.rotate(dx, dy);
@@ -2810,6 +3863,56 @@ impl ViewerApp {
                     {
                         self.debug.viewer.toggle_pin(chunk);
                     }
+                    // Galaxy click (same barely-traveled rule): pick the
+                    // nearest star into the SELECTION dock + arm the
+                    // journey machine.
+                    if click
+                        && screen == MainScreen::GalaxyMap
+                        && in_viewport
+                        && let Some((cx, cy)) = cursor
+                    {
+                        let layout = match self.main.as_ref() {
+                            Some(ctx) => {
+                                let (w, h) = ctx.size();
+                                app_layout(screen, w, h)
+                            }
+                            None => return,
+                        };
+                        let vp = layout.viewport;
+                        if let Some(i) = self
+                            .debug
+                            .galaxy
+                            .select_at((cx, cy), (vp.x, vp.y, vp.w, vp.h))
+                        {
+                            self.debug.journey.update(JourneyEvent::SelectStar(i));
+                        }
+                    }
+                    // System click: pick the nearest planet the same way.
+                    if click
+                        && screen == MainScreen::SystemMap
+                        && in_viewport
+                        && let Some((cx, cy)) = cursor
+                    {
+                        let layout = match self.main.as_ref() {
+                            Some(ctx) => {
+                                let (w, h) = ctx.size();
+                                app_layout(screen, w, h)
+                            }
+                            None => return,
+                        };
+                        let vp = layout.viewport;
+                        if let Some(i) = self
+                            .debug
+                            .system
+                            .select_at((cx, cy), (vp.x, vp.y, vp.w, vp.h))
+                        {
+                            self.debug.journey.update(JourneyEvent::SelectPlanet(i));
+                        }
+                        // A miss clears the screen selection; the machine
+                        // keeps its armed planet — the transit UI (UMAP-018)
+                        // re-arms from screen state before committing, so
+                        // the stale arm can never fire.
+                    }
                     return;
                 }
                 let (cx, cy, w, h) = match self.main.as_ref() {
@@ -2830,17 +3933,26 @@ impl ViewerApp {
                         return;
                     }
                 }
-                // Viewport drag starts an orbit.
+                // Viewport drag starts an orbit (sphere/UV) or a pan
+                // (map screens).
                 if layout.viewport.contains(cx, cy) {
                     self.dragging_orbit = true;
-                    // A sphere-screen press may end as a chunk-pin click
-                    // (decided on release by travel distance).
-                    if screen == MainScreen::SphereViewer {
+                    // A sphere-screen press may end as a chunk-pin click,
+                    // a map-screen press as a star/planet-pick click (all
+                    // decided on release by travel distance).
+                    if screen == MainScreen::SphereViewer
+                        || screen == MainScreen::GalaxyMap
+                        || screen == MainScreen::SystemMap
+                    {
                         self.press_cursor = Some((cx, cy));
                     }
                     return;
                 }
                 // Panel widgets (viewer window, both screens).
+                // A staged seed load (galaxy Load button) applies after
+                // this block: the block holds the viewer borrow, and the
+                // loader needs `&mut self`.
+                let mut pending_seed: Option<u64> = None;
                 let regenerated = {
                     let viewer = &mut self.debug.viewer;
                     let lh = self.atlas.line_height();
@@ -2882,6 +3994,19 @@ impl ViewerApp {
                             viewer.seam_cb.click(lrects.seam_box, cx, cy);
                             viewer.sync_toggles();
                         }
+                        // Seed widgets on the galaxy screen: click focuses
+                        // the field, Load stages a seed (applied after
+                        // the viewer borrow ends, below).
+                        MainScreen::GalaxyMap => {
+                            let plan = galaxy_left_plan(layout.left, lh);
+                            self.debug.galaxy.seed_field.click(plan.rects.field, cx, cy);
+                            if plan.rects.load.contains(cx, cy)
+                                && let Ok(seed) = self.debug.galaxy.seed_field.text.parse::<u64>()
+                            {
+                                pending_seed = Some(seed);
+                            }
+                        }
+                        MainScreen::SystemMap => {}
                     }
                     // Shared right dock.
                     let rrects =
@@ -2899,6 +4024,9 @@ impl ViewerApp {
                 };
                 if regenerated {
                     self.refresh_mesh();
+                }
+                if let Some(seed) = pending_seed {
+                    self.load_galaxy_seed(seed);
                 }
                 // Global camera presets: 2×2 VIEW grid retargets the free
                 // orbit camera (same as G/T/B/R) — sphere screen only.
@@ -2939,7 +4067,15 @@ impl ViewerApp {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
                     };
-                    if self.debug.viewer.player.active {
+                    if self.debug.main_screen == MainScreen::GalaxyMap {
+                        // Log zoom on the map: wheel-up (positive scroll)
+                        // shrinks the view radius.
+                        let factor = (1.0 - 0.12 * scroll).max(0.05) as f64;
+                        self.debug.galaxy.camera.zoom_by(factor);
+                    } else if self.debug.main_screen == MainScreen::SystemMap {
+                        let factor = (1.0 - 0.12 * scroll).max(0.05) as f64;
+                        self.debug.system.camera.zoom_by(factor);
+                    } else if self.debug.viewer.player.active {
                         self.debug.viewer.player.zoom_camera(scroll);
                     } else {
                         self.camera.zoom(scroll);
@@ -2973,7 +4109,9 @@ impl ViewerApp {
                     )
                 {
                     let viewer = &mut self.debug.viewer;
-                    let fields_free = !viewer.subdiv_field.focused && !viewer.radius_field.focused;
+                    let fields_free = !viewer.subdiv_field.focused
+                        && !viewer.radius_field.focused
+                        && !self.debug.galaxy.seed_field.focused;
                     if viewer.player.active && fields_free {
                         let pressed = state == ElementState::Pressed;
                         let mut keys = viewer.player.keys();
@@ -3010,15 +4148,30 @@ impl ViewerApp {
                 match physical_key {
                     PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                     PhysicalKey::Code(KeyCode::Enter) => {
-                        let viewer = &mut self.debug.viewer;
-                        viewer.subdiv_field.focused = false;
-                        viewer.radius_field.focused = false;
+                        // Enter confirms the focused field: seed field
+                        // loads the typed universe (or surfaces the miss),
+                        // sphere fields just unfocus.
+                        if self.debug.galaxy.seed_field.focused {
+                            match self.debug.galaxy.seed_field.text.parse::<u64>() {
+                                Ok(seed) => self.load_galaxy_seed(seed),
+                                Err(_) => self.debug.fx.notify(format!(
+                                    "Invalid seed '{}'",
+                                    self.debug.galaxy.seed_field.text
+                                )),
+                            }
+                            self.debug.galaxy.seed_field.focused = false;
+                        } else {
+                            let viewer = &mut self.debug.viewer;
+                            viewer.subdiv_field.focused = false;
+                            viewer.radius_field.focused = false;
+                        }
                     }
                     PhysicalKey::Code(KeyCode::Backspace) => {
                         let viewer = &mut self.debug.viewer;
                         viewer.subdiv_field.backspace();
                         viewer.radius_field.backspace();
                         viewer.sync_slider_from_field();
+                        self.debug.galaxy.seed_field.backspace();
                     }
                     PhysicalKey::Code(KeyCode::F1) => {
                         self.debug.select_main_by_fkey(1);
@@ -3027,7 +4180,14 @@ impl ViewerApp {
                         self.debug.select_main_by_fkey(2);
                     }
                     PhysicalKey::Code(KeyCode::F3) => {
-                        // Reopen the tools window if the user closed it.
+                        self.debug.select_main_by_fkey(3);
+                    }
+                    PhysicalKey::Code(KeyCode::F4) => {
+                        self.debug.select_main_by_fkey(4);
+                    }
+                    PhysicalKey::Code(KeyCode::F5) => {
+                        // Reopen the tools window if the user closed it
+                        // (moved from F3/F4: F-keys follow nav order).
                         if self.tools.is_none() {
                             self.tools = Some(self.create_window(
                                 event_loop,
@@ -3046,7 +4206,10 @@ impl ViewerApp {
                     ) => {
                         // Direct debug-mode select (fields unfocused only).
                         let viewer = &self.debug.viewer;
-                        if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
+                        if !viewer.subdiv_field.focused
+                            && !viewer.radius_field.focused
+                            && !self.debug.galaxy.seed_field.focused
+                        {
                             let i = match physical_key {
                                 PhysicalKey::Code(KeyCode::Digit1) => 0,
                                 PhysicalKey::Code(KeyCode::Digit2) => 1,
@@ -3072,7 +4235,10 @@ impl ViewerApp {
                         // from focused fields (`u` is printable input
                         // there).
                         let viewer = &self.debug.viewer;
-                        if !viewer.subdiv_field.focused && !viewer.radius_field.focused {
+                        if !viewer.subdiv_field.focused
+                            && !viewer.radius_field.focused
+                            && !self.debug.galaxy.seed_field.focused
+                        {
                             self.debug.viewer.player.toggle();
                             self.update_hover();
                         } else if let Some(text) = text {
@@ -3089,24 +4255,237 @@ impl ViewerApp {
                         let viewer = &mut self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
+                            && !self.debug.galaxy.seed_field.focused
                             && viewer.player.active
                         {
                             self.debug.viewer.player.cycle_camera();
                         }
                     }
-                    PhysicalKey::Code(
-                        KeyCode::KeyG | KeyCode::KeyT | KeyCode::KeyB | KeyCode::KeyR,
-                    ) => {
+                    PhysicalKey::Code(KeyCode::KeyR) => {
+                        // R re-rolls the galaxy seed on the map screen;
+                        // the sphere screen keeps R = Right preset.
+                        let fields_free = {
+                            let viewer = &self.debug.viewer;
+                            !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && !self.debug.galaxy.seed_field.focused
+                        };
+                        if fields_free {
+                            if self.debug.main_screen == MainScreen::GalaxyMap {
+                                self.load_galaxy_seed(self.debug.galaxy.seed + 1);
+                            } else if self.debug.main_screen == MainScreen::SphereViewer {
+                                let radius = self.debug.viewer.radius;
+                                snap_global_camera(&mut self.camera, GlobalPreset::Right, radius);
+                                self.update_hover();
+                            }
+                        } else if let Some(text) = text {
+                            let viewer = &mut self.debug.viewer;
+                            for ch in text.chars() {
+                                viewer.subdiv_field.insert_char(ch);
+                                viewer.radius_field.insert_char(ch);
+                            }
+                            viewer.sync_slider_from_field();
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyE) => {
+                        // Drill down: armed galaxy star → SystemMap.
+                        // Instant faded map navigation (the timed transit
+                        // wraps arrivals, not drill-down).
+                        let fields_free = {
+                            let viewer = &self.debug.viewer;
+                            !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && !self.debug.galaxy.seed_field.focused
+                        };
+                        if fields_free
+                            && self.debug.main_screen == MainScreen::GalaxyMap
+                            && let Some(i) = self.debug.galaxy.selected
+                        {
+                            self.debug.journey.update(JourneyEvent::SelectStar(i));
+                            let _fx = self.debug.journey.update(JourneyEvent::EnterSystem);
+                            // Fade/prefetch effects surface in the transit
+                            // UI; the screen switch is the visible half of
+                            // the transition today.
+                            if self.debug.journey.active_layer() == Layer::System {
+                                let seed = self.debug.galaxy.seed;
+                                let star = self.debug.galaxy.galaxy.stars[i as usize].clone();
+                                self.debug.system.load(seed, &star);
+                                self.refresh_system();
+                                self.debug.select_main(MainScreen::SystemMap);
+                                self.debug.fx.trigger_fade();
+                                self.debug.fx.notify(format!(
+                                    "System star {i} · {} planets",
+                                    self.debug.system.system.planets.len()
+                                ));
+                            }
+                        } else if fields_free && self.debug.main_screen == MainScreen::SystemMap {
+                            // Begin the transit countdown on the armed
+                            // travel offer (UMAP-018). The journey must
+                            // already sit on this layer (normal flow:
+                            // galaxy E drills down first); a direct F4
+                            // jump without it gets an honest surface, not
+                            // a silent desync.
+                            if self.debug.journey.active_layer() != Layer::System {
+                                self.debug.fx.notify(
+                                    "Journey out of sync — re-enter via galaxy [E]".to_owned(),
+                                );
+                            } else if let Some(i) = self.debug.system.travel_offer {
+                                if self.debug.system.transit.is_none() {
+                                    let star = self.debug.system.system.id.star_index();
+                                    self.debug.system.transit = Some(Transit::begin(star, i));
+                                    self.transit_acc = 0.0;
+                                    let orbit = self
+                                        .debug
+                                        .system
+                                        .system
+                                        .planets
+                                        .get(i as usize)
+                                        .map(|p| p.orbit_radius_au)
+                                        .unwrap_or(0.0);
+                                    let cost = plan_cost(orbit);
+                                    self.debug.fx.notify(format!(
+                                        "Transit underway → planet {i} · fuel {:.1} (deferred)",
+                                        cost.fuel
+                                    ));
+                                }
+                            } else {
+                                self.debug
+                                    .fx
+                                    .notify("Arm a travel offer first [T]".to_owned());
+                            }
+                        } else if !fields_free && let Some(text) = text {
+                            let viewer = &mut self.debug.viewer;
+                            for ch in text.chars() {
+                                viewer.subdiv_field.insert_char(ch);
+                                viewer.radius_field.insert_char(ch);
+                            }
+                            viewer.sync_slider_from_field();
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyQ) => {
+                        // Back one journey layer (map screens only). An
+                        // underway transit cancels first — leaving
+                        // abandons the hop.
+                        let fields_free = {
+                            let viewer = &self.debug.viewer;
+                            !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && !self.debug.galaxy.seed_field.focused
+                        };
+                        if fields_free
+                            && matches!(
+                                self.debug.main_screen,
+                                MainScreen::GalaxyMap | MainScreen::SystemMap
+                            )
+                        {
+                            if self.debug.system.transit.is_some() {
+                                self.debug.system.transit = None;
+                                self.transit_acc = 0.0;
+                                self.debug.fx.notify("Transit cancelled".to_owned());
+                            }
+                            let _fx = self.debug.journey.update(JourneyEvent::Ascend);
+                            if self.debug.journey.active_layer() == Layer::Galaxy {
+                                self.debug.select_main(MainScreen::GalaxyMap);
+                                self.debug.fx.trigger_fade();
+                                self.debug.fx.notify("Galaxy map".to_owned());
+                            }
+                        } else if !fields_free && let Some(text) = text {
+                            let viewer = &mut self.debug.viewer;
+                            for ch in text.chars() {
+                                viewer.subdiv_field.insert_char(ch);
+                                viewer.radius_field.insert_char(ch);
+                            }
+                            viewer.sync_slider_from_field();
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyF) => {
+                        // L4 planet-focus toggle (system screen only) +
+                        // journey mirror.
+                        let fields_free = {
+                            let viewer = &self.debug.viewer;
+                            !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && !self.debug.galaxy.seed_field.focused
+                        };
+                        if fields_free && self.debug.main_screen == MainScreen::SystemMap {
+                            self.debug.system.toggle_focus();
+                            let focus = self.debug.system.focus;
+                            self.debug.journey.update(JourneyEvent::FocusPlanet(focus));
+                            match focus {
+                                Some(i) => self
+                                    .debug
+                                    .fx
+                                    .notify(format!("Focus planet {i} · [F] unfocus")),
+                                None => self.debug.fx.notify("Focus cleared".to_owned()),
+                            }
+                        } else if !fields_free && let Some(text) = text {
+                            let viewer = &mut self.debug.viewer;
+                            for ch in text.chars() {
+                                viewer.subdiv_field.insert_char(ch);
+                                viewer.radius_field.insert_char(ch);
+                            }
+                            viewer.sync_slider_from_field();
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyT) => {
+                        // Travel offer arm/withdraw + transit cancel
+                        // (system screen only).
+                        let fields_free = {
+                            let viewer = &self.debug.viewer;
+                            !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && !self.debug.galaxy.seed_field.focused
+                        };
+                        if fields_free && self.debug.main_screen == MainScreen::SystemMap {
+                            let had_transit = self.debug.system.transit.is_some();
+                            let selected = self.debug.system.selected;
+                            self.debug.system.travel_offer =
+                                match (self.debug.system.travel_offer, selected) {
+                                    (Some(_), _) => None,
+                                    (None, Some(i)) => Some(i),
+                                    (None, None) => None,
+                                };
+                            match (self.debug.system.travel_offer, had_transit) {
+                                (Some(i), _) => self.debug.fx.notify(format!(
+                                    "Travel offer: planet {i} · [E] begin transit"
+                                )),
+                                (None, true) => {
+                                    self.debug.system.transit = None;
+                                    self.transit_acc = 0.0;
+                                    self.debug.fx.notify("Transit cancelled".to_owned());
+                                }
+                                (None, false) => {
+                                    self.debug.fx.notify("Travel offer withdrawn".to_owned())
+                                }
+                            }
+                        } else if fields_free && self.debug.main_screen == MainScreen::SphereViewer
+                        {
+                            // The sphere screen keeps T = Top preset.
+                            let radius = self.debug.viewer.radius;
+                            snap_global_camera(&mut self.camera, GlobalPreset::Top, radius);
+                            self.update_hover();
+                        } else if !fields_free && let Some(text) = text {
+                            let viewer = &mut self.debug.viewer;
+                            for ch in text.chars() {
+                                viewer.subdiv_field.insert_char(ch);
+                                viewer.radius_field.insert_char(ch);
+                            }
+                            viewer.sync_slider_from_field();
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyG | KeyCode::KeyB) => {
                         // Global camera presets (same as the VIEW buttons).
+                        // T and R have their own arms above.
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
+                            && !self.debug.galaxy.seed_field.focused
                             && self.debug.main_screen == MainScreen::SphereViewer
                         {
                             let preset = match physical_key {
-                                PhysicalKey::Code(KeyCode::KeyT) => GlobalPreset::Top,
                                 PhysicalKey::Code(KeyCode::KeyB) => GlobalPreset::Bottom,
-                                PhysicalKey::Code(KeyCode::KeyR) => GlobalPreset::Right,
+                                // G (and anything else) = Perspective; T
+                                // and R have their own arms above.
                                 _ => GlobalPreset::Perspective,
                             };
                             let radius = self.debug.viewer.radius;
@@ -3122,7 +4501,16 @@ impl ViewerApp {
                         }
                     }
                     _ => {
-                        if let Some(text) = text {
+                        // The focused seed field eats keystrokes first;
+                        // otherwise printable input goes to the sphere
+                        // fields (their insert guards on focus).
+                        if self.debug.galaxy.seed_field.focused {
+                            if let Some(text) = text {
+                                for ch in text.chars() {
+                                    self.debug.galaxy.seed_field.insert_char(ch);
+                                }
+                            }
+                        } else if let Some(text) = text {
                             let viewer = &mut self.debug.viewer;
                             for ch in text.chars() {
                                 viewer.subdiv_field.insert_char(ch);
@@ -3219,6 +4607,65 @@ impl ViewerApp {
             .unwrap_or(0.0)
             .clamp(0.0, 0.25);
         self.last_frame = Some(now);
+        // Transit countdown (UMAP-018): fixed-step accumulation of the
+        // frame dt into sim ticks. Commit fires journey EnterOrbit at
+        // duration; the arrival view lands in UMAP-020.
+        if self.debug.main_screen == MainScreen::SystemMap && self.debug.system.transit.is_some() {
+            self.transit_acc += dt;
+            while self.transit_acc >= SIM_DT_SECS {
+                self.transit_acc -= SIM_DT_SECS;
+                if let Some(transit) = self.debug.system.transit.as_mut() {
+                    transit.tick();
+                }
+            }
+            if self
+                .debug
+                .system
+                .transit
+                .as_ref()
+                .is_some_and(|transit| transit.ready())
+            {
+                let planet = self
+                    .debug
+                    .system
+                    .transit
+                    .as_ref()
+                    .expect("checked above")
+                    .planet_index();
+                self.debug.system.transit = None;
+                self.transit_acc = 0.0;
+                self.debug.system.travel_offer = None;
+                self.debug
+                    .journey
+                    .update(JourneyEvent::SelectPlanet(planet));
+                let _fx = self.debug.journey.update(JourneyEvent::EnterOrbit);
+                if self.debug.journey.active_layer() != Layer::Orbit {
+                    self.debug
+                        .fx
+                        .notify("Arrival failed: journey left Orbit".to_owned());
+                } else if let Some(arrival) = arrival_for(&self.debug.system.system, planet) {
+                    // UMAP-020: bind the orbit view to the target
+                    // descriptor — the viewer rebuilds at descriptor
+                    // radius with the atmosphere tint; the mesh seed
+                    // rides the held SeededPlanet into M2/M3.
+                    let radius = self.debug.arrive(arrival);
+                    self.refresh_mesh();
+                    self.debug.select_main(MainScreen::SphereViewer);
+                    self.debug.fx.trigger_fade();
+                    let bound = self.debug.viewer.arrival.as_ref().expect("just bound");
+                    self.debug.fx.notify(format!(
+                        "Arrived orbit · {:?} planet · R {:.1} km",
+                        bound.planet_type, radius
+                    ));
+                } else {
+                    // Stale planet index (system reloaded mid-flight):
+                    // surface it, never panic.
+                    self.debug.fx.notify(format!(
+                        "Arrival failed: planet {planet} not in this system"
+                    ));
+                }
+            }
+        }
         if !self.debug.viewer.player.active {
             return;
         }
@@ -3277,6 +4724,13 @@ impl ViewerApp {
                 build_sphere_ui(&mut self.atlas, &self.debug.viewer, layout)
             }
             MainScreen::UvNet => build_uv_ui(&mut self.atlas, &self.debug.viewer, layout),
+            MainScreen::GalaxyMap => build_galaxy_ui(&mut self.atlas, &self.debug.galaxy, layout),
+            MainScreen::SystemMap => build_system_ui(
+                &mut self.atlas,
+                &self.debug.system,
+                &self.debug.journey,
+                layout,
+            ),
         };
         // Player dot: the walker projected through the main-view matrices
         // (sphere screen only).
@@ -3290,6 +4744,34 @@ impl ViewerApp {
                 let tip = world_to_pixels(main_vp, sphere_tip_world(player, player.position()), vp);
                 draw_player_marker(&mut items, origin, tip);
             }
+        }
+        // Transition fade + notice banner (UMAP-017): a fullscreen black
+        // ramp over the fresh layer, then a banner pill top-center of
+        // the viewport. Both ride the UI pass (alpha-blended).
+        let fade = self.debug.fx.fade_alpha();
+        if fade > 0.0 {
+            items.solid(
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: win_w,
+                    h: win_h,
+                },
+                [0.0, 0.0, 0.0, fade],
+            );
+        }
+        if let Some(text) = self.debug.fx.notice_text() {
+            let lh = self.atlas.line_height();
+            let vp = layout.viewport;
+            let pill_w = (text.len() as f32 * 8.0 + 24.0).min(vp.w).max(0.0);
+            let pill = Rect {
+                x: vp.x + (vp.w - pill_w) * 0.5,
+                y: vp.y + 10.0,
+                w: pill_w,
+                h: lh + 10.0,
+            };
+            items.solid(pill, [0.05, 0.06, 0.10, 0.92]);
+            items.text(text.to_owned(), pill.x + 12.0, pill.y + lh - 2.0, C_TEXT);
         }
         self.sync_atlas(WindowKind::Main);
         let ui_verts = ui_items_to_vertices(&items, &mut self.atlas);
@@ -3335,13 +4817,23 @@ impl ViewerApp {
             CommandBufferUsage::OneTimeSubmit,
         )
         .expect("command buffer builder must create");
+        // Orbit backdrop (UMAP-020): the arrival target's atmosphere
+        // color, scaled to a near-black space read; the default tint
+        // otherwise. Descriptor palette straight to the frame.
+        let backdrop: [f32; 4] = self
+            .debug
+            .viewer
+            .arrival
+            .as_ref()
+            .map(|arrival| {
+                let c = arrival.atmosphere.color;
+                [c[0] * 0.07, c[1] * 0.07, c[2] * 0.07 + 0.02, 1.0]
+            })
+            .unwrap_or([0.02, 0.03, 0.08, 1.0]);
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![
-                        Some([0.02, 0.03, 0.08, 1.0].into()),
-                        Some(ClearValue::Depth(1.0)),
-                    ],
+                    clear_values: vec![Some(backdrop.into()), Some(ClearValue::Depth(1.0))],
                     ..RenderPassBeginInfo::framebuffer(
                         ctx.framebuffers[image_index as usize].clone(),
                     )
@@ -3387,7 +4879,70 @@ impl ViewerApp {
                     extent: [vp.w, vp.h],
                     depth_range: 0.0..=1.0,
                 };
-                if view == MainScreen::SphereViewer {
+                if view == MainScreen::GalaxyMap {
+                    // Galaxy map: one static point buffer (backdrop +
+                    // impostors + stars); pan/zoom ride the MVP push.
+                    let galaxy = &self.debug.galaxy;
+                    let mvp = galaxy.camera.mvp(vp.w, vp.h);
+                    let pplx = vp.h / (2.0 * galaxy.camera.view_radius as f32);
+                    builder
+                        .set_viewport(0, [viewport].into_iter().collect())
+                        .expect("viewport must set")
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, self.map_vertices.clone())
+                        .expect("vertex buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            MapPush { mvp, pplx },
+                        )
+                        .expect("map push constants must upload");
+                    // SAFETY: `vertex_count` equals the uploaded point
+                    // count and the buffer holds exactly those vertices;
+                    // no index buffer is bound for this `PointList` draw.
+                    unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
+                        .expect("map draw must record");
+                } else if view == MainScreen::SystemMap {
+                    // System map: orbit rings through the line pipeline,
+                    // star + planets through the map point pipeline — both
+                    // under the AU camera MVP, rings first.
+                    let system = &self.debug.system;
+                    let mvp = system.camera.mvp(vp.w, vp.h);
+                    builder
+                        .set_viewport(0, [viewport].into_iter().collect())
+                        .expect("viewport must set")
+                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, self.system_lines.clone())
+                        .expect("vertex buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.line.layout().clone(),
+                            0,
+                            LinePush { mvp, inflate: 0.0 },
+                        )
+                        .expect("line push constants must upload");
+                    // SAFETY: same PointList-style contract as the
+                    // wireframe draw — buffer holds exactly the uploaded
+                    // ring segments, no index buffer bound.
+                    unsafe { builder.draw(self.system_lines.len() as u32, 1, 0, 0) }
+                        .expect("system rings draw must record");
+                    let pplx = vp.h / (2.0 * system.camera.view_radius as f32);
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, self.system_points.clone())
+                        .expect("vertex buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            MapPush { mvp, pplx },
+                        )
+                        .expect("map push constants must upload");
+                    // SAFETY: same contract as the galaxy map draw.
+                    unsafe { builder.draw(self.system_points.len() as u32, 1, 0, 0) }
+                        .expect("system points draw must record");
+                } else if view == MainScreen::SphereViewer {
                     let aspect = vp.w / vp.h;
                     // Player mode renders the sphere through the player
                     // camera.
@@ -3398,6 +4953,16 @@ impl ViewerApp {
                         self.camera.projection_matrix(aspect) * self.camera.view_matrix()
                     };
                     let mvp = main_vp.to_cols_array_2d();
+                    // Orbit arrival tint (UMAP-021): the target's
+                    // atmosphere color re-lights the mesh; no arrival =
+                    // untinted default look.
+                    let (tint_rgb, use_tint) = self
+                        .debug
+                        .viewer
+                        .arrival
+                        .as_ref()
+                        .map(|arrival| (arrival.atmosphere.color, 1.0))
+                        .unwrap_or(([0.0, 0.0, 0.0], 0.0));
                     builder
                         .set_viewport(0, [viewport].into_iter().collect())
                         .expect("viewport must set")
@@ -3412,6 +4977,8 @@ impl ViewerApp {
                             0,
                             FillPush {
                                 mvp,
+                                tint_rgb,
+                                use_tint,
                                 highlight,
                                 mode,
                                 density,
@@ -3460,6 +5027,8 @@ impl ViewerApp {
                             0,
                             FillPush {
                                 mvp,
+                                tint_rgb: [0.0, 0.0, 0.0],
+                                use_tint: 0.0,
                                 highlight,
                                 mode,
                                 density,
@@ -3482,6 +5051,8 @@ impl ViewerApp {
                                 0,
                                 FillPush {
                                     mvp,
+                                    tint_rgb: [0.0, 0.0, 0.0],
+                                    use_tint: 0.0,
                                     highlight,
                                     mode,
                                     density,
@@ -3772,15 +5343,15 @@ fn main() {
 
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
-    let headless = match parse_args(&argv) {
-        Ok(headless) => headless,
+    let args = match parse_args(&argv) {
+        Ok(args) => args,
         Err(error) => {
             eprintln!("{error}");
             return 2;
         }
     };
-    if headless {
-        return run_headless();
+    if args.headless {
+        return run_headless(args.seed);
     }
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
@@ -3789,7 +5360,7 @@ fn run() -> i32 {
             return 1;
         }
     };
-    let mut app = ViewerApp::new(&event_loop);
+    let mut app = ViewerApp::new(&event_loop, args.seed);
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("viewer failed: {error:?}");
         return 1;
@@ -3808,6 +5379,32 @@ mod tests {
         assert_eq!(fmt_int(642), "642");
         assert_eq!(fmt_int(40962), "40,962");
         assert_eq!(fmt_int(655362), "655,362");
+    }
+
+    #[test]
+    fn cli_seed_parsing() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Bare + headless.
+        let args = parse_args(&argv(&["game_debug"])).expect("bare must parse");
+        assert!(!args.headless && args.seed.is_none());
+        let args = parse_args(&argv(&["game_debug", "--headless"])).expect("flag must parse");
+        assert!(args.headless && args.seed.is_none());
+        // Seed forms.
+        let args = parse_args(&argv(&["game_debug", "--seed", "42"])).expect("seed must parse");
+        assert_eq!(args.seed, Some(42));
+        let args = parse_args(&argv(&["game_debug", "--headless", "--seed", "7"]))
+            .expect("combined must parse");
+        assert!(args.headless && args.seed == Some(7));
+        // Failures carry usage.
+        for bad in [
+            vec!["game_debug", "--seed"],
+            vec!["game_debug", "--seed", "abc"],
+            vec!["game_debug", "--seed", "-1"],
+            vec!["game_debug", "--nope"],
+        ] {
+            let err = parse_args(&argv(&bad)).expect_err("must reject");
+            assert!(err.contains("usage:"), "error lacks usage: {err}");
+        }
     }
 
     #[test]
@@ -3830,6 +5427,8 @@ mod tests {
             (ShaderKind::Fragment, LINE_FRAG, "line frag"),
             (ShaderKind::Vertex, UI_VERT, "ui vert"),
             (ShaderKind::Fragment, UI_FRAG, "ui frag"),
+            (ShaderKind::Vertex, MAP_VERT, "map vert"),
+            (ShaderKind::Fragment, MAP_FRAG, "map frag"),
         ] {
             if let Err(error) = compile_glsl_to_spirv(kind, source) {
                 panic!("{what} must compile: {error}");
@@ -3846,6 +5445,16 @@ mod tests {
         assert!(
             bytes <= 128,
             "FillPush is {bytes} B, over the 128 B Vulkan 1.1 floor"
+        );
+    }
+
+    #[test]
+    fn map_push_constants_fit_vulkan_floor() {
+        // Same 128 B floor for the map block (MVP + pixels-per-ly).
+        let bytes = std::mem::size_of::<MapPush>();
+        assert!(
+            bytes <= 128,
+            "MapPush is {bytes} B, over the 128 B Vulkan 1.1 floor"
         );
     }
 

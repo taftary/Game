@@ -27,13 +27,21 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   (straight leg, curving leg, turn-in-place leg, idle) through all four
   modes, logging lon/lat/heading (interactive `winit` binding deferred).
 - Debug viewer (`cargo run -p game_debug`, two windows): viewer window
-  `F1` = Sphere Viewer, `F2` = UV Net, `F3` reopens the tools window
+  `F1` = Sphere Viewer, `F2` = UV Net, `F3` = Galaxy Map, `F4` = System
+  Map, `F5` reopens the tools window
   (FPS / Console / Inspector tabs on window-local `1/2/3`); `U`
   toggles player mode, `WASD`/arrows drive thrust/turn on the sphere,
   `P` cycles Follow → First-person → Third-person, `1`–`6` select the
-  debug-shader mode, `G`/`T`/`B`/`R` snap the global camera to
-  Perspective/Top/Bottom/Right (sphere screen only, same as the panel
-  VIEW buttons). The player marker is a center dot plus a heading
+  debug-shader mode, `G`/`T`/`B` snap the global camera to
+  Perspective/Top/Bottom (sphere screen only, same as the panel VIEW
+  buttons; `R` = Right preset there). Map screens (`plans/universe-maps`):
+  wheel = log zoom, drag = pan, click = select star/planet; Galaxy Map
+  `E` drills into the selected star's system, `R` re-rolls the seed, seed
+  field + Load (or Enter) loads a typed universe (`--seed N` flag does
+  the same at startup); System Map `F` toggles L4 planet focus, `T`
+  arms/withdraws the travel offer, `E` begins the timed transit
+  (cancellable with `T`/`Q` before commit), `Q` ascends one journey
+  layer. The player marker is a center dot plus a heading
   arrow on the sphere; the SELECTION panel shows `lon / lat /
   cam + loaded / heading` plus the walk keys while the player is on.
 

@@ -63,4 +63,17 @@ no underground player state.
 
 Each transition has explicit enter/exit, asset prefetch hints, and a fallback (fade + spinner) if streaming misses budget.
 
+Implementation (M5 universe maps, `plans/universe-maps`): the top
+segment is built — `game::journey` runs `GalaxyMap`/`SystemMap`/`Orbit`
+with selection/event transitions, fade + prefetch/evict effects, and a
+pinned-hash fixed-step regression; `game::transit` adds the timed,
+pre-commit-cancellable interplanetary hop (60 ticks @ 20 Hz, deferred
+fuel/energy hook); `engine::universe` generates stages 1–2 with
+quantized cross-platform hashes; `game_debug` hosts the Galaxy Map
+(F3: star points + nebula impostors + L1 backdrop, log zoom/pan/click)
+and System Map (F4: orbit rings + planets + L4 focus + travel offer)
+screens plus the orbit arrival binding (viewer rebuilds at descriptor
+radius with the atmosphere tint). `Descent`/`Surface` (L6–L7) land with
+the descent milestone (M2).
+
 Rendering side: [`../techstack/rendering.md`](../techstack/rendering.md). Budgets: [`../techstack/quality.md`](../techstack/quality.md).

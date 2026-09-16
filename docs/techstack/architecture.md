@@ -41,7 +41,9 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     render/      # vulkano boot (1.1 floor) + tiers + orbit camera +
                  # seeded planet mesh + naga shaders (M1 renderer smoke)
                  # + icosa-net UV unwrap (uv) + flat chunk map (chunk_flat)
-    universe/    # seeds, galaxy/system/planet generation
+    universe/    # seeds, galaxy/system/planet generation (M5 shipped
+                 # stages 1–2: descriptors + hashes; stage 3 lands with
+                 # descent/surface)
      hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
                   # cell-chunk identity (`ChunkId` = cell index, ADR-010)
     sim/         # colonies, robots, resources, tick

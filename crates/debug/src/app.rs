@@ -7,24 +7,37 @@
 //! net, `F1`/`F2`) on the viewer window, [`ToolsScreen`] (FPS / console
 //! / inspector, window-local `1/2/3`) on the tools window.
 
+use crate::fx::FxState;
+use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
 use crate::sphere_viewer::SphereViewerState;
+use crate::system_map::{OrbitArrival, SystemMapView};
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
+use game::journey::Journey;
 
 /// Viewer-window screens in nav-bar order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainScreen {
     SphereViewer,
     UvNet,
+    GalaxyMap,
+    SystemMap,
 }
 
 impl MainScreen {
     /// Nav-bar order; index doubles as the F-key number minus one.
-    pub const ALL: [MainScreen; 2] = [MainScreen::SphereViewer, MainScreen::UvNet];
+    pub const ALL: [MainScreen; 4] = [
+        MainScreen::SphereViewer,
+        MainScreen::UvNet,
+        MainScreen::GalaxyMap,
+        MainScreen::SystemMap,
+    ];
 
     pub fn index(self) -> usize {
         match self {
             MainScreen::SphereViewer => 0,
             MainScreen::UvNet => 1,
+            MainScreen::GalaxyMap => 2,
+            MainScreen::SystemMap => 3,
         }
     }
 
@@ -37,6 +50,8 @@ impl MainScreen {
         match self {
             MainScreen::SphereViewer => "Sphere Viewer",
             MainScreen::UvNet => "UV Net",
+            MainScreen::GalaxyMap => "Galaxy Map",
+            MainScreen::SystemMap => "System Map",
         }
     }
 }
@@ -84,6 +99,16 @@ pub struct App {
     pub main_screen: MainScreen,
     pub tools_screen: ToolsScreen,
     pub viewer: SphereViewerState,
+    /// Galaxy-map screen state (camera + selection survive switching,
+    /// same as the viewer state).
+    pub galaxy: GalaxyMapView,
+    /// System-map screen state (loaded system + focus + selection).
+    pub system: SystemMapView,
+    /// Journey machine both map screens drive (UMAP-015): selections
+    /// arm it, E/T/Q commit travel and layer changes.
+    pub journey: Journey,
+    /// Transition fades + notice banner (UMAP-017).
+    pub fx: FxState,
     /// Frame-health recorder (fed once per event-loop iteration).
     pub fps: FpsOverlay,
     /// Backing state for the console placeholder (captures nothing yet).
@@ -99,14 +124,38 @@ impl App {
 
     /// App with an explicit viewer state (e.g. the windowed default).
     pub fn with_viewer(viewer: SphereViewerState) -> Self {
+        let galaxy = GalaxyMapView::new(DEFAULT_GALAXY_SEED);
+        // The system screen opens on star 0 of the same galaxy (always
+        // present at the v1 default count).
+        let star0 = galaxy.galaxy.stars[0].clone();
+        let system = SystemMapView::new(DEFAULT_GALAXY_SEED, &star0);
         App {
             main_screen: MainScreen::SphereViewer,
             tools_screen: ToolsScreen::Fps,
             viewer,
+            galaxy,
+            system,
+            journey: Journey::new(DEFAULT_GALAXY_SEED),
+            fx: FxState::default(),
             fps: FpsOverlay::new(),
             console: LogConsole,
             inspector: StateInspector,
         }
+    }
+
+    /// Bind an orbit arrival (UMAP-020): the sphere viewer rebuilds at
+    /// the descriptor radius (subdivisions unchanged) holding the
+    /// arrival tint + seeded planet. Returns the applied radius for the
+    /// arrival notice. Generator radii always validate, so the rebuild
+    /// cannot fail — a manual regenerate later clears the binding.
+    pub fn arrive(&mut self, arrival: OrbitArrival) -> f32 {
+        use crate::ui::TextField;
+
+        let radius = arrival.radius_km;
+        self.viewer.radius_field = TextField::new(&radius.to_string());
+        let _rebuilt = self.viewer.regenerate();
+        self.viewer.arrival = Some(arrival);
+        radius
     }
 
     /// Switch viewer screens; viewer state is preserved (field never touched).
@@ -119,7 +168,7 @@ impl App {
         self.tools_screen = screen;
     }
 
-    /// F1–F2 routing (`f` is 1–2); returns false for other keys.
+    /// F1–F4 routing (`f` is 1–4); returns false for other keys.
     pub fn select_main_by_fkey(&mut self, f: u8) -> bool {
         match crate::ui::nav_index_for_fkey(f).and_then(MainScreen::from_index) {
             Some(screen) => {
@@ -154,12 +203,12 @@ mod tests {
 
     #[test]
     fn main_nav_order_matches_fkeys() {
-        assert_eq!(MainScreen::ALL.len(), 2);
+        assert_eq!(MainScreen::ALL.len(), 4);
         for (i, screen) in MainScreen::ALL.iter().enumerate() {
             assert_eq!(screen.index(), i);
             assert_eq!(MainScreen::from_index(i), Some(*screen));
         }
-        assert_eq!(MainScreen::from_index(2), None);
+        assert_eq!(MainScreen::from_index(4), None);
     }
 
     #[test]
@@ -170,6 +219,23 @@ mod tests {
             assert_eq!(ToolsScreen::from_index(i), Some(*screen));
         }
         assert_eq!(ToolsScreen::from_index(3), None);
+    }
+
+    #[test]
+    fn arrival_rebuilds_viewer_at_descriptor_radius() {
+        use crate::system_map::arrival_for;
+
+        let mut app = App::new();
+        let arrival = arrival_for(&app.system.system, 0).expect("planet 0");
+        let radius = app.arrive(arrival);
+        assert_eq!(radius, app.viewer.radius);
+        assert!((2.0..=8.0).contains(&radius));
+        let bound = app.viewer.arrival.as_ref().expect("arrival held");
+        assert_eq!(bound.radius_km, radius);
+        assert_eq!(bound.seeded.radius(), radius);
+        // Manual regenerate clears the binding (fresh mesh, no target).
+        app.viewer.regenerate().expect("fields valid");
+        assert!(app.viewer.arrival.is_none());
     }
 
     #[test]
@@ -195,8 +261,12 @@ mod tests {
         assert_eq!(app.main_screen, MainScreen::UvNet);
         assert!(app.select_main_by_fkey(1));
         assert_eq!(app.main_screen, MainScreen::SphereViewer);
-        assert!(!app.select_main_by_fkey(3));
-        assert_eq!(app.main_screen, MainScreen::SphereViewer);
+        assert!(app.select_main_by_fkey(3));
+        assert_eq!(app.main_screen, MainScreen::GalaxyMap);
+        assert!(app.select_main_by_fkey(4));
+        assert_eq!(app.main_screen, MainScreen::SystemMap);
+        assert!(!app.select_main_by_fkey(5));
+        assert_eq!(app.main_screen, MainScreen::SystemMap);
     }
 
     #[test]

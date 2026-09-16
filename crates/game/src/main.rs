@@ -9,6 +9,7 @@
 //! feed the same [`MoveInput`](game::player::MoveInput).
 
 use game::camera::{CameraMode, PlayerCamera};
+use game::journey::{Journey, JourneyEvent};
 use game::player::{MoveInput, Player};
 use game::streaming::ChunkStreamer;
 use game_engine::hexsphere::HexSphere;
@@ -115,4 +116,31 @@ fn main() {
         player.heading().to_degrees(),
         streamer.loaded_count(),
     );
+
+    // Journey top segment (UMAP-009): scripted GalaxyMap → SystemMap →
+    // Orbit → back traversal. Same event script the lib regression pins;
+    // the headless gate replays it and prints the state hashes.
+    let mut journey = Journey::new(99);
+    println!(
+        "journey start: {:?} hash={:016x}",
+        journey.state(),
+        journey.state_hash()
+    );
+    for event in [
+        JourneyEvent::SelectStar(2),
+        JourneyEvent::EnterSystem,
+        JourneyEvent::SelectPlanet(1),
+        JourneyEvent::FocusPlanet(Some(1)),
+        JourneyEvent::FocusPlanet(None),
+        JourneyEvent::EnterOrbit,
+        JourneyEvent::Ascend,
+        JourneyEvent::Ascend,
+    ] {
+        let effects = journey.update(event);
+        println!(
+            "journey {event:?} -> {:?} hash={:016x} fx={effects:?}",
+            journey.active_layer(),
+            journey.state_hash(),
+        );
+    }
 }

@@ -13,6 +13,7 @@ use crate::mesh::{
 };
 use crate::params::{self, MAX_SUBDIVISIONS, MIN_SUBDIVISIONS, ParamsError, ValidParams};
 use crate::player_view::PlayerViewState;
+use crate::system_map::OrbitArrival;
 use crate::ui::{Checkbox, Slider, TextField};
 
 /// Default radius shown in the panel.
@@ -153,6 +154,11 @@ pub struct SphereViewerState {
     /// streaming. Reset to the applied radius on regenerate (keeping the
     /// active flag); the binary renders through it while active.
     pub player: PlayerViewState,
+    /// Orbit arrival binding (UMAP-020): the target descriptor's tint +
+    /// seeded planet, set by the transit commit. Cleared by any manual
+    /// regenerate (fresh mesh, no target) — the orbit backdrop and the
+    /// planet tint read this.
+    pub arrival: Option<OrbitArrival>,
     /// Read-only stats, refreshed after each regeneration.
     pub stats: ViewerStats,
 }
@@ -216,6 +222,7 @@ impl SphereViewerState {
             pinned: None,
             cell_sides: Vec::new(),
             player: PlayerViewState::new(radius),
+            arrival: None,
             stats: ViewerStats {
                 cells: 0,
                 corners: 0,
@@ -257,6 +264,9 @@ impl SphereViewerState {
         // Fresh mesh, fresh pointing: hover never survives a rebuild,
         // and pins survive only if the id still names a real chunk.
         self.hovered = None;
+        // Manual regenerate drops any arrival binding (fresh mesh, no
+        // target): only the transit commit sets `arrival`.
+        self.arrival = None;
         if self
             .pinned
             .is_some_and(|pin| (pin.index() as usize) >= mesh.cell_count())
