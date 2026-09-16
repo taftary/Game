@@ -51,6 +51,30 @@ pub fn ray_from_cursor(cursor: (f32, f32), viewport: Rect, view_proj: Mat4) -> R
     }
 }
 
+/// Project a world-space point through `view_proj` (built with the
+/// exact matrices the renderer draws with) to y-down viewport pixels
+/// in `viewport` (universe-maps-3d: the 3D map pick path).
+///
+/// Returns `None` when the point is behind the camera (`w ≤ 0`) or
+/// the projection is degenerate — the caller skips such candidates.
+/// The NDC→pixel step uses the app convention (NDC +1 = top row:
+/// `x = (ndc.x + 1) / 2 · w`, `y = (1 − ndc.y) / 2 · h`), the exact
+/// inverse of [`ray_from_cursor`]'s cursor→NDC step.
+pub fn project_to_screen(world: Vec3, view_proj: Mat4, viewport: Rect) -> Option<(f32, f32)> {
+    let clip = view_proj * world.extend(1.0);
+    if clip.w <= 0.0 || !clip.w.is_finite() {
+        return None;
+    }
+    let ndc = Vec3::new(clip.x, clip.y, clip.z) / clip.w;
+    if !ndc.x.is_finite() || !ndc.y.is_finite() {
+        return None;
+    }
+    Some((
+        viewport.x + (ndc.x + 1.0) * 0.5 * viewport.w,
+        viewport.y + (1.0 - ndc.y) * 0.5 * viewport.h,
+    ))
+}
+
 /// Analytic ray hit on the origin-centered sphere of `radius`: the
 /// nearest positive-`t` point, or `None` on a miss (cursor over empty
 /// space), a degenerate ray, or an invalid radius.
@@ -424,6 +448,55 @@ mod tests {
         };
         let ray = ray_from_cursor((0.0, 0.0), flat, view_proj);
         assert_eq!(intersect_sphere(ray, 1.0), None);
+    }
+
+    #[test]
+    fn project_to_screen_roundtrips_cursor_rays() {
+        // universe-maps-3d: the 3D map pick path. A world point must
+        // project to the cursor whose ray passes through it, and the
+        // NDC→pixel step must invert `ray_from_cursor`'s cursor→NDC
+        // step exactly (same `ndc = (2u−1, 1−2v)` convention).
+        use game_engine::render::OrbitCamera;
+        let camera = OrbitCamera::framing_planet(1.0);
+        let vp = viewport();
+        let view_proj = camera.projection_matrix(vp.w / vp.h) * camera.view_matrix();
+        let eye = camera.eye();
+        // Near-side surface point facing the camera.
+        let facing = eye + (Vec3::ZERO - eye).normalize() * (camera.distance() - 1.0);
+        let (sx, sy) = project_to_screen(facing, view_proj, vp).expect("facing point projects");
+        // The projected cursor's ray must strike the same surface point.
+        let ray = ray_from_cursor((sx, sy), vp, view_proj);
+        let hit = intersect_sphere(ray, 1.0).expect("projected cursor must hit");
+        assert!(
+            hit.distance_squared(facing) < 1e-6,
+            "hit {hit:?} vs {facing:?}"
+        );
+        // Off-axis anchor (above the facing point): must round-trip
+        // through an asymmetric pixel, not just the center.
+        let above = (facing + Vec3::Y * 0.3).normalize();
+        let (ax, ay) = project_to_screen(above, view_proj, vp).expect("off-axis projects");
+        let ray = ray_from_cursor((ax, ay), vp, view_proj);
+        let hit = intersect_sphere(ray, 1.0).expect("off-axis cursor must hit");
+        assert!(
+            hit.distance_squared(above) < 1e-6,
+            "hit {hit:?} vs {above:?}"
+        );
+    }
+
+    #[test]
+    fn project_to_screen_rejects_behind_camera() {
+        use game_engine::render::OrbitCamera;
+        let camera = OrbitCamera::framing_planet(1.0);
+        let vp = viewport();
+        let view_proj = camera.projection_matrix(vp.w / vp.h) * camera.view_matrix();
+        // A point behind the camera (past the eye along the view ray)
+        // has w ≤ 0: no pixels.
+        let behind = camera.eye() * 2.0;
+        assert_eq!(project_to_screen(behind, view_proj, vp), None);
+        // The target itself (origin) centers in the viewport.
+        let (sx, sy) = project_to_screen(Vec3::ZERO, view_proj, vp).expect("target projects");
+        assert!((sx - (vp.x + vp.w / 2.0)).abs() < 1e-3);
+        assert!((sy - (vp.y + vp.h / 2.0)).abs() < 1e-3);
     }
 
     #[test]

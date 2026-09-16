@@ -1,26 +1,35 @@
-//! Galaxy-map view state: camera, seed-driven sprites, selection.
+//! Galaxy-map view state: 3D camera, seed-driven sprites, selection.
 //!
 //! Pure + headless — f64 map math lives here, GPU upload in the binary.
-//! Top-down ENU map: east (+x) → screen right, north (+z) → screen up,
-//! NDC +1 = the top row (same convention as
-//! [`picking::ray_from_cursor`](crate::picking::ray_from_cursor)).
+//! 3D perspective view (universe-maps-3d) over the same compressed-ly
+//! map space: the disk thickness in `StarDescriptor::position_ly[1]`
+//! (dropped by the old 2D ortho view) is real data and now drawn.
 //!
-//! The journey machine (`game::journey`) is NOT wired here yet: this
-//! screen owns a local selection; UMAP-014/015 (SystemMap + travel)
-//! promote selection into journey events.
+//! World embedding: `world = (east, up, −north)` — the engine
+//! ENU/player frame (y-up, north = −z) — so the default south-approach
+//! framing shows north up and east right like the classic map.
+//!
+//! Picking is view-projection screen-space: project every star,
+//! nearest within [`PICK_RADIUS_PX`], lowest index wins ties.
 
 use game_engine::core::SeededRng;
 use game_engine::universe::{
-    DEFAULT_STAR_COUNT, GALAXY_RADIUS_LY, GalaxyDescriptor, SpectralClass, generate_galaxy,
+    DEFAULT_STAR_COUNT, GALAXY_RADIUS_LY, GalaxyDescriptor, SpectralClass, StarDescriptor,
+    generate_galaxy,
 };
+use glam::Vec3;
 
-use crate::ui::TextField;
+use crate::map_camera::{DEFAULT_PITCH, DEFAULT_YAW, MapOrbitCamera};
+use crate::picking::project_to_screen;
+use crate::ui::{Rect, TextField};
 
 /// Seed the map opens on (overridden by `--seed`; the viewer panel
 /// field edits it at runtime).
 pub const DEFAULT_GALAXY_SEED: u64 = 1234;
 
-/// Closest the camera may zoom: half-extent in compressed ly.
+/// Closest the camera may zoom: vertical half-extent in compressed ly
+/// (mirrors the old ortho minimum; converted to an orbit distance by
+/// [`framing_camera`]).
 pub const MIN_VIEW_RADIUS_LY: f64 = 500.0;
 
 /// Widest the camera may zoom out: the full disk plus a margin.
@@ -32,119 +41,40 @@ pub const DEFAULT_NEBULA_COUNT: usize = 28;
 /// L1 cosmic-web backdrop sprite count (generated sprite field, OQ-5).
 pub const DEFAULT_BACKDROP_COUNT: usize = 400;
 
-/// Click-select radius in screen pixels (converted to ly at pick time).
+/// Click-select radius in screen pixels (nearest projected star within
+/// this distance wins).
 pub const PICK_RADIUS_PX: f32 = 8.0;
 
-/// f64 map camera: center (x, z) + half-height extent. Zoom is
-/// multiplicative on the extent; pan is in map units. Both clamp.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GalaxyCamera {
-    pub center_x: f64,
-    pub center_z: f64,
-    /// Half-extent of the visible z range; x half-extent scales by
-    /// viewport aspect so light-years stay square.
-    pub view_radius: f64,
+/// World-space position of a star in the map embedding
+/// (`east, up, −north`): the disk thickness in `position_ly[1]` is
+/// drawn; the north axis flips sign into the y-up world.
+pub fn star_world(star: &StarDescriptor) -> Vec3 {
+    Vec3::new(
+        star.position_ly[0] as f32,
+        star.position_ly[1] as f32,
+        -(star.position_ly[2] as f32),
+    )
 }
 
-impl GalaxyCamera {
-    /// Whole disk in view.
-    pub fn full_galaxy() -> Self {
-        Self {
-            center_x: 0.0,
-            center_z: 0.0,
-            view_radius: MAX_VIEW_RADIUS_LY,
-        }
-    }
-
-    /// Zoom: `factor < 1` zooms in. Clamped to
-    /// [`MIN_VIEW_RADIUS_LY`]..=[`MAX_VIEW_RADIUS_LY`].
-    pub fn zoom_by(&mut self, factor: f64) {
-        self.view_radius =
-            (self.view_radius * factor).clamp(MIN_VIEW_RADIUS_LY, MAX_VIEW_RADIUS_LY);
-    }
-
-    /// Pan by map-unit deltas. The center clamps to the disk plus a
-    /// half-view margin, so the galaxy can never be lost off-screen.
-    pub fn pan_by(&mut self, dx: f64, dz: f64) {
-        let margin = GALAXY_RADIUS_LY + self.view_radius;
-        self.center_x = (self.center_x + dx).clamp(-margin, margin);
-        self.center_z = (self.center_z + dz).clamp(-margin, margin);
-    }
-
-    /// Compressed ly per screen pixel (x and z agree by construction:
-    /// the x half-extent scales by viewport aspect).
-    pub fn ly_per_pixel(&self, _vp_w: f32, vp_h: f32) -> f64 {
-        2.0 * self.view_radius / f64::from(vp_h.max(1.0))
-    }
-
-    /// Map (x, z) → y-down viewport pixels. `vp` is (x, y, w, h).
-    /// North (+z) maps up — the y-down flip lives in this one line.
-    pub fn map_to_screen(&self, x: f64, z: f64, vp: (f32, f32, f32, f32)) -> (f32, f32) {
-        let (vpx, vpy, vpw, vph) = vp;
-        let nx = (x - self.center_x)
-            / (self.view_radius * f64::from(vpw.max(1.0)) / f64::from(vph.max(1.0)));
-        let ny = (z - self.center_z) / self.view_radius;
-        (
-            vpx + ((nx * 0.5 + 0.5) * f64::from(vpw.max(1.0))) as f32,
-            vpy + ((0.5 - ny * 0.5) * f64::from(vph.max(1.0))) as f32,
-        )
-    }
-
-    /// Viewport pixels → map (x, z). Exact inverse of
-    /// [`GalaxyCamera::map_to_screen`] (round-trip tested).
-    pub fn screen_to_map(&self, sx: f32, sy: f32, vp: (f32, f32, f32, f32)) -> (f64, f64) {
-        let (vpx, vpy, vpw, vph) = vp;
-        let w = f64::from(vpw.max(1.0));
-        let h = f64::from(vph.max(1.0));
-        let nx = (f64::from(sx - vpx) / w - 0.5) * 2.0;
-        let ny = (0.5 - f64::from(sy - vpy) / h) * 2.0;
-        (
-            self.center_x + nx * self.view_radius * w / h,
-            self.center_z + ny * self.view_radius,
-        )
-    }
-
-    /// Ortho MVP over map space for the point pipeline, column-major
-    /// `[[f32; 4]; 4]` (matches `Mat4::to_cols_array_2d` uploads
-    /// elsewhere): map (x, z) → NDC with +1 = top (north up). Depth
-    /// passes through; points carry no z.
-    pub fn mvp(&self, vp_w: f32, vp_h: f32) -> [[f32; 4]; 4] {
-        let sx = (self.view_radius * f64::from(vp_w.max(1.0)) / f64::from(vp_h.max(1.0))) as f32;
-        let sy = self.view_radius as f32;
-        let (cx, cz) = (self.center_x as f32, self.center_z as f32);
-        [
-            [1.0 / sx, 0.0, 0.0, 0.0],
-            [0.0, 1.0 / sy, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [-cx / sx, -cz / sy, 0.0, 1.0],
-        ]
-    }
-}
-
-/// Nearest star to map point (x, z) within `threshold` ly. Exact ties
-/// keep the lowest star index (same rule as chunk picking).
-pub fn pick_star(
-    stars: &[game_engine::universe::StarDescriptor],
-    x: f64,
-    z: f64,
-    threshold: f64,
-) -> Option<u32> {
-    let mut best: Option<(u32, f64)> = None;
-    for star in stars {
-        let dx = star.position_ly[0] - x;
-        let dz = star.position_ly[2] - z;
-        let d = dx * dx + dz * dz;
-        if d <= threshold * threshold
-            && best.is_none_or(|(bi, bd)| d < bd || (d == bd && star.star_index < bi))
-        {
-            best = Some((star.star_index, d));
-        }
-    }
-    best.map(|(i, _)| i)
+/// Default 3D framing for the galaxy: whole disk plus margin, tilted
+/// open from the south side. Zoom range mirrors the old ortho
+/// half-extents via [`MapOrbitCamera::distance_for_half_height`].
+pub fn framing_camera() -> MapOrbitCamera {
+    let max_half = MAX_VIEW_RADIUS_LY as f32;
+    MapOrbitCamera::new(
+        Vec3::ZERO,
+        MapOrbitCamera::distance_for_half_height(max_half),
+        DEFAULT_YAW,
+        DEFAULT_PITCH,
+        MapOrbitCamera::distance_for_half_height(MIN_VIEW_RADIUS_LY as f32),
+        MapOrbitCamera::distance_for_half_height(max_half),
+        max_half,
+    )
 }
 
 /// One nebula impostor (OQ-2 billboard): map-space disk, tint, alpha.
 /// Derived from the galaxy seed — no baked assets, no hardcoding.
+/// Plane haze: uploaded at world height 0.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NebulaSprite {
     pub x: f64,
@@ -154,13 +84,14 @@ pub struct NebulaSprite {
     pub alpha: f32,
 }
 
-/// L1 cosmic-web backdrop sprite (OQ-5 generated sprite field): dim far
-/// points over an extended field. Map-space like everything else — the
-/// "far" read comes from dimness, not a separate projection (L1 is
-/// backdrop-only; motion fidelity is not a v1 requirement).
+/// L1 cosmic-web backdrop sprite (OQ-5 generated sprite field): dim
+/// far points over an extended 3D volume. The "far" read comes from
+/// dimness, not a separate projection (L1 is backdrop-only; motion
+/// fidelity is not a v1 requirement).
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackdropSprite {
     pub x: f64,
+    pub y: f64,
     pub z: f64,
     pub brightness: f32,
 }
@@ -195,12 +126,15 @@ pub fn nebula_sprites(seed: u64, count: usize) -> Vec<NebulaSprite> {
     out
 }
 
-/// Derive `count` L1 backdrop sprites from `seed` over a 3× field.
+/// Derive `count` L1 backdrop sprites from `seed` over a 3× field,
+/// now a 3D volume (the y draw is appended after x/z on the same
+/// stream — still deterministic per seed, still view-only).
 pub fn backdrop_sprites(seed: u64, count: usize) -> Vec<BackdropSprite> {
     let mut rng = SeededRng::stream(seed, "galaxy/backdrop");
     (0..count)
         .map(|_| BackdropSprite {
             x: rng.range_f64(-1.5, 1.5) * GALAXY_RADIUS_LY,
+            y: rng.range_f64(-1.5, 1.5) * GALAXY_RADIUS_LY,
             z: rng.range_f64(-1.5, 1.5) * GALAXY_RADIUS_LY,
             brightness: rng.range_f64(0.05, 0.22) as f32,
         })
@@ -227,7 +161,7 @@ pub fn spectral_color(class: SpectralClass) -> [f32; 3] {
 pub struct GalaxyMapView {
     pub seed: u64,
     pub galaxy: GalaxyDescriptor,
-    pub camera: GalaxyCamera,
+    pub camera: MapOrbitCamera,
     pub nebulae: Vec<NebulaSprite>,
     pub backdrop: Vec<BackdropSprite>,
     pub selected: Option<u32>,
@@ -242,7 +176,7 @@ impl GalaxyMapView {
         let mut view = Self {
             seed,
             galaxy: generate_galaxy(seed, DEFAULT_STAR_COUNT),
-            camera: GalaxyCamera::full_galaxy(),
+            camera: framing_camera(),
             nebulae: nebula_sprites(seed, DEFAULT_NEBULA_COUNT),
             backdrop: backdrop_sprites(seed, DEFAULT_BACKDROP_COUNT),
             selected: None,
@@ -252,24 +186,36 @@ impl GalaxyMapView {
         view
     }
 
-    /// Re-roll everything for `seed` (camera resets to full disk,
-    /// selection clears, field mirrors the seed).
+    /// Re-roll everything for `seed` (camera resets to the default 3D
+    /// framing, selection clears, field mirrors the seed).
     pub fn regenerate(&mut self, seed: u64) {
         self.seed = seed;
         self.galaxy = generate_galaxy(seed, DEFAULT_STAR_COUNT);
-        self.camera = GalaxyCamera::full_galaxy();
+        self.camera = framing_camera();
         self.nebulae = nebula_sprites(seed, DEFAULT_NEBULA_COUNT);
         self.backdrop = backdrop_sprites(seed, DEFAULT_BACKDROP_COUNT);
         self.selected = None;
         self.seed_field = TextField::new(&seed.to_string());
     }
 
-    /// Click-select: viewport cursor → map point → nearest star within
-    /// [`PICK_RADIUS_PX`]. Stores and returns the pick.
-    pub fn select_at(&mut self, cursor: (f32, f32), vp: (f32, f32, f32, f32)) -> Option<u32> {
-        let (x, z) = self.camera.screen_to_map(cursor.0, cursor.1, vp);
-        let threshold = f64::from(PICK_RADIUS_PX) * self.camera.ly_per_pixel(vp.2, vp.3);
-        self.selected = pick_star(&self.galaxy.stars, x, z, threshold);
+    /// Click-select: project every star through the current
+    /// view-projection, keep the nearest projected point within
+    /// [`PICK_RADIUS_PX`]. Exact projected-distance ties keep the
+    /// lowest star index. Stores and returns the pick.
+    pub fn select_at(&mut self, cursor: (f32, f32), vp: Rect) -> Option<u32> {
+        let view_proj = self.camera.view_proj(vp.w / vp.h);
+        let mut best: Option<(u32, f32)> = None;
+        for star in &self.galaxy.stars {
+            if let Some((sx, sy)) = project_to_screen(star_world(star), view_proj, vp) {
+                let d = (sx - cursor.0).hypot(sy - cursor.1);
+                if d <= PICK_RADIUS_PX
+                    && best.is_none_or(|(bi, bd)| d < bd || (d == bd && star.star_index < bi))
+                {
+                    best = Some((star.star_index, d));
+                }
+            }
+        }
+        self.selected = best.map(|(i, _)| i);
         self.selected
     }
 }
@@ -278,75 +224,76 @@ impl GalaxyMapView {
 mod tests {
     use super::*;
 
-    const VP: (f32, f32, f32, f32) = (0.0, 0.0, 800.0, 600.0);
-
-    #[test]
-    fn screen_map_round_trips() {
-        let cam = GalaxyCamera::full_galaxy();
-        // Through f32 pixels: the honest bound is one pixel in ly.
-        let tol = cam.ly_per_pixel(VP.2, VP.3);
-        for (x, z) in [(0.0, 0.0), (12_000.0, -4_500.0), (-49_000.0, 49_000.0)] {
-            let (sx, sy) = cam.map_to_screen(x, z, VP);
-            let (rx, rz) = cam.screen_to_map(sx, sy, VP);
-            assert!((rx - x).abs() < tol, "{x} -> {rx}");
-            assert!((rz - z).abs() < tol, "{z} -> {rz}");
+    fn vp() -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
         }
     }
 
     #[test]
-    fn north_is_up_east_is_right() {
-        let cam = GalaxyCamera::full_galaxy();
-        let (cx, cy) = cam.map_to_screen(0.0, 0.0, VP);
-        assert_eq!((cx, cy), (400.0, 300.0));
-        let (ex, ey) = cam.map_to_screen(10_000.0, 0.0, VP);
-        assert!(ex > cx && ey == cy);
-        let (nx, ny) = cam.map_to_screen(0.0, 10_000.0, VP);
-        assert!(nx == cx && ny < cy);
+    fn default_framing_keeps_map_conventions() {
+        // South-approach tilt: north (−z world) reads up-screen, east
+        // (+x world) reads right-screen — the classic map read.
+        let view = GalaxyMapView::new(3);
+        let view_proj = view.camera.view_proj(vp().w / vp().h);
+        let screen =
+            |world: Vec3| project_to_screen(world, view_proj, vp()).expect("framed point projects");
+        let (cx, cy) = screen(Vec3::ZERO);
+        assert!((cx - 400.0).abs() < 1.0 && (cy - 300.0).abs() < 1.0);
+        let (ex, ey) = screen(Vec3::new(10_000.0, 0.0, 0.0));
+        assert!(ex > cx && (ey - cy).abs() < 2.0, "east must be right");
+        // North in map space (+z) uploads as world −z.
+        let (nx, ny) = screen(Vec3::new(0.0, 0.0, -10_000.0));
+        assert!(ny < cy && (nx - cx).abs() < 2.0, "north must be up");
     }
 
     #[test]
-    fn mvp_agrees_with_screen_math() {
-        // MVP maps the camera center to NDC origin and north to +y.
-        let cam = GalaxyCamera::full_galaxy();
-        let m = cam.mvp(800.0, 600.0);
-        let apply = |x: f32, z: f32| (m[0][0] * x + m[3][0], m[1][1] * z + m[3][1]);
-        let (nx, ny) = apply(0.0, 0.0);
-        assert!(nx.abs() < 1e-6 && ny.abs() < 1e-6);
-        let (_, py) = apply(0.0, 10_000.0);
-        assert!(py > 0.0, "north must be +y NDC");
-        let (px, _) = apply(10_000.0, 0.0);
-        assert!(px > 0.0, "east must be +x NDC");
-        // Square ly: a 10k-ly east step and a 10k-ly north step cover
-        // the same NDC distance on a square viewport.
-        let sq = GalaxyCamera::full_galaxy().mvp(600.0, 600.0);
-        let ex = (sq[0][0] * 10_000.0 + sq[3][0]).abs();
-        let no = (sq[1][1] * 10_000.0 + sq[3][1]).abs();
-        assert!((ex - no).abs() < 1e-6, "{ex} vs {no}");
+    fn top_down_snap_keeps_conventions() {
+        let mut view = GalaxyMapView::new(3);
+        view.camera.toggle_top_down();
+        let view_proj = view.camera.view_proj(vp().w / vp().h);
+        let screen = |world: Vec3| {
+            project_to_screen(world, view_proj, vp()).expect("snapped point projects")
+        };
+        let (cx, cy) = screen(Vec3::ZERO);
+        assert!((cx - 400.0).abs() < 2.0 && (cy - 300.0).abs() < 2.0);
+        let (ex, ey) = screen(Vec3::new(10_000.0, 0.0, 0.0));
+        assert!(ex > cx && (ey - cy).abs() < 2.0);
+        let (nx, ny) = screen(Vec3::new(0.0, 0.0, -10_000.0));
+        assert!(ny < cy && (nx - cx).abs() < 2.0);
     }
 
     #[test]
-    fn zoom_and_pan_clamp() {
-        let mut cam = GalaxyCamera::full_galaxy();
-        cam.zoom_by(0.0);
-        assert_eq!(cam.view_radius, MIN_VIEW_RADIUS_LY);
-        cam.zoom_by(1e9);
-        assert_eq!(cam.view_radius, MAX_VIEW_RADIUS_LY);
-        cam.pan_by(1e12, -1e12);
-        assert!(cam.center_x <= GALAXY_RADIUS_LY + cam.view_radius);
-        assert!(cam.center_z >= -GALAXY_RADIUS_LY - cam.view_radius);
-    }
-
-    #[test]
-    fn pick_nearest_lowest_index_wins_ties_and_misses() {
-        let galaxy = generate_galaxy(42, 3);
-        let a = &galaxy.stars[0];
-        // Exact hit on star 0's position.
-        assert_eq!(
-            pick_star(&galaxy.stars, a.position_ly[0], a.position_ly[2], 1.0),
-            Some(0)
+    fn disk_thickness_separates_on_screen() {
+        // Two stars sharing (x, z) but at opposite thickness extremes
+        // must land on different pixels once tilted: depth is drawn.
+        let view = GalaxyMapView::new(3);
+        let view_proj = view.camera.view_proj(vp().w / vp().h);
+        let a = project_to_screen(Vec3::new(5_000.0, 1_200.0, -3_000.0), view_proj, vp())
+            .expect("thick star projects");
+        let b = project_to_screen(Vec3::new(5_000.0, -1_200.0, -3_000.0), view_proj, vp())
+            .expect("thick star projects");
+        assert!(
+            (a.0 - b.0).hypot(a.1 - b.1) > 0.5,
+            "thickness must separate on screen: {a:?} vs {b:?}"
         );
-        // Empty point far outside the disk misses.
-        assert_eq!(pick_star(&galaxy.stars, 1e9, 1e9, 1_000.0), None);
+    }
+
+    #[test]
+    fn zoom_clamps_to_configured_range() {
+        let mut view = GalaxyMapView::new(3);
+        view.camera.zoom_by(1e-9);
+        assert_eq!(view.camera.distance(), view.camera.min_distance());
+        view.camera.zoom_by(1e9);
+        assert_eq!(view.camera.distance(), view.camera.max_distance());
+        // The range mirrors the old ortho half-extents.
+        let expect_min = MapOrbitCamera::distance_for_half_height(MIN_VIEW_RADIUS_LY as f32);
+        let expect_max = MapOrbitCamera::distance_for_half_height(MAX_VIEW_RADIUS_LY as f32);
+        assert!((view.camera.min_distance() - expect_min).abs() < 1e-3);
+        assert!((view.camera.max_distance() - expect_max).abs() < 1e-3);
     }
 
     #[test]
@@ -354,10 +301,17 @@ mod tests {
         assert_eq!(nebula_sprites(7, 10), nebula_sprites(7, 10));
         assert_ne!(nebula_sprites(7, 10), nebula_sprites(8, 10));
         assert_eq!(backdrop_sprites(7, 50), backdrop_sprites(7, 50));
+        assert_ne!(backdrop_sprites(7, 50), backdrop_sprites(8, 50));
         for sprite in nebula_sprites(7, DEFAULT_NEBULA_COUNT) {
             assert!((0.05..=0.12).contains(&sprite.alpha));
             let r = (sprite.x * sprite.x + sprite.z * sprite.z).sqrt();
             assert!(r <= GALAXY_RADIUS_LY);
+        }
+        for sprite in backdrop_sprites(7, DEFAULT_BACKDROP_COUNT) {
+            assert!((0.05..=0.22).contains(&sprite.brightness));
+            assert!(sprite.x.abs() <= 1.5 * GALAXY_RADIUS_LY);
+            assert!(sprite.y.abs() <= 1.5 * GALAXY_RADIUS_LY);
+            assert!(sprite.z.abs() <= 1.5 * GALAXY_RADIUS_LY);
         }
     }
 
@@ -366,10 +320,11 @@ mod tests {
         let mut view = GalaxyMapView::new(1);
         view.selected = Some(5);
         view.camera.zoom_by(0.01);
+        view.camera.rotate(30.0, 10.0);
         view.regenerate(2);
         assert_eq!(view.seed, 2);
         assert_eq!(view.selected, None);
-        assert_eq!(view.camera, GalaxyCamera::full_galaxy());
+        assert_eq!(view.camera, framing_camera());
         assert_eq!(view.galaxy.stars.len(), DEFAULT_STAR_COUNT as usize);
         assert_eq!(view.seed_field.text, "2");
     }
@@ -378,11 +333,45 @@ mod tests {
     fn select_at_picks_the_projected_star() {
         let mut view = GalaxyMapView::new(3);
         let star = &view.galaxy.stars[0];
-        let (sx, sy) = view
-            .camera
-            .map_to_screen(star.position_ly[0], star.position_ly[2], VP);
-        assert_eq!(view.select_at((sx, sy), VP), Some(0));
+        let (sx, sy) = project_to_screen(
+            star_world(star),
+            view.camera.view_proj(vp().w / vp().h),
+            vp(),
+        )
+        .expect("star 0 projects");
+        assert_eq!(view.select_at((sx, sy), vp()), Some(0));
         assert_eq!(view.selected, Some(0));
-        assert_eq!(view.select_at((0.0, 0.0), VP), view.selected);
+        // A click far from every projection misses (the full-disk
+        // framing leaves no star within 8 px of a corner... unless one
+        // lands there — assert consistency instead: re-pick at the
+        // same cursor returns the same star).
+        assert_eq!(view.select_at((sx, sy), vp()), Some(0));
+    }
+
+    #[test]
+    fn select_at_honors_pixel_threshold() {
+        let mut view = GalaxyMapView::new(3);
+        let star = &view.galaxy.stars[0];
+        let (sx, sy) = project_to_screen(
+            star_world(star),
+            view.camera.view_proj(vp().w / vp().h),
+            vp(),
+        )
+        .expect("star 0 projects");
+        // Just outside the pick radius along +x: star 0 may still lose
+        // to a nearer star, but whatever wins must be within radius of
+        // the cursor — check the winner is near the click.
+        let won = view.select_at((sx + PICK_RADIUS_PX + 2.0, sy), vp());
+        if let Some(i) = won {
+            let winner = &view.galaxy.stars[i as usize];
+            let (wx, wy) = project_to_screen(
+                star_world(winner),
+                view.camera.view_proj(vp().w / vp().h),
+                vp(),
+            )
+            .expect("winner projects");
+            let d = (wx - (sx + PICK_RADIUS_PX + 2.0)).hypot(wy - sy);
+            assert!(d <= PICK_RADIUS_PX, "winner must be within radius");
+        }
     }
 }

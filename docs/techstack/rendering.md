@@ -205,14 +205,27 @@ naga compile helper, 1.1-floor boot).
 - `engine::hexsphere` topology and the release `game` binary are untouched; all
   UI code lives in `crates/debug` (first custom swapchain-UI consumer
   per [`stack.md`](stack.md)).
-- Universe maps (`plans/universe-maps`, 2026-09-16): a `PointList` map
-  pipeline (one static buffer, per-vertex color/size/kind, circular
+- Universe maps (`plans/universe-maps`, 3D views in
+  `plans/universe-maps-3d`, 2026-09-16): a `PointList` map pipeline
+  (one static buffer, per-vertex color/size/kind, circular
   `gl_PointCoord` mask, alpha blend, no depth write) draws the Galaxy
   Map (L1 backdrop + nebula impostors + 25k star points) and the System
-  Map star/planets (orbit rings ride the existing line pipeline with a
-  map-space MVP); pan/zoom ride push constants, never the buffers. The
-  map cameras share the screen-space conventions (east/right, north/up,
-  NDC +1 = top). `FillPush` grew an arrival tint (`tint_rgb` right after
+  Map star/planets (orbit rings ride the existing line pipeline with
+  the map view-projection); orbit/pan/zoom ride push constants, never
+  the buffers. Both maps share one `MapOrbitCamera` (debug lib, pure:
+  target/distance/yaw/pitch, per-map clamps; default south-approach
+  tilt, `Home` top-down toggle) under the un-flipped
+  `directx::perspective` projection. World embedding is
+  `(east, up, −north)` — the engine ENU/player frame — so the
+  top-down snap reads exactly like the old 2D map (north up, east
+  right). Vertices are `vec3` world positions (stars carry the real
+  disk thickness from `position_ly[1]`; system orbits add
+  presentation-only inclinations ≤ 10° + ascending nodes off a
+  stream-free index hash — never in descriptors); world-sized sprites
+  scale by `px_scale / clip.w` in the vertex shader. Picking projects
+  every candidate through the same view-projection
+  (`project_to_screen`, NDC +1 = top, `w ≤ 0` rejected) and takes the
+  nearest within 8/10 px, lowest index wins ties. `FillPush` grew an arrival tint (`tint_rgb` right after
   the MVP so `repr(C)` and std430 pack identically, 104 B total — still
   under the 128 B floor): the orbit arrival re-lights the Lit planet
   with the target's atmosphere color and tints the clear color, all

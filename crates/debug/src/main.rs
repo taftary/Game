@@ -29,11 +29,9 @@ use game::journey::{Journey, JourneyEvent, Layer};
 use game::transit::{SIM_DT_SECS, Transit, plan_cost};
 use game_debug::app::{App as DebugApp, MainScreen, ToolsScreen};
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
-use game_debug::galaxy_map::{
-    DEFAULT_GALAXY_SEED, GalaxyMapView, MIN_VIEW_RADIUS_LY, spectral_color,
-};
+use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
-use game_debug::picking::{Ray, intersect_sphere, pick_cell, ray_from_cursor};
+use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
 use game_debug::player_view::{MoveKeys, PlayerViewState};
 use game_debug::sphere_viewer::{DebugMode, SphereViewerState};
 use game_debug::system_map::{SystemMapView, arrival_for, orbit_ring_points, planet_slot};
@@ -368,24 +366,26 @@ void main() {
     f_color = vec4(v_color.rgb, v_color.a * a);
 }";
 
-// Galaxy-map point sprites (universe-maps): one static buffer, one draw.
-// Stars use pixel sizes (`kind` 0); nebula impostors use world-ly sizes
-// (`kind` 1) scaled by `pplx` push (pixels per ly at current zoom), so a
-// single upload serves every zoom level. Circular mask via gl_PointCoord;
-// sizes clamp to 256 px (documented debug-viewer cap).
+// Galaxy/system-map point sprites (universe-maps, universe-maps-3d):
+// one static buffer, one draw. Stars use pixel sizes (`kind` 0);
+// nebula impostors use world sizes (`kind` 1) scaled per-vertex by the
+// perspective divide (`px_scale / clip.w`), so a single upload serves
+// every zoom level and tilt. Circular mask via gl_PointCoord; sizes
+// clamp to 256 px (documented debug-viewer cap).
 const MAP_VERT: &str = r"#version 450
-layout(location = 0) in vec2 map_pos;
+layout(location = 0) in vec3 map_pos;
 layout(location = 1) in vec3 color;
 layout(location = 2) in vec3 misc;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
-    float pplx;
+    float px_scale;
 } pc;
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
 void main() {
-    gl_Position = pc.mvp * vec4(map_pos.x, map_pos.y, 0.0, 1.0);
-    float px = (misc.z < 0.5) ? misc.x : misc.x * pc.pplx;
+    vec4 clip = pc.mvp * vec4(map_pos, 1.0);
+    gl_Position = clip;
+    float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
     gl_PointSize = clamp(px, 1.0, 256.0);
     v_color = color;
     v_alpha = misc.y;
@@ -506,27 +506,30 @@ struct UiPush {
     use_tex: f32,
 }
 
-/// Galaxy-map point vertex: map-space (x, z) in compressed ly + tint +
-/// (size, alpha, kind). `kind` 0 = pixel size (stars, backdrop);
-/// `kind` 1 = world-ly size scaled by `MapPush::pplx` (nebulae).
+/// Galaxy/system-map point vertex: world-space `(east, up, −north)`
+/// in map units (compressed ly / AU) + tint + (size, alpha, kind).
+/// `kind` 0 = pixel size (stars, backdrop, planets); `kind` 1 =
+/// world-unit size scaled by `MapPush::px_scale` over the perspective
+/// divide (nebulae).
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
 struct MapVertex {
-    #[format(R32G32_SFLOAT)]
-    map_pos: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    map_pos: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
     color: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
     misc: [f32; 3],
 }
 
-/// Map push constants: map-space ortho MVP + pixels-per-ly for
-/// world-sized sprites (68 B < 128 B Vulkan 1.1 floor).
+/// Map push constants: perspective view-projection + pixels-per-unit
+/// at the target depth for world-sized sprites (68 B < 128 B
+/// Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct MapPush {
     mvp: [[f32; 4]; 4],
-    pplx: f32,
+    px_scale: f32,
 }
 
 /// Depth format shared by the render pass and the depth image.
@@ -726,8 +729,8 @@ fn run_headless(seed: Option<u64>) -> i32 {
         "player_selftest=lon{lon:.2} lat{lat:.2} loaded{} ok",
         walk.loaded_count(),
     );
-    // Galaxy-map self-test (universe-maps): default seed builds the v1
-    // star count; projecting star 0 and picking it resolves star 0;
+    // Galaxy-map self-test (universe-maps-3d): default seed builds the
+    // v1 star count; projecting star 0 and picking it resolves star 0;
     // zoom clamps hold. GPU-free like the rest of this path.
     let mut map = GalaxyMapView::new(seed.unwrap_or(DEFAULT_GALAXY_SEED));
     assert_eq!(
@@ -735,31 +738,43 @@ fn run_headless(seed: Option<u64>) -> i32 {
         game_engine::universe::DEFAULT_STAR_COUNT as usize,
         "galaxy must build the v1 default star count"
     );
-    let vp = (0.0, 0.0, 800.0, 600.0);
+    let vp = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 800.0,
+        h: 600.0,
+    };
     let star = &map.galaxy.stars[0];
-    let (sx, sy) = map
-        .camera
-        .map_to_screen(star.position_ly[0], star.position_ly[2], vp);
+    let (sx, sy) = project_to_screen(star_world(star), map.camera.view_proj(vp.w / vp.h), vp)
+        .expect("star 0 must project in the default framing");
     assert_eq!(
         map.select_at((sx, sy), vp),
         Some(0),
         "project-then-pick must resolve star 0"
     );
-    map.camera.zoom_by(0.0);
-    assert_eq!(map.camera.view_radius, MIN_VIEW_RADIUS_LY);
+    map.camera.zoom_by(1e-9);
+    assert_eq!(map.camera.distance(), map.camera.min_distance());
+    map.camera.zoom_by(1e9);
+    assert_eq!(map.camera.distance(), map.camera.max_distance());
     println!(
         "galaxy_seed={} galaxy_stars={} galaxy_hash={:016x} pick_selftest=star0 ok",
         map.seed,
         map.galaxy.stars.len(),
         game_engine::universe::galaxy_hash(&map.galaxy),
     );
-    // System-map self-test (universe-maps): load star 0's system,
+    // System-map self-test (universe-maps-3d): load star 0's system,
     // project planet 0 and pick it, toggle the L4 focus, drive the
     // journey drill-down GalaxyMap → SystemMap. GPU-free.
     let star0 = map.galaxy.stars[0].clone();
     let mut system = SystemMapView::new(map.seed, &star0);
-    let (px, pz) = game_debug::system_map::planet_slot(system.system.planets[0].orbit_radius_au, 0);
-    let (sx, sy) = system.camera.map_to_screen(px, pz, vp);
+    let (px, py, pz) =
+        game_debug::system_map::planet_slot(system.system.planets[0].orbit_radius_au, 0);
+    let (sx, sy) = project_to_screen(
+        Vec3::new(px as f32, py as f32, pz as f32),
+        system.camera.view_proj(vp.w / vp.h),
+        vp,
+    )
+    .expect("planet 0 must project in the default framing");
     assert_eq!(system.select_at((sx, sy), vp), Some(0));
     system.toggle_focus();
     assert_eq!(system.focus, Some(0));
@@ -1521,7 +1536,7 @@ struct GalaxyLeftPlan {
     stats_row: Rect,
     cam_row: Rect,
     cam_header: Rect,
-    hints: [Rect; 4],
+    hints: [Rect; 6],
     seed_header: Rect,
     rects: GalaxyLeftRects,
 }
@@ -1557,7 +1572,14 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
     let cam_row = row(&mut y);
     y += 4.0;
     let cam_header = bar(&mut y);
-    let hints = [row(&mut y), row(&mut y), row(&mut y), row(&mut y)];
+    let hints = [
+        row(&mut y),
+        row(&mut y),
+        row(&mut y),
+        row(&mut y),
+        row(&mut y),
+        row(&mut y),
+    ];
     y += 4.0;
     let seed_header = bar(&mut y);
     let field_w = ((left.w - 16.0) * 0.62).max(0.0);
@@ -1623,16 +1645,21 @@ fn build_galaxy_ui(atlas: &mut GlyphAtlas, galaxy: &GalaxyMapView, layout: Layou
         lh,
         plan.cam_row,
         format!(
-            "center {:+.0},{:+.0} R {:.0} ly",
-            galaxy.camera.center_x, galaxy.camera.center_z, galaxy.camera.view_radius
+            "target {:+.0},{:+.0},{:+.0} D {:.0} ly",
+            galaxy.camera.target().x,
+            galaxy.camera.target().y,
+            galaxy.camera.target().z,
+            galaxy.camera.distance()
         ),
         C_DIM,
     );
     section_bar(&mut items, plan.cam_header, "CAMERA");
     for (rect, hint) in plan.hints.iter().zip([
         "wheel: zoom (log)",
-        "drag: pan",
+        "left-drag: orbit",
+        "right-drag: pan",
         "click: select star",
+        "Home: top-down",
         "R: re-roll seed",
     ]) {
         text_row(&mut items, lh, *rect, hint.to_owned(), C_DIM);
@@ -1722,48 +1749,48 @@ fn build_galaxy_ui(atlas: &mut GlyphAtlas, galaxy: &GalaxyMapView, layout: Layou
     }
 
     // ---- Viewport: selection ring around the picked star ----
+    // Projected through the 3D view; hidden when the star is behind
+    // the camera.
     if let Some(star) = galaxy
         .selected
         .and_then(|i| galaxy.galaxy.stars.get(i as usize))
     {
         let vp = layout.viewport;
-        let (sx, sy) = galaxy.camera.map_to_screen(
-            star.position_ly[0],
-            star.position_ly[2],
-            (vp.x, vp.y, vp.w, vp.h),
-        );
-        // Ring as four thin rects (matches the panel aesthetic).
-        // Clamped into the viewport.
-        let r = 7.0;
-        let x0 = sx.clamp(vp.x, vp.x + vp.w);
-        let y0 = sy.clamp(vp.y, vp.y + vp.h);
-        for rect in [
-            Rect {
-                x: x0 - r,
-                y: y0 - r,
-                w: 2.0 * r,
-                h: 1.5,
-            },
-            Rect {
-                x: x0 - r,
-                y: y0 + r,
-                w: 2.0 * r,
-                h: 1.5,
-            },
-            Rect {
-                x: x0 - r,
-                y: y0 - r,
-                w: 1.5,
-                h: 2.0 * r,
-            },
-            Rect {
-                x: x0 + r,
-                y: y0 - r,
-                w: 1.5,
-                h: 2.0 * r,
-            },
-        ] {
-            items.solid(rect, C_KNOB);
+        let view_proj = galaxy.camera.view_proj(vp.w / vp.h);
+        if let Some((sx, sy)) = project_to_screen(star_world(star), view_proj, vp) {
+            // Ring as four thin rects (matches the panel aesthetic).
+            // Clamped into the viewport.
+            let r = 7.0;
+            let x0 = sx.clamp(vp.x, vp.x + vp.w);
+            let y0 = sy.clamp(vp.y, vp.y + vp.h);
+            for rect in [
+                Rect {
+                    x: x0 - r,
+                    y: y0 - r,
+                    w: 2.0 * r,
+                    h: 1.5,
+                },
+                Rect {
+                    x: x0 - r,
+                    y: y0 + r,
+                    w: 2.0 * r,
+                    h: 1.5,
+                },
+                Rect {
+                    x: x0 - r,
+                    y: y0 - r,
+                    w: 1.5,
+                    h: 2.0 * r,
+                },
+                Rect {
+                    x: x0 + r,
+                    y: y0 - r,
+                    w: 1.5,
+                    h: 2.0 * r,
+                },
+            ] {
+                items.solid(rect, C_KNOB);
+            }
         }
     }
     items
@@ -1837,8 +1864,11 @@ fn build_system_ui(
         lh,
         row(&mut y),
         format!(
-            "center {:+.2},{:+.2} R {:.2} AU",
-            system.camera.center_x, system.camera.center_z, system.camera.view_radius
+            "target {:+.2},{:+.2},{:+.2} D {:.2} AU",
+            system.camera.target().x,
+            system.camera.target().y,
+            system.camera.target().z,
+            system.camera.distance()
         ),
         C_DIM,
     );
@@ -1872,8 +1902,10 @@ fn build_system_ui(
     y += lh + 12.0;
     for hint in [
         "wheel: zoom (log)",
-        "drag: pan",
+        "left-drag: orbit",
+        "right-drag: pan",
         "click: select planet",
+        "Home: top-down",
         "F: focus planet (L4)",
         "T: offer / cancel",
         "E: begin transit",
@@ -2037,13 +2069,18 @@ fn build_system_ui(
     }
 
     // ---- Viewport: selection + focus rings ----
+    // Projected through the 3D view; a ring hides when its planet is
+    // behind the camera.
     let vp = layout.viewport;
+    let view_proj = system.camera.view_proj(vp.w / vp.h);
     let mut ring = |planet_index: u32, color: Color| {
         let planet = &system.system.planets[planet_index as usize];
-        let (px, pz) = planet_slot(planet.orbit_radius_au, planet_index);
-        let (sx, sy) = system
-            .camera
-            .map_to_screen(px, pz, (vp.x, vp.y, vp.w, vp.h));
+        let (px, py, pz) = planet_slot(planet.orbit_radius_au, planet_index);
+        let Some((sx, sy)) =
+            project_to_screen(Vec3::new(px as f32, py as f32, pz as f32), view_proj, vp)
+        else {
+            return;
+        };
         let r = 9.0;
         let x0 = sx.clamp(vp.x, vp.x + vp.w);
         let y0 = sy.clamp(vp.y, vp.y + vp.h);
@@ -2955,16 +2992,19 @@ fn upload_lines(
     .expect("wireframe vertex buffer upload must succeed")
 }
 
-/// Upload the galaxy-map point buffer (universe-maps): L1 backdrop
-/// sprites, nebula impostors, then stars — upload order is draw order
-/// for the alpha-blended point draw. One upload per regeneration; zoom
-/// and pan ride the MVP push constants, never the buffer.
+/// Upload the galaxy-map point buffer (universe-maps, universe-maps-3d):
+/// L1 backdrop sprites, nebula impostors, then stars — upload order is
+/// draw order for the alpha-blended point draw. Positions are world
+/// `(east, up, −north)` (stars carry the real disk thickness; nebulae
+/// are plane haze; backdrop is a seeded 3D volume). One upload per
+/// regeneration; orbit/pan/zoom ride the view-projection push, never
+/// the buffer.
 fn upload_map(
     allocator: &Arc<StandardMemoryAllocator>,
     map: &GalaxyMapView,
 ) -> Subbuffer<[MapVertex]> {
     let backdrop = map.backdrop.iter().map(|sprite| MapVertex {
-        map_pos: [sprite.x as f32, sprite.z as f32],
+        map_pos: [sprite.x as f32, sprite.y as f32, -(sprite.z as f32)],
         color: [
             0.55 * sprite.brightness,
             0.60 * sprite.brightness,
@@ -2973,7 +3013,7 @@ fn upload_map(
         misc: [1.5, 1.0, 0.0],
     });
     let nebulae = map.nebulae.iter().map(|sprite| MapVertex {
-        map_pos: [sprite.x as f32, sprite.z as f32],
+        map_pos: [sprite.x as f32, 0.0, -(sprite.z as f32)],
         color: sprite.tint,
         misc: [sprite.radius as f32, sprite.alpha, 1.0],
     });
@@ -2986,8 +3026,9 @@ fn upload_map(
                 | game_engine::universe::SpectralClass::F => 2.5,
                 _ => 2.0,
             };
+        let world = star_world(star);
         MapVertex {
-            map_pos: [star.position_ly[0] as f32, star.position_ly[2] as f32],
+            map_pos: world.to_array(),
             color: spectral_color(star.spectral_class),
             misc: [size, 1.0, 0.0],
         }
@@ -3011,23 +3052,24 @@ fn upload_map(
     .expect("galaxy map vertex buffer upload must succeed")
 }
 
-/// Upload the system-map point buffer (universe-maps): the central star
-/// then the planets at their golden-angle slots, tinted by spectral
-/// class / atmosphere color straight off the descriptors. One upload
-/// per system load; focus and pan ride push constants.
+/// Upload the system-map point buffer (universe-maps, universe-maps-3d):
+/// the central star then the planets at their tilted world slots,
+/// tinted by spectral class / atmosphere color straight off the
+/// descriptors. One upload per system load; focus and camera ride
+/// push constants.
 fn upload_system_points(
     allocator: &Arc<StandardMemoryAllocator>,
     system: &SystemMapView,
 ) -> Subbuffer<[MapVertex]> {
     let star = std::iter::once(MapVertex {
-        map_pos: [0.0, 0.0],
+        map_pos: [0.0, 0.0, 0.0],
         color: spectral_color(system.system.star.spectral_class),
         misc: [9.0, 1.0, 0.0],
     });
     let planets = system.system.planets.iter().enumerate().map(|(i, planet)| {
-        let (px, pz) = planet_slot(planet.orbit_radius_au, i as u32);
+        let (px, py, pz) = planet_slot(planet.orbit_radius_au, i as u32);
         MapVertex {
-            map_pos: [px as f32, pz as f32],
+            map_pos: [px as f32, py as f32, pz as f32],
             color: planet.descriptor.atmosphere.color,
             misc: [3.0 + planet.descriptor.radius_km * 0.4, 1.0, 0.0],
         }
@@ -3049,21 +3091,22 @@ fn upload_system_points(
     .expect("system map vertex buffer upload must succeed")
 }
 
-/// Upload the system-map orbit rings as line segments (universe-maps):
-/// each ring tessellates into segment pairs for the `LineList` pipeline.
+/// Upload the system-map orbit rings as line segments
+/// (universe-maps, universe-maps-3d): each ring tessellates into
+/// segment pairs for the `LineList` pipeline, in tilted world space.
 fn upload_system_lines(
     allocator: &Arc<StandardMemoryAllocator>,
     system: &SystemMapView,
 ) -> Subbuffer<[LineVertex]> {
     let mut verts = Vec::new();
-    for planet in &system.system.planets {
-        let ring = orbit_ring_points(planet.orbit_radius_au);
+    for (i, planet) in system.system.planets.iter().enumerate() {
+        let ring = orbit_ring_points(planet.orbit_radius_au, i as u32);
         for pair in ring.windows(2) {
             verts.push(LineVertex {
-                position: [pair[0].0, pair[0].1, 0.0],
+                position: [pair[0].0, pair[0].1, pair[0].2],
             });
             verts.push(LineVertex {
-                position: [pair[1].0, pair[1].1, 0.0],
+                position: [pair[1].0, pair[1].1, pair[1].2],
             });
         }
     }
@@ -3194,6 +3237,9 @@ struct ViewerApp {
     transit_acc: f32,
     atlas_image: Option<Arc<Image>>,
     dragging_orbit: bool,
+    /// Right/middle-button viewport drag on the map screens: pans the
+    /// 3D map camera (universe-maps-3d; left-drag orbits there).
+    dragging_pan: bool,
     dragging_slider: bool,
     dragging_density: bool,
     /// Last frame time: the player movement `dt` source (clamped).
@@ -3371,6 +3417,7 @@ impl ViewerApp {
             transit_acc: 0.0,
             atlas_image: None,
             dragging_orbit: false,
+            dragging_pan: false,
             dragging_slider: false,
             dragging_density: false,
             last_frame: None,
@@ -3784,27 +3831,13 @@ impl ViewerApp {
                     if let Some(last) = last {
                         let (dx, dy) = (cursor.0 - last.0, cursor.1 - last.1);
                         if screen == MainScreen::GalaxyMap || screen == MainScreen::SystemMap {
-                            // Map pan: content follows the cursor —
-                            // the inverse of `map_to_screen` (screen +dx
-                            // is map −x; screen +dy, with north up, is
-                            // map +z).
-                            if let Some(ctx) = self.main.as_ref() {
-                                let (w, h) = ctx.size();
-                                let layout = app_layout(screen, w, h);
-                                let vp = layout.viewport;
-                                if screen == MainScreen::GalaxyMap {
-                                    let lpp = self.debug.galaxy.camera.ly_per_pixel(vp.w, vp.h);
-                                    self.debug
-                                        .galaxy
-                                        .camera
-                                        .pan_by(-dx as f64 * lpp, dy as f64 * lpp);
-                                } else {
-                                    let app = self.debug.system.camera.au_per_pixel(vp.w, vp.h);
-                                    self.debug
-                                        .system
-                                        .camera
-                                        .pan_by(-dx as f64 * app, dy as f64 * app);
-                                }
+                            // Map orbit: left-drag rotates the 3D map
+                            // camera (universe-maps-3d; right/middle
+                            // drag pans, below).
+                            if screen == MainScreen::GalaxyMap {
+                                self.debug.galaxy.camera.rotate(dx, dy);
+                            } else {
+                                self.debug.system.camera.rotate(dx, dy);
                             }
                         } else if self.debug.viewer.player.active {
                             // Player mode orbits the follow camera instead
@@ -3813,6 +3846,23 @@ impl ViewerApp {
                             self.debug.viewer.player.rotate_camera(dx, dy);
                         } else {
                             self.camera.rotate(dx, dy);
+                        }
+                    }
+                } else if self.dragging_pan {
+                    // Map pan: right/middle-drag moves the 3D map camera
+                    // target in the view plane (content follows the
+                    // cursor). Sphere/UV screens never set this flag.
+                    let last = self.main.as_ref().and_then(|ctx| ctx.last_cursor);
+                    if let Some(last) = last
+                        && let Some(ctx) = self.main.as_ref()
+                    {
+                        let (dx, dy) = (cursor.0 - last.0, cursor.1 - last.1);
+                        let (w, h) = ctx.size();
+                        let vp = app_layout(screen, w, h).viewport;
+                        if screen == MainScreen::GalaxyMap {
+                            self.debug.galaxy.camera.pan_screen(dx, dy, vp.h);
+                        } else if screen == MainScreen::SystemMap {
+                            self.debug.system.camera.pan_screen(dx, dy, vp.h);
                         }
                     }
                 }
@@ -3824,11 +3874,30 @@ impl ViewerApp {
                 self.update_hover();
             }
             WindowEvent::MouseInput { button, state, .. } => {
+                let pressed = state == ElementState::Pressed;
+                let screen = self.debug.main_screen;
+                // Right/middle buttons pan the 3D map cameras
+                // (universe-maps-3d; left-drag orbits there). Other
+                // buttons are ignored.
+                if matches!(button, MouseButton::Right | MouseButton::Middle) {
+                    if !pressed {
+                        self.dragging_pan = false;
+                    } else if screen == MainScreen::GalaxyMap || screen == MainScreen::SystemMap {
+                        let in_viewport = self.main.as_ref().is_some_and(|ctx| {
+                            let (w, h) = ctx.size();
+                            ctx.last_cursor.is_some_and(|(cx, cy)| {
+                                app_layout(screen, w, h).viewport.contains(cx, cy)
+                            })
+                        });
+                        if in_viewport {
+                            self.dragging_pan = true;
+                        }
+                    }
+                    return;
+                }
                 if button != MouseButton::Left {
                     return;
                 }
-                let pressed = state == ElementState::Pressed;
-                let screen = self.debug.main_screen;
                 if !pressed {
                     // Release: a press that barely traveled counts as a
                     // click — pin the hovered chunk. The release must
@@ -3879,11 +3948,7 @@ impl ViewerApp {
                             None => return,
                         };
                         let vp = layout.viewport;
-                        if let Some(i) = self
-                            .debug
-                            .galaxy
-                            .select_at((cx, cy), (vp.x, vp.y, vp.w, vp.h))
-                        {
+                        if let Some(i) = self.debug.galaxy.select_at((cx, cy), vp) {
                             self.debug.journey.update(JourneyEvent::SelectStar(i));
                         }
                     }
@@ -3901,11 +3966,7 @@ impl ViewerApp {
                             None => return,
                         };
                         let vp = layout.viewport;
-                        if let Some(i) = self
-                            .debug
-                            .system
-                            .select_at((cx, cy), (vp.x, vp.y, vp.w, vp.h))
-                        {
+                        if let Some(i) = self.debug.system.select_at((cx, cy), vp) {
                             self.debug.journey.update(JourneyEvent::SelectPlanet(i));
                         }
                         // A miss clears the screen selection; the machine
@@ -3933,8 +3994,9 @@ impl ViewerApp {
                         return;
                     }
                 }
-                // Viewport drag starts an orbit (sphere/UV) or a pan
-                // (map screens).
+                // Viewport drag starts an orbit drag (left button
+                // everywhere now — the 3D map cameras orbit on left,
+                // pan on right/middle).
                 if layout.viewport.contains(cx, cy) {
                     self.dragging_orbit = true;
                     // A sphere-screen press may end as a chunk-pin click,
@@ -4069,11 +4131,11 @@ impl ViewerApp {
                     };
                     if self.debug.main_screen == MainScreen::GalaxyMap {
                         // Log zoom on the map: wheel-up (positive scroll)
-                        // shrinks the view radius.
-                        let factor = (1.0 - 0.12 * scroll).max(0.05) as f64;
+                        // shrinks the camera distance.
+                        let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.galaxy.camera.zoom_by(factor);
                     } else if self.debug.main_screen == MainScreen::SystemMap {
-                        let factor = (1.0 - 0.12 * scroll).max(0.05) as f64;
+                        let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.system.camera.zoom_by(factor);
                     } else if self.debug.viewer.player.active {
                         self.debug.viewer.player.zoom_camera(scroll);
@@ -4471,6 +4533,27 @@ impl ViewerApp {
                                 viewer.radius_field.insert_char(ch);
                             }
                             viewer.sync_slider_from_field();
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::Home) => {
+                        // Top-down snap toggle (universe-maps-3d): map
+                        // screens only. First press frames the classic
+                        // 2D read (north up, east right); second press
+                        // restores the previous tilt.
+                        let fields_free = {
+                            let viewer = &self.debug.viewer;
+                            !viewer.subdiv_field.focused
+                                && !viewer.radius_field.focused
+                                && !self.debug.galaxy.seed_field.focused
+                        };
+                        if fields_free {
+                            if self.debug.main_screen == MainScreen::GalaxyMap {
+                                self.debug.galaxy.camera.toggle_top_down();
+                                self.debug.fx.notify("Top-down · [Home] tilt".to_owned());
+                            } else if self.debug.main_screen == MainScreen::SystemMap {
+                                self.debug.system.camera.toggle_top_down();
+                                self.debug.fx.notify("Top-down · [Home] tilt".to_owned());
+                            }
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyG | KeyCode::KeyB) => {
@@ -4881,10 +4964,11 @@ impl ViewerApp {
                 };
                 if view == MainScreen::GalaxyMap {
                     // Galaxy map: one static point buffer (backdrop +
-                    // impostors + stars); pan/zoom ride the MVP push.
+                    // impostors + stars); orbit/pan/zoom ride the
+                    // view-projection push.
                     let galaxy = &self.debug.galaxy;
-                    let mvp = galaxy.camera.mvp(vp.w, vp.h);
-                    let pplx = vp.h / (2.0 * galaxy.camera.view_radius as f32);
+                    let mvp = galaxy.camera.view_proj(vp.w / vp.h).to_cols_array_2d();
+                    let px_scale = galaxy.camera.px_scale(vp.h);
                     builder
                         .set_viewport(0, [viewport].into_iter().collect())
                         .expect("viewport must set")
@@ -4895,7 +4979,7 @@ impl ViewerApp {
                         .push_constants(
                             ctx.pipelines.map.layout().clone(),
                             0,
-                            MapPush { mvp, pplx },
+                            MapPush { mvp, px_scale },
                         )
                         .expect("map push constants must upload");
                     // SAFETY: `vertex_count` equals the uploaded point
@@ -4906,9 +4990,9 @@ impl ViewerApp {
                 } else if view == MainScreen::SystemMap {
                     // System map: orbit rings through the line pipeline,
                     // star + planets through the map point pipeline — both
-                    // under the AU camera MVP, rings first.
+                    // under the perspective view-projection, rings first.
                     let system = &self.debug.system;
-                    let mvp = system.camera.mvp(vp.w, vp.h);
+                    let mvp = system.camera.view_proj(vp.w / vp.h).to_cols_array_2d();
                     builder
                         .set_viewport(0, [viewport].into_iter().collect())
                         .expect("viewport must set")
@@ -4927,7 +5011,7 @@ impl ViewerApp {
                     // ring segments, no index buffer bound.
                     unsafe { builder.draw(self.system_lines.len() as u32, 1, 0, 0) }
                         .expect("system rings draw must record");
-                    let pplx = vp.h / (2.0 * system.camera.view_radius as f32);
+                    let px_scale = system.camera.px_scale(vp.h);
                     builder
                         .bind_pipeline_graphics(ctx.pipelines.map.clone())
                         .expect("pipeline must bind")
@@ -4936,7 +5020,7 @@ impl ViewerApp {
                         .push_constants(
                             ctx.pipelines.map.layout().clone(),
                             0,
-                            MapPush { mvp, pplx },
+                            MapPush { mvp, px_scale },
                         )
                         .expect("map push constants must upload");
                     // SAFETY: same contract as the galaxy map draw.
@@ -5450,7 +5534,7 @@ mod tests {
 
     #[test]
     fn map_push_constants_fit_vulkan_floor() {
-        // Same 128 B floor for the map block (MVP + pixels-per-ly).
+        // Same 128 B floor for the map block (MVP + pixels-per-unit).
         let bytes = std::mem::size_of::<MapPush>();
         assert!(
             bytes <= 128,

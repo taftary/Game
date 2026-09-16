@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.11.0 (2026-09-16, M5 universe maps implemented: `engine::universe` stages 1–2 + `engine::core` RNG/quantization, `game` journey top segment + timed transit, `game_debug` Galaxy/System map screens + orbit arrival binding)
+- **Version:** 0.12.0 (2026-09-16, universe maps in 3D: shared `MapOrbitCamera` + projection picking in `game_debug`, galaxy disk thickness drawn from descriptors, presentation-only system inclinations, `Home` top-down snap; no engine/`game` changes)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

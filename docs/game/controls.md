@@ -34,9 +34,12 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   `P` cycles Follow → First-person → Third-person, `1`–`6` select the
   debug-shader mode, `G`/`T`/`B` snap the global camera to
   Perspective/Top/Bottom (sphere screen only, same as the panel VIEW
-  buttons; `R` = Right preset there). Map screens (`plans/universe-maps`):
-  wheel = log zoom, drag = pan, click = select star/planet; Galaxy Map
-  `E` drills into the selected star's system, `R` re-rolls the seed, seed
+   buttons; `R` = Right preset there). Map screens (`plans/universe-maps`,
+   `plans/universe-maps-3d`): 3D perspective views — wheel = log zoom,
+   left-drag = orbit, right/middle-drag = pan, click = select
+   star/planet, `Home` = top-down snap toggle (classic north-up /
+   east-right framing); Galaxy Map
+   `E` drills into the selected star's system, `R` re-rolls the seed, seed
   field + Load (or Enter) loads a typed universe (`--seed N` flag does
   the same at startup); System Map `F` toggles L4 planet focus, `T`
   arms/withdraws the travel offer, `E` begins the timed transit
