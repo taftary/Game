@@ -10,3 +10,4 @@
 - [x] ADR-008: ECS — adopt `hecs`, custom scheduling — [`ADR-008.md`](ADR-008.md).
 - [x] ADR-009: allocator default (`mimalloc`, validate M1) + `tracing` logging — [`ADR-009.md`](ADR-009.md).
 - [x] ADR-010: cell-chunk identity (chunk = dual cell index, grouping deferred to M2) — [`ADR-010.md`](ADR-010.md).
+- [x] ADR-011: build-order re-sequence — M5 universe maps executes ahead of M2–M4 (numbers are labels; landing-site selection moves M5 → M2) — [`ADR-011.md`](ADR-011.md).

@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.9.0 (2026-09-16, scale hierarchy: `plans/scale-hierarchy` — `journey.md` adopts the canonical 8-level cosmic-to-subterranean table + drill-down diagram + Level 8 deep-dive; satellite docs synced)
+- **Version:** 0.10.0 (2026-09-16, roadmap re-sequence ADR-011: M5 universe maps executes ahead of M2–M4; `plans/universe-maps` notion drafted; landing-site selection moved M5 → M2)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
