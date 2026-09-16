@@ -16,8 +16,9 @@ pub const PLAYER_GRACE_TICKS: u64 = 10;
 /// equatorial lap takes ~12.6 s — brisk but inspectable).
 pub const SPEED_RADIUS_RATIO: f32 = 0.5;
 
-/// Held movement keys. North/south drive the tangent-plane forward axis,
-/// west/east the right axis; opposing pairs cancel.
+/// Held movement keys. North/south drive thrust (forward/backward
+/// along the heading), west/east rotate the heading (left/right);
+/// opposing pairs cancel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MoveKeys {
     pub north: bool,
@@ -27,7 +28,8 @@ pub struct MoveKeys {
 }
 
 impl MoveKeys {
-    /// Fold held keys into a [`MoveInput`] (each axis `-1.0..=1.0`).
+    /// Fold held keys into a [`MoveInput`]: north/south → thrust
+    /// `±1.0`, west/east → turn `∓/±1.0` (each axis `-1.0..=1.0`).
     pub fn input(self) -> MoveInput {
         let axis = |pos: bool, neg: bool| f32::from(pos) - f32::from(neg);
         MoveInput::new(axis(self.north, self.south), axis(self.east, self.west))
@@ -129,6 +131,12 @@ impl PlayerViewState {
         self.player.position()
     }
 
+    /// Direction the player faces (stored heading in the tangent frame,
+    /// unit length) — the debug marker arrow source.
+    pub fn facing(&self) -> Vec3 {
+        self.player.facing()
+    }
+
     /// Player camera position for the current mode.
     pub fn eye(&self) -> Vec3 {
         self.camera.eye(&self.player)
@@ -150,6 +158,11 @@ impl PlayerViewState {
             self.player.longitude().to_degrees(),
             self.player.latitude().to_degrees(),
         )
+    }
+
+    /// Compass bearing in degrees for the panel readout.
+    pub fn heading_deg(&self) -> f32 {
+        self.player.heading().to_degrees()
     }
 
     /// Currently loaded chunk count.
@@ -179,13 +192,14 @@ mod tests {
     }
 
     #[test]
-    fn keys_fold_to_tangent_input() {
+    fn keys_fold_to_heading_input() {
         assert_eq!(MoveKeys::default().input(), MoveInput::idle());
         let keys = MoveKeys {
             north: true,
             east: true,
             ..MoveKeys::default()
         };
+        // Thrust forward + turn right.
         assert_eq!(keys.input(), MoveInput::new(1.0, 1.0));
         // Opposing pairs cancel.
         let stuck = MoveKeys {
@@ -198,19 +212,36 @@ mod tests {
     }
 
     #[test]
-    fn update_walks_and_streams() {
+    fn turn_key_rotates_without_walking() {
         let mut state = active_state();
+        let before = state.position();
         state.set_keys(MoveKeys {
             east: true,
             ..MoveKeys::default()
         });
         let delta = state.update(0.05, &[1, 2, 3]);
         assert_eq!(delta.loaded, vec![1, 2, 3]);
-        let (lon, lat) = state.lon_lat_deg();
-        assert!(lon > 0.0, "east walk must raise longitude, got {lon}");
-        assert!(lat.abs() < 1e-4, "{lat}");
+        assert!((state.position() - before).length() < 1e-6);
+        assert!(
+            state.heading_deg() > 0.0,
+            "east key must turn right, got {}",
+            state.heading_deg()
+        );
         assert_eq!(state.tick(), 1);
         assert_eq!(state.loaded_count(), 3);
+    }
+
+    #[test]
+    fn thrust_key_walks_along_heading() {
+        let mut state = active_state();
+        state.set_keys(MoveKeys {
+            north: true,
+            ..MoveKeys::default()
+        });
+        state.update(0.05, &[1, 2, 3]);
+        let (lon, lat) = state.lon_lat_deg();
+        assert!(lat > 0.0, "north thrust must raise latitude, got {lat}");
+        assert!(lon.abs() < 1e-4, "{lon}");
     }
 
     #[test]

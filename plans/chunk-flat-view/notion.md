@@ -2,8 +2,14 @@
 
 ## Status
 
-`in-review` (plan: [`plan.md`](plan.md) — all DoD criteria implemented
-and gate-verified; awaiting windowed visual confirmation in the viewer)
+`in-progress` (plan: [`plan.md`](plan.md) — base feature implemented;
+reopened 2026-09-16 for the continuous-player-marker amendment:
+exact-projection marker, rim-only re-anchor, streaming decouple;
+see Phase 5. Awaiting windowed visual confirmation in the viewer.)
+
+Parent updates driving this amendment:
+[`../player-sphere-movement/update-2026-09-16-0736/notion.md`](../player-sphere-movement/update-2026-09-16-0736/notion.md),
+[`../debug-player-view/update-2026-09-16-0736/notion.md`](../debug-player-view/update-2026-09-16-0736/notion.md).
 
 ## Context
 
@@ -104,6 +110,26 @@ of load/unload behavior.
 - `--headless` prints `chunk_flat_*` self-test line (coverage +
   antipodal reload + flat pick check).
 
+### Amendment 2026-09-16 — continuous player marker (Phase 5)
+
+The flat player marker snapped cell-center to cell-center and the
+viewpoint re-centered every 100 ms, teleporting the marker to map
+center each sync. New behavior:
+
+- `build_chunk_flat` also returns its `(lo, span)` normalization
+  (`ChunkFlatNorm` + `chunk_flat_normalize`); `SphereViewerState`
+  stores it at every rebuild and exposes `player_flat_uv()` — the
+  player's exact position in buffer UV space (no cell snap, clamped
+  at the rim).
+- The flat viewpoint stays fixed while the player walks inside its
+  hemisphere and re-anchors on the player only when the viewpoint
+  cosine drops below `FLAT_RECENTER_DOT` (~70°): movement is never
+  interrupted (re-anchor is a view change; the sim is untouched), and
+  the marker glides continuously between re-anchors.
+- Streaming desired-set decouples from the flat viewpoint: the binary
+  refreshes the player's own hemisphere on a 100 ms throttle
+  (`STREAM_SYNC_MS`) instead of cloning the flat cells.
+
 ## Non-functional requirements
 
 - All `docs/techstack/quality.md` gates green.
@@ -123,6 +149,9 @@ of load/unload behavior.
 - [ ] Arrow keys orbit + reload buffers (unload/load).
 - [ ] Hover/pin works on the flat map.
 - [ ] `--headless` self-test covers hemisphere + reload + pick.
+- [ ] Amendment: marker uses exact projection (norm round-trip pinned
+  by test); viewpoint re-anchors at the rim only; streaming follows
+  the player, not the viewpoint.
 - [ ] Docs updated; all touched links resolve.
 - [ ] All quality.md gates green; plan.md DoD verification records
   evidence per criterion.

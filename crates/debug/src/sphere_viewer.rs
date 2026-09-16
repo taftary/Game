@@ -6,11 +6,12 @@
 use std::time::Instant;
 
 use game_engine::hexsphere::{ChunkId, DEFAULT_SUBDIVISIONS, HexSphere};
-use game_engine::render::{FlatUnwrap, PlanetVertex, orbit_viewpoint};
+use game_engine::render::{FlatUnwrap, PlanetVertex, orbit_viewpoint, project_to_tangent};
 
 use crate::mesh::{
-    ChunkFlatVertex, FillDebug, ViewerStats, build_chunk_flat, build_chunk_flat_wireframe,
-    build_fill, build_fill_debug, build_wireframe, viewer_stats,
+    ChunkFlatNorm, ChunkFlatVertex, FillDebug, ViewerStats, build_chunk_flat,
+    build_chunk_flat_wireframe, build_fill, build_fill_debug, build_wireframe,
+    chunk_flat_normalize, viewer_stats,
 };
 use crate::params::{self, MAX_SUBDIVISIONS, MIN_SUBDIVISIONS, ParamsError, ValidParams};
 use crate::player_view::PlayerViewState;
@@ -184,6 +185,11 @@ pub struct SphereViewerState {
     pub chunk_flat_cells: Vec<u32>,
     /// Normalized `[0, 1]²` centers aligned with `chunk_flat_cells`.
     pub chunk_flat_centers: Vec<[f32; 2]>,
+    /// Raw-tangent → `[0, 1]²` normalization of the current flat
+    /// buffers (stored at every rebuild): the binary projects the exact
+    /// player position through it, so the marker glides continuously
+    /// instead of snapping cell-center to cell-center.
+    pub chunk_flat_norm: ChunkFlatNorm,
     /// Flat chunk-map fill vertices (cell-by-cell fans).
     pub chunk_flat_vertices: Vec<ChunkFlatVertex>,
     /// Flat chunk-map index buffer (triangle list).
@@ -258,6 +264,7 @@ impl SphereViewerState {
             chunk_flat_viewpoint: [0.0, 1.0, 0.0],
             chunk_flat_cells: Vec::new(),
             chunk_flat_centers: Vec::new(),
+            chunk_flat_norm: ([0.0; 2], [1.0; 2]),
             chunk_flat_vertices: Vec::new(),
             chunk_flat_indices: Vec::new(),
             chunk_flat_wire: Vec::new(),
@@ -320,27 +327,31 @@ impl SphereViewerState {
         {
             self.pinned = None;
         }
-        // Fresh mesh, fresh viewpoint: reset to the north pole, then
-        // load its hemisphere. The player restarts on the new planet
-        // (same mode) so streaming ids never go stale across meshes.
+        // Fresh mesh, fresh viewpoint: open the flat map on the
+        // restarted player (same mode) so the exact marker starts
+        // centered with no first-frame re-anchor jump, and streaming
+        // ids never go stale across meshes.
         self.stats = viewer_stats(&mesh, gen_ms);
         self.mesh = mesh;
         self.player.reset(applied.radius);
-        self.chunk_flat_viewpoint = [0.0, self.radius, 0.0];
+        self.chunk_flat_viewpoint = self.player.position().to_array();
         self.rebuild_chunk_flat();
         Ok(applied)
     }
 
     /// Rebuild the flat hemisphere buffers for the current viewpoint:
     /// unloads the old half, loads the new one. Called by
-    /// [`SphereViewerState::regenerate`] and every arrow-key orbit step.
+    /// [`SphereViewerState::regenerate`], every arrow-key orbit step,
+    /// and the player-mode rim re-anchor (the viewpoint only moves
+    /// there; walking inside the hemisphere never rebuilds).
     pub fn rebuild_chunk_flat(&mut self) {
-        let (vertices, indices, cells, centers) =
+        let (vertices, indices, cells, centers, norm) =
             build_chunk_flat(&self.mesh, self.chunk_flat_viewpoint);
         self.chunk_flat_vertices = vertices;
         self.chunk_flat_indices = indices;
         self.chunk_flat_cells = cells;
         self.chunk_flat_centers = centers;
+        self.chunk_flat_norm = norm;
         self.chunk_flat_wire = build_chunk_flat_wireframe(&self.mesh, self.chunk_flat_viewpoint);
         // Hover never survives a load/unload cycle. Pins are chunk
         // identities, not loaded state: they survive even when the
@@ -365,6 +376,16 @@ impl SphereViewerState {
             *v *= scale;
         }
         self.rebuild_chunk_flat();
+    }
+
+    /// Exact player position in normalized flat UV: the true position
+    /// through the same projection + normalization as the buffers — no
+    /// cell-center snap, so the marker moves continuously like the
+    /// sphere view. Clamped to `[0, 1]²` at the hemisphere rim.
+    pub fn player_flat_uv(&self) -> [f32; 2] {
+        let raw = project_to_tangent(self.player.position().to_array(), self.chunk_flat_viewpoint);
+        let (lo, span) = self.chunk_flat_norm;
+        chunk_flat_normalize(raw, lo, span)
     }
 
     /// Current field texts: Regenerate enabled only when both validate.
@@ -475,7 +496,11 @@ mod tests {
         assert_eq!(state.flat.indices.len() % 3, 0);
         assert!(state.flat.uv.len() >= state.fill_vertices.len());
         assert_eq!(state.flat.source.len(), state.flat.uv.len());
-        assert_eq!(state.chunk_flat_viewpoint, [0.0, 1.0, 0.0]);
+        // The flat map opens on the player (no first-frame re-anchor).
+        assert_eq!(
+            state.chunk_flat_viewpoint,
+            state.player.position().to_array()
+        );
         assert_eq!(state.chunk_flat_cells.len(), state.chunk_flat_centers.len());
         assert!(!state.chunk_flat_cells.is_empty());
         assert!(state.chunk_flat_cells.len() < state.stats.cells);

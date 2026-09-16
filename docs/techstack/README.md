@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.6.6 (2026-09-15, debug viewer panel UX: left view dock (VIEW / UV DEBUG / OVERLAYS) + right data dock (INPUTS / SELECTION / STATS) with section bars, 2×2 camera preset grid, non-viewer screens reclaim full width)
+- **Version:** 0.6.8 (2026-09-16, 3D projection un-flipped: `OrbitCamera::projection_matrix` now outputs framebuffer-true NDC (+1 = top row, matching the UI ortho and flat-map MVP) instead of glam's Y-flipped `vulkan::perspective`; player tangent frame made true ENU so turn input steers toward the avatar's own right; follow camera opens south of the player looking north)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

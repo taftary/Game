@@ -74,8 +74,12 @@ impl PlayerCamera {
             mode: CameraMode::Follow,
             radius,
             global: OrbitCamera::framing_planet(radius),
+            // South of a north-facing player, looking north: thrust
+            // walks up-screen, east lies right-screen (map-like view).
+            // (Negative pitch: the world-space offset sits on the
+            // south side; yaw 0 keeps it outside the planet.)
             follow_yaw: 0.0,
-            follow_pitch: 0.5,
+            follow_pitch: -0.5,
             follow_distance: radius * 0.8,
             eye_height: radius * 0.01,
             chase_distance: radius * 0.2,

@@ -5,7 +5,7 @@
 //! World units are meters; the camera is decoupled from game logic
 //! (VR future-proofing per `docs/game/scope.md`).
 
-use glam::camera::rh::proj::vulkan::perspective;
+use glam::camera::rh::proj::directx::perspective;
 use glam::camera::rh::view::look_at_mat4;
 use glam::{Mat4, Vec3};
 
@@ -95,7 +95,15 @@ impl OrbitCamera {
         look_at_mat4(self.eye(), self.target, Vec3::Y)
     }
 
-    /// Perspective projection in Vulkan NDC (Z in [0, 1], Y-down).
+    /// Perspective projection in framebuffer NDC (Z in `[0, 1]`, NDC
+    /// +1 = top row — the app's proven convention: the UI ortho and
+    /// the flat-map MVP both treat pixel row 0 as NDC +1, and picking
+    /// unprojects the same way). This is the RH/ZO matrix **without**
+    /// glam's Y-flip: `vulkan::perspective` (`directx` is the same
+    /// convention) baked a Y-flip into the projection, which mirrored
+    /// every 3D view vertically on screen (player-camera flip,
+    /// 2026-09-16). The mesh's CCW-outward fans then classify as CCW
+    /// front faces directly (`FrontFace::CounterClockwise`).
     pub fn projection_matrix(&self, aspect: f32) -> Mat4 {
         perspective(FOV_Y, aspect, 0.05, 1000.0)
     }
@@ -162,13 +170,17 @@ mod tests {
 
     #[test]
     fn projection_uses_vulkan_ndc() {
-        use glam::camera::rh::proj::{opengl, vulkan};
+        use glam::camera::rh::proj::{directx, vulkan};
         let camera = camera();
         let aspect = 16.0 / 9.0;
         let projection = camera.projection_matrix(aspect);
-        // Vulkan NDC: matches the native Vulkan constructor exactly.
-        assert_eq!(projection, vulkan::perspective(FOV_Y, aspect, 0.05, 1000.0));
-        // And differs from OpenGL NDC (Y-up, Z in [-1, 1]).
-        assert_ne!(projection, opengl::perspective(FOV_Y, aspect, 0.05, 1000.0));
+        // Framebuffer-true NDC (Z in [0, 1], no Y-flip): matches the
+        // DirectX/WebGPU constructor exactly.
+        assert_eq!(
+            projection,
+            directx::perspective(FOV_Y, aspect, 0.05, 1000.0)
+        );
+        // And differs from glam's Y-flipped Vulkan constructor.
+        assert_ne!(projection, vulkan::perspective(FOV_Y, aspect, 0.05, 1000.0));
     }
 }

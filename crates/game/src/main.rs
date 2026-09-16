@@ -25,12 +25,13 @@ const DT: f32 = 0.05;
 /// Ticks an unseen chunk survives before eviction.
 const UNLOAD_GRACE_TICKS: u64 = 10;
 
-/// One scripted leg: walk input, step count, camera mode for the leg.
+/// One scripted leg: heading-relative walk input, step count, camera
+/// mode for the leg. Thrust walks along the heading, turn rotates it.
 const LEGS: [(MoveInput, u64, CameraMode); 4] = [
     (
         MoveInput {
-            forward: 0.0,
-            right: 1.0,
+            forward: 1.0,
+            turn: 0.0,
         },
         12,
         CameraMode::Follow,
@@ -38,7 +39,7 @@ const LEGS: [(MoveInput, u64, CameraMode); 4] = [
     (
         MoveInput {
             forward: 1.0,
-            right: 0.5,
+            turn: 0.5,
         },
         12,
         CameraMode::FirstPerson,
@@ -46,7 +47,7 @@ const LEGS: [(MoveInput, u64, CameraMode); 4] = [
     (
         MoveInput {
             forward: 0.0,
-            right: -1.0,
+            turn: -1.0,
         },
         12,
         CameraMode::ThirdPerson,
@@ -54,7 +55,7 @@ const LEGS: [(MoveInput, u64, CameraMode); 4] = [
     (
         MoveInput {
             forward: 0.0,
-            right: 0.0,
+            turn: 0.0,
         },
         12,
         CameraMode::Global,
@@ -92,9 +93,10 @@ fn main() {
             );
             let eye = camera.eye(&player);
             println!(
-                "t={tick:02} mode={mode:?} lon={:7.2} lat={:6.2} want={} +{} -{} have={} eye=({:.1},{:.1},{:.1})",
+                "t={tick:02} mode={mode:?} lon={:7.2} lat={:6.2} hdg={:6.1} want={} +{} -{} have={} eye=({:.1},{:.1},{:.1})",
                 player.longitude().to_degrees(),
                 player.latitude().to_degrees(),
+                player.heading().to_degrees(),
                 desired.len(),
                 delta.loaded.len(),
                 delta.unloaded.len(),
@@ -107,9 +109,10 @@ fn main() {
     }
 
     println!(
-        "done: lon={:.2} lat={:.2} loaded={}",
+        "done: lon={:.2} lat={:.2} hdg={:.1} loaded={}",
         player.longitude().to_degrees(),
         player.latitude().to_degrees(),
+        player.heading().to_degrees(),
         streamer.loaded_count(),
     );
 }

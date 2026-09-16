@@ -492,7 +492,7 @@ mod tests {
         use crate::mesh::build_chunk_flat;
         for n in 1..=2 {
             let mesh = HexSphere::generate(n, 1.0);
-            let (_, _, cells, centers) = build_chunk_flat(&mesh, [0.0, 1.0, 0.0]);
+            let (_, _, cells, centers, _) = build_chunk_flat(&mesh, [0.0, 1.0, 0.0]);
             for (slot, &cell) in cells.iter().enumerate() {
                 assert_eq!(
                     pick_flat_visible(&mesh, &cells, &centers, centers[slot]).index(),

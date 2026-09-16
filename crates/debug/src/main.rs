@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use game::camera::CameraMode;
 use game_debug::app::{App as DebugApp, Screen};
+use game_debug::mesh::chunk_flat_normalize;
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{
     Ray, flat_point_from_cursor, intersect_sphere, pick_cell, pick_flat_visible, ray_from_cursor,
@@ -33,7 +34,7 @@ use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
 use game_engine::render::{
     MAX_PITCH, OrbitCamera, ShaderKind, compile_glsl_to_spirv, create_instance, device_score,
-    log_physical_device, required_device_extensions, visible_hemisphere,
+    log_physical_device, project_to_tangent, required_device_extensions, visible_hemisphere,
 };
 use glam::{Mat4, Vec3};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -538,9 +539,15 @@ fn app_layout(screen: Screen, win_w: f32, win_h: f32) -> Layout {
 /// Player marker dot (sphere + flat map).
 const C_PLAYER: Color = [0.30, 1.00, 0.45, 1.0];
 /// Player marker size, pixels.
-const PLAYER_DOT: f32 = 10.0;
-/// Flat-map follow reload throttle while tracking the player.
-const FLAT_SYNC_MS: u64 = 100;
+const PLAYER_DOT: f32 = 6.0;
+/// Streaming desired-set refresh throttle while player mode is active.
+const STREAM_SYNC_MS: u64 = 100;
+/// Flat-map rim re-anchor: recenter the viewpoint on the player only
+/// when the cosine of their angular distance drops below this
+/// (~70 deg). Walking inside the hemisphere never rebuilds the map,
+/// so marker movement stays continuous; past the rim the walker would
+/// leave the projected half entirely.
+const FLAT_RECENTER_DOT: f32 = 0.35;
 
 // ---------------------------------------------------------------------------
 // Args + headless.
@@ -649,13 +656,21 @@ fn run_headless() -> i32 {
         viewer.chunk_flat_indices.len() / 3,
         flat_picked.index(),
     );
-    // Player self-test (debug-player-view): walk east on the default
-    // mesh; longitude must rise, latitude hold, streaming settle on the
-    // walker's hemisphere.
+    // Player self-test (debug-player-view): face east, then thrust
+    // along the heading on the default mesh; longitude must rise,
+    // latitude hold, streaming settle on the walker's hemisphere.
     let mut walk = PlayerViewState::new(viewer.radius);
     walk.toggle();
     walk.set_keys(MoveKeys {
         east: true,
+        ..MoveKeys::default()
+    });
+    for _ in 0..10 {
+        let desired = visible_hemisphere(&viewer.mesh, walk.position().to_array());
+        walk.update(0.05, &desired);
+    }
+    walk.set_keys(MoveKeys {
+        north: true,
         ..MoveKeys::default()
     });
     for _ in 0..20 {
@@ -840,6 +855,79 @@ fn flat_uv_to_pixels(rect: Rect, uv: [f32; 2]) -> Option<(f32, f32)> {
     ))
 }
 
+/// One screen-space triangle (y-down pixels): the `UiItems::tri`
+/// payload and the player-arrow geometry unit.
+type UiTri = ((f32, f32), (f32, f32), (f32, f32));
+
+/// Screen-space arrow from `origin` along unit `dir` (y-down pixels):
+/// shaft quad + triangular head. Returns 3 tris (2 shaft, 1 head).
+/// Pure geometry — unit-tested below.
+fn arrow_tris(origin: (f32, f32), dir: (f32, f32), len: f32, width: f32, head: f32) -> [UiTri; 3] {
+    let (ox, oy) = origin;
+    let (dx, dy) = dir;
+    let (nx, ny) = (-dy, dx);
+    let shaft = (len - head).max(0.0);
+    let (bx, by) = (ox + dx * shaft, oy + dy * shaft);
+    let (tx, ty) = (ox + dx * len, oy + dy * len);
+    let hw = width / 2.0;
+    [
+        (
+            (ox + nx * hw, oy + ny * hw),
+            (bx + nx * hw, by + ny * hw),
+            (ox - nx * hw, oy - ny * hw),
+        ),
+        (
+            (ox - nx * hw, oy - ny * hw),
+            (bx + nx * hw, by + ny * hw),
+            (bx - nx * hw, by - ny * hw),
+        ),
+        (
+            (bx + nx * width, by + ny * width),
+            (tx, ty),
+            (bx - nx * width, by - ny * width),
+        ),
+    ]
+}
+
+/// World-space arrow tip for the sphere marker: along the facing at
+/// an eye-distance-proportional length (readable once the pixels are
+/// clamped in [`draw_player_marker`]). Shared by the frame draw and
+/// the marker regression tests below.
+fn sphere_tip_world(player: &PlayerViewState, pos: Vec3) -> Vec3 {
+    let eye_dist = (player.eye() - pos).length().max(1e-6);
+    pos + player.facing() * eye_dist * 0.08
+}
+
+/// Player marker: center dot at the exact position plus an arrow along
+/// the projected facing (`tip`, skipped when it doesn't project or is
+/// too short to read — FirstPerson hides it by design: the camera
+/// looks along the heading, so screen-up IS the player direction).
+/// Same shape in the sphere and flat views.
+fn draw_player_marker(items: &mut UiItems, origin: (f32, f32), tip: Option<(f32, f32)>) {
+    let (mx, my) = origin;
+    items.solid(
+        Rect {
+            x: mx - PLAYER_DOT / 2.0,
+            y: my - PLAYER_DOT / 2.0,
+            w: PLAYER_DOT,
+            h: PLAYER_DOT,
+        },
+        C_PLAYER,
+    );
+    if let Some((tx, ty)) = tip {
+        let (dx, dy) = (tx - mx, ty - my);
+        let len = dx.hypot(dy);
+        if len > 4.0 {
+            let clamped = len.clamp(16.0, 48.0);
+            let dir = (dx / len, dy / len);
+            for (a, b, c) in arrow_tris(origin, dir, clamped, 4.0, 10.0) {
+                items.tri(a, b, c, C_PLAYER);
+            }
+        }
+    }
+    items.text("YOU".to_owned(), mx + PLAYER_DOT, my - 6.0, C_PLAYER);
+}
+
 /// Widget rects inside the left view dock (preview + view controls).
 /// Only built for the Sphere Viewer screen.
 struct LeftRects {
@@ -1015,16 +1103,23 @@ struct UiText {
     color: Color,
 }
 
-/// Frame UI: solid rects + text runs (converted to vertices later).
+/// Frame UI: solid rects + triangles + text runs (converted to
+/// vertices later). Triangles cover rotated shapes (the player heading
+/// arrow) that axis-aligned rects cannot express.
 #[derive(Default)]
 struct UiItems {
     solids: Vec<(Rect, Color)>,
+    tris: Vec<(UiTri, Color)>,
     texts: Vec<UiText>,
 }
 
 impl UiItems {
     fn solid(&mut self, rect: Rect, color: Color) {
         self.solids.push((rect, color));
+    }
+
+    fn tri(&mut self, a: (f32, f32), b: (f32, f32), c: (f32, f32), color: Color) {
+        self.tris.push(((a, b, c), color));
     }
 
     fn text(&mut self, text: String, x: f32, baseline: f32, color: Color) {
@@ -1317,8 +1412,9 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
         (None, Some(_)) => "state:     hover".to_owned(),
         (None, None) => "state:     —".to_owned(),
     };
-    // Player overlay readout: lon/lat in degrees, player camera mode,
-    // streamed chunk count. `U` toggles, `WASD`/arrows walk, `P` cycles.
+    // Player overlay readout: lon/lat/heading in degrees, player
+    // camera mode, streamed chunk count. `U` toggles, `WASD`/arrows
+    // walk (W/S thrust, A/D turn), `P` cycles.
     let player = &viewer.player;
     let (lon, lat) = player.lon_lat_deg();
     let player_rows = if player.active {
@@ -1326,9 +1422,10 @@ fn build_viewer_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
             format!("lon:      {lon:7.2} deg"),
             format!("lat:      {lat:7.2} deg"),
             format!(
-                "cam: {} +{}",
+                "cam: {} +{} hdg {:5.1}",
                 short_mode(player.mode()),
-                player.loaded_count()
+                player.loaded_count(),
+                player.heading_deg()
             ),
         ]
     } else {
@@ -1412,6 +1509,14 @@ fn ui_items_to_vertices(items: &UiItems, atlas: &mut GlyphAtlas) -> Vec<UiVertex
         ]);
     }
     let mut quads = Vec::new();
+    for (tri, color) in &items.tris {
+        let vert = |p: (f32, f32)| UiVertex {
+            pos: [p.0, p.1],
+            uv: [0.0, 0.0],
+            color: *color,
+        };
+        verts.extend_from_slice(&[vert(tri.0), vert(tri.1), vert(tri.2)]);
+    }
     for run in &items.texts {
         let before = quads.len();
         atlas.push_text(&mut quads, &run.text, run.x, run.baseline);
@@ -1499,16 +1604,15 @@ fn build_fill_pipeline(
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState {
                 cull_mode: CullMode::Back,
-                // `OrbitCamera::projection_matrix` outputs Y-down NDC
-                // (glam `vulkan::perspective`): the baked-in Y-flip
-                // mirrors triangle winding in framebuffer space, where
-                // Vulkan classifies front faces — so the mesh's
-                // CCW-outward fans (`fill_faces_point_outward`) land as
-                // CW. Clockwise front keeps the near-side outward faces
-                // and culls the far side; the CCW default culled the
-                // near side and rendered the sphere inside-out
-                // (issue-2026-09-14-2113).
-                front_face: FrontFace::Clockwise,
+                // `OrbitCamera::projection_matrix` outputs
+                // framebuffer-true NDC (NDC +1 = top row, no Y-flip),
+                // so the mesh's CCW-outward fans
+                // (`fill_faces_point_outward`) classify as CCW front
+                // faces directly: the near side is kept, the far side
+                // culled. (The retired Y-flipped projection mirrored
+                // winding, which is why this used to be Clockwise —
+                // issue-2026-09-14-2113.)
+                front_face: FrontFace::CounterClockwise,
                 ..Default::default()
             }),
             multisample_state: Some(MultisampleState::default()),
@@ -2105,9 +2209,13 @@ struct ViewerApp {
     last_cursor: Option<(f32, f32)>,
     /// Last frame time: the player movement `dt` source (clamped).
     last_frame: Option<Instant>,
-    /// Last flat-map follow rebuild: throttles hemisphere reloads while
-    /// the flat view tracks the player.
-    last_flat_sync: Option<Instant>,
+    /// Last streaming sync: throttles the player-hemisphere reloads
+    /// that feed the chunk streamer while player mode is active.
+    last_stream_sync: Option<Instant>,
+    /// Cached streaming desired set (the player's own hemisphere,
+    /// refreshed on [`ViewerApp::last_stream_sync`]): decoupled from
+    /// the flat-map viewpoint, which no longer follows the player.
+    stream_desired: Vec<u32>,
     /// Cursor position at left-button press (main-viewport sphere presses
     /// only): release within [`CLICK_MAX_DRAG_PX`] of it counts as a click
     /// (chunk pin) rather than an orbit drag.
@@ -2245,7 +2353,8 @@ impl ViewerApp {
             dragging_density: false,
             last_cursor: None,
             last_frame: None,
-            last_flat_sync: None,
+            last_stream_sync: None,
+            stream_desired: Vec::new(),
             press_cursor: None,
             rcx: None,
         }
@@ -2988,9 +3097,12 @@ impl ViewerApp {
         if win_w < 1.0 || win_h < 1.0 {
             return;
         }
-        // Player frame: walk by real `dt`, then stream the current
-        // hemisphere. The flat viewpoint tracks the walker (throttled
-        // reload); the desired set stays at most one sync behind.
+        // Player frame: walk by real `dt`, then stream the player's own
+        // hemisphere (throttled). The flat viewpoint stays fixed while
+        // the player walks inside it — the marker uses the exact
+        // projection, so movement is continuous and never interrupted.
+        // Only near the hemisphere rim does the map re-anchor on the
+        // player (a view change; the sim is untouched).
         let now = Instant::now();
         let dt = self
             .last_frame
@@ -3001,7 +3113,16 @@ impl ViewerApp {
         let player_active =
             self.debug.screen == Screen::SphereViewer && self.debug.viewer.player.active;
         if player_active {
-            let desired = self.debug.viewer.chunk_flat_cells.clone();
+            let stream_due = self
+                .last_stream_sync
+                .is_none_or(|last| now - last >= Duration::from_millis(STREAM_SYNC_MS));
+            if stream_due {
+                let viewer = &self.debug.viewer;
+                self.stream_desired =
+                    visible_hemisphere(&viewer.mesh, viewer.player.position().to_array());
+                self.last_stream_sync = Some(now);
+            }
+            let desired = self.stream_desired.clone();
             self.debug.viewer.player.update(dt, &desired);
             let position = self.debug.viewer.player.position();
             let viewer = &self.debug.viewer;
@@ -3009,16 +3130,11 @@ impl ViewerApp {
             let along = viewer.chunk_flat_viewpoint[0] * position.x
                 + viewer.chunk_flat_viewpoint[1] * position.y
                 + viewer.chunk_flat_viewpoint[2] * position.z;
-            let moved = along / radius / radius < 1.0 - 1e-6;
-            let due = self
-                .last_flat_sync
-                .is_none_or(|last| now - last >= Duration::from_millis(FLAT_SYNC_MS));
-            if moved && due {
+            if along / radius / radius < FLAT_RECENTER_DOT {
                 let viewer = &mut self.debug.viewer;
                 viewer.chunk_flat_viewpoint = position.to_array();
                 viewer.rebuild_chunk_flat();
                 self.refresh_chunk_flat();
-                self.last_flat_sync = Some(now);
             }
         }
         {
@@ -3056,8 +3172,9 @@ impl ViewerApp {
             build_placeholder_ui(&mut self.atlas, self.debug.screen, layout)
         };
         // Player dots: the sphere dot projects the walker through the
-        // main-view matrices; the flat dot resolves the walker's chunk
-        // to its visible-center pixels (skipped while unloaded).
+        // main-view matrices; the flat dot projects the walker's exact
+        // position through the flat map's own normalization (continuous,
+        // no cell-center snap).
         let mut sphere_marker: Option<(f32, f32)> = None;
         if player_active && viewer_screen && self.debug.viewer.focus == ViewFocus::SphereMain {
             let player = &self.debug.viewer.player;
@@ -3068,28 +3185,31 @@ impl ViewerApp {
         let mut flat_marker: Option<(f32, f32)> = None;
         if player_active && viewer_screen && self.debug.viewer.focus == ViewFocus::ChunkFlat {
             let viewer = &self.debug.viewer;
-            let position = viewer.player.position();
-            let chunk = pick_cell(&viewer.mesh, position, None).index();
-            if let Some(slot) = viewer
-                .chunk_flat_cells
-                .iter()
-                .position(|&cell| cell == chunk)
-            {
-                flat_marker = flat_uv_to_pixels(layout.viewport, viewer.chunk_flat_centers[slot]);
-            }
+            flat_marker = flat_uv_to_pixels(layout.viewport, viewer.player_flat_uv());
         }
         if player_active {
-            for (mx, my) in sphere_marker.into_iter().chain(flat_marker) {
-                items.solid(
-                    Rect {
-                        x: mx - PLAYER_DOT / 2.0,
-                        y: my - PLAYER_DOT / 2.0,
-                        w: PLAYER_DOT,
-                        h: PLAYER_DOT,
-                    },
-                    C_PLAYER,
+            // Sphere arrow: facing tip sized to a readable pixel length
+            // (eye-distance proportional, then clamped).
+            if let Some(origin) = sphere_marker {
+                let player = &self.debug.viewer.player;
+                let vp = layout.viewport;
+                let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
+                let tip = world_to_pixels(main_vp, sphere_tip_world(player, player.position()), vp);
+                draw_player_marker(&mut items, origin, tip);
+            }
+            // Flat arrow: the exact marker plus the facing tip through
+            // the same normalization (locally direction-true).
+            if let Some(origin) = flat_marker {
+                let viewer = &self.debug.viewer;
+                let pos = viewer.player.position();
+                let raw_tip = project_to_tangent(
+                    (pos + viewer.player.facing() * viewer.radius * 0.03).to_array(),
+                    viewer.chunk_flat_viewpoint,
                 );
-                items.text("YOU".to_owned(), mx + PLAYER_DOT, my - 6.0, C_PLAYER);
+                let (lo, span) = viewer.chunk_flat_norm;
+                let tip =
+                    flat_uv_to_pixels(layout.viewport, chunk_flat_normalize(raw_tip, lo, span));
+                draw_player_marker(&mut items, origin, tip);
             }
         }
         self.sync_atlas();
@@ -3792,6 +3912,116 @@ mod tests {
         };
         let at = flat_uv_to_pixels(tall, [0.5, 0.5]).expect("center");
         assert!((at.0 - 200.0).abs() < 1e-3 && (at.1 - 400.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn arrow_tris_points_along_dir() {
+        // Origin (0,0), +x dir, 20 long, 4 wide, 8 head: shaft spans
+        // x 0..12, head tip lands exactly on (20, 0).
+        let [s0, s1, head] = arrow_tris((0.0, 0.0), (1.0, 0.0), 20.0, 4.0, 8.0);
+        assert_eq!(s0, ((0.0, 2.0), (12.0, 2.0), (0.0, -2.0)));
+        assert_eq!(s1, ((0.0, -2.0), (12.0, 2.0), (12.0, -2.0)));
+        assert_eq!(head, ((12.0, 4.0), (20.0, 0.0), (12.0, -4.0)));
+    }
+
+    #[test]
+    fn draw_player_marker_emits_dot_arrow_and_label() {
+        let mut items = UiItems::default();
+        draw_player_marker(&mut items, (100.0, 100.0), Some((130.0, 100.0)));
+        assert_eq!(items.solids.len(), 1, "one center dot");
+        assert_eq!(items.tris.len(), 3, "shaft (2) + head (1)");
+        assert_eq!(items.texts.len(), 1);
+        assert_eq!(items.texts[0].text, "YOU");
+        // No tip: dot + label only.
+        let mut bare = UiItems::default();
+        draw_player_marker(&mut bare, (100.0, 100.0), None);
+        assert_eq!(bare.solids.len(), 1);
+        assert!(bare.tris.is_empty());
+    }
+
+    #[test]
+    fn follow_marker_arrow_visible_and_oriented() {
+        use game_debug::player_view::MoveKeys;
+
+        let mut viewer = SphereViewerState::with_values(1, 1.0);
+        viewer.player.toggle();
+        assert_eq!(viewer.player.mode(), CameraMode::Follow);
+        let layout = ui::layout(1280.0, 720.0);
+        let vp = layout.viewport;
+        let player = &viewer.player;
+        let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
+        let pos = player.position();
+        let origin = world_to_pixels(main_vp, pos, vp).expect("player projects");
+        // Fresh heading is north: the arrow tip must project, readably
+        // long, pointing up-screen (smaller y-down pixel).
+        let tip = world_to_pixels(main_vp, sphere_tip_world(player, pos), vp)
+            .expect("arrow tip projects in Follow");
+        let len = (tip.0 - origin.0).hypot(tip.1 - origin.1);
+        assert!(
+            len >= 16.0,
+            "arrow readable, got {len:.1}px origin={origin:?} tip={tip:?}"
+        );
+        assert!(
+            tip.1 < origin.1,
+            "north must be up-screen, origin={origin:?} tip={tip:?}"
+        );
+        // Turn right (D): facing east must swing toward screen right.
+        viewer.player.set_keys(MoveKeys {
+            east: true,
+            ..MoveKeys::default()
+        });
+        let desired = viewer.chunk_flat_cells.clone();
+        viewer.player.update(0.5, &desired);
+        let player = &viewer.player;
+        let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
+        let pos = player.position();
+        let origin = world_to_pixels(main_vp, pos, vp).expect("player projects");
+        let tip = world_to_pixels(main_vp, sphere_tip_world(player, pos), vp)
+            .expect("turned tip projects");
+        assert!(
+            tip.0 > origin.0,
+            "east must be right-screen, origin={origin:?} tip={tip:?}"
+        );
+    }
+
+    #[test]
+    fn first_person_hides_marker_and_looks_along_heading() {
+        let mut viewer = SphereViewerState::with_values(1, 1.0);
+        viewer.player.toggle();
+        viewer.player.cycle_camera();
+        assert_eq!(viewer.player.mode(), CameraMode::FirstPerson);
+        let layout = ui::layout(1280.0, 720.0);
+        let vp = layout.viewport;
+        let player = &viewer.player;
+        let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
+        // Own eyes sit in the eye plane: no dot by design (screen-up IS
+        // the heading there).
+        assert_eq!(world_to_pixels(main_vp, player.position(), vp), None);
+        // Looking exactly along the facing: centered horizontally.
+        let ahead = world_to_pixels(
+            main_vp,
+            player.eye() + player.facing() * viewer.radius * 0.5,
+            vp,
+        )
+        .expect("view direction projects");
+        assert!(
+            (ahead.0 - (vp.x + vp.w / 2.0)).abs() < 2.0,
+            "view must center on heading, got {ahead:?}"
+        );
+    }
+
+    #[test]
+    fn flat_marker_spawns_centered() {
+        let viewer = SphereViewerState::with_values(1, 1.0);
+        // Regenerate opens the flat map on the player: exact marker
+        // strictly inside the map, never rim-pinned.
+        let uv = viewer.player_flat_uv();
+        assert!(
+            uv[0] > 0.02 && uv[0] < 0.98 && uv[1] > 0.02 && uv[1] < 0.98,
+            "marker must spawn inside the map, got {uv:?}"
+        );
+        let layout = ui::layout(1280.0, 720.0);
+        assert!(flat_uv_to_pixels(layout.viewport, uv).is_some());
     }
 
     #[test]

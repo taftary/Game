@@ -156,17 +156,39 @@ pub struct ChunkFlatVertex {
     pub seam: f32,
 }
 
+/// Raw-tangent → `[0, 1]²` affine map used by [`build_chunk_flat`]:
+/// `(lo, span)` per axis. Stored at every rebuild so the binary can
+/// project extra points (the exact player marker) into the same
+/// normalized space the buffers live in.
+pub type ChunkFlatNorm = ([f32; 2], [f32; 2]);
+
+/// Applies a [`build_chunk_flat`] normalization to one raw tangent
+/// point (same clamp as the buffers).
+pub fn chunk_flat_normalize(p: [f32; 2], lo: [f32; 2], span: [f32; 2]) -> [f32; 2] {
+    [
+        ((p[0] - lo[0]) / span[0]).clamp(0.0, 1.0),
+        ((p[1] - lo[1]) / span[1]).clamp(0.0, 1.0),
+    ]
+}
+
 /// Filled hemisphere chunk map for `viewpoint`: one center + ring fan
 /// per fully-inside cell (Lambert equal-area projection of true cell
 /// corners, so neighbors share edges and every chunk keeps its size).
 /// Positions are normalized to `[0, 1]²`. Returns `(vertices, indices,
-/// cells, centers)` where `cells`/`centers` are the visible cell ids
-/// and their normalized centers (for picking).
+/// cells, centers, norm)` where `cells`/`centers` are the visible cell
+/// ids and their normalized centers (for picking), and `norm` is the
+/// normalization (for projecting extra points like the player marker).
 #[allow(clippy::type_complexity)]
 pub fn build_chunk_flat(
     mesh: &HexSphere,
     viewpoint: [f32; 3],
-) -> (Vec<ChunkFlatVertex>, Vec<u32>, Vec<u32>, Vec<[f32; 2]>) {
+) -> (
+    Vec<ChunkFlatVertex>,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<[f32; 2]>,
+    ChunkFlatNorm,
+) {
     let cells = visible_hemisphere(mesh, viewpoint);
     let face_ids = base_face_ids(mesh.subdivisions());
     // Raw tangent coords per visible cell: center + corners. The
@@ -191,12 +213,7 @@ pub fn build_chunk_flat(
         }
     }
     let span = [(hi[0] - lo[0]).max(1e-6), (hi[1] - lo[1]).max(1e-6)];
-    let norm = |p: [f32; 2]| {
-        [
-            ((p[0] - lo[0]) / span[0]).clamp(0.0, 1.0),
-            ((p[1] - lo[1]) / span[1]).clamp(0.0, 1.0),
-        ]
-    };
+    let norm = |p: [f32; 2]| chunk_flat_normalize(p, lo, span);
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut centers = Vec::with_capacity(cells.len());
@@ -237,13 +254,13 @@ pub fn build_chunk_flat(
             ]);
         }
     }
-    (vertices, indices, cells, centers)
+    (vertices, indices, cells, centers, (lo, span))
 }
 
 /// Hemisphere boundary wireframe: deduplicated projected polygon edges
 /// for the visible cells. Returns position pairs in `[0, 1]²`.
 pub fn build_chunk_flat_wireframe(mesh: &HexSphere, viewpoint: [f32; 3]) -> Vec<[f32; 2]> {
-    let (vertices, indices, _, _) = build_chunk_flat(mesh, viewpoint);
+    let (vertices, indices, _, _, _) = build_chunk_flat(mesh, viewpoint);
     let pos = |i: u32| vertices[i as usize].position;
     let key = |p: [f32; 2]| [(p[0] * 1e6) as i32, (p[1] * 1e6) as i32];
     let mut edges: BTreeSet<([i32; 2], [i32; 2])> = BTreeSet::new();
@@ -521,10 +538,21 @@ mod tests {
         for n in 1..=2 {
             let mesh = HexSphere::generate(n, 1.0);
             let view = [0.0, 1.0, 0.0];
-            let (vertices, indices, cells, centers) = build_chunk_flat(&mesh, view);
+            let (vertices, indices, cells, centers, norm) = build_chunk_flat(&mesh, view);
             let expected = game_engine::render::visible_hemisphere(&mesh, view);
             assert_eq!(cells, expected, "N={n}");
             assert_eq!(centers.len(), cells.len(), "N={n}");
+            // The stored normalization maps the raw tangent space onto
+            // the same `[0, 1]²` the buffers use (marker projection).
+            for (slot, &cell) in cells.iter().enumerate() {
+                let raw = project_to_tangent(mesh.cell_center(cell), view);
+                let back = chunk_flat_normalize(raw, norm.0, norm.1);
+                assert!(
+                    (back[0] - centers[slot][0]).abs() < 1e-6
+                        && (back[1] - centers[slot][1]).abs() < 1e-6,
+                    "N={n} norm round-trip drifted for cell {cell}"
+                );
+            }
             // One center + ring fan per visible cell.
             let ring_sum: usize = cells
                 .iter()
@@ -554,7 +582,7 @@ mod tests {
         // the horizon must not reach the buffers — no partial polygons.
         let mesh = HexSphere::generate(2, 1.0);
         let view = [0.0, 1.0, 0.0];
-        let (_, _, cells, _) = build_chunk_flat(&mesh, view);
+        let (_, _, cells, _, _) = build_chunk_flat(&mesh, view);
         let dot = |p: [f32; 3]| p[0] * view[0] + p[1] * view[1] + p[2] * view[2];
         let mut partial = 0;
         for cell in 0..mesh.cell_count() as u32 {
@@ -578,8 +606,8 @@ mod tests {
         // Orbiting halfway around the globe must unload the old half and
         // load a mostly disjoint set (the streaming behavior).
         let mesh = HexSphere::generate(2, 1.0);
-        let (_, _, north, _) = build_chunk_flat(&mesh, [0.0, 1.0, 0.0]);
-        let (_, _, south, _) = build_chunk_flat(&mesh, [0.0, -1.0, 0.0]);
+        let (_, _, north, _, _) = build_chunk_flat(&mesh, [0.0, 1.0, 0.0]);
+        let (_, _, south, _, _) = build_chunk_flat(&mesh, [0.0, -1.0, 0.0]);
         // Rim cells differ per pole, so counts only agree roughly.
         let (small, large) = (
             north.len().min(south.len()) as f32,
