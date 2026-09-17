@@ -7,7 +7,7 @@ Navigation-engine ADRs (004, 006, 012–021) derive from the adopted spec
 
 - [x] ADR-001: `vulkano` / `winit` / `naga` / `fontdue` / `glam` versions + `winit`↔`raw-window-handle` compat + `vulkano` kill-switch — [`ADR-001.md`](ADR-001.md).
 - [x] ADR-002: planet representation — hex-dominant geodesic dual mesh (`engine::hexsphere`) — [`ADR-002.md`](ADR-002.md).
-- [ ] ADR-003: atmosphere/sky model (analytic choice + mobile fallback) — prefigured by spec §9 (Rayleigh/Mie valid at waypoints 7–10 only); resolves with `plans/v0.2.0/depth-cueing`.
+- [x] ADR-003: atmosphere/sky model (analytic choice + mobile fallback) — Rayleigh/Mie source terms with Low-tier fallback; [`ADR-003.md`](ADR-003.md).
 - [x] ADR-004: save binary encoding + migration strategy — binary autosave, atomic writes, rotating snapshots (spec §10) — draft in [`ADR-004.md`](ADR-004.md), lands with `plans/v0.3.0/autosave-persistence`.
 - [ ] ADR-005: UI framework (custom immediate vs. retained) + localization keys — spec §10 constrains HUD to a decoupled fast overlay; framework choice stays open.
 - [x] ADR-006: audio backend — **deferred to spec v0.5**; v0.4 scope ships silent, no audio-clock dependency — [`ADR-006.md`](ADR-006.md).

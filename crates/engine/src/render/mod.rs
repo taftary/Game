@@ -23,6 +23,7 @@ pub mod boot;
 pub mod camera;
 pub mod checker;
 pub mod chunk_flat;
+pub mod cue;
 pub mod depth;
 pub mod exposure;
 pub mod planet;
@@ -47,6 +48,12 @@ pub use checker::{
     glsl_const_block,
 };
 pub use chunk_flat::{orbit_viewpoint, project_to_tangent, tangent_basis, visible_hemisphere};
+pub use cue::{
+    CueRegime, CueState, DustColumn, ExtinctionParams, RaymarchBudget, WebDensity,
+    atmosphere_radiance, color_excess, extinction_transmission, hubble_redshift, mie_phase,
+    peculiar_velocity_tint, rayleigh_optical_depth, raymarch_web, redden_rgb, regime_for_frame,
+    sample_dust_column, sample_web_density, visual_extinction,
+};
 pub use depth::{
     LOG_GUARD_EPSILON, LogDepthParams, glsl_log_depth_epilogue, glsl_log_depth_push_field,
     linear_depth_f32, planet_vert_logdepth, same_float_depth, same_unorm_quantum,

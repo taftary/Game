@@ -60,7 +60,7 @@ commit when it reaches `done` (workflow rule:
 | [`log-depth-rendering`](../../plans/v0.2.0/log-depth-rendering/) | done | §4 Depth strategy |
 | [`star-catalog-streaming`](../../plans/v0.2.0/star-catalog-streaming/) | done | §4 LOD & streaming |
 | [`exposure-tone-mapping`](../../plans/v0.2.0/exposure-tone-mapping/) | done | §9.2 Dynamic range |
-| [`depth-cueing`](../../plans/v0.2.0/depth-cueing/) | draft notion | §9.1 Depth cues |
+| [`depth-cueing`](../../plans/v0.2.0/depth-cueing/) | done | §9.1 Depth cues |
 | [`zodiacal-light`](../../plans/v0.2.0/zodiacal-light/) | done | §9.4 Zodiacal model |
 | [`waypoint-transitions`](../../plans/v0.2.0/waypoint-transitions/) | draft notion | §9.3 Waypoint experience |
 

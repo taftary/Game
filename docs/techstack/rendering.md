@@ -159,6 +159,17 @@ preserves NDC +1 = top (orientation contract pinned in `post`). The
 demo keys); the `game_debug` Planet View applies the kernel to the sky
 alpha path (`F5` cycles twilight stages for DoD-2 captures).
 
+Physical depth cues (v0.2.0, `plans/v0.2.0/depth-cueing`, ADR-021 and
+ADR-003): `engine::render::cue` maps the active `FrameId` to the physical
+regime required by spec section 9.1. Atmosphere frames use analytic Rayleigh
+and Mie source terms; vacuum frames use zodiacal glow, seeded dust
+extinction/reddening, peculiar-velocity tinting, or cosmic-web redshift and
+density terms. All outputs are linear-radiance source terms consumed before
+exposure. Cosmic-web raymarch budgets are tiered at 64x64/16 steps on Low,
+128x128/32 on Medium, and 256x256/64 on High; Low retains an analytic
+fallback. The active-frame switch harness is GPU-free and does not alter
+camera, projection, picking, ENU, winding, or culling conventions.
+
 ## Quality tiers
 
 | Tier | Target | Resolution | Shadows | Terrain density | Atmosphere |

@@ -34,13 +34,17 @@ use std::time::Instant;
 
 mod catalog_cook;
 
+use game_engine::frames::{BodyId, FrameId};
 use game_engine::render::{
-    DominantSource, ExposureLoop, ExposureParams, FOV_Y, HdrSelection, IndexedMesh, OrbitCamera,
-    PLANET_FRAG, PLANET_VERT, PlanetVertex, QualityTier, RESOLVE_VERT, ResolvePush, SeededPlanet,
-    ShaderKind, aces_approx, compile_glsl_to_spirv, create_instance, device_score,
-    log_physical_device, planet_vert_logdepth, required_device_extensions, resolve_frag_aces,
-    select_hdr_format, star_visibility,
+    CueRegime, CueState, DominantSource, ExposureLoop, ExposureParams, ExtinctionParams, FOV_Y,
+    HdrSelection, IndexedMesh, OrbitCamera, PLANET_FRAG, PLANET_VERT, PlanetVertex, QualityTier,
+    RESOLVE_VERT, RaymarchBudget, ResolvePush, SeededPlanet, ShaderKind, aces_approx,
+    atmosphere_radiance, color_excess, compile_glsl_to_spirv, create_instance, device_score,
+    log_physical_device, planet_vert_logdepth, raymarch_web, regime_for_frame,
+    required_device_extensions, resolve_frag_aces, sample_dust_column, sample_web_density,
+    select_hdr_format, star_visibility, visual_extinction,
 };
+use game_engine::seeding::RegionId;
 use glam::Vec3;
 use glam::camera::rh::proj::directx::perspective;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -226,6 +230,7 @@ fn run_headless(args: &Args) -> i32 {
     ok &= run_handoff_selftest();
     ok &= run_twilight_selftest();
     ok &= run_tonemap_selftest();
+    ok &= run_cue_selftest(args);
     if ok { 0 } else { 1 }
 }
 
@@ -308,6 +313,53 @@ fn run_tonemap_selftest() -> bool {
     }
     let pass = clean && max_out <= 1.0;
     println!("tonemap_clip=max_out={max_out:.4} scenes=3 pass={pass}");
+    pass
+}
+
+/// DoD-1/2: verify the physical regime table, deterministic seeded sources,
+/// and active-frame replacement through the same GPU-free smoke binary used
+/// by the Low-tier gate.
+fn run_cue_selftest(args: &Args) -> bool {
+    let region = RegionId {
+        frame: FrameId::Cosmological,
+        cell: [2, -1, 3],
+    };
+    let dust_a = sample_dust_column(args.seed, region, [1.0, 2.0, 3.0]);
+    let dust_b = sample_dust_column(args.seed, region, [1.0, 2.0, 3.0]);
+    let web_a = sample_web_density(args.seed, region, [1.0, 2.0, 3.0]);
+    let web_b = sample_web_density(args.seed, region, [1.0, 2.0, 3.0]);
+
+    let mut state = CueState::new(FrameId::SolarSystem);
+    let switched_to_local = state.set_frame(FrameId::LocalGroup);
+    let switched_to_atmosphere = state.set_frame(FrameId::LocalEnu(BodyId::EARTH));
+    let clean_switch = switched_to_local
+        && switched_to_atmosphere
+        && state.regime() == CueRegime::Atmosphere
+        && regime_for_frame(FrameId::Cosmological) == CueRegime::CosmicWeb;
+
+    let params = ExtinctionParams::spec_defaults();
+    let av = visual_extinction(color_excess(dust_a.density, params), params);
+    let atmosphere = atmosphere_radiance(2.0, 0.8, 550.0, args.tier == QualityTier::Low);
+    let budget = RaymarchBudget::for_tier(args.tier);
+    let web_radiance = raymarch_web(web_a, budget);
+    let pass = clean_switch
+        && dust_a == dust_b
+        && web_a == web_b
+        && av.is_finite()
+        && atmosphere.is_finite()
+        && web_radiance.is_finite()
+        && (0.0..=1.0).contains(&web_radiance)
+        && budget.steps > 0;
+    println!(
+        "depth_cue=regime={:?} dust={:.4} av={:.4} web={:.4}/{:.4} radiance={:.4} steps={} pass={pass}",
+        state.regime(),
+        dust_a.density,
+        av,
+        web_a.filament,
+        web_a.dust_node,
+        web_radiance,
+        budget.steps
+    );
     pass
 }
 

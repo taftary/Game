@@ -2,13 +2,13 @@
 
 ## Status
 
-`draft`
+`done` (all DoD criteria checked in `plan.md`, ANALYST + SECURITY signed 2026-09-17)
 
 ## Context
 
 Milestone v0.2.0 (scale rendering & visuals), spec
 [`cosmic-navigation-engine-v0.4.md`](../../../docs/techstack/cosmic-navigation-engine-v0.4.md)
-§9.1. Decided by ADR-021 in [`../../docs/decisions/`](../../../docs/decisions/).
+§9.1. Decided by ADR-021 in [`../../../docs/decisions/`](../../../docs/decisions/).
 Rayleigh/Mie haze is physically valid only inside an atmosphere
 (waypoints 7–10 and descent into 7); every vacuum regime needs a
 physically valid substitute.
@@ -48,12 +48,30 @@ Implement the spec §9.1 regime table:
 - Players: legible depth at every scale with physical honesty.
 - Developers: one documented cue model per regime.
 
+UX notes (2026-09-17): depth cueing is a passive visual layer and adds no
+controls or affordances. Perceptual exaggeration is limited to tunable
+calibration factors with readable defaults; style must not invert the physical
+direction of a cue. Reference captures verify readability for every regime.
+
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— perceptual exaggeration degree is a player-facing style question (spec
-§10 open item). ARCHITECT consulted (required if cross-module): pending
-(render + procedural density fields).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes —
+passive visual layer and perceptual calibration notes under `Users /
+Stakeholders` (2026-09-17). ARCHITECT consulted (required if cross-module):
+yes — cue models belong in `engine::render`, dust column density uses
+domain-separated `engine::seeding` sub-seeds per ADR-019, volumetric raymarch
+stays within tier budgets, and rendering invariants are untouched (2026-09-17).
+ADR-021 covers the regime table; binding ADR-003 records the atmosphere model
+and fallback; no new ADR is needed for this feature.
+
+PO sign-off for `draft → planned` (2026-09-17): checklist green — problem
+stated without prescribing implementation; non-goals explicit; DoD criteria
+verifiable. DoD-2 uses an approved active-frame switch harness asserting cue
+model replacement with no leftover state, since waypoint runtime belongs to
+`waypoint-transitions`. ADR-021 fixes the physical basis; visual style may
+only tune parameters, so the spec §10 open item remains open. Volumetric
+density resolution is resolved by the tier budget in `plan.md` and
+`docs/techstack/quality.md`.
 
 ## Functional requirements
 
