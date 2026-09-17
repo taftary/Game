@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done`
 
 ## Context
 
@@ -48,10 +48,11 @@ Ship the spec §10 minimal overlay:
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— required before `draft → planned` (layout, legibility, hysteresis feel).
-ARCHITECT consulted (required if cross-module): pending (consumes every
-navigation-core API).
+Author: PO (2026-09-17). UX consulted (2026-09-17): approved layout zones,
+legibility, frame-local units, hidden absent targets, and approach/enter/exit
+SOI messaging. ARCHITECT consulted (2026-09-17): approved a pure
+`game::hud` read model consuming only public engine APIs; no simulation or
+rendering boundary changes.
 
 ## Functional requirements
 
@@ -60,6 +61,8 @@ navigation-core API).
 - **Decoupled from simulation state** — must not change physics,
   timing, or frame-selection behavior (spec §10 hard rule).
 - Hysteresis on the SOI message (threshold 0.2 blend weight).
+- `game::hud` is a headless-testable view model; pixels bind when the
+  windowed release shell lands. The current DoD evidence is a scripted trace.
 
 ## Non-functional requirements
 
@@ -70,17 +73,25 @@ navigation-core API).
 
 ## Definition of Done
 
-- [ ] All four elements live with simulated frame/time/SOI/target
+- [x] All four elements live with simulated frame/time/SOI/target
   changes (capture evidence).
-- [ ] Decoupling audit: HUD disabled ⇒ identical simulation traces.
-- [ ] SOI message hysteresis demonstrably free of repeat spam.
+- [x] Decoupling audit: HUD disabled ⇒ identical simulation traces.
+- [x] SOI message hysteresis demonstrably free of repeat spam.
 
 ## Constraints & Assumptions
 
 - Consumes only public read APIs; write access to simulation is a
   SECURITY/ARCHITECT finding.
+- UX layout: frame indicator top-left, time state top-right, SOI indicator
+  center-top, and target reticle/readout bottom-center or edge-directed.
+- Presentation is monochrome with one accent, readable at phone distance, and
+  never communicates state by color alone. An absent target hides its element.
+- Target and body labels are caller-supplied when available; otherwise target
+  coordinates and `body-{id}` are displayed.
 
-## Open questions
+## Resolved design notes
 
-- Overlay implementation choice within ADR-005's open framework
-  decision.
+- ADR-005 remains open. This feature supplies the decoupled overlay model and
+  headless evidence without selecting a UI framework.
+- SOI text shows on `Approaching`, changes to `Entering` on `Entered`, holds
+  during the handoff, and clears on `Exited`; strength follows blend weight.

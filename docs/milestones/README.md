@@ -68,7 +68,7 @@ commit when it reaches `done` (workflow rule:
 
 | Feature | Status | Spec section |
 |---|---|---|
-| [`navigation-hud`](../../plans/v0.3.0/navigation-hud/) | draft notion | §10 HUD & overlay |
+| [`navigation-hud`](../../plans/v0.3.0/navigation-hud/) | done | §10 HUD & overlay |
 | [`autosave-persistence`](../../plans/v0.3.0/autosave-persistence/) | draft notion | §10 Persistence |
 | [`scale-debug-screens`](../../plans/v0.3.0/scale-debug-screens/) | done | spec §1 + §9.3 (dev tooling) |
 

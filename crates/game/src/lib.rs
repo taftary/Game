@@ -7,6 +7,7 @@
 //! `game` never touches `vulkano`: rendering lives in `engine::render`.
 
 pub mod camera;
+pub mod hud;
 pub mod journey;
 pub mod player;
 pub mod streaming;

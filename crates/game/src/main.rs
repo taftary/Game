@@ -9,11 +9,17 @@
 //! feed the same [`MoveInput`](game::player::MoveInput).
 
 use game::camera::{CameraMode, PlayerCamera};
+use game::hud::{Hud, HudInputs};
 use game::journey::{Journey, JourneyEvent};
 use game::player::{MoveInput, Player};
 use game::streaming::ChunkStreamer;
+use game_engine::flight::{FlyToExec, ShipState, Target, plan_fly_to};
+use game_engine::frames::{BodyId, FrameChain, FrameId, FrameLink};
+use game_engine::handoff::HandoffMonitor;
 use game_engine::hexsphere::HexSphere;
 use game_engine::render::{project_to_tangent, visible_hemisphere};
+use game_engine::time::CompressionClock;
+use glam::{DQuat, DVec3};
 
 /// Demo planet radius in meters.
 const RADIUS: f32 = 100.0;
@@ -143,4 +149,65 @@ fn main() {
             journey.state_hash(),
         );
     }
+
+    run_hud_trace();
+}
+
+fn run_hud_trace() {
+    let mut ship = ShipState {
+        chain: FrameChain::new(
+            FrameId::SolarSystem,
+            DVec3::new(2.0, 0.0, 0.0),
+            DQuat::IDENTITY,
+            vec![FrameLink::identity(); 4],
+        ),
+        vel: DVec3::ZERO,
+        mass_kg: 5_000.0,
+        fuel: 1.0,
+    };
+    let mut clock = CompressionClock::default();
+    let target = Target::new(FrameId::SolarSystem, DVec3::new(3.0, 0.0, 0.0))
+        .expect("trace target is finite");
+    let plan = plan_fly_to(FrameId::SolarSystem, ship.chain.position(), &target, 0.0)
+        .expect("trace target is outside arrival sphere");
+    let mut executor = FlyToExec::new(plan);
+    executor.commit().expect("trace fly-to commits once");
+    let mut monitor = HandoffMonitor::new(BodyId::EARTH);
+    let mut hud = Hud::new();
+
+    println!("hud-trace: begin");
+    for (step, weight) in [0.0, 0.25, 0.5, 1.0].into_iter().enumerate() {
+        if step == 2 {
+            clock.slew(100.0, 1.0);
+        }
+        monitor.update(weight);
+        let events = monitor.events();
+        let frame = hud.update(&HudInputs {
+            ship: &ship,
+            clock: &clock,
+            executor: Some(&executor),
+            target_label: Some("Earth orbit"),
+            soi_weight: weight,
+            soi_events: &events,
+            body_label: Some("earth"),
+        });
+        println!(
+            "hud t={step} {} | {} | soi={} | target={}",
+            frame.frame_line,
+            frame.time_line,
+            frame
+                .soi
+                .as_ref()
+                .map(|soi| soi.message.as_str())
+                .unwrap_or("hidden"),
+            frame
+                .target
+                .as_ref()
+                .map(|target| target.line.as_str())
+                .unwrap_or("hidden")
+        );
+        ship.chain
+            .set_position(ship.chain.position() + DVec3::new(0.01, 0.0, 0.0));
+    }
+    println!("hud-trace: end");
 }

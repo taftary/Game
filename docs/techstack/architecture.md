@@ -11,7 +11,7 @@ Cargo.lock    - committed for reproducible builds
 .cargo/       - Windows main-thread stack reserve (16 MB)
 crates/
   engine/     - library crate game_engine (empty modules, src/lib.rs is empty)
-  game/       - clean release game binary, empty fn main() {}
+  game/       - clean release game binary + pure player HUD view model
   tools/      - tooling binary, empty fn main() {} (not a default member)
    debug/      - game_debug lib (Galaxy Map + System Map + Planet View
                    screens, tools window with live FPS +
@@ -54,7 +54,8 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     input/       # unified touch/mouse/keyboard/gamepad actions
     save/        # versioned save format
     core/        # math, units, time, RNG, error types
-crates/game/     # `game` binary: clean release entry — game states, camera journey, UI wiring
+crates/game/     # `game` binary: clean release entry — game states, camera
+                 # journey, pure HUD view model, UI wiring when windowed shell lands
 crates/debug/    # `game_debug` lib (viewer screens: mesh/params/ui/
                    # text/app/planet_viewer/picking modules + live fps
                    # recorder + console/inspector stubs) + binary

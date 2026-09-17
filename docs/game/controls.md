@@ -51,6 +51,15 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
    Scale. The Scale screen opens a global ten-dimension matrix; click any
    dimension card for its per-dimension state and transition log.
 
+### Navigation HUD
+
+The shipping HUD view model exposes four readouts without changing simulation:
+the active frame and local units, real-time/compressed time state, SOI handoff
+status with hysteresis, and the active select-to-focus target with distance and
+ETA. The target uses its caller label or canonical frame coordinates. The
+current headless release binary prints a deterministic `hud-trace`; pixel
+placement binds when the windowed release shell lands.
+
 ## Audio / UI
 
 - Audio: ambient pad + UI + hazard stingers; full music/sfx pass is stretch. Mix buses with mute; no audio-codec crash on any target.

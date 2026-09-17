@@ -1,7 +1,7 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.27.0 (2026-09-17, `scale-debug-screens` done: ten-dimension
-  read-only debug registry, global transition evidence, and selectable scale screens)
+- **Version:** 0.28.0 (2026-09-17, `navigation-hud` done: decoupled four-element
+  HUD view model, SOI hysteresis readout, and deterministic headless trace)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
