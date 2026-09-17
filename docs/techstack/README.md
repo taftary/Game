@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.12.1 (2026-09-16, debug viewer tabs: UV Net screen removed, Sphere Viewer renamed to Planet View (`planet_viewer`), tab order Galaxy Map / System Map / Planet View on `F1`–`F3`, tools reopen on `F4`)
+- **Version:** 0.13.0 (2026-09-17, milestones reorganized into versioned releases — v0.0.1 foundations … v0.3.0 player layer; navigation-engine spec v0.4 adopted under `docs/techstack/`; ADR-004/006 filled + ADR-012–021 drafted; 15 draft notions incl. per-dimension debug screens)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
@@ -16,3 +16,4 @@ Locked for v1 unless an ADR (see [`../decisions/`](../decisions/)) overturns it.
 - [`persistence.md`](persistence.md) — versioned save format and migration.
 - [`assets.md`](assets.md) — content pipeline, formats, fonts, hot-reload.
 - [`quality.md`](quality.md) — performance budgets, test gates, test policy (canonical gate list).
+- [`cosmic-navigation-engine-v0.4.md`](cosmic-navigation-engine-v0.4.md) — adopted navigation-engine technical specification (v0.4): scale hierarchy, frames, rendering, physics, seeding, environment visuals, product decisions. Source of truth for milestones v0.1.0+ ([`../milestones/`](../milestones/)); spec-derived ADRs in [`../decisions/`](../decisions/).

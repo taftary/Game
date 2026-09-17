@@ -63,7 +63,7 @@ no underground player state.
 
 Each transition has explicit enter/exit, asset prefetch hints, and a fallback (fade + spinner) if streaming misses budget.
 
-Implementation (M5 universe maps, `plans/universe-maps`): the top
+Implementation (M5 universe maps, `plans/v0.0.1/universe-maps`): the top
 segment is built — `game::journey` runs `GalaxyMap`/`SystemMap`/`Orbit`
 with selection/event transitions, fade + prefetch/evict effects, and a
 pinned-hash fixed-step regression; `game::transit` adds the timed,
@@ -71,7 +71,7 @@ pre-commit-cancellable interplanetary hop (60 ticks @ 20 Hz, deferred
 fuel/energy hook); `engine::universe` generates stages 1–2 with
 quantized cross-platform hashes; `game_debug` hosts the Galaxy Map
 (F1: star points + nebula impostors + L1 backdrop, 3D orbit/pan/log
-zoom/click, `Home` top-down snap — `plans/universe-maps-3d`)
+zoom/click, `Home` top-down snap — `plans/v0.0.1/universe-maps-3d`)
 and System Map (F2: inclined orbit rings + planets + L4 focus +
 travel offer)
 screens plus the orbit arrival binding (viewer rebuilds at descriptor

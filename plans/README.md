@@ -15,17 +15,26 @@ plans/
     issue-specs.md
     issue-report.md
     issue-plan.md
-  <feature-name>/          # kebab-case, unique per idea
-    notion.md              # needs, Status + Definition of Done (defines)
-    plan.md                # organized features + todo list (checks)
-    update-YYYY-MM-DD-HHMM/
-      notion.md
-      plan.md
-    issue-YYYY-MM-DD-HHMM-<slug>/
-      specs.md             # intake, day one
-      report.md            # added after investigation
-      plan.md              # added after investigation
+  <version>/               # v<MAJOR>.<MINOR>.<PATCH> release folder (grouping only, never a feature)
+    <feature-name>/        # kebab-case, unique per idea
+      notion.md            # needs, Status + Definition of Done (defines)
+      plan.md              # organized features + todo list (checks)
+      update-YYYY-MM-DD-HHMM/
+        notion.md
+        plan.md
+      issue-YYYY-MM-DD-HHMM-<slug>/
+        specs.md           # intake, day one
+        report.md          # added after investigation
+        plan.md            # added after investigation
 ```
+
+Current version folders (contents + per-version scope:
+[`../docs/milestones/`](../docs/milestones/)):
+
+- `v0.0.1/` — Foundations (done + in-review features)
+- `v0.1.0/` — Navigation core (navigation-engine spec §2, §3, §5, §6)
+- `v0.2.0/` — Scale rendering & visuals (spec §4, §9)
+- `v0.3.0/` — Player-facing layer (spec §10 + debug screens)
 
 ## Role gates
 
@@ -49,13 +58,22 @@ stops `done` until re-reviewed.
 
 ## Rules
 
-### 1. Feature folder
+### 1. Version folder
 
-- Name: kebab-case only, `^[a-z0-9]+(-[a-z0-9]+)*$`, e.g. `voxel-terrain/`. Must be unique; never reuse a name. `_template/` is reserved (underscore prefix can never collide).
-- Copy `_template/notion.md` → `<feature>/notion.md`, fill it first. Copy `_template/plan.md` → `<feature>/plan.md` only after notion is written. Never the reverse.
+- Name: `^v\d+\.\d+\.\d+$` (e.g. `v0.1.0/`), matching a release in
+  `docs/milestones/`. Grouping only — a version folder is never a feature
+  and holds no `notion.md` of its own.
+- Every feature lives in exactly one version folder. Moving a feature to
+  another version = moving the whole folder; every doc link to it must
+  follow (AGENTS.md docs-maintenance rule).
+
+### 2. Feature folder
+
+- Name: kebab-case only, `^[a-z0-9]+(-[a-z0-9]+)*$`, e.g. `voxel-terrain/`. Must be unique across **all** versions; never reuse a name. `_template/` is reserved (underscore prefix can never collide).
+- Copy `_template/notion.md` → `<version>/<feature>/notion.md`, fill it first. Copy `_template/plan.md` → `<version>/<feature>/plan.md` only after notion is written. Never the reverse.
 - Valid feature = both files present.
 
-### 2. Status (Definition of Done tracking)
+### 3. Status (Definition of Done tracking)
 
 Single vocabulary everywhere (feature `notion.md`, update `notion.md`, issue `specs.md`):
 
@@ -64,19 +82,19 @@ Single vocabulary everywhere (feature `notion.md`, update `notion.md`, issue `sp
 - `done` only when every DoD criterion is checked in the corresponding `plan.md`.
 - `on-hold` / `cancelled` require a one-line reason next to the status.
 
-### 3. Definition of Done
+### 4. Definition of Done
 
 - `notion.md` **defines**: `## Definition of Done` = bullet list of verifiable criteria.
 - `plan.md` **checks**: `## DoD verification` table maps each criterion → status + evidence.
 
-### 4. Updates (after done)
+### 5. Updates (after done)
 
 - Allowed only when parent feature `Status: done`.
 - Folder `update-YYYY-MM-DD-HHMM/` directly under the feature. Timestamp is **UTC**, 24h (e.g. `update-2026-09-14-1430`). Collision → append `-02`, `-03`.
 - Self-contained: own `notion.md` (from `update-notion.md`) + own `plan.md` (from `update-plan.md`). Todo IDs namespaced per update: `UPD-YYYYMMDD-001`, …
 - Never edit parent files in place. Parent stays `done`; cross-link parent ↔ update.
 
-### 5. Issues (inside a feature)
+### 6. Issues (inside a feature)
 
 - Folder `issue-YYYY-MM-DD-HHMM-<slug>/` directly under the feature. Timestamp **UTC**, 24h; `<slug>` is a kebab-case symptom (e.g. `issue-2026-09-14-1430-crash-on-load`).
 - Lifecycle files:

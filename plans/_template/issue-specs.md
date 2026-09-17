@@ -1,6 +1,6 @@
 # Issue specs — <feature-name> / issue-YYYY-MM-DD-HHMM-<slug> (UTC)
 
-Parent feature: [`../../notion.md`](../../notion.md)
+Parent feature: [`../notion.md`](../notion.md)
 
 ## Status
 

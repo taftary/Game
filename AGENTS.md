@@ -58,7 +58,7 @@ Every feature or change must update the docs it affects and verify them:
 - `docs/` — update the part your change touches (`techstack/`, `game/`,
   `milestones/`, `risks/`, `decisions/`); bump the Version line in
   `docs/techstack/README.md`.
-- `plans/<feature>/` — keep `notion.md` / `plan.md` (and update/issue files)
+- `plans/<version>/<feature>/` — keep `notion.md` / `plan.md` (and update/issue files)
   in sync with what actually landed, including DoD evidence.
 - Verify: every link you touched resolves, no section contradicts another,
   and anything this file documents still matches — otherwise update this file too.

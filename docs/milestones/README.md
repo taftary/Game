@@ -1,19 +1,88 @@
-# Milestones (suggested order; each is a `plans/` feature)
+# Milestones — versioned releases
 
-1. **M0 — Scaffold repair (done 2026-09-14):** `docs/examples` removed from workspace; `viewer` example dropped, smoke moves to `tools`. Workspace must build green on Linux/Win/mac.
-2. **M1 — Renderer smoke + tiers (done 2026-09-14, `plans/renderer-smoke`):** `vulkano` boot in `tools` (Instance → Surface → swapchain, capped at Vulkan 1.1 + portability enumeration), seeded sphere planet (`engine::render::SeededPlanet`, tier N=3/4/6), Low/Med/High tiers as code, orbit camera, naga-compiled planet pipeline, `--headless` CI gate. Written against the Vulkan 1.1 device floor (ADR-007 in [`../decisions/`](../decisions/)); CI guards mobile compilation from here (see [`../techstack/quality.md`](../techstack/quality.md)).
-3. **M2 — Descent slice:** orbit → atmosphere → sky → soil state machine with fades + chunk streaming stub + landing-site selection ([`journey.md`](../game/journey.md) levels L5–L7 transition; site selection moved here from M5 by ADR-011 in [`../decisions/`](../decisions/)).
-4. **M3 — Surface walk:** character/rover controller + heightfield collision on one planet (L7).
-5. **M4 — Colonies + robots core:** place 3 buildings, spawn robots, extract + haul loop, save/load.
-6. **M5 — Universe v1 (executes next, ahead of M2–M4 — ADR-011 in [`../decisions/`](../decisions/)):** galaxy/system maps, 2+ planet types, travel ([`journey.md`](../game/journey.md) levels L1–L4; L1 backdrop-only, L4 companions visual-only; landing-site selection moved to M2).
-7. **M6 — Mobile hardening:** touch controls, dynamic resolution, suspend/resume, perf budgets on reference devices.
-8. **M7 — Content + polish slice:** POIs, hazards, codex, audio minimums, English UI lock.
-9. **M8 — VR prep audit:** stereo-readiness, input abstraction, UI world-space review — no VR implementation.
+Versions group [`plans/`](../../plans/) features into shippable steps; each
+version is a folder under `plans/` (canonical rules:
+[`plans/README.md`](../../plans/README.md)). Historical M0–M8 labels are
+preserved for traceability (per ADR-011 in
+[`../decisions/`](../decisions/): numbers are labels, not sequence).
+Navigation-engine work from v0.1.0 on executes the adopted spec
+[`../techstack/cosmic-navigation-engine-v0.4.md`](../techstack/cosmic-navigation-engine-v0.4.md)
+("the spec").
 
-Each milestone gets `plans/<name>/notion.md` (needs + Status + DoD) then `plan.md` per `plans/README.md`. No implementation from notion alone.
+Each planned feature gets `plans/<version>/<name>/notion.md` (needs +
+Status + DoD) then `plan.md`. No implementation from notion alone.
 
-*Next step: implement M5 content (universe maps: galaxy/system maps + travel + planet types) per `plans/universe-maps/plan.md` (notion `planned` 2026-09-16, ARCHITECT + TECHLEAD signed) — re-sequenced ahead of M2–M4 by ADR-011 in [`../decisions/`](../decisions/). Milestone numbers are labels, not sequence: execution order is M0, M1, M5, M2, M3, M4, M6, M7, M8. The `debug-sphere-viewer` (implemented 2026-09-14, `plans/debug-sphere-viewer`) consumes `engine::render` (orbit camera + planet triangulation).*
+## v0.0.1 — Foundations (current state, 2026-09-17)
 
-Post-v1 candidates (unscheduled, no milestone number): subterranean
-geometry ([`journey.md`](../game/journey.md) L8), traversable universe
-layer (L1), landable moons (L4).
+Every feature done or in-review today. Historical mapping: M0 (scaffold
+repair), M1 (renderer smoke + tiers + debug tooling), M5 (universe maps,
+re-sequenced ahead of M2–M4 by ADR-011).
+
+| Feature | Status | Historical label |
+|---|---|---|
+| [`build-foundations`](../../plans/v0.0.1/build-foundations/) | done | M0 |
+| [`renderer-smoke`](../../plans/v0.0.1/renderer-smoke/) | done | M1 |
+| [`hex-sphere`](../../plans/v0.0.1/hex-sphere/) | done | M1 (ADR-002) |
+| [`cell-chunks`](../../plans/v0.0.1/cell-chunks/) | done | M1/M2 groundwork (ADR-010) |
+| [`debug-screens`](../../plans/v0.0.1/debug-screens/) | done | M1 tooling |
+| [`debug-sphere-viewer`](../../plans/v0.0.1/debug-sphere-viewer/) | done | M1 tooling |
+| [`sphere-uv-debug`](../../plans/v0.0.1/sphere-uv-debug/) | done | M1 tooling |
+| [`debug-player-view`](../../plans/v0.0.1/debug-player-view/) | done | M1 tooling |
+| [`player-sphere-movement`](../../plans/v0.0.1/player-sphere-movement/) | done | M1/M3 groundwork |
+| [`scale-hierarchy`](../../plans/v0.0.1/scale-hierarchy/) | done | docs contract (8 journey levels) |
+| [`universe-maps`](../../plans/v0.0.1/universe-maps/) | in-review | M5 |
+| [`universe-maps-3d`](../../plans/v0.0.1/universe-maps-3d/) | in-review | M5 |
+| [`debug-ui-reorganize`](../../plans/v0.0.1/debug-ui-reorganize/) | in-review | M1 tooling |
+
+Cancelled, kept for the record: [`chunk-flat-view`](../../plans/v0.0.1/chunk-flat-view/)
+(visual-debug only; engine-side `render::chunk_flat` stays for player
+streaming).
+
+## v0.1.0 — Navigation core (spec §2, §3, §5, §6)
+
+| Feature | Status | Spec section |
+|---|---|---|
+| [`frame-hierarchy`](../../plans/v0.1.0/frame-hierarchy/) | draft notion | §3 Coordinate & precision |
+| [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | draft notion | §2 Navigation model |
+| [`time-compression`](../../plans/v0.1.0/time-compression/) | draft notion | §2 Time compression |
+| [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | draft notion | §3 SOI handoff |
+| [`scale-physics`](../../plans/v0.1.0/scale-physics/) | draft notion | §5 Physics per scale |
+| [`hierarchical-seeding`](../../plans/v0.1.0/hierarchical-seeding/) | draft notion | §6 Procedural seeding |
+
+## v0.2.0 — Scale rendering & visuals (spec §4, §9)
+
+| Feature | Status | Spec section |
+|---|---|---|
+| [`log-depth-rendering`](../../plans/v0.2.0/log-depth-rendering/) | draft notion | §4 Depth strategy |
+| [`star-catalog-streaming`](../../plans/v0.2.0/star-catalog-streaming/) | draft notion | §4 LOD & streaming |
+| [`exposure-tone-mapping`](../../plans/v0.2.0/exposure-tone-mapping/) | draft notion | §9.2 Dynamic range |
+| [`depth-cueing`](../../plans/v0.2.0/depth-cueing/) | draft notion | §9.1 Depth cues |
+| [`zodiacal-light`](../../plans/v0.2.0/zodiacal-light/) | draft notion | §9.4 Zodiacal model |
+| [`waypoint-transitions`](../../plans/v0.2.0/waypoint-transitions/) | draft notion | §9.3 Waypoint experience |
+
+## v0.3.0 — Player-facing layer (spec §10 + debug tooling)
+
+| Feature | Status | Spec section |
+|---|---|---|
+| [`navigation-hud`](../../plans/v0.3.0/navigation-hud/) | draft notion | §10 HUD & overlay |
+| [`autosave-persistence`](../../plans/v0.3.0/autosave-persistence/) | draft notion | §10 Persistence |
+| [`scale-debug-screens`](../../plans/v0.3.0/scale-debug-screens/) | draft notion | spec §1 + §9.3 (dev tooling) |
+
+## Post-v0.3 (unscheduled)
+
+- **Colony milestones (historical labels):** M2 descent slice, M3 surface
+  walk, M4 colonies + robots core, M6 mobile hardening, M7 content +
+  polish slice, M8 VR prep audit. ADR-011 execution order for these (M2 →
+  M3 → M4 → M6 → M7 → M8, after M5) applies when scheduled; landing-site
+  selection stays with M2.
+- **Audio:** deferred to navigation-engine spec v0.5 (spec §10, ADR-006
+  in [`../decisions/`](../decisions/)).
+- **Post-v1 candidates:** subterranean geometry
+  ([`../game/journey.md`](../game/journey.md) L8), traversable universe
+  layer (L1), landable moons (L4).
+
+## Open product items (spec §10 — must not be silently dropped)
+
+Visual/rendering style (PBR vs stylized), facility anchor coordinates,
+player craft definition, terrain data policy, network/content policy,
+validation plan. These gate the notions above moving `draft → planned`.

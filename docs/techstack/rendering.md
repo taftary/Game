@@ -12,9 +12,9 @@
   conventions section below), so culling pipelines use
   `FrontFace::CounterClockwise` with `CullMode::Back`. Both windowed
   binaries (`game_debug` fill, `game_tools` planet) follow it —
-  `plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`
+  `plans/v0.0.1/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`
   (historical `Clockwise` compensation, superseded by
-  `plans/debug-player-view/issue-2026-09-16-0851-3d-view-y-flipped`).
+  `plans/v0.0.1/debug-player-view/issue-2026-09-16-0851-3d-view-y-flipped`).
 - Orbit input convention (`OrbitCamera::rotate`, shared): drag up
   pitches the camera toward the sphere's top (FPS-style non-inverted),
   drag right yaws with the drag.
@@ -88,7 +88,7 @@ Enforced by the `tools` renderer smoke + device profiles (see [`quality.md`](qua
 
 The `game_tools` renderer smoke is the renderer test: open a seeded planet, orbit it, force all three tiers.
 
-M1 status (2026-09-14, `plans/renderer-smoke`): the smoke exists and is
+M1 status (2026-09-14, `plans/v0.0.1/renderer-smoke`): the smoke exists and is
 CI-gated headlessly.
 
 - Windowed: `winit` window + `vulkano` boot (`Instance` capped at Vulkan
@@ -110,7 +110,7 @@ CI-gated headlessly.
 ## Debug planet view (`game_debug`)
 
 The `game_debug` viewer is the mesh-inspection tool, spread over two
-OS windows sharing one Vulkan device (`plans/debug-ui-reorganize`,
+OS windows sharing one Vulkan device (`plans/v0.0.1/debug-ui-reorganize`,
 2026-09-16). The viewer window hosts the Galaxy Map (`F1`), the System
 Map (`F2`) and the Planet View (`F3`: current `HexSphere` as dual-cell
 fans with the shared `OrbitCamera`, a wireframe overlay and a pentagon
@@ -121,7 +121,7 @@ Inspector (placeholders), on window-local `1/2/3` tabs; closing it
 hides it, `F4` on the viewer window reopens it. Viewer state is
 preserved across screen switches.
 
-`plans/debug-sphere-viewer` status (2026-09-14): implemented against
+`plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).
 
@@ -136,16 +136,16 @@ naga compile helper, 1.1-floor boot).
   pipelines from them plus its own surface/swapchain/framebuffers and
   atlas descriptor set. The windowed default opens at
    N=4 (readable faces + pentagon sites; N=6 cells are subpixel —
-   `plans/debug-sphere-viewer/update-2026-09-14-2008`). The fill pipeline
+   `plans/v0.0.1/debug-sphere-viewer/update-2026-09-14-2008`). The fill pipeline
    follows the Backend winding convention (`FrontFace::CounterClockwise`)
    and passes the radial outward normal through unflipped
-   (`plans/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`,
+   (`plans/v0.0.1/debug-sphere-viewer/issue-2026-09-14-2113-faces-inverted-orbit-mirrored`,
    projection un-flipped in
-   `plans/debug-player-view/issue-2026-09-16-0851-3d-view-y-flipped`).
+   `plans/v0.0.1/debug-player-view/issue-2026-09-16-0851-3d-view-y-flipped`).
 - `--headless`: GPU-free viewer-mesh build (N=6, R=1.0) + stats print,
   including `uv_islands`/`uv_seam_verts` from the icosa-net unwrap;
   runs in CI as `cargo run -p game_debug -- --headless`.
-- UV inspection (`plans/sphere-uv-debug`, 2026-09-15): `engine::render::uv`
+- UV inspection (`plans/v0.0.1/sphere-uv-debug`, 2026-09-15): `engine::render::uv`
   lays the 20 base faces out as the classic 5-10-5 triangle strip
   (closed-form absolute slots, one rooted tree walk assigning the forced
   icosa neighbor per slot — pairwise SAT-tested overlap-free); every
@@ -154,7 +154,7 @@ naga compile helper, 1.1-floor boot).
   Gnomonic Checker with density slider, Seams+Islands, LonLat;
   `1`–`6` select). The 3D view keeps the single-UV honest-stretch look.
   Checker mode uses a cube-domain mapping
-  (`plans/sphere-uv-debug/issue-2026-09-15-0817-3d-checker-gnomonic`):
+  (`plans/v0.0.1/sphere-uv-debug/issue-2026-09-15-0817-3d-checker-gnomonic`):
   an icosahedral square grid provably cannot be globally consistent
   (60° vertex holonomy vs 90° grid symmetry — it always shows triangles
   at the 12 vertices and mismatched seams), so the checker runs on the
@@ -170,7 +170,7 @@ naga compile helper, 1.1-floor boot).
   it flows across the icosa seam overlay.
    `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
    it, so the `game_tools` smoke is unaffected.
-- Panel UX (`plans/debug-ui-reorganize`): inputs appear only when
+- Panel UX (`plans/v0.0.1/debug-ui-reorganize`): inputs appear only when
   needed. The planet screen uses a left dock (VIEW section with the 2×2
   camera presets, SHADER section with the mode selector, OVERLAYS with
   wireframe/pentagons/seams) and the right data dock (INPUTS
@@ -179,15 +179,15 @@ naga compile helper, 1.1-floor boot).
   bar. The checker-density slider only
   exists in Checker mode, the walk/cam key hints only exist when the
   player is on, and the preset keys only work on the planet screen.
-- Tools window (`plans/debug-ui-reorganize`, 2026-09-16): a second OS
+- Tools window (`plans/v0.0.1/debug-ui-reorganize`, 2026-09-16): a second OS
   window hosts the FPS / Console / Inspector tabs (window-local `1/2/3`
   + click nav). The FPS tab shows the live `FpsOverlay` recorder (one
   sample per event-loop iteration): fps, mean/max frame ms, sample
   count, and a 120-sample sparkline (right = newest, green <20 ms,
   yellow <34 ms, red above). Console and Inspector stay placeholders
   (console direction is still ADR-009's `tracing` layer).
-- Flat chunk map (`plans/chunk-flat-view`, CANCELLED 2026-09-16 by
-  `plans/debug-ui-reorganize`): the viewer flat view (third
+- Flat chunk map (`plans/v0.0.1/chunk-flat-view`, CANCELLED 2026-09-16 by
+  `plans/v0.0.1/debug-ui-reorganize`): the viewer flat view (third
   `ViewFocus::ChunkFlat` mode, `CHUNK_FLAT_VERT` pipeline, arrow-key
   orbit, flat picking, flat player marker) is deleted. The engine side
   stays: `engine::render::chunk_flat` still projects one hemisphere at
@@ -197,8 +197,8 @@ naga compile helper, 1.1-floor boot).
 - `engine::hexsphere` topology and the release `game` binary are untouched; all
   UI code lives in `crates/debug` (first custom swapchain-UI consumer
   per [`stack.md`](stack.md)).
-- Universe maps (`plans/universe-maps`, 3D views in
-  `plans/universe-maps-3d`, 2026-09-16): a `PointList` map pipeline
+- Universe maps (`plans/v0.0.1/universe-maps`, 3D views in
+  `plans/v0.0.1/universe-maps-3d`, 2026-09-16): a `PointList` map pipeline
   (one static buffer, per-vertex color/size/kind, circular
   `gl_PointCoord` mask, alpha blend, no depth write) draws the Galaxy
   Map (L1 backdrop + nebula impostors + 25k star points) and the System
