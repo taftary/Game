@@ -57,7 +57,7 @@ commit when it reaches `done` (workflow rule:
 
 | Feature | Status | Spec section |
 |---|---|---|
-| [`log-depth-rendering`](../../plans/v0.2.0/log-depth-rendering/) | draft notion | §4 Depth strategy |
+| [`log-depth-rendering`](../../plans/v0.2.0/log-depth-rendering/) | done | §4 Depth strategy |
 | [`star-catalog-streaming`](../../plans/v0.2.0/star-catalog-streaming/) | draft notion | §4 LOD & streaming |
 | [`exposure-tone-mapping`](../../plans/v0.2.0/exposure-tone-mapping/) | draft notion | §9.2 Dynamic range |
 | [`depth-cueing`](../../plans/v0.2.0/depth-cueing/) | draft notion | §9.1 Depth cues |

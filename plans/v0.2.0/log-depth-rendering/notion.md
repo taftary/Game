@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done` (all DoD criteria checked in `plan.md`, ANALYST + SECURITY signed 2026-09-17)
 
 ## Context
 
@@ -43,8 +43,15 @@ necessary but not sufficient.
 ## Roles
 
 Author: PO (2026-09-17). UX consulted (required if player-facing): n-a at
-draft (no UI). ARCHITECT consulted (required if cross-module): pending —
-touches the render pipeline contract.
+planned (no UI). ARCHITECT consulted (required if cross-module): yes —
+touches the render pipeline contract (`docs/techstack/rendering.md`).
+PO sign-off for `draft → planned` (2026-09-17): checklist green — problem
+stated without prescribing implementation; non-goals explicit; every DoD
+criterion verifiable with evidence; open questions listed as questions
+(band boundaries per tier, deferred to plan Phase with ADR-007 data). No
+spec §10 open item blocks this feature (visual style, facility anchor,
+terrain data policy, network/content policy all deferred per-feature per
+v0.2.0 kickoff agreement).
 
 ## Functional requirements
 

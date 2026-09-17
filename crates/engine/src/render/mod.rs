@@ -10,17 +10,24 @@
 //!
 //! [`camera`] and [`planet`] triangulation are pure math; [`shaders`]
 //! compiles headlessly. Only [`boot`] helpers that touch `Instance` /
-//! `PhysicalDevice` need a GPU at runtime.
+//! `PhysicalDevice` need a GPU at runtime. [`depth`] and [`bands`] plan
+//! log-depth encodings and multi-pass compositing, also GPU-free.
 
+pub mod bands;
 pub mod boot;
 pub mod camera;
 pub mod checker;
 pub mod chunk_flat;
+pub mod depth;
 pub mod planet;
 pub mod shaders;
 pub mod tier;
 pub mod uv;
 
+pub use bands::{
+    BandConfig, BandPass, ContentLayer, DepthMode, LayerKind, PassBucket, bucket_for, plan_passes,
+    shares_depth_pass,
+};
 pub use boot::{
     MAX_API_VERSION, VALIDATION_LAYER, create_instance, device_score, instance_create_info,
     log_physical_device, required_device_extensions,
@@ -31,6 +38,10 @@ pub use checker::{
     glsl_const_block,
 };
 pub use chunk_flat::{orbit_viewpoint, project_to_tangent, tangent_basis, visible_hemisphere};
+pub use depth::{
+    LOG_GUARD_EPSILON, LogDepthParams, glsl_log_depth_epilogue, glsl_log_depth_push_field,
+    linear_depth_f32, planet_vert_logdepth, same_float_depth, same_unorm_quantum,
+};
 pub use planet::{IndexedMesh, PlanetVertex, SeededPlanet};
 pub use shaders::{
     PLANET_FRAG, PLANET_VERT, ShaderCompileError, ShaderKind, compile_glsl_to_spirv,

@@ -73,6 +73,55 @@ Pinning tests: `projection_uses_vulkan_ndc` (engine),
 - Water/lava (if any): flat shaded planes with animated normals in v1; no FFT oceans.
 - Post: tone map; bloom/shadows are quality-tier gated.
 
+## Depth bands & log-depth (v0.2.0, `plans/v0.2.0/log-depth-rendering`, ADR-016 binding)
+
+26 decades of scale cannot fit one depth range. Two mechanisms combine;
+both change **depth writes only** — the Camera & screen-space
+conventions above (NDC +1 = top, un-flipped RH projection,
+`CounterClockwise` + `Back`) hold inside every band.
+
+- **Log-depth within a pass** (`engine::render::depth`): Outerra-style
+  `log(z)` in the vertex shader, Vulkan Z ∈ [0, 1] form
+  `d(w) = log2(1 + w) / log2(1 + far)`. Shader sources are composed
+  from the single-authored base (`planet_vert_logdepth`), never
+  hand-duplicated. Log passes use `D32_SFLOAT` (mandatory Vulkan 1.1
+  format): D16 quanta are coarser than the log slope at decade range
+  (pinned by `oracle_log_depth_needs_float_buffer_at_decade_range`).
+- **Multi-pass compositing across passes** (`engine::render::bands`):
+  bands execute far → near; every band clears depth (no band inherits
+  another band's values) and color composites with load/preserve.
+  Cross-band occlusion is painter order; within a band, depth resolves.
+
+Bucket rule (the per-pair-of-scales sharing table, executable as
+`bucket_for` / `shares_depth_pass`): a layer's home-frame depth vs the
+active-frame depth decides its pass — coarser homes share Far, the
+active home owns Mid, finer homes share Near. Backdrop (no depth) leads,
+UI (no depth) trails. No global depth range exists.
+
+| Active frame | Backdrop | Far (log) | Mid (log) | Near (tight linear) |
+|---|---|---|---|---|
+| Cosmological | skybox-like | — (nothing coarser) | `(0.1, 3e26)` | `(0.1, finest content extent)` |
+| Galactocentric | skybox-like | `(1e21, 3e26)` | `(0.1, 1e21)` | `(0.1, finest)` |
+| LocalGroup | skybox-like | `(3e23, 3e26)` | `(0.1, 3e23)` | `(0.1, finest)` |
+| StellarNeighborhood | skybox-like | `(1e18, 3e26)` | `(0.1, 1e18)` | `(0.1, finest)` |
+| SolarSystem | skybox-like | `(1e15, 3e26)` | `(0.1, 1e15)` | `(0.1, finest)` |
+| Planetocentric | skybox-like | `(1e9, 3e26)` | `(0.1, 1e9)` | `(0.1, finest)` |
+| LocalEnu | skybox-like | `(1e5, 3e26)` | `(0.1, 1e5)` | — (nothing finer) |
+
+Ranges in meters, Low-tier defaults (`BandConfig::low_defaults`:
+`near_plane` 0.1 m, `log_far` 3e26 m); exact boundaries per tier stay
+override hooks until ADR-007 device data lands. Worked example: at
+active SolarSystem, galaxy content (Galactocentric) and stellar content
+share the Far pass, planets own Mid, lander geometry shares Near —
+`plan_passes` emits exactly `[Far, Mid, Near]`, all depth-cleared.
+
+Pipeline-kind classification (existing consumers): map `PointList`
+stays a no-depth-write Backdrop band; planet fill is Mid/Far content;
+line overlays ride their home scale's pass (depth-tested, no write);
+UI is the trailing pass. The `game_tools` smoke demonstrates the plan
+on GPU behind `--log-depth`: Backdrop clear → Mid log planet (D32F) →
+Near linear quad (tight 0.05–10 projection, own depth clear).
+
 ## Quality tiers
 
 | Tier | Target | Resolution | Shadows | Terrain density | Atmosphere |

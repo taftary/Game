@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.20.0 (2026-09-17, `free-flight-navigation` done: `engine::flight` dynamics + fly-to, v0.1.0 complete — all six features done)
+- **Version:** 0.21.0 (2026-09-17, `log-depth-rendering` done: `engine::render::depth` + `bands` + `game_tools --log-depth` 3-band demo, ADR-016 binding — v0.2.0 first feature)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
