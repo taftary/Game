@@ -11,6 +11,7 @@
 | Cold start to menu | <5 s mid-tier phone | <4 s | <3 s |
 | Planet chunk stream (descent) | fade ≤2 s acceptable | ≤1.5 s | ≤1 s |
 | Depth bands per frame (v0.2.0) | ≤3 passes, one transient D32F depth image (demo-pinned) | ≤3 until ADR-007 tier data lands | same as Medium |
+| Post chain per frame (v0.2.0) | +1 fullscreen resolve pass, one transient HDR image (16F preferred, packed-float fallback, content-preserving LDR bypass) | same | same |
 
 Budgets are enforced by the `tools` renderer smoke + device profiles, not by vibes. Any feature that blows Low tier is cut or tier-gated.
 

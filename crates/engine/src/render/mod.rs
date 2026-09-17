@@ -13,7 +13,10 @@
 //! `PhysicalDevice` need a GPU at runtime. [`depth`] and [`bands`] plan
 //! log-depth encodings and multi-pass compositing, also GPU-free.
 //! [`stars`] expands catalog tiles to Backdrop point sprites, also
-//! GPU-free (binaries own the buffers).
+//! GPU-free (binaries own the buffers). [`exposure`] is the pure
+//! auto-exposure / tone-map / dark-adaptation kernel and [`post`] its
+//! headless-testable format-selection + resolve-shader half (binaries
+//! own the HDR images and pipelines).
 
 pub mod bands;
 pub mod boot;
@@ -21,7 +24,9 @@ pub mod camera;
 pub mod checker;
 pub mod chunk_flat;
 pub mod depth;
+pub mod exposure;
 pub mod planet;
+pub mod post;
 pub mod shaders;
 pub mod stars;
 pub mod tier;
@@ -46,7 +51,16 @@ pub use depth::{
     LOG_GUARD_EPSILON, LogDepthParams, glsl_log_depth_epilogue, glsl_log_depth_push_field,
     linear_depth_f32, planet_vert_logdepth, same_float_depth, same_unorm_quantum,
 };
+pub use exposure::{
+    DominantSource, EXPOSURE_MAX, EXPOSURE_MIN, ExposureLoop, ExposureParams, MIDDLE_GREY,
+    PHOTOMETRIC_ZERO_POINT, aces_approx, adapt_exposure, calibrate, exposure_for_key,
+    select_source, star_visibility,
+};
 pub use planet::{IndexedMesh, PlanetVertex, SeededPlanet};
+pub use post::{
+    ACES_FIT_GLSL, HDR_FORMAT_PREFERENCE, HdrSelection, RESOLVE_FRAG_FIXED, RESOLVE_VERT,
+    ResolvePush, resolve_frag_aces, select_hdr_format,
+};
 pub use shaders::{
     PLANET_FRAG, PLANET_VERT, ShaderCompileError, ShaderKind, compile_glsl_to_spirv,
 };

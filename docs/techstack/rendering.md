@@ -71,7 +71,8 @@ Pinning tests: `projection_uses_vulkan_ndc` (engine),
 - Sky: gradient + sun + haze; clouds are billboard/impostor tier in v1, volumetric is out.
 - Colony/robots: instanced low-poly meshes, one directional light + hemisphere ambient in low tier.
 - Water/lava (if any): flat shaded planes with animated normals in v1; no FFT oceans.
-- Post: tone map; bloom/shadows are quality-tier gated.
+- Post: tone map (shipped v0.2.0: HDR scene target + ACES resolve,
+  `exposure-tone-mapping`); bloom/shadows are quality-tier gated.
 
 ## Depth bands & log-depth (v0.2.0, `plans/v0.2.0/log-depth-rendering`, ADR-016 binding)
 
@@ -129,15 +130,34 @@ deterministic fallback slots to camera-relative point sprites on a
 re-uploads only on tile-set change, camera motion rides the MVP push).
 First live surface is the `game_debug` Planet View backdrop (reuses the
 map `PointList` pipeline; tile state shows in the STATS dock, dev-only).
-Sky frame is J2000 equatorial axes; photometric calibration stays with
-`exposure-tone-mapping`.
+Sky frame is J2000 equatorial axes; photometric calibration landed
+with `exposure-tone-mapping` (`PHOTOMETRIC_ZERO_POINT` anchor; the
+twilight star fade-in drives the sky alpha path in the Planet View).
 
 Interplanetary sky glow (v0.2.0, `plans/v0.2.0/zodiacal-light`,
 ADR-021 binding): the solar-system frame's real faint dust glow is the
 analytic spec §9.4 model in `engine::render::zodiacal` (per-pixel from
-the camera ray in ecliptic coordinates, linear radiance out). It feeds
-the exposure path owned by `exposure-tone-mapping`; no sky renderer
-consumes it yet.
+the camera ray in ecliptic coordinates, linear radiance out). First
+consumer is the exposure path (`calibrate` scales `ZodiacalSource`
+output by the photometric zero point); no sky renderer consumes it
+directly yet.
+
+Exposure post chain (v0.2.0, `plans/v0.2.0/exposure-tone-mapping`,
+ADR-021 binding): the scene renders into an HDR color attachment
+(`R16G16B16A16_SFLOAT` preferred, `B10G11R11_UFLOAT_PACK32` fallback,
+content-preserving LDR bypass when neither is renderable —
+`engine::render::post::select_hdr_format`); a fullscreen resolve pass
+tone maps into the swapchain (ACES fit, `resolve_frag_aces` composed
+from the fixed variant — never hand-duplicated). Auto-exposure keys to
+the dominant source (Sun / albedo / starlight, hysteresis-filtered)
+with rate-split adaptation (dark slower than light) and twilight star
+fade-in (`engine::render::exposure`; absolute anchor
+`PHOTOMETRIC_ZERO_POINT`). Pass order: bands → resolve → UI (UI stays
+LDR, never tone mapped); the resolve triangle disables culling and
+preserves NDC +1 = top (orientation contract pinned in `post`). The
+`game_tools` smoke demonstrates the chain behind `--hdr` (`H` cycles
+demo keys); the `game_debug` Planet View applies the kernel to the sky
+alpha path (`F5` cycles twilight stages for DoD-2 captures).
 
 ## Quality tiers
 
@@ -168,8 +188,12 @@ CI-gated headlessly.
 - Tier planet levels: Low N=3 (642 cells / 3,840 tris), Medium N=4
   (2,562 cells / 15,360 tris), High N=6 (40,962 cells / 245,760 tris).
 - `--headless`: GPU-free (never loads the Vulkan loader) planet
-  generation + stats print; runs in CI as
+  generation + stats print + exposure self-test lines
+  (`exposure_handoff`, `twilight_fade`, `tonemap_clip`); runs in CI as
   `cargo run -p game_tools -- --headless --tier low`.
+- `--hdr` (windowed): HDR scene target + ACES resolve pass
+  (`exposure-tone-mapping`); `H` cycles Sun-day → Albedo →
+  Starlight-night demo keys through the live adaptation loop.
 - `resolution_scale` is a tier parameter (0.6 / 0.85 / 1.0) but stays
   unapplied until M6 dynamic resolution; shadows are a tier flag only.
 

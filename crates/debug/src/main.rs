@@ -40,9 +40,9 @@ use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
 use game_engine::catalog::scheduler::SkyView;
 use game_engine::render::{
-    FOV_Y, MAX_PITCH, OrbitCamera, ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv,
-    create_instance, device_score, log_physical_device, required_device_extensions,
-    visible_hemisphere,
+    ExposureParams, FOV_Y, MAX_PITCH, OrbitCamera, ShaderKind, WORLD_TO_EQUATORIAL,
+    compile_glsl_to_spirv, create_instance, device_score, log_physical_device,
+    required_device_extensions, star_visibility, visible_hemisphere,
 };
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -324,6 +324,7 @@ layout(location = 2) in vec3 misc;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     float px_scale;
+    float exposure;
 } pc;
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
@@ -333,7 +334,11 @@ void main() {
     float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
     gl_PointSize = clamp(px, 1.0, 256.0);
     v_color = color;
-    v_alpha = misc.y;
+    // Exposure/visibility multiplier (ETM-006/009): 1.0 everywhere
+    // except the Planet-View sky draw, where the twilight stage fades
+    // catalog stars per the exposure kernel. Alpha-side so sprite
+    // sizes (which encode magnitude) stay untouched.
+    v_alpha = misc.y * pc.exposure;
 }";
 
 const MAP_FRAG: &str = r"#version 450
@@ -445,13 +450,28 @@ struct MapVertex {
 }
 
 /// Map push constants: perspective view-projection + pixels-per-unit
-/// at the target depth for world-sized sprites (68 B < 128 B
-/// Vulkan 1.1 floor).
+/// at the target depth for world-sized sprites + exposure/visibility
+/// multiplier (72 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct MapPush {
     mvp: [[f32; 4]; 4],
     px_scale: f32,
+    exposure: f32,
+}
+
+/// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
+/// mid of each twilight band, so Planet-View captures step through the
+/// star fade-in (exposure-tone-mapping DoD-2). Keys sit inside bands
+/// (never on a threshold) so each stage shows unmistakable partial
+/// visibility except the endpoints.
+fn twilight_key(stage: u8) -> (f64, &'static str) {
+    match stage % 4 {
+        0 => (1.0, "Day"),
+        1 => (10f64.powf(-4.5), "Civil"),
+        2 => (10f64.powf(-6.25), "Nautical"),
+        _ => (10f64.powf(-7.5), "Astronomical"),
+    }
 }
 
 /// Depth format shared by the render pass and the depth image.
@@ -2904,6 +2924,10 @@ struct ViewerApp {
     /// its Backdrop point buffer, drawn first in the Planet View.
     sky: CatalogSky,
     sky_vertices: Subbuffer<[MapVertex]>,
+    /// Twilight demo stage (F5 cycles Day → Civil → Nautical →
+    /// Astronomical): keys the sky-luminance input of the star
+    /// fade-in (exposure-tone-mapping DoD-2 captures).
+    twilight_stage: u8,
     /// Partial sim-step accumulator for the transit countdown
     /// (fixed-step consumption of the frame dt).
     transit_acc: f32,
@@ -3091,6 +3115,7 @@ impl ViewerApp {
             system_lines,
             sky,
             sky_vertices,
+            twilight_stage: 0,
             transit_acc: 0.0,
             atlas_image: None,
             dragging_orbit: false,
@@ -3924,6 +3949,14 @@ impl ViewerApp {
                             ));
                         }
                     }
+                    PhysicalKey::Code(KeyCode::F5) => {
+                        // Twilight stage demo (exposure-tone-mapping
+                        // DoD-2): cycle the sky-luminance key; the
+                        // Planet-View sky fades per stage.
+                        self.twilight_stage = (self.twilight_stage + 1) % 4;
+                        let (_, name) = twilight_key(self.twilight_stage);
+                        self.debug.fx.notify(format!("Twilight {name}"));
+                    }
                     PhysicalKey::Code(
                         KeyCode::Digit1
                         | KeyCode::Digit2
@@ -4602,7 +4635,11 @@ impl ViewerApp {
                         .push_constants(
                             ctx.pipelines.map.layout().clone(),
                             0,
-                            MapPush { mvp, px_scale },
+                            MapPush {
+                                mvp,
+                                px_scale,
+                                exposure: 1.0,
+                            },
                         )
                         .expect("map push constants must upload");
                     // SAFETY: `vertex_count` equals the uploaded point
@@ -4643,7 +4680,11 @@ impl ViewerApp {
                         .push_constants(
                             ctx.pipelines.map.layout().clone(),
                             0,
-                            MapPush { mvp, px_scale },
+                            MapPush {
+                                mvp,
+                                px_scale,
+                                exposure: 1.0,
+                            },
                         )
                         .expect("map push constants must upload");
                     // SAFETY: same contract as the galaxy map draw.
@@ -4686,6 +4727,13 @@ impl ViewerApp {
                     if sky_changed {
                         self.sky_vertices = upload_sky_points(&self.memory_allocator, sky_points);
                     }
+                    // Twilight stage (F5): the sky-luminance key drives
+                    // star visibility through the exposure kernel, so
+                    // the viewer shows the DoD-2 fade-in live (ETM-009:
+                    // this is where the catalog photometry calibrates).
+                    let (sky_key, _) = twilight_key(self.twilight_stage);
+                    let sky_exposure =
+                        star_visibility(sky_key, &ExposureParams::spec_defaults()) as f32;
                     // Orbit arrival tint (UMAP-021): the target's
                     // atmosphere color re-lights the mesh; no arrival =
                     // untinted default look.
@@ -4708,7 +4756,11 @@ impl ViewerApp {
                             0,
                             // `px_scale` is inert here: sky sprites are
                             // kind 0 (pixel size), never world-scaled.
-                            MapPush { mvp, px_scale: 1.0 },
+                            MapPush {
+                                mvp,
+                                px_scale: 1.0,
+                                exposure: sky_exposure,
+                            },
                         )
                         .expect("sky push constants must upload");
                     // SAFETY: same PointList contract as the map draws —

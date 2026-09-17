@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done` (all DoD criteria checked in `plan.md`, ANALYST + SECURITY signed 2026-09-17)
 
 ## Context
 
@@ -40,12 +40,32 @@ daylight vs deep space ~30 stops. No fixed exposure covers both.
 - Players: readable scene at every scale without manual exposure.
 - UX: adaptation pacing is a feel-critical player-facing behavior.
 
+UX notes (2026-09-17): dark adaptation must be slower than light
+adaptation (mirroring scotopic behavior); star fade-in is gradual
+across civil → nautical → astronomical twilight — never a pop at a
+fixed altitude; dominant-source switches (hardest: waypoint 6 → 5)
+must show no visible exposure step; all pacing constants ship as
+tunable calibration, UX acceptance rows land in `plan.md`.
+
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— required before `draft → planned` (adaptation pacing/feel). ARCHITECT
-consulted (required if cross-module): pending (render pipeline + light
-sources).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes —
+adaptation pacing is the player-facing surface here; UX notes under
+`Users / Stakeholders` (2026-09-17). ARCHITECT consulted (required if
+cross-module): yes — render-pipeline placement confirmed (HDR scene
+target + tonemap resolve pass; UI stays LDR post-resolve; `game` never
+touches vulkano); ADR-021 already covers the decision, no new ADR
+(2026-09-17).
+PO sign-off for `draft → planned` (2026-09-17): checklist green —
+problem stated without prescribing implementation; non-goals explicit;
+DoD criteria verifiable (DoD-1 via the analytic Sun angular-diameter
+sweep harness — approved evidence form 2026-09-17, since no waypoint
+runtime exists yet (`waypoint-transitions` owns it); DoD-2 via twilight
+captures; DoD-3 via never-clip unit tests on synthetic HDR scenes);
+open question (ACES variant vs mobile cost) stays open, resolved in
+`plan.md` via runtime HDR-format query + tier fallback (ADR-007). The
+spec §10 visual/rendering-style open item does not block this feature:
+ADR-021 fixes the physical basis, style tunes parameters only.
 
 ## Functional requirements
 
@@ -64,14 +84,19 @@ sources).
 ## Definition of Done
 
 - [ ] Sun-disk to Sun-as-point transition (waypoint 6 → 5) with smooth
-  exposure handoff (capture evidence).
+  exposure handoff — evidence: analytic Sun angular-diameter sweep
+  harness (headless self-test asserts continuity, no pops) + debug
+  captures; approved evidence form 2026-09-17 (no waypoint runtime
+  exists yet — `waypoint-transitions` owns it).
 - [ ] Twilight sequence shows progressive star fade-in, no altitude
   pop.
 - [ ] Tone mapper never clips test HDR scenes (validation captures).
 
 ## Constraints & Assumptions
 
-- ADR-021 draft becomes binding here.
+- ADR-021 is binding (2026-09-17): the physical basis (auto-exposure
+  keyed to dominant source, filmic mapping, twilight dark adaptation)
+  is fixed; PBR-vs-stylized style choices tune parameters only.
 - All environment source terms (zodiacal, extinction, scattering) must
   convert to linear radiance **before** this stage (spec §9.4 rule).
 

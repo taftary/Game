@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.23.0 (2026-09-17, `star-catalog-streaming` done: `engine::catalog` HEALPix index + tile format + cache/scheduler/fallback/identity, `game_tools catalog` cooker, debug planet-view sky backdrop, ADR-017/ADR-020 binding — v0.2.0 third feature)
+- **Version:** 0.24.0 (2026-09-17, `exposure-tone-mapping` done: `engine::render::exposure` kernel (dominant-source hysteresis, rate-split adaptation, ACES mirror, twilight fade) + `engine::render::post` HDR selection/resolve + `game_tools --hdr` chain with live loop + debug sky-alpha path with F5 twilight stages + headless self-test lines — v0.2.0 fourth feature)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
