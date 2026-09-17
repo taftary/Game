@@ -389,6 +389,46 @@ close the four items still listed under *Still open* below.
   `soi-handoff` eligibility and `time-compression`'s
   gravitationally-significant radius.
 
+### Resolved for star-catalog-streaming (PO decisions, 2026-09-17)
+
+Provisional where noted — they unblock the `star-catalog-streaming`
+notion moving `draft → planned` and may be revised by later versions.
+They do not close the four items still listed under *Still open* below.
+
+#### Catalog data source (unblocks tile ingestion)
+
+- Cooker ingests a small local Gaia DR3 extract (CSV) plus a seeded
+  synthetic generator that fills the Gaia schema (source id, ra/dec,
+  proper motions, G magnitude, BP–RP color) with realistic density
+  tiers (galactic plane included). Full-sky real import is later work.
+  Synthetic tile version stamp: `gaia-dr3-synth/1.0`; real-extract
+  stamp: `gaia-dr3/1.0`.
+
+#### Concurrency model (unblocks the streaming scheduler)
+
+- `std::thread` worker pool + `std::sync::mpsc` channels. No async
+  runtime, no new dependency — `stack.md` is untouched. Decode is pure;
+  worker threads never feed the sim tick.
+
+#### HEALPix implementation (unblocks the spatial index)
+
+- Hand-rolled NESTED-scheme index in `engine` (pure `f64` math,
+  reference-vector pinned). No external math crate — consistent with
+  the hand-rolled RNG posture (audit surface stays flat).
+
+#### First rendering surface (unblocks integration order)
+
+- Space sky: catalog stars render in the Backdrop depth band of the
+  space/planet view. The galaxy map keeps procedural stars for now;
+  its rewiring is later work.
+
+#### On-disk cache (provisional, ties to the network/content open item)
+
+- Same binary tile v1 format on disk; cooker `--out` configurable,
+  default `assets/catalog/gaia-dr3/` for the packaged demo extract.
+  Cache-size cap stays provisional pending the network/content policy
+  decision.
+
 ### Still open
 
 The following items remain open and must not be silently dropped:

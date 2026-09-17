@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.22.0 (2026-09-17, `zodiacal-light` done: `engine::render::zodiacal` analytic model + `ZodiacalSource` interface, ADR-021 binding — v0.2.0 second feature)
+- **Version:** 0.23.0 (2026-09-17, `star-catalog-streaming` done: `engine::catalog` HEALPix index + tile format + cache/scheduler/fallback/identity, `game_tools catalog` cooker, debug planet-view sky backdrop, ADR-017/ADR-020 binding — v0.2.0 third feature)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

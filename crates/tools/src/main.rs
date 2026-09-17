@@ -12,6 +12,10 @@
 //! Usage: `game_tools [--tier low|medium|high] [--seed N] [--radius R]
 //!   [--headless] [--log-depth]`.
 //!
+//! `game_tools catalog --out <dir> ...`: catalog cooker (see the
+//! `catalog_cook` module): deterministic Gaia-schema tile writer,
+//! GPU-free.
+//!
 //! `--log-depth` (windowed only) switches the planet pipeline to the
 //! log-depth vertex variant (`engine::render::depth`, ADR-016) with a
 //! `D32_SFLOAT` depth attachment. Default pixels are unchanged without
@@ -19,6 +23,8 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+
+mod catalog_cook;
 
 use game_engine::render::{
     FOV_Y, IndexedMesh, OrbitCamera, PLANET_FRAG, PLANET_VERT, PlanetVertex, QualityTier,
@@ -1088,6 +1094,11 @@ fn main() {
 
 fn run() -> i32 {
     let argv: Vec<String> = std::env::args().collect();
+    // The cooker subcommand dispatches before the smoke parser (which
+    // would reject its flags) and never touches the Vulkan loader.
+    if argv.get(1).is_some_and(|first| first == "catalog") {
+        return catalog_cook::run(&argv[2..]);
+    }
     let args = match parse_args(&argv) {
         Ok(args) => args,
         Err(error) => {

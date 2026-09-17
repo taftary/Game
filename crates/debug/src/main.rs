@@ -34,14 +34,17 @@ use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subd
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
 use game_debug::planet_viewer::{DebugMode, PlanetViewerState};
 use game_debug::player_view::{MoveKeys, PlayerViewState};
+use game_debug::sky::{CatalogSky, SKY_ORDER, SkySummary};
 use game_debug::system_map::{SystemMapView, arrival_for, orbit_ring_points, planet_slot};
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
+use game_engine::catalog::scheduler::SkyView;
 use game_engine::render::{
-    MAX_PITCH, OrbitCamera, ShaderKind, compile_glsl_to_spirv, create_instance, device_score,
-    log_physical_device, required_device_extensions, visible_hemisphere,
+    FOV_Y, MAX_PITCH, OrbitCamera, ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv,
+    create_instance, device_score, log_physical_device, required_device_extensions,
+    visible_hemisphere,
 };
-use glam::{Mat4, Vec3};
+use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
@@ -722,6 +725,10 @@ fn run_headless(seed: Option<u64>) -> i32 {
         cost.fuel,
         cost.energy,
     );
+    // Catalog-sky self-test (star-catalog-streaming): model-only sky,
+    // synthetic orbiting views; asserts the plan → fallback → expand
+    // loop never blanks. GPU-free like the rest of this path.
+    println!("{} ok", CatalogSky::headless_check());
     0
 }
 
@@ -1016,7 +1023,7 @@ struct RightPlan {
     chunk_lines: [Rect; 4],
     player_lines: Vec<Rect>,
     stats_header: Rect,
-    stat_lines: [Rect; 6],
+    stat_lines: [Rect; 9],
 }
 
 fn right_panel_plan(panel: Rect, lh: f32, warn: bool, player_active: bool) -> RightPlan {
@@ -1050,6 +1057,9 @@ fn right_panel_plan(panel: Rect, lh: f32, warn: bool, player_active: bool) -> Ri
     };
     let stats_header = rows.next(lh + 6.0, 4.0);
     let stat_lines = [
+        rows.next(lh, 4.0),
+        rows.next(lh, 4.0),
+        rows.next(lh, 4.0),
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
         rows.next(lh, 4.0),
@@ -1232,7 +1242,12 @@ fn shader_rows(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, rects: 
 /// dock groups its widgets under section bars so controls, params,
 /// selection and stats stay visually separate instead of one long
 /// undifferentiated column.
-fn build_planet_ui(atlas: &mut GlyphAtlas, viewer: &PlanetViewerState, layout: Layout) -> UiItems {
+fn build_planet_ui(
+    atlas: &mut GlyphAtlas,
+    viewer: &PlanetViewerState,
+    sky: &SkySummary,
+    layout: Layout,
+) -> UiItems {
     let lh = atlas.line_height();
     let mut items = UiItems::default();
     build_nav(
@@ -1303,7 +1318,7 @@ fn build_planet_ui(atlas: &mut GlyphAtlas, viewer: &PlanetViewerState, layout: L
         checkbox_row(&mut items, lh, box_rect, label_row, label, checked);
     }
 
-    build_right_dock(&mut items, lh, viewer, layout.panel);
+    build_right_dock(&mut items, lh, viewer, sky, layout.panel);
     items
 }
 
@@ -1917,7 +1932,13 @@ fn build_system_ui(
 /// SELECTION holds chunk + player, STATS is read-only. The player block
 /// shrinks to a single "off" line when the player is off, so walk/cam
 /// key hints only exist when the player is on.
-fn build_right_dock(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, panel: Rect) {
+fn build_right_dock(
+    items: &mut UiItems,
+    lh: f32,
+    viewer: &PlanetViewerState,
+    sky: &SkySummary,
+    panel: Rect,
+) {
     let warn = parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
     let plan = right_panel_plan(panel, lh, warn, viewer.player.active);
     items.solid(panel, C_PANEL_BG);
@@ -2059,6 +2080,7 @@ fn build_right_dock(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, pa
     // ---- Right dock: STATS (read-only) ----
     section_bar(items, plan.stats_header, "STATS");
     let stats = &viewer.stats;
+    let sky_mode = if sky.model_only { "model" } else { "tiles" };
     for (row, line) in plan.stat_lines.iter().zip([
         format!("cells:     {}", fmt_int(stats.cells)),
         format!("corners:    {}", fmt_int(stats.corners)),
@@ -2066,6 +2088,21 @@ fn build_right_dock(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, pa
         format!("hash:       {}", stats.hash8),
         format!("gen:        {:.1} ms", stats.gen_ms),
         format!("view:       {}", viewer.debug_mode.title()),
+        // Catalog sky (star-catalog-streaming, dev-only): resident
+        // catalog tiles vs fallback tiles, expanded stars + cache,
+        // loader latency. Never player-facing.
+        format!(
+            "sky:       cat {} fb {} ({})",
+            fmt_int(sky.resident_tiles),
+            fmt_int(sky.fallback_tiles),
+            sky_mode
+        ),
+        format!(
+            "sky:       {} stars {:.1} MB",
+            fmt_int(sky.resident_stars + sky.fallback_stars),
+            sky.cache_bytes as f64 / 1_048_576.0
+        ),
+        format!("sky:       p50 {:.0} p95 {:.0} ms", sky.p50_ms, sky.p95_ms),
     ]) {
         text_row(items, lh, *row, line, C_TEXT);
     }
@@ -2646,6 +2683,46 @@ fn upload_map(
     .expect("galaxy map vertex buffer upload must succeed")
 }
 
+/// Upload catalog-sky points as Backdrop sprites (`misc` = pixel size,
+/// alpha, kind 0). Re-uploaded only when the tile set changes —
+/// camera motion rides the MVP push, never this buffer. Empty sets
+/// upload one transparent guard point (vulkano rejects zero-length
+/// vertex buffers).
+fn upload_sky_points(
+    allocator: &Arc<StandardMemoryAllocator>,
+    points: &[game_engine::render::stars::StarPoint],
+) -> Subbuffer<[MapVertex]> {
+    let mut verts: Vec<MapVertex> = points
+        .iter()
+        .map(|point| MapVertex {
+            map_pos: point.pos,
+            color: point.color,
+            misc: [point.size_px, point.alpha, 0.0],
+        })
+        .collect();
+    if verts.is_empty() {
+        verts.push(MapVertex {
+            map_pos: [0.0, 0.0, -900.0],
+            color: [0.0, 0.0, 0.0],
+            misc: [1.0, 0.0, 0.0],
+        });
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("sky vertex buffer upload must succeed")
+}
+
 /// Upload the system-map point buffer (universe-maps, universe-maps-3d):
 /// the central star then the planets at their tilted world slots,
 /// tinted by spectral class / atmosphere color straight off the
@@ -2823,6 +2900,10 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
+    /// Catalog sky runtime (scheduler + loader + cache + fallback) and
+    /// its Backdrop point buffer, drawn first in the Planet View.
+    sky: CatalogSky,
+    sky_vertices: Subbuffer<[MapVertex]>,
     /// Partial sim-step accumulator for the transit countdown
     /// (fixed-step consumption of the frame dt).
     transit_acc: f32,
@@ -2978,6 +3059,14 @@ impl ViewerApp {
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
+        // Catalog sky over the cooker layout (`assets/catalog`); missing
+        // manifest ⇒ procedural fallback sky (model-only, logged). The
+        // sky shares the universe seed so fallback content is stable
+        // per seed.
+        let sky_seed = seed.unwrap_or(DEFAULT_GALAXY_SEED);
+        let sky = CatalogSky::open("assets/catalog".into(), SKY_ORDER, sky_seed)
+            .expect("catalog sky must open (order is valid)");
+        let sky_vertices = upload_sky_points(&memory_allocator, &[]);
         // Shader modules compile once here; each window builds its own
         // pipelines from them (see `build_pipelines`).
         let shaders = ShaderSet::compile(&device);
@@ -3000,6 +3089,8 @@ impl ViewerApp {
             map_vertices,
             system_points,
             system_lines,
+            sky,
+            sky_vertices,
             transit_acc: 0.0,
             atlas_image: None,
             dragging_orbit: false,
@@ -4335,7 +4426,10 @@ impl ViewerApp {
         // Build frame UI (atlas insertions happen here) and sync the GPU
         // atlas before recording.
         let mut items = match self.debug.main_screen {
-            MainScreen::PlanetView => build_planet_ui(&mut self.atlas, &self.debug.viewer, layout),
+            MainScreen::PlanetView => {
+                let sky_summary = self.sky.summary();
+                build_planet_ui(&mut self.atlas, &self.debug.viewer, &sky_summary, layout)
+            }
             MainScreen::GalaxyMap => build_galaxy_ui(&mut self.atlas, &self.debug.galaxy, layout),
             MainScreen::SystemMap => build_system_ui(
                 &mut self.atlas,
@@ -4566,6 +4660,32 @@ impl ViewerApp {
                         self.camera.projection_matrix(aspect) * self.camera.view_matrix()
                     };
                     let mvp = main_vp.to_cols_array_2d();
+                    // Catalog sky backdrop (star-catalog-streaming):
+                    // plan → fetch → expand on cadence; the GPU buffer
+                    // re-uploads only when the tile set changes.
+                    let (eye_world, view_f32) = if player_active {
+                        let player = &self.debug.viewer.player;
+                        (player.eye().as_dvec3(), player.view_matrix())
+                    } else {
+                        (
+                            self.camera.anchor() + self.camera.eye().as_dvec3(),
+                            self.camera.view_matrix(),
+                        )
+                    };
+                    let forward = (view_f32.inverse() * Vec4::new(0.0, 0.0, -1.0, 0.0)).truncate();
+                    let wide = main_vp.to_cols_array().map(|x| x as f64);
+                    self.sky.update(&SkyView {
+                        view_proj: DMat4::from_cols_array(&wide),
+                        cam_forward_world: forward.as_dvec3(),
+                        fov_y_rad: FOV_Y as f64,
+                        aspect: aspect as f64,
+                        world_to_equatorial: WORLD_TO_EQUATORIAL,
+                        velocity_world: DVec3::ZERO,
+                    });
+                    let (sky_points, sky_changed) = self.sky.points(eye_world);
+                    if sky_changed {
+                        self.sky_vertices = upload_sky_points(&self.memory_allocator, sky_points);
+                    }
                     // Orbit arrival tint (UMAP-021): the target's
                     // atmosphere color re-lights the mesh; no arrival =
                     // untinted default look.
@@ -4579,6 +4699,25 @@ impl ViewerApp {
                     builder
                         .set_viewport(0, [viewport].into_iter().collect())
                         .expect("viewport must set")
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, self.sky_vertices.clone())
+                        .expect("vertex buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            // `px_scale` is inert here: sky sprites are
+                            // kind 0 (pixel size), never world-scaled.
+                            MapPush { mvp, px_scale: 1.0 },
+                        )
+                        .expect("sky push constants must upload");
+                    // SAFETY: same PointList contract as the map draws —
+                    // `vertex_count` equals the uploaded point count, no
+                    // index buffer bound. Backdrop band: no depth write,
+                    // the planet fill overdraws next.
+                    unsafe { builder.draw(self.sky_vertices.len() as u32, 1, 0, 0) }
+                        .expect("sky draw must record");
+                    builder
                         .bind_pipeline_graphics(ctx.pipelines.fill.clone())
                         .expect("pipeline must bind")
                         .bind_vertex_buffers(0, self.fill_vertices.clone())
@@ -5125,7 +5264,12 @@ mod tests {
                 .join("\n")
         };
         // Planet screen: presets + planet overlays, nav shows all tabs.
-        let planet = joined(&build_planet_ui(&mut atlas, &viewer, layout));
+        let planet = joined(&build_planet_ui(
+            &mut atlas,
+            &viewer,
+            &SkySummary::default(),
+            layout,
+        ));
         assert!(!planet.is_empty());
         for needle in [
             "Planet View",
@@ -5173,7 +5317,12 @@ mod tests {
         // Checker mode reveals the density slider on the planet screen.
         let mut checker_viewer = PlanetViewerState::with_values(1, 1.0);
         checker_viewer.debug_mode = DebugMode::Checker;
-        let planet_checker = joined(&build_planet_ui(&mut atlas, &checker_viewer, layout));
+        let planet_checker = joined(&build_planet_ui(
+            &mut atlas,
+            &checker_viewer,
+            &SkySummary::default(),
+            layout,
+        ));
         assert!(planet_checker.contains("Checker density:"));
     }
 
@@ -5349,7 +5498,7 @@ mod tests {
         let desired = visible_hemisphere(&viewer.mesh, viewer.player.position().to_array());
         viewer.player.update(0.05, &desired);
         let layout = ui::layout(1280.0, 720.0);
-        let items = build_planet_ui(&mut atlas, &viewer, layout);
+        let items = build_planet_ui(&mut atlas, &viewer, &SkySummary::default(), layout);
         let joined = items
             .texts
             .iter()
@@ -5409,7 +5558,7 @@ mod tests {
         let mut atlas = GlyphAtlas::new(UI_PX);
         let viewer = PlanetViewerState::new();
         let layout = ui::layout(1280.0, 720.0);
-        let items = build_planet_ui(&mut atlas, &viewer, layout);
+        let items = build_planet_ui(&mut atlas, &viewer, &SkySummary::default(), layout);
         let verts = ui_items_to_vertices(&items, &mut atlas);
         let text_quads: usize = items.texts.iter().map(|t| t.text.chars().count()).sum();
         assert_eq!(verts.len(), items.solids.len() * 6 + text_quads * 6);

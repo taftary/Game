@@ -12,6 +12,8 @@
 //! compiles headlessly. Only [`boot`] helpers that touch `Instance` /
 //! `PhysicalDevice` need a GPU at runtime. [`depth`] and [`bands`] plan
 //! log-depth encodings and multi-pass compositing, also GPU-free.
+//! [`stars`] expands catalog tiles to Backdrop point sprites, also
+//! GPU-free (binaries own the buffers).
 
 pub mod bands;
 pub mod boot;
@@ -21,6 +23,7 @@ pub mod chunk_flat;
 pub mod depth;
 pub mod planet;
 pub mod shaders;
+pub mod stars;
 pub mod tier;
 pub mod uv;
 pub mod zodiacal;
@@ -46,6 +49,11 @@ pub use depth::{
 pub use planet::{IndexedMesh, PlanetVertex, SeededPlanet};
 pub use shaders::{
     PLANET_FRAG, PLANET_VERT, ShaderCompileError, ShaderKind, compile_glsl_to_spirv,
+};
+pub use stars::{
+    CROSSFADE_MS, SKY_SHELL_RADIUS, StarPoint, WORLD_TO_EQUATORIAL, crossfade_alpha,
+    equatorial_to_world, expand_catalog_record, expand_fallback_star, expand_tile_catalog,
+    expand_tile_fallback, mag_to_size_px, spectral_color, world_to_equatorial,
 };
 pub use tier::{ParseTierError, QualityTier};
 pub use uv::{

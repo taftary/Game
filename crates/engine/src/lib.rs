@@ -30,6 +30,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+pub mod catalog;
 pub mod core;
 pub mod flight;
 pub mod frames;

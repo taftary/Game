@@ -122,6 +122,16 @@ UI is the trailing pass. The `game_tools` smoke demonstrates the plan
 on GPU behind `--log-depth`: Backdrop clear → Mid log planet (D32F) →
 Near linear quad (tight 0.05–10 projection, own depth clear).
 
+Catalog star layer (v0.2.0, `plans/v0.2.0/star-catalog-streaming`,
+ADR-017 binding): `engine::render::stars` expands resident tiles plus
+deterministic fallback slots to camera-relative point sprites on a
+900-unit shell (Backdrop band, drawn ahead of content; GPU buffer
+re-uploads only on tile-set change, camera motion rides the MVP push).
+First live surface is the `game_debug` Planet View backdrop (reuses the
+map `PointList` pipeline; tile state shows in the STATS dock, dev-only).
+Sky frame is J2000 equatorial axes; photometric calibration stays with
+`exposure-tone-mapping`.
+
 Interplanetary sky glow (v0.2.0, `plans/v0.2.0/zodiacal-light`,
 ADR-021 binding): the solar-system frame's real faint dust glow is the
 analytic spec §9.4 model in `engine::render::zodiacal` (per-pixel from
