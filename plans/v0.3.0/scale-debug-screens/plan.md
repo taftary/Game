@@ -49,7 +49,7 @@ by: ANALYST (2026-09-17) · Security reviewed by: SECURITY (2026-09-17).
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | 10 per-dimension screens registered and reachable in `game_debug`, each showing live in-frame state. | verified | `ScaleDebugState::rows`, Scale tab, and model tests. | ANALYST 2026-09-17 |
+| 1 | 10 per-dimension screens registered and reachable in `game_debug`, each showing live in-frame state. | verified | `ScaleDebugState::rows`, Scale tab, model tests, and the explicit tools-window 900x720 launch size with digit-5 headless routing check. | ANALYST 2026-09-17 |
 | 2 | Global screen shows all dimensions, live transitions, and event log. | verified | `build_scale_tab`, bounded transition/SOI evidence, headless build. | ANALYST 2026-09-17 |
 | 3 | No simulation state mutated from debug UI. | verified | Scale UI only mutates `ScaleDebugState::selected`; journey is read-only. | ANALYST 2026-09-17; SECURITY 2026-09-17 |
 | 4 | Docs updated: architecture, controls, and techstack version. | verified | Documentation changes in this feature commit. | ANALYST 2026-09-17 |

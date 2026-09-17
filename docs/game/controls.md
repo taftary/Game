@@ -47,9 +47,11 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   layer. The player marker is a center dot plus a heading
    arrow on the planet; the SELECTION panel shows `lon / lat /
    cam + loaded / heading` plus the walk keys while the player is on.
-   Tools window: `1` FPS, `2` Console, `3` Inspector, `4` Transitions, `5`
-   Scale. The Scale screen opens a global ten-dimension matrix; click any
-   dimension card for its per-dimension state and transition log.
+   Tools window: focus the `PlanetCrafter — debug tools` window, then use
+   `1` FPS, `2` Console, `3` Inspector, `4` Transitions, `5` Scale (or click
+   the tabs). The Scale screen opens a global ten-dimension matrix; click any
+   dimension card for its per-dimension state and transition log. The tools
+   window opens at 900x720 so all five tabs are visible.
 
 ### Navigation HUD
 

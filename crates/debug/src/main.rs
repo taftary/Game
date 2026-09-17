@@ -9,8 +9,9 @@
 //! and Planet View (F3: orbit camera, filled dual-cell mesh, wireframe
 //! overlay, pentagon highlight, cell-chunk hover highlight +
 //! click-to-pin with panel readout, inputs panel, read-only stats). The
-//! tools window hosts the FPS / Console / Inspector tabs (window-local
-//! `1/2/3`; Console/Inspector are placeholders). Closing the tools
+//! tools window hosts the FPS / Console / Inspector / Transitions / Scale
+//! tabs (window-local `1/2/3/4/5`; Console/Inspector are placeholders).
+//! Closing the tools
 //! window hides it (`F4` on the viewer window reopens); closing the
 //! viewer window (or `Esc`) exits.
 //!
@@ -585,6 +586,9 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
 /// map checks run on (`--seed N`).
 fn run_headless(seed: Option<u64>) -> i32 {
     let viewer = PlanetViewerState::new();
+    let mut debug_app = DebugApp::new();
+    assert!(debug_app.select_tools_by_digit(5));
+    assert_eq!(debug_app.tools_screen, ToolsScreen::Scale);
     // Pick self-test (cell-chunks): aiming at cell 0's center from 5
     // radii out must resolve chunk 0 — fails loudly on picking or
     // mesh-ordering regressions.
@@ -3513,6 +3517,13 @@ impl ViewerApp {
         position: Option<winit::dpi::PhysicalPosition<i32>>,
     ) -> WindowContext {
         let mut attrs = Window::default_attributes().with_title(title);
+        if title.ends_with("debug tools") {
+            // Five 140 px tabs need at least 700 px; keep the full Scale tab
+            // visible on first launch instead of relying on platform defaults.
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(900, 720));
+        } else {
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
+        }
         if let Some(pos) = position {
             attrs = attrs.with_position(pos);
         }

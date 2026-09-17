@@ -1,6 +1,7 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.29.0 (2026-09-17, `autosave-persistence` done: ADR-004 binary
+- **Version:** 0.30.0 (2026-09-17, debug tools Scale tab discoverability and
+  deterministic headless routing check; `autosave-persistence` done: ADR-004 binary
   autosave envelope, atomic rotation ring with quarantine fallback, and
   trigger policy with headless recovery evidence)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
