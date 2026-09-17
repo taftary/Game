@@ -47,7 +47,7 @@ commit when it reaches `done` (workflow rule:
 | Feature | Status | Spec section |
 |---|---|---|
 | [`frame-hierarchy`](../../plans/v0.1.0/frame-hierarchy/) | done | §3 Coordinate & precision |
-| [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | draft notion | §2 Navigation model |
+| [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | done | §2 Navigation model |
 | [`time-compression`](../../plans/v0.1.0/time-compression/) | done | §2 Time compression |
 | [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | done | §3 SOI handoff |
 | [`scale-physics`](../../plans/v0.1.0/scale-physics/) | done | §5 Physics per scale |

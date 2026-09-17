@@ -43,25 +43,12 @@ pub struct RegionId {
 }
 
 impl RegionId {
-    /// Explicit frame encoding for the domain grammar: discriminant +
-    /// body id. Never `Debug`-formatted (format stability is not a
-    /// determinism basis).
-    fn frame_code(self) -> (u8, u64) {
-        match self.frame {
-            FrameId::Cosmological => (0, 0),
-            FrameId::Galactocentric => (1, 0),
-            FrameId::LocalGroup => (2, 0),
-            FrameId::StellarNeighborhood => (3, 0),
-            FrameId::SolarSystem => (4, 0),
-            FrameId::Planetocentric(body) => (5, body.0),
-            FrameId::LocalEnu(body) => (6, body.0),
-        }
-    }
-
     /// Stable domain string. Grammar v1:
-    /// `seed/v1/frame/{d}/body/{b}/cell/{x},{y},{z}`.
+    /// `seed/v1/frame/{d}/body/{b}/cell/{x},{y},{z}`, with the frame
+    /// encoding from [`FrameId::code`] (never `Debug`-formatted: format
+    /// stability is not a determinism basis).
     fn domain(self) -> String {
-        let (d, b) = self.frame_code();
+        let (d, b) = self.frame.code();
         let [x, y, z] = self.cell;
         format!("seed/v{SEED_VERSION}/frame/{d}/body/{b}/cell/{x},{y},{z}")
     }

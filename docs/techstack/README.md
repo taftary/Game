@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.19.0 (2026-09-17, `time-compression` done: `engine::time` state machine + slew + codec, ADR-015 binding)
+- **Version:** 0.20.0 (2026-09-17, `free-flight-navigation` done: `engine::flight` dynamics + fly-to, v0.1.0 complete — all six features done)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

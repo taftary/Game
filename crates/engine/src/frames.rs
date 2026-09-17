@@ -174,6 +174,36 @@ impl FrameId {
             _ => None,
         }
     }
+
+    /// Explicit identity encoding: discriminant + body id. Basis for
+    /// save codecs (`flight::ShipSnapshot`) and seed domains
+    /// (`seeding::RegionId`); never `Debug`-formatted.
+    pub fn code(self) -> (u8, u64) {
+        match self {
+            FrameId::Cosmological => (0, 0),
+            FrameId::Galactocentric => (1, 0),
+            FrameId::LocalGroup => (2, 0),
+            FrameId::StellarNeighborhood => (3, 0),
+            FrameId::SolarSystem => (4, 0),
+            FrameId::Planetocentric(body) => (5, body.0),
+            FrameId::LocalEnu(body) => (6, body.0),
+        }
+    }
+
+    /// Inverse of [`FrameId::code`]: `None` for unknown discriminants
+    /// (codec rejection path — never default a frame).
+    pub fn from_code(discriminant: u8, body: u64) -> Option<FrameId> {
+        match discriminant {
+            0 => Some(FrameId::Cosmological),
+            1 => Some(FrameId::Galactocentric),
+            2 => Some(FrameId::LocalGroup),
+            3 => Some(FrameId::StellarNeighborhood),
+            4 => Some(FrameId::SolarSystem),
+            5 => Some(FrameId::Planetocentric(BodyId(body))),
+            6 => Some(FrameId::LocalEnu(BodyId(body))),
+            _ => None,
+        }
+    }
 }
 
 /// Transform from one frame to its immediate parent: frame axes expressed
@@ -285,6 +315,23 @@ impl FrameChain {
     /// Orientation in the active frame.
     pub fn orientation(&self) -> DQuat {
         self.orientation
+    }
+
+    /// Overwrite the active-frame position (ship integration writes
+    /// back through here — the chain owns position truth).
+    pub fn set_position(&mut self, position: DVec3) {
+        self.position = position;
+    }
+
+    /// Overwrite the active-frame orientation.
+    pub fn set_orientation(&mut self, orientation: DQuat) {
+        self.orientation = orientation;
+    }
+
+    /// The active frame's parent link (`links[0]`), if any. Consumers
+    /// (ship velocity mapping) read the rotation through here.
+    pub fn link_to_parent(&self) -> Option<&FrameLink> {
+        self.links.first()
     }
 
     /// One resolution step into the parent frame. `None` at the root.

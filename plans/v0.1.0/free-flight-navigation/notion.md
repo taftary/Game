@@ -2,7 +2,10 @@
 
 ## Status
 
-`draft`
+`done`
+
+(2026-09-17: ANALYST DoD-verified + SECURITY reviewed; single commit
+on branch `v0.1.0` per `plans/README.md` § *7. Version branch*.)
 
 ## Context
 
@@ -46,10 +49,15 @@ against the per-scale model).
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— required before `draft → planned` (flight feel + selection UX).
-ARCHITECT consulted (required if cross-module): pending (touches
-simulation + input + camera).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes
+(2026-09-17) — flight feel + selection UX reviewed: abstract
+thrust/attitude input maps to the `controls.md` unified action map
+(W = thrust-forward analog, stick = attitude); failure surface =
+explicit cancel + typed target errors; HUD data (mode, target,
+distance, ETA, time-state) exposed as accessors for `navigation-hud`.
+No release-binary UI in this feature (engine only). ARCHITECT
+consulted (required if cross-module): yes (2026-09-17) — breakdown in
+`plan.md` (touches simulation + input + camera-anchor feed).
 
 ## Functional requirements
 
@@ -87,4 +95,7 @@ simulation + input + camera).
 ## Open questions
 
 - Resolved (PO 2026-09-17): craft envelope + assists scope decided for
-  v0.1.0 scope — see spec §10 addendum *Resolved for v0.1.0*.
+  v0.1.0 scope — see spec §10 addendum *Resolved for v0.1.0*
+  (reference dry mass 5,000 kg, max 30 m/s², rotation stabilization ON,
+  translation damping OFF by default, infinite propellant, no
+  collision/landing/atmosphere).
