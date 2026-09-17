@@ -15,6 +15,8 @@
 //!   derivation, domain-separated layers, catalog overrides. Pure.
 //! - [`handoff`] — soft patched-conic SOI handoff (spec §3): Laplace /
 //!   Hill radii, smoothstep blend band, hysteresis monitor. Pure.
+//! - [`time`] — explicit time-compression state machine (spec §2):
+//!   occupancy rule, slew clock, substep advance, snapshot codec. Pure.
 //! - [`render`] — Vulkan renderer boot (1.1 floor), quality tiers, orbit
 //!   camera, seeded planet mesh. GPU calls live here; `game` never touches
 //!   `vulkano` directly.
@@ -33,4 +35,5 @@ pub mod hexsphere;
 pub mod physics;
 pub mod render;
 pub mod seeding;
+pub mod time;
 pub mod universe;

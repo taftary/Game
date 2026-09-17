@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.18.0 (2026-09-17, `soi-handoff` done: `engine::handoff` blend + monitor, ADR-014 binding, Hill/Laplace ratio corrected)
+- **Version:** 0.19.0 (2026-09-17, `time-compression` done: `engine::time` state machine + slew + codec, ADR-015 binding)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

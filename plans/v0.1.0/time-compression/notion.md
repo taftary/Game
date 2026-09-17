@@ -2,7 +2,10 @@
 
 ## Status
 
-`draft`
+`done`
+
+(2026-09-17: ANALYST DoD-verified + SECURITY reviewed; single commit
+on branch `v0.1.0` per `plans/README.md` § *7. Version branch*.)
 
 ## Context
 
@@ -40,10 +43,14 @@ rotation ≈ 225 Myr is meaningless to a player).
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— required before `draft → planned` (time-state display legibility).
-ARCHITECT consulted (required if cross-module): pending (simulation +
-frames + persistence).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes
+(2026-09-17) — time-state display legibility is player-facing, but
+rendering belongs to `navigation-hud` (v0.3.0, explicit non-goal).
+UX acceptance for THIS feature = queryable + persisted time state
+(mode + ratio + sim time) with stable semantics for the future HUD.
+Confirmed in `plan.md`. ARCHITECT consulted (required if
+cross-module): yes (2026-09-17) — breakdown in `plan.md` (simulation
++ frames + persistence shape).
 
 ## Functional requirements
 
@@ -66,7 +73,7 @@ frames + persistence).
 - [ ] State machine implemented with unit tests: occupancy change →
   correct mode; no global multiplier path exists.
 - [ ] Orbital period in real-time mode matches analytic value within
-  tolerance (validation-plan number TBD, spec §10).
+  0.1% (spec §10 addendum *Resolved for v0.1.0*).
 - [ ] Compression state round-trips through save/load.
 
 ## Constraints & Assumptions
