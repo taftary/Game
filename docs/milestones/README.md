@@ -40,6 +40,10 @@ streaming).
 
 ## v0.1.0 — Navigation core (spec §2, §3, §5, §6)
 
+Work happens on branch `v0.1.0`; each feature lands as exactly one
+commit when it reaches `done` (workflow rule:
+[`plans/README.md`](../../plans/README.md) § *7. Version branch*).
+
 | Feature | Status | Spec section |
 |---|---|---|
 | [`frame-hierarchy`](../../plans/v0.1.0/frame-hierarchy/) | draft notion | §3 Coordinate & precision |
