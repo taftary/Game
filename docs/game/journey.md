@@ -70,9 +70,9 @@ pinned-hash fixed-step regression; `game::transit` adds the timed,
 pre-commit-cancellable interplanetary hop (60 ticks @ 20 Hz, deferred
 fuel/energy hook); `engine::universe` generates stages 1–2 with
 quantized cross-platform hashes; `game_debug` hosts the Galaxy Map
-(F3: star points + nebula impostors + L1 backdrop, 3D orbit/pan/log
+(F1: star points + nebula impostors + L1 backdrop, 3D orbit/pan/log
 zoom/click, `Home` top-down snap — `plans/universe-maps-3d`)
-and System Map (F4: inclined orbit rings + planets + L4 focus +
+and System Map (F2: inclined orbit rings + planets + L4 focus +
 travel offer)
 screens plus the orbit arrival binding (viewer rebuilds at descriptor
 radius with the atmosphere tint). `Descent`/`Surface` (L6–L7) land with

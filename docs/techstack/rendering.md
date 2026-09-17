@@ -29,7 +29,7 @@ convention existing nowhere in writing.
 
 1. **Framebuffer:** NDC `+1` = **top** row, `-1` = bottom (y-down
    pixels). Proven by the upright UI (`ortho_matrix` maps pixel row 0
-   to NDC +1) and by the aspect-fit UV MVP (`flat_mvp_centers_unit_square`).
+   to NDC +1, pinned by `ortho_maps_corners`).
 2. **Projection:** `OrbitCamera::projection_matrix` (shared by global
    and player cameras, both binaries) is glam
    `directx::perspective` — right-handed, Z ∈ [0, 1], **no Y-flip**.
@@ -57,7 +57,7 @@ convention existing nowhere in writing.
 Pinning tests: `projection_uses_vulkan_ndc` (engine),
 `tangent_frame_is_east_north_up` + `turn_right_rotates_toward_own_right`
 (player frame), `fill_faces_point_outward` (mesh),
-`ortho_maps_corners` + `flat_mvp_centers_unit_square` (UI + UV MVPs),
+`ortho_maps_corners` (UI ortho),
 `ray_from_cursor` round-trips (picking),
 `follow_marker_arrow_visible_and_oriented` +
 `first_person_hides_marker_and_looks_along_heading` (markers),
@@ -107,28 +107,28 @@ CI-gated headlessly.
 - `resolution_scale` is a tier parameter (0.6 / 0.85 / 1.0) but stays
   unapplied until M6 dynamic resolution; shadows are a tier flag only.
 
-## Debug sphere viewer (`game_debug`)
+## Debug planet view (`game_debug`)
 
 The `game_debug` viewer is the mesh-inspection tool, spread over two
 OS windows sharing one Vulkan device (`plans/debug-ui-reorganize`,
-2026-09-16). The viewer window hosts the Sphere Viewer screen (`F1`:
-current `HexSphere` as dual-cell fans with the shared `OrbitCamera`, a
-wireframe overlay and a pentagon highlight, plus an inputs panel with
-subdivisions 0–8 and live 10·4^N+2 cost hint, validated radius,
-explicit Regenerate, read-only stats) and the UV Net screen (`F2`:
-full-viewport icosa-net unwrap with its own dock). The tools window
-hosts FPS (live frame-health), Console and Inspector (placeholders),
-on window-local `1/2/3` tabs; closing it hides it, `F3` on the viewer
-window reopens it. Viewer state is preserved across screen switches.
+2026-09-16). The viewer window hosts the Galaxy Map (`F1`), the System
+Map (`F2`) and the Planet View (`F3`: current `HexSphere` as dual-cell
+fans with the shared `OrbitCamera`, a wireframe overlay and a pentagon
+highlight, plus an inputs panel with subdivisions 0–8 and live
+10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
+stats). The tools window hosts FPS (live frame-health), Console and
+Inspector (placeholders), on window-local `1/2/3` tabs; closing it
+hides it, `F4` on the viewer window reopens it. Viewer state is
+preserved across screen switches.
 
 `plans/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).
 
 - Windowed: `winit` windows + `vulkano` boot mirroring the tools smoke,
-  viewer-owned pipelines (fill with highlight flag and `flat`
-  per-cell tint, translucent `LineList` wireframe with radial inflation,
-  flat UV-net fill + wire, UI textured quads), D16 depth attachment,
+  viewer-owned pipelines (fill with highlight flag and per-cell tint,
+  translucent `LineList` wireframe with radial inflation, UI textured
+  quads), D16 depth attachment,
   `fontdue` atlas from the vendored `assets/fonts/DejaVuSans.ttf`,
   viewport-clipped 3D + full-window UI in one render pass per window,
   swapchain recreation on resize, adapter + mesh stats logged at
@@ -149,17 +149,10 @@ naga compile helper, 1.1-floor boot).
   lays the 20 base faces out as the classic 5-10-5 triangle strip
   (closed-form absolute slots, one rooted tree walk assigning the forced
   icosa neighbor per slot — pairwise SAT-tested overlap-free); every
-  `PlanetVertex` carries `uv`, the debug sidecar adds seam/island flags. The UV Net screen (F2) renders the
-  unwrap full-viewport with its own dock (net info, shader selector,
-  UV-wire/seam overlays), and six fragment-shader modes (Lit, Normal, Tint,
-  Gnomonic Checker with density slider, Seams+Islands, LonLat) shared by
-  the 3D and UV pipelines (`1`–`6` select, UV view is aspect-fit so the
-  checker never lies). The UV view uses proper seam duplication
-  (update-2026-09-15-0730): seam cells (dual centers on base edges/vertices)
-  emit one fan per incident island from expanded buffers
-  (`render::uv::FlatUnwrap`), so every net triangle stays inside one
-  island — no cross-net stretch — and the UV wireframe clips at island
-  boundaries; the 3D view keeps the single-UV honest-stretch look.
+  `PlanetVertex` carries `uv`, the debug sidecar adds seam/island flags.
+  The Planet View offers six fragment-shader modes (Lit, Normal, Tint,
+  Gnomonic Checker with density slider, Seams+Islands, LonLat;
+  `1`–`6` select). The 3D view keeps the single-UV honest-stretch look.
   Checker mode uses a cube-domain mapping
   (`plans/sphere-uv-debug/issue-2026-09-15-0817-3d-checker-gnomonic`):
   an icosahedral square grid provably cannot be globally consistent
@@ -174,19 +167,18 @@ naga compile helper, 1.1-floor boot).
   edges at every density 2–32; the topologically forced same-color
   faults (odd 3-cycles at cube vertices) are confined to a perfect
   matching of 4 edges. The checker is a pure function of direction, so
-  it flows across the icosa seam overlay and both views agree.
+  it flows across the icosa seam overlay.
    `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
    it, so the `game_tools` smoke is unaffected.
 - Panel UX (`plans/debug-ui-reorganize`): inputs appear only when
-  needed. The sphere screen uses a left dock (VIEW section with the 2×2
+  needed. The planet screen uses a left dock (VIEW section with the 2×2
   camera presets, SHADER section with the mode selector, OVERLAYS with
-  wireframe/pentagons/seams) and the shared right data dock (INPUTS
+  wireframe/pentagons/seams) and the right data dock (INPUTS
   with subdivisions/radius + Regenerate, SELECTION merging the chunk +
   player readouts, read-only STATS), each group under its own section
-  bar. The UV screen swaps the left dock for net info + the same SHADER
-  selector + UV-wire/seams overlays. The checker-density slider only
+  bar. The checker-density slider only
   exists in Checker mode, the walk/cam key hints only exist when the
-  player is on, and the preset keys only work on the sphere screen.
+  player is on, and the preset keys only work on the planet screen.
 - Tools window (`plans/debug-ui-reorganize`, 2026-09-16): a second OS
   window hosts the FPS / Console / Inspector tabs (window-local `1/2/3`
   + click nav). The FPS tab shows the live `FpsOverlay` recorder (one

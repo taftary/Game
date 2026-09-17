@@ -13,10 +13,11 @@ crates/
   engine/     - library crate game_engine (empty modules, src/lib.rs is empty)
   game/       - clean release game binary, empty fn main() {}
   tools/      - tooling binary, empty fn main() {} (not a default member)
-   debug/      - game_debug lib (Sphere Viewer + UV Net screens, tools
-                  window with live FPS + console/inspector stubs) +
-                  game_debug binary: windowed sphere viewer with
-                  developer tools (not a default member)
+   debug/      - game_debug lib (Galaxy Map + System Map + Planet View
+                   screens, tools window with live FPS +
+                   console/inspector stubs) + game_debug binary:
+                   windowed planet viewer with developer tools (not a
+                   default member)
 docs/         - project docs (game overview + techstack/game/milestones/risks/decisions)
 plans/        - feature lifecycle: notion -> plan -> implement (see plans/README.md)
 tests/        - consolidated test package; every target is empty
@@ -53,16 +54,16 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
     core/        # math, units, time, RNG, error types
 crates/game/     # `game` binary: clean release entry — game states, camera journey, UI wiring
 crates/debug/    # `game_debug` lib (viewer screens: mesh/params/ui/
-                   # text/app/sphere_viewer/picking modules + live fps
+                   # text/app/planet_viewer/picking modules + live fps
                    # recorder + console/inspector stubs) + binary
-                   # (non-default member): viewer window (orbit camera,
-                   # fill + wireframe + pentagon highlight, cell-chunk
-                   # hover highlight + click-to-pin with panel readout,
-                   # full-viewport UV net screen, 6 debug-shader modes,
-                   # inputs panel, --headless CI mode with pick + player
-                   # self-tests) + tools window (FPS / console /
-                   # inspector tabs); developer screens never leak
-                   # into the release binary
+                   # (non-default member): viewer window (Galaxy Map +
+                   # System Map + Planet View with orbit camera, fill +
+                   # wireframe + pentagon highlight, cell-chunk hover
+                   # highlight + click-to-pin with panel readout,
+                   # 6 debug-shader modes, inputs panel, --headless CI
+                   # mode with pick + player self-tests) + tools window
+                   # (FPS / console / inspector tabs); developer screens
+                   # never leak into the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
                  # planet preview / renderer smoke (M1: seeded planet, orbit
                  # camera, Low/Med/High tiers, --headless CI mode), save

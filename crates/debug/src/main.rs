@@ -1,22 +1,22 @@
-//! `game_debug` sphere viewer binary (`plans/debug-ui-reorganize`).
+//! `game_debug` planet viewer binary.
 //!
-//! - `--headless`: GPU-free path (CI-safe — never loads the Vulkan
-//!   loader): builds the default N=6/R=1.0 viewer mesh through the
-//!   `game_debug` lib and prints stats.
-//! - Windowed (default): two `winit` windows sharing one `vulkano`
-//!   device. The viewer window hosts the Sphere Viewer screen (F1:
-//!   orbit camera, filled dual-cell mesh, wireframe overlay, pentagon
-//!   highlight, cell-chunk hover highlight + click-to-pin with panel
-//!   readout, inputs panel, read-only stats) and the UV Net screen (F2:
-//!   full-viewport icosa-net unwrap with its own dock). The tools window
-//!   hosts the FPS / Console / Inspector tabs (window-local `1/2/3`;
-//!   Console/Inspector are placeholders). Closing the tools window hides
-//!   it (`F3` on the viewer window reopens); closing the viewer window
-//!   (or `Esc`) exits.
+//! `--headless` runs the GPU-free path (CI-safe — never loads the Vulkan
+//! loader): builds the default N=6/R=1.0 viewer mesh through the
+//! `game_debug` lib and prints stats.
+//!
+//! Windowed (default) opens two `winit` windows sharing one `vulkano`
+//! device. The viewer window hosts the Galaxy Map (F1), System Map (F2)
+//! and Planet View (F3: orbit camera, filled dual-cell mesh, wireframe
+//! overlay, pentagon highlight, cell-chunk hover highlight +
+//! click-to-pin with panel readout, inputs panel, read-only stats). The
+//! tools window hosts the FPS / Console / Inspector tabs (window-local
+//! `1/2/3`; Console/Inspector are placeholders). Closing the tools
+//! window hides it (`F4` on the viewer window reopens); closing the
+//! viewer window (or `Esc`) exits.
 //!
 //! All screen logic lives in the `game_debug` lib (window- and GPU-free);
 //! this binary owns the winit event loop, the graphics pipelines (fill,
-//! wireframe lines, flat UV, UI quads), the depth buffers and the
+//! wireframe lines, UI quads), the depth buffers and the
 //! font-atlas texture. `game_engine` and `game` are untouched.
 //!
 //! Usage: `game_debug [--headless]`.
@@ -32,8 +32,8 @@ use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
+use game_debug::planet_viewer::{DebugMode, PlanetViewerState};
 use game_debug::player_view::{MoveKeys, PlayerViewState};
-use game_debug::sphere_viewer::{DebugMode, SphereViewerState};
 use game_debug::system_map::{SystemMapView, arrival_for, orbit_ring_points, planet_slot};
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
@@ -250,64 +250,6 @@ void main() {
     f_color = vec4(col, 1.0);
 }";
 
-const FLAT_VERT: &str = r##"#version 450
-layout(location = 0) in vec2 uv_pos;
-layout(location = 1) in vec3 normal;
-layout(location = 2) in float tint;
-layout(location = 3) in vec2 dbg;
-layout(push_constant) uniform PushConstants {
-    mat4 mvp;
-    vec3 tint_rgb;
-    float use_tint;
-    float highlight;
-    float mode;
-    float density;
-    float seams_on;
-    float hover_cell;
-    float pin_cell;
-} pc;
-layout(location = 0) out vec3 v_normal;
-layout(location = 1) flat out float v_tint;
-layout(location = 2) out vec2 v_uv;
-layout(location = 3) flat out float v_seam;
-layout(location = 4) flat out float v_island;
-layout(location = 5) flat out float v_hover;
-layout(location = 6) flat out float v_pin;
-layout(location = 7) flat out vec3 v_tint_rgb;
-layout(location = 8) flat out float v_use_tint;
-void main() {
-    gl_Position = pc.mvp * vec4(uv_pos, 0.0, 1.0);
-    v_normal = normal;
-    v_tint = tint * pc.highlight;
-    v_uv = uv_pos;
-    v_seam = dbg.x;
-    v_island = dbg.y;
-    // No chunk hover in the flat UV net (v1): the shared fragment shader
-    // still declares these inputs, so they must be written.
-    v_hover = 0.0;
-    v_pin = 0.0;
-    // Same arrival tint as the 3D fill: the UV net shows the same planet.
-    v_tint_rgb = pc.tint_rgb;
-    v_use_tint = pc.use_tint;
-}"##;
-
-const FLAT_LINE_VERT: &str = r##"#version 450
-layout(location = 0) in vec2 uv_pos;
-layout(push_constant) uniform PushConstants {
-    mat4 mvp;
-    float highlight;
-    float mode;
-    float density;
-    float seams_on;
-    // Unused here (no chunk hover on UV wireframe, v1) — declared so the
-    // shared FillPush block stays one size across all pipelines.
-    float hover_cell;
-    float pin_cell;
-} pc;
-void main() {
-    gl_Position = pc.mvp * vec4(uv_pos, 0.0, 1.0);
-}"##;
-
 const LINE_VERT: &str = r##"#version 450
 layout(location = 0) in vec3 position;
 layout(push_constant) uniform PushConstants {
@@ -417,7 +359,7 @@ struct LineVertex {
 
 /// Combined fill vertex: engine position/normal/tint/uv plus the
 /// debug-only seam/island sidecar (`dbg.x` = seam flag, `dbg.y` =
-/// island id). Built at upload from `SphereViewerState`.
+/// island id). Built at upload from `PlanetViewerState`.
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
 struct FillVertex {
@@ -431,29 +373,6 @@ struct FillVertex {
     uv: [f32; 2],
     #[format(R32G32_SFLOAT)]
     dbg: [f32; 2],
-}
-
-/// Flat UV-view vertex: icosa-net position plus the same debug varyings.
-/// Shares the fill index buffer (identical topology).
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-struct FlatVertex {
-    #[format(R32G32_SFLOAT)]
-    uv_pos: [f32; 2],
-    #[format(R32G32B32_SFLOAT)]
-    normal: [f32; 3],
-    #[format(R32_SFLOAT)]
-    tint: f32,
-    #[format(R32G32_SFLOAT)]
-    dbg: [f32; 2],
-}
-
-/// Flat-view wireframe vertex: icosa-net position only.
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-struct FlatLineVertex {
-    #[format(R32G32_SFLOAT)]
-    uv_pos: [f32; 2],
 }
 
 /// UI quad vertex: screen pixels + atlas UV + tint.
@@ -570,19 +489,18 @@ const C_SECTION_BG: Color = [0.11, 0.13, 0.19, 1.0];
 const C_FPS_OK: Color = [0.30, 0.85, 0.45, 1.0];
 const C_FPS_WARN: Color = [1.00, 0.75, 0.25, 1.0];
 const C_FPS_HITCH: Color = [1.00, 0.35, 0.30, 1.0];
-/// Screen-aware layout: both viewer-window screens (sphere + UV net)
-/// get the left dock + center viewport + right data dock; the tools
-/// window reclaims the full width so viewer inputs stay attached to
-/// the viewer window.
+/// Screen-aware layout: every viewer-window screen (galaxy, system,
+/// planet) gets the left dock + center viewport + right data dock; the
+/// tools window reclaims the full width so viewer inputs stay attached
+/// to the viewer window.
 fn app_layout(screen: MainScreen, win_w: f32, win_h: f32) -> Layout {
     match screen {
-        MainScreen::SphereViewer
-        | MainScreen::UvNet
-        | MainScreen::GalaxyMap
-        | MainScreen::SystemMap => ui::layout_viewer(win_w, win_h),
+        MainScreen::GalaxyMap | MainScreen::SystemMap | MainScreen::PlanetView => {
+            ui::layout_viewer(win_w, win_h)
+        }
     }
 }
-/// Player marker dot (sphere view).
+/// Player marker dot (planet view).
 const C_PLAYER: Color = [0.30, 1.00, 0.45, 1.0];
 /// Player marker size, pixels.
 const PLAYER_DOT: f32 = 6.0;
@@ -643,7 +561,7 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
 /// `VulkanLibrary` or `EventLoop`. `seed` overrides the universe the
 /// map checks run on (`--seed N`).
 fn run_headless(seed: Option<u64>) -> i32 {
-    let viewer = SphereViewerState::new();
+    let viewer = PlanetViewerState::new();
     // Pick self-test (cell-chunks): aiming at cell 0's center from 5
     // radii out must resolve chunk 0 — fails loudly on picking or
     // mesh-ordering regressions.
@@ -678,11 +596,9 @@ fn run_headless(seed: Option<u64>) -> i32 {
         stats.gen_ms,
     );
     println!(
-        "uv_islands={} uv_seam_verts={} uv_flat_tris={} uv_flat_verts={} mode={:?}",
+        "uv_islands={} uv_seam_verts={} mode={:?}",
         islands.len(),
         seams,
-        viewer.flat.indices.len() / 3,
-        viewer.flat.uv.len(),
         viewer.debug_mode,
     );
     println!("pick_selftest=chunk{} ok", picked.index());
@@ -848,26 +764,6 @@ fn ortho_matrix(w: f32, h: f32) -> [[f32; 4]; 4] {
     ]
 }
 
-/// Aspect-fit square MVP for flat UV views: maps `[0,1]²` (v=0 top,
-/// y-down like the UI) into the largest centered square of `vp`,
-/// outputting Vulkan NDC. Stretching would lie about distortion, so the
-/// long axis letterboxes instead.
-fn flat_mvp(vp: Rect) -> [[f32; 4]; 4] {
-    let aspect = vp.w / vp.h;
-    // NDC: x = sx*u + tx, y = sy*v + ty.
-    let (sx, tx, sy, ty) = if aspect >= 1.0 {
-        (2.0 / aspect, -1.0 / aspect, -2.0, 1.0)
-    } else {
-        (2.0, -1.0, -2.0 * aspect, aspect)
-    };
-    [
-        [sx, 0.0, 0.0, 0.0],
-        [0.0, sy, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [tx, ty, 0.0, 1.0],
-    ]
-}
-
 /// Global orbit-camera presets behind the panel VIEW buttons
 /// (and the `G`/`T`/`B`/`R` keys). They retarget the free orbit camera;
 /// the player cameras are untouched.
@@ -977,7 +873,7 @@ fn arrow_tris(origin: (f32, f32), dir: (f32, f32), len: f32, width: f32, head: f
     ]
 }
 
-/// World-space arrow tip for the sphere marker: along the facing at
+/// World-space arrow tip for the planet marker: along the facing at
 /// an eye-distance-proportional length (readable once the pixels are
 /// clamped in [`draw_player_marker`]). Shared by the frame draw and
 /// the marker regression tests below.
@@ -990,7 +886,6 @@ fn sphere_tip_world(player: &PlayerViewState, pos: Vec3) -> Vec3 {
 /// the projected facing (`tip`, skipped when it doesn't project or is
 /// too short to read — FirstPerson hides it by design: the camera
 /// looks along the heading, so screen-up IS the player direction).
-/// Same shape in the sphere and flat views.
 fn draw_player_marker(items: &mut UiItems, origin: (f32, f32), tip: Option<(f32, f32)>) {
     let (mx, my) = origin;
     items.solid(
@@ -1026,9 +921,9 @@ fn check_box(row: Rect, lh: f32) -> Rect {
     }
 }
 
-/// Widget rects inside the sphere screen's left dock (presets + shader
-/// + sphere overlays). Only built for the Sphere Viewer screen.
-struct SphereLeftRects {
+/// Widget rects inside the planet screen's left dock (presets + shader
+/// + planet overlays). Only built for the Planet View screen.
+struct PlanetLeftRects {
     shader_button: Rect,
     density_track: Option<Rect>,
     wire_box: Rect,
@@ -1038,12 +933,12 @@ struct SphereLeftRects {
     preset_grid: [[Rect; 2]; 2],
 }
 
-/// Sphere left-dock row plan: widget rects + label rows in draw order.
+/// Planet left-dock row plan: widget rects + label rows in draw order.
 /// Built with a single cursor so hit-testing and drawing always agree.
 /// The density rows only exist in Checker mode (inputs appear only when
 /// needed — the cursor flows up when they don't).
-struct SphereLeftPlan {
-    rects: SphereLeftRects,
+struct PlanetLeftPlan {
+    rects: PlanetLeftRects,
     view_header: Rect,
     preset_hint: Rect,
     shader_header: Rect,
@@ -1055,7 +950,7 @@ struct SphereLeftPlan {
     seam_label: Rect,
 }
 
-fn sphere_left_plan(left: Rect, lh: f32, checker: bool) -> SphereLeftPlan {
+fn planet_left_plan(left: Rect, lh: f32, checker: bool) -> PlanetLeftPlan {
     let mut rows = ui::PanelRows::new(left, 8.0);
     let view_header = rows.next(lh + 6.0, 4.0);
     let preset_hint = rows.next(lh, 4.0);
@@ -1075,8 +970,8 @@ fn sphere_left_plan(left: Rect, lh: f32, checker: bool) -> SphereLeftPlan {
     let seam_label = rows.next(lh, 4.0);
     let top = ui::split_row_2(preset_row_top, 6.0);
     let bot = ui::split_row_2(preset_row_bot, 6.0);
-    SphereLeftPlan {
-        rects: SphereLeftRects {
+    PlanetLeftPlan {
+        rects: PlanetLeftRects {
             shader_button,
             density_track,
             wire_box: check_box(wire_label, lh),
@@ -1096,64 +991,8 @@ fn sphere_left_plan(left: Rect, lh: f32, checker: bool) -> SphereLeftPlan {
     }
 }
 
-/// Widget rects inside the UV screen's left dock (shader + UV
-/// overlays). Only built for the UV Net screen.
-struct UvLeftRects {
-    shader_button: Rect,
-    density_track: Option<Rect>,
-    uvwire_box: Rect,
-    seam_box: Rect,
-}
-
-/// UV left-dock row plan: same cursor contract as the sphere plan; the
-/// density rows only exist in Checker mode.
-struct UvLeftPlan {
-    rects: UvLeftRects,
-    uv_header: Rect,
-    uv_info: Rect,
-    shader_header: Rect,
-    shader_hint: Rect,
-    density_label: Option<Rect>,
-    overlay_header: Rect,
-    uvwire_label: Rect,
-    seam_label: Rect,
-}
-
-fn uv_left_plan(left: Rect, lh: f32, checker: bool) -> UvLeftPlan {
-    let mut rows = ui::PanelRows::new(left, 8.0);
-    let uv_header = rows.next(lh + 6.0, 4.0);
-    let uv_info = rows.next(lh, 4.0);
-    let shader_header = rows.next(lh + 6.0, 4.0);
-    let shader_button = rows.next(28.0, 4.0);
-    let shader_hint = rows.next(lh, 4.0);
-    let (density_label, density_track) = if checker {
-        (Some(rows.next(lh, 4.0)), Some(rows.next(20.0, 6.0)))
-    } else {
-        (None, None)
-    };
-    let overlay_header = rows.next(lh + 6.0, 4.0);
-    let uvwire_label = rows.next(lh, 4.0);
-    let seam_label = rows.next(lh, 4.0);
-    UvLeftPlan {
-        rects: UvLeftRects {
-            shader_button,
-            density_track,
-            uvwire_box: check_box(uvwire_label, lh),
-            seam_box: check_box(seam_label, lh),
-        },
-        uv_header,
-        uv_info,
-        shader_header,
-        shader_hint,
-        density_label,
-        overlay_header,
-        uvwire_label,
-        seam_label,
-    }
-}
-
 /// Widget rects inside the right data dock (params + selection + stats).
-/// Only built for the Sphere Viewer screen.
+/// Only built for the Planet View screen.
 struct RightRects {
     subdiv_field: Rect,
     subdiv_track: Rect,
@@ -1343,10 +1182,10 @@ struct ShaderRowRects {
     density_track: Option<Rect>,
 }
 
-/// Shader selector rows shared by both viewer screens: cycle button +
-/// usage hint + checker-density slider (only in Checker mode — inputs
-/// appear only when needed).
-fn shader_rows(items: &mut UiItems, lh: f32, viewer: &SphereViewerState, rects: &ShaderRowRects) {
+/// Shader selector rows on the planet screen: cycle button + usage
+/// hint + checker-density slider (only in Checker mode — inputs appear
+/// only when needed).
+fn shader_rows(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, rects: &ShaderRowRects) {
     section_bar(items, rects.header, "SHADER");
     items.solid(rects.button, C_BTN);
     items.text(
@@ -1388,25 +1227,25 @@ fn shader_rows(items: &mut UiItems, lh: f32, viewer: &SphereViewerState, rects: 
     }
 }
 
-/// Sphere Viewer UI: left dock (camera presets + shader + sphere
+/// Planet View UI: left dock (camera presets + shader + planet
 /// overlays) + shared right data dock (the 3D draws separately). Each
 /// dock groups its widgets under section bars so controls, params,
 /// selection and stats stay visually separate instead of one long
 /// undifferentiated column.
-fn build_sphere_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: Layout) -> UiItems {
+fn build_planet_ui(atlas: &mut GlyphAtlas, viewer: &PlanetViewerState, layout: Layout) -> UiItems {
     let lh = atlas.line_height();
     let mut items = UiItems::default();
     build_nav(
         &mut items,
         layout,
         &MainScreen::ALL.map(|s| s.title()),
-        MainScreen::SphereViewer.index(),
+        MainScreen::PlanetView.index(),
         lh,
     );
 
-    // ---- Left dock: VIEW (camera presets — sphere screen only) ----
+    // ---- Left dock: VIEW (camera presets — planet screen only) ----
     let checker = viewer.debug_mode == DebugMode::Checker;
-    let left = sphere_left_plan(layout.left, lh, checker);
+    let left = planet_left_plan(layout.left, lh, checker);
     items.solid(layout.left, C_PANEL_BG);
     section_bar(&mut items, left.view_header, "VIEW");
     text_row(
@@ -1432,7 +1271,7 @@ fn build_sphere_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
         }
     }
 
-    // ---- Left dock: SHADER + OVERLAYS (sphere-relevant only) ----
+    // ---- Left dock: SHADER + OVERLAYS (planet-relevant only) ----
     shader_rows(
         &mut items,
         lh,
@@ -1458,59 +1297,6 @@ fn build_sphere_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: L
             left.pent_label,
             "Pentagons",
             viewer.pentagons,
-        ),
-        (left.rects.seam_box, left.seam_label, "Seams", viewer.seams),
-    ] {
-        checkbox_row(&mut items, lh, box_rect, label_row, label, checked);
-    }
-
-    build_right_dock(&mut items, lh, viewer, layout.panel);
-    items
-}
-
-/// UV Net UI: left dock (net info + shader + UV overlays) + shared
-/// right data dock (the icosa-net unwrap draws separately).
-fn build_uv_ui(atlas: &mut GlyphAtlas, viewer: &SphereViewerState, layout: Layout) -> UiItems {
-    let lh = atlas.line_height();
-    let mut items = UiItems::default();
-    build_nav(
-        &mut items,
-        layout,
-        &MainScreen::ALL.map(|s| s.title()),
-        MainScreen::UvNet.index(),
-        lh,
-    );
-
-    let checker = viewer.debug_mode == DebugMode::Checker;
-    let left = uv_left_plan(layout.left, lh, checker);
-    items.solid(layout.left, C_PANEL_BG);
-    section_bar(&mut items, left.uv_header, "UV NET");
-    text_row(
-        &mut items,
-        lh,
-        left.uv_info,
-        "icosa net · 20 islands".to_owned(),
-        C_DIM,
-    );
-    shader_rows(
-        &mut items,
-        lh,
-        viewer,
-        &ShaderRowRects {
-            header: left.shader_header,
-            hint: left.shader_hint,
-            button: left.rects.shader_button,
-            density_label: left.density_label,
-            density_track: left.rects.density_track,
-        },
-    );
-    section_bar(&mut items, left.overlay_header, "OVERLAYS");
-    for (box_rect, label_row, label, checked) in [
-        (
-            left.rects.uvwire_box,
-            left.uvwire_label,
-            "UV wire",
-            viewer.wire_on_uv,
         ),
         (left.rects.seam_box, left.seam_label, "Seams", viewer.seams),
     ] {
@@ -2127,11 +1913,11 @@ fn build_system_ui(
     items
 }
 
-/// Right data dock shared by both viewer screens: INPUTS holds mesh
-/// params, SELECTION holds chunk + player, STATS is read-only. The
-/// player block shrinks to a single "off" line when the player is off,
-/// so walk/cam key hints only exist when the player is on.
-fn build_right_dock(items: &mut UiItems, lh: f32, viewer: &SphereViewerState, panel: Rect) {
+/// Right data dock on the planet screen: INPUTS holds mesh params,
+/// SELECTION holds chunk + player, STATS is read-only. The player block
+/// shrinks to a single "off" line when the player is off, so walk/cam
+/// key hints only exist when the player is on.
+fn build_right_dock(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, panel: Rect) {
     let warn = parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
     let plan = right_panel_plan(panel, lh, warn, viewer.player.active);
     items.solid(panel, C_PANEL_BG);
@@ -2482,8 +2268,6 @@ struct ShaderSet {
     fill_frag: Arc<ShaderModule>,
     line_vert: Arc<ShaderModule>,
     line_frag: Arc<ShaderModule>,
-    flat_vert: Arc<ShaderModule>,
-    flat_line_vert: Arc<ShaderModule>,
     ui_vert: Arc<ShaderModule>,
     ui_frag: Arc<ShaderModule>,
     map_vert: Arc<ShaderModule>,
@@ -2497,13 +2281,6 @@ impl ShaderSet {
             fill_frag: compile_shader(device, ShaderKind::Fragment, FILL_FRAG, "fill fragment"),
             line_vert: compile_shader(device, ShaderKind::Vertex, LINE_VERT, "line vertex"),
             line_frag: compile_shader(device, ShaderKind::Fragment, LINE_FRAG, "line fragment"),
-            flat_vert: compile_shader(device, ShaderKind::Vertex, FLAT_VERT, "flat vertex"),
-            flat_line_vert: compile_shader(
-                device,
-                ShaderKind::Vertex,
-                FLAT_LINE_VERT,
-                "flat line vertex",
-            ),
             ui_vert: compile_shader(device, ShaderKind::Vertex, UI_VERT, "ui vertex"),
             ui_frag: compile_shader(device, ShaderKind::Fragment, UI_FRAG, "ui fragment"),
             map_vert: compile_shader(device, ShaderKind::Vertex, MAP_VERT, "map vertex"),
@@ -2630,120 +2407,6 @@ fn build_line_pipeline(
     .expect("line graphics pipeline must create")
 }
 
-fn build_flat_pipeline(
-    device: &Arc<Device>,
-    shaders: &ShaderSet,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
-    let vs = shaders
-        .flat_vert
-        .entry_point("main")
-        .expect("vertex entry point");
-    // The UV net shares the fill fragment shader.
-    let fs = shaders
-        .fill_frag
-        .entry_point("main")
-        .expect("fragment entry point");
-    let vertex_input_state = FlatVertex::per_vertex()
-        .definition(&vs)
-        .expect("flat vertex layout must match shader");
-    let (layout, stages) = pipeline_layout_for(device, vs, fs);
-    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
-    GraphicsPipeline::new(
-        device.clone(),
-        None,
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                // UV-space winding is arbitrary per island: never cull.
-                cull_mode: CullMode::None,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
-                ColorBlendAttachmentState::default(),
-            )),
-            depth_stencil_state: Some(DepthStencilState {
-                // Flat islands are coplanar by construction and seam
-                // triangles legitimately cross over other islands: never
-                // write depth here or cuts z-fight (issue-2026-09-15-0648).
-                // Draw order decides overdraw; the UI pass draws after.
-                depth: Some(DepthState {
-                    write_enable: false,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .expect("flat graphics pipeline must create")
-}
-
-fn build_flat_line_pipeline(
-    device: &Arc<Device>,
-    shaders: &ShaderSet,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
-    let vs = shaders
-        .flat_line_vert
-        .entry_point("main")
-        .expect("vertex entry point");
-    let fs = shaders
-        .line_frag
-        .entry_point("main")
-        .expect("fragment entry point");
-    let vertex_input_state = FlatLineVertex::per_vertex()
-        .definition(&vs)
-        .expect("flat line vertex layout must match shader");
-    let (layout, stages) = pipeline_layout_for(device, vs, fs);
-    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
-    GraphicsPipeline::new(
-        device.clone(),
-        None,
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState {
-                topology: PrimitiveTopology::LineList,
-                ..Default::default()
-            }),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::None,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
-                ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend::alpha()),
-                    ..Default::default()
-                },
-            )),
-            depth_stencil_state: Some(DepthStencilState {
-                // Same no-write rule as the flat fill: coplanar UV lines
-                // must not fight the islands underneath.
-                depth: Some(DepthState {
-                    write_enable: false,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .expect("flat line graphics pipeline must create")
-}
-
 fn build_ui_pipeline(
     device: &Arc<Device>,
     shaders: &ShaderSet,
@@ -2855,7 +2518,7 @@ fn build_map_pipeline(
 
 fn upload_fill(
     allocator: &Arc<StandardMemoryAllocator>,
-    viewer: &SphereViewerState,
+    viewer: &PlanetViewerState,
 ) -> (Subbuffer<[FillVertex]>, Subbuffer<[u32]>) {
     let vertices = Buffer::from_iter(
         allocator.clone(),
@@ -2901,78 +2564,9 @@ fn upload_fill(
     (vertices, indices)
 }
 
-fn upload_flat(
-    allocator: &Arc<StandardMemoryAllocator>,
-    viewer: &SphereViewerState,
-) -> (Subbuffer<[FlatVertex]>, Subbuffer<[u32]>) {
-    let vertices = Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        viewer.flat.uv.iter().enumerate().map(|(i, uv)| {
-            let src = viewer.fill_vertices[viewer.flat.source[i] as usize];
-            FlatVertex {
-                uv_pos: *uv,
-                normal: src.normal,
-                tint: src.tint,
-                dbg: [
-                    if viewer.flat.seam[i] { 1.0 } else { 0.0 },
-                    viewer.flat.island[i] as f32,
-                ],
-            }
-        }),
-    )
-    .expect("flat vertex buffer upload must succeed");
-    let indices = Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::INDEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        viewer.flat.indices.iter().copied(),
-    )
-    .expect("flat index buffer upload must succeed");
-    (vertices, indices)
-}
-
-fn upload_flat_lines(
-    allocator: &Arc<StandardMemoryAllocator>,
-    viewer: &SphereViewerState,
-) -> Subbuffer<[FlatLineVertex]> {
-    Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        viewer
-            .uv_lines
-            .iter()
-            .map(|uv| FlatLineVertex { uv_pos: *uv }),
-    )
-    .expect("flat wireframe vertex buffer upload must succeed")
-}
-
 fn upload_lines(
     allocator: &Arc<StandardMemoryAllocator>,
-    viewer: &SphereViewerState,
+    viewer: &PlanetViewerState,
 ) -> Subbuffer<[LineVertex]> {
     Buffer::from_iter(
         allocator.clone(),
@@ -3226,9 +2820,6 @@ struct ViewerApp {
     fill_vertices: Subbuffer<[FillVertex]>,
     fill_indices: Subbuffer<[u32]>,
     line_vertices: Subbuffer<[LineVertex]>,
-    flat_vertices: Subbuffer<[FlatVertex]>,
-    flat_indices: Subbuffer<[u32]>,
-    flat_lines: Subbuffer<[FlatLineVertex]>,
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
@@ -3250,7 +2841,7 @@ struct ViewerApp {
     /// Cached streaming desired set (the player's own hemisphere,
     /// refreshed on [`ViewerApp::last_stream_sync`]).
     stream_desired: Vec<u32>,
-    /// Cursor position at left-button press (sphere-viewport presses
+    /// Cursor position at left-button press (planet-viewport presses
     /// only): release within [`CLICK_MAX_DRAG_PX`] of it counts as a click
     /// (chunk pin) rather than an orbit drag.
     press_cursor: Option<(f32, f32)>,
@@ -3360,7 +2951,7 @@ impl ViewerApp {
         // defeats the inspection goal of the default view. The `--headless`
         // path stays N=6 to cross-check the committed engine mesh hash
         // (update-2026-09-14-2008).
-        let mut debug = DebugApp::with_viewer(SphereViewerState::with_values(
+        let mut debug = DebugApp::with_viewer(PlanetViewerState::with_values(
             WINDOWED_SUBDIV,
             WINDOWED_RADIUS,
         ));
@@ -3380,12 +2971,10 @@ impl ViewerApp {
             radius = viewer.radius,
             cells = viewer.stats.cells,
             hash8 = viewer.stats.hash8.as_str(),
-            "sphere viewer mesh generated",
+            "planet view mesh generated",
         );
         let (fill_vertices, fill_indices) = upload_fill(&memory_allocator, viewer);
         let line_vertices = upload_lines(&memory_allocator, viewer);
-        let (flat_vertices, flat_indices) = upload_flat(&memory_allocator, viewer);
-        let flat_lines = upload_flat_lines(&memory_allocator, viewer);
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
@@ -3408,9 +2997,6 @@ impl ViewerApp {
             fill_vertices,
             fill_indices,
             line_vertices,
-            flat_vertices,
-            flat_indices,
-            flat_lines,
             map_vertices,
             system_points,
             system_lines,
@@ -3435,8 +3021,6 @@ impl ViewerApp {
         let viewer = &self.debug.viewer;
         (self.fill_vertices, self.fill_indices) = upload_fill(&self.memory_allocator, viewer);
         self.line_vertices = upload_lines(&self.memory_allocator, viewer);
-        (self.flat_vertices, self.flat_indices) = upload_flat(&self.memory_allocator, viewer);
-        self.flat_lines = upload_flat_lines(&self.memory_allocator, viewer);
         self.camera = OrbitCamera::framing_planet(viewer.radius);
         tracing::info!(
             subdivisions = viewer.subdiv,
@@ -3444,7 +3028,7 @@ impl ViewerApp {
             cells = viewer.stats.cells,
             hash8 = viewer.stats.hash8.as_str(),
             gen_ms = format!("{:.1}", viewer.stats.gen_ms),
-            "sphere viewer mesh regenerated",
+            "planet view mesh regenerated",
         );
     }
 
@@ -3473,7 +3057,7 @@ impl ViewerApp {
     }
 
     /// Route typed text into whichever field holds focus (seed field on
-    /// the galaxy screen, subdiv/radius on the sphere screen). Every
+    /// the galaxy screen, subdiv/radius on the planet screen). Every
     /// `TextField::insert_char` guards on its own `focused` flag, so
     /// pushing to all three is safe — only the focused one accepts.
     /// Without this, the shortcut arms below (digits, U, R, E, Q, F,
@@ -3511,7 +3095,7 @@ impl ViewerApp {
     }
 
     /// Recompute the hovered chunk from the current cursor: only on the
-    /// Sphere Viewer screen with the cursor inside the main viewport. A
+    /// Planet View screen with the cursor inside the main viewport. A
     /// miss (cursor over empty space, panel, or nav) clears the hover.
     /// Hover feeds the fill highlight + panel CHUNK readout; it never
     /// touches the mesh. Callers refresh after every cursor or camera
@@ -3521,7 +3105,7 @@ impl ViewerApp {
             .main
             .as_ref()
             .and_then(|ctx| ctx.last_cursor.map(|cursor| (cursor, ctx.size())))
-            .filter(|_| self.debug.main_screen == MainScreen::SphereViewer)
+            .filter(|_| self.debug.main_screen == MainScreen::PlanetView)
             .and_then(|((cx, cy), (w, h))| {
                 let layout = app_layout(self.debug.main_screen, w, h);
                 let rect = layout.viewport;
@@ -3620,8 +3204,6 @@ impl ViewerApp {
         let pipelines = Pipelines {
             fill: build_fill_pipeline(&self.device, &self.shaders, &render_pass),
             line: build_line_pipeline(&self.device, &self.shaders, &render_pass),
-            flat: build_flat_pipeline(&self.device, &self.shaders, &render_pass),
-            flat_line: build_flat_line_pipeline(&self.device, &self.shaders, &render_pass),
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
         };
@@ -3632,8 +3214,6 @@ impl ViewerApp {
 struct Pipelines {
     fill: Arc<GraphicsPipeline>,
     line: Arc<GraphicsPipeline>,
-    flat: Arc<GraphicsPipeline>,
-    flat_line: Arc<GraphicsPipeline>,
     ui: Arc<GraphicsPipeline>,
     map: Arc<GraphicsPipeline>,
 }
@@ -3750,7 +3330,7 @@ impl ApplicationHandler for ViewerApp {
         // `resumed` can fire more than once: only create windows that
         // don't have a live context yet.
         if self.main.is_none() {
-            self.main = Some(self.create_window(event_loop, "PlanetCrafter — sphere viewer", None));
+            self.main = Some(self.create_window(event_loop, "PlanetCrafter — planet view", None));
         }
         if self.tools.is_none() {
             self.tools = Some(self.create_window(
@@ -3793,7 +3373,7 @@ impl ApplicationHandler for ViewerApp {
     }
 }
 impl ViewerApp {
-    /// Viewer-window events (both viewer screens).
+    /// Viewer-window events (galaxy / system / planet screens).
     fn main_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -3827,13 +3407,10 @@ impl ViewerApp {
                         let layout = app_layout(screen, w, h);
                         let checker = viewer.debug_mode == DebugMode::Checker;
                         let track = match screen {
-                            MainScreen::SphereViewer => {
-                                sphere_left_plan(layout.left, lh, checker)
+                            MainScreen::PlanetView => {
+                                planet_left_plan(layout.left, lh, checker)
                                     .rects
                                     .density_track
-                            }
-                            MainScreen::UvNet => {
-                                uv_left_plan(layout.left, lh, checker).rects.density_track
                             }
                             // No density slider on the map screens.
                             MainScreen::GalaxyMap | MainScreen::SystemMap => None,
@@ -3868,7 +3445,7 @@ impl ViewerApp {
                 } else if self.dragging_pan {
                     // Map pan: right/middle-drag moves the 3D map camera
                     // target in the view plane (content follows the
-                    // cursor). Sphere/UV screens never set this flag.
+                    // cursor). The planet screen never sets this flag.
                     let last = self.main.as_ref().and_then(|ctx| ctx.last_cursor);
                     if let Some(last) = last
                         && let Some(ctx) = self.main.as_ref()
@@ -3918,8 +3495,8 @@ impl ViewerApp {
                 if !pressed {
                     // Release: a press that barely traveled counts as a
                     // click — pin the hovered chunk. The release must
-                    // still land in the sphere viewport (pinning only
-                    // exists on the sphere screen).
+                    // still land in the planet viewport (pinning only
+                    // exists on the planet screen).
                     let (cursor, in_viewport) = match self.main.as_ref() {
                         Some(ctx) => {
                             let (w, h) = ctx.size();
@@ -3943,7 +3520,7 @@ impl ViewerApp {
                     self.dragging_density = false;
                     self.press_cursor = None;
                     if click
-                        && screen == MainScreen::SphereViewer
+                        && screen == MainScreen::PlanetView
                         && in_viewport
                         && let Some(chunk) = self.debug.viewer.hovered
                     {
@@ -4016,10 +3593,10 @@ impl ViewerApp {
                 // pan on right/middle).
                 if layout.viewport.contains(cx, cy) {
                     self.dragging_orbit = true;
-                    // A sphere-screen press may end as a chunk-pin click,
+                    // A planet-screen press may end as a chunk-pin click,
                     // a map-screen press as a star/planet-pick click (all
                     // decided on release by travel distance).
-                    if screen == MainScreen::SphereViewer
+                    if screen == MainScreen::PlanetView
                         || screen == MainScreen::GalaxyMap
                         || screen == MainScreen::SystemMap
                     {
@@ -4040,8 +3617,8 @@ impl ViewerApp {
                     let checker = viewer.debug_mode == DebugMode::Checker;
                     // Screen-specific left dock first.
                     match screen {
-                        MainScreen::SphereViewer => {
-                            let lrects = &sphere_left_plan(layout.left, lh, checker).rects;
+                        MainScreen::PlanetView => {
+                            let lrects = &planet_left_plan(layout.left, lh, checker).rects;
                             if lrects.shader_button.contains(cx, cy) {
                                 viewer.cycle_debug_mode();
                             }
@@ -4054,22 +3631,6 @@ impl ViewerApp {
                             }
                             viewer.wire_cb.click(lrects.wire_box, cx, cy);
                             viewer.pent_cb.click(lrects.pent_box, cx, cy);
-                            viewer.seam_cb.click(lrects.seam_box, cx, cy);
-                            viewer.sync_toggles();
-                        }
-                        MainScreen::UvNet => {
-                            let lrects = &uv_left_plan(layout.left, lh, checker).rects;
-                            if lrects.shader_button.contains(cx, cy) {
-                                viewer.cycle_debug_mode();
-                            }
-                            if let Some(track) = lrects.density_track
-                                && track.contains(cx, cy)
-                            {
-                                self.dragging_density = true;
-                                viewer.density_slider.drag_to(track, cx);
-                                viewer.sync_density_from_slider();
-                            }
-                            viewer.uvwire_cb.click(lrects.uvwire_box, cx, cy);
                             viewer.seam_cb.click(lrects.seam_box, cx, cy);
                             viewer.sync_toggles();
                         }
@@ -4108,13 +3669,13 @@ impl ViewerApp {
                     self.load_galaxy_seed(seed);
                 }
                 // Global camera presets: 2×2 VIEW grid retargets the free
-                // orbit camera (same as G/T/B/R) — sphere screen only.
+                // orbit camera (same as G/T/B/R) — planet screen only.
                 // Grid order is [[Top, Bot], [Right, Persp]] matching
                 // `GlobalPreset::ALL`.
-                let preset = if screen == MainScreen::SphereViewer {
+                let preset = if screen == MainScreen::PlanetView {
                     let lh = self.atlas.line_height();
                     let checker = self.debug.viewer.debug_mode == DebugMode::Checker;
-                    sphere_left_plan(layout.left, lh, checker)
+                    planet_left_plan(layout.left, lh, checker)
                         .rects
                         .preset_grid
                         .iter()
@@ -4229,7 +3790,7 @@ impl ViewerApp {
                     PhysicalKey::Code(KeyCode::Enter) => {
                         // Enter confirms the focused field: seed field
                         // loads the typed universe (or surfaces the miss),
-                        // sphere fields just unfocus.
+                        // planet fields just unfocus.
                         if self.debug.galaxy.seed_field.focused {
                             match self.debug.galaxy.seed_field.text.parse::<u64>() {
                                 Ok(seed) => self.load_galaxy_seed(seed),
@@ -4262,11 +3823,8 @@ impl ViewerApp {
                         self.debug.select_main_by_fkey(3);
                     }
                     PhysicalKey::Code(KeyCode::F4) => {
-                        self.debug.select_main_by_fkey(4);
-                    }
-                    PhysicalKey::Code(KeyCode::F5) => {
                         // Reopen the tools window if the user closed it
-                        // (moved from F3/F4: F-keys follow nav order).
+                        // (F-keys follow nav order: F1–F3 screens, F4 tools).
                         if self.tools.is_none() {
                             self.tools = Some(self.create_window(
                                 event_loop,
@@ -4335,7 +3893,7 @@ impl ViewerApp {
                     }
                     PhysicalKey::Code(KeyCode::KeyR) => {
                         // R re-rolls the galaxy seed on the map screen;
-                        // the sphere screen keeps R = Right preset.
+                        // the planet screen keeps R = Right preset.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
@@ -4345,7 +3903,7 @@ impl ViewerApp {
                         if fields_free {
                             if self.debug.main_screen == MainScreen::GalaxyMap {
                                 self.load_galaxy_seed(self.debug.galaxy.seed + 1);
-                            } else if self.debug.main_screen == MainScreen::SphereViewer {
+                            } else if self.debug.main_screen == MainScreen::PlanetView {
                                 let radius = self.debug.viewer.radius;
                                 snap_global_camera(&mut self.camera, GlobalPreset::Right, radius);
                                 self.update_hover();
@@ -4389,7 +3947,7 @@ impl ViewerApp {
                             // Begin the transit countdown on the armed
                             // travel offer (UMAP-018). The journey must
                             // already sit on this layer (normal flow:
-                            // galaxy E drills down first); a direct F4
+                            // galaxy E drills down first); a direct F2
                             // jump without it gets an honest surface, not
                             // a silent desync.
                             if self.debug.journey.active_layer() != Layer::System {
@@ -4510,9 +4068,8 @@ impl ViewerApp {
                                     self.debug.fx.notify("Travel offer withdrawn".to_owned())
                                 }
                             }
-                        } else if fields_free && self.debug.main_screen == MainScreen::SphereViewer
-                        {
-                            // The sphere screen keeps T = Top preset.
+                        } else if fields_free && self.debug.main_screen == MainScreen::PlanetView {
+                            // The planet screen keeps T = Top preset.
                             let radius = self.debug.viewer.radius;
                             snap_global_camera(&mut self.camera, GlobalPreset::Top, radius);
                             self.update_hover();
@@ -4548,7 +4105,7 @@ impl ViewerApp {
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.galaxy.seed_field.focused
-                            && self.debug.main_screen == MainScreen::SphereViewer
+                            && self.debug.main_screen == MainScreen::PlanetView
                         {
                             let preset = match physical_key {
                                 PhysicalKey::Code(KeyCode::KeyB) => GlobalPreset::Bottom,
@@ -4565,7 +4122,7 @@ impl ViewerApp {
                     }
                     _ => {
                         // The focused seed field eats keystrokes first;
-                        // otherwise printable input goes to the sphere
+                        // otherwise printable input goes to the planet
                         // fields (their insert guards on focus).
                         if self.debug.galaxy.seed_field.focused {
                             if let Some(text) = text {
@@ -4591,7 +4148,7 @@ impl ViewerApp {
     fn tools_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                // Hide the tools window; F3 on the viewer window reopens it.
+                // Hide the tools window; F4 on the viewer window reopens it.
                 self.tools = None;
             }
             WindowEvent::Resized(_) => {
@@ -4708,7 +4265,7 @@ impl ViewerApp {
                     // rides the held SeededPlanet into M2/M3.
                     let radius = self.debug.arrive(arrival);
                     self.refresh_mesh();
-                    self.debug.select_main(MainScreen::SphereViewer);
+                    self.debug.select_main(MainScreen::PlanetView);
                     self.debug.fx.trigger_fade();
                     let bound = self.debug.viewer.arrival.as_ref().expect("just bound");
                     self.debug.fx.notify(format!(
@@ -4778,10 +4335,7 @@ impl ViewerApp {
         // Build frame UI (atlas insertions happen here) and sync the GPU
         // atlas before recording.
         let mut items = match self.debug.main_screen {
-            MainScreen::SphereViewer => {
-                build_sphere_ui(&mut self.atlas, &self.debug.viewer, layout)
-            }
-            MainScreen::UvNet => build_uv_ui(&mut self.atlas, &self.debug.viewer, layout),
+            MainScreen::PlanetView => build_planet_ui(&mut self.atlas, &self.debug.viewer, layout),
             MainScreen::GalaxyMap => build_galaxy_ui(&mut self.atlas, &self.debug.galaxy, layout),
             MainScreen::SystemMap => build_system_ui(
                 &mut self.atlas,
@@ -4791,8 +4345,8 @@ impl ViewerApp {
             ),
         };
         // Player dot: the walker projected through the main-view matrices
-        // (sphere screen only).
-        if player_active && self.debug.main_screen == MainScreen::SphereViewer {
+        // (planet screen only).
+        if player_active && self.debug.main_screen == MainScreen::PlanetView {
             let player = &self.debug.viewer.player;
             let vp = layout.viewport;
             let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
@@ -5001,9 +4555,9 @@ impl ViewerApp {
                     // SAFETY: same contract as the galaxy map draw.
                     unsafe { builder.draw(self.system_points.len() as u32, 1, 0, 0) }
                         .expect("system points draw must record");
-                } else if view == MainScreen::SphereViewer {
+                } else if view == MainScreen::PlanetView {
                     let aspect = vp.w / vp.h;
-                    // Player mode renders the sphere through the player
+                    // Player mode renders the planet through the player
                     // camera.
                     let main_vp = if player_active {
                         let player = &self.debug.viewer.player;
@@ -5069,61 +4623,6 @@ impl ViewerApp {
                         // no index buffer is bound for this `LineList` draw.
                         unsafe { builder.draw(self.debug.viewer.lines.len() as u32, 1, 0, 0) }
                             .expect("wireframe draw must record");
-                    }
-                } else {
-                    let mvp = flat_mvp(vp);
-                    builder
-                        .set_viewport(0, [viewport].into_iter().collect())
-                        .expect("viewport must set")
-                        .bind_pipeline_graphics(ctx.pipelines.flat.clone())
-                        .expect("pipeline must bind")
-                        .bind_vertex_buffers(0, self.flat_vertices.clone())
-                        .expect("vertex buffer must bind")
-                        .bind_index_buffer(self.flat_indices.clone())
-                        .expect("index buffer must bind")
-                        .push_constants(
-                            ctx.pipelines.flat.layout().clone(),
-                            0,
-                            FillPush {
-                                mvp,
-                                tint_rgb: [0.0, 0.0, 0.0],
-                                use_tint: 0.0,
-                                highlight,
-                                mode,
-                                density,
-                                seams_on,
-                                hover_cell,
-                                pin_cell,
-                            },
-                        )
-                        .expect("flat push constants must upload");
-                    unsafe { builder.draw_indexed(self.flat_indices.len() as u32, 1, 0, 0, 0) }
-                        .expect("flat draw must record");
-                    if self.debug.viewer.wire_on_uv && !self.debug.viewer.uv_lines.is_empty() {
-                        builder
-                            .bind_pipeline_graphics(ctx.pipelines.flat_line.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, self.flat_lines.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.flat_line.layout().clone(),
-                                0,
-                                FillPush {
-                                    mvp,
-                                    tint_rgb: [0.0, 0.0, 0.0],
-                                    use_tint: 0.0,
-                                    highlight,
-                                    mode,
-                                    density,
-                                    seams_on,
-                                    hover_cell,
-                                    pin_cell,
-                                },
-                            )
-                            .expect("flat line push constants must upload");
-                        // SAFETY: same contract as the 3D wireframe draw.
-                        unsafe { builder.draw(self.debug.viewer.uv_lines.len() as u32, 1, 0, 0) }
-                            .expect("flat wireframe draw must record");
                     }
                 }
             }
@@ -5480,8 +4979,6 @@ mod tests {
         for (kind, source, what) in [
             (ShaderKind::Vertex, FILL_VERT, "fill vert"),
             (ShaderKind::Fragment, FILL_FRAG, "fill frag"),
-            (ShaderKind::Vertex, FLAT_VERT, "flat vert"),
-            (ShaderKind::Vertex, FLAT_LINE_VERT, "flat line vert"),
             (ShaderKind::Vertex, LINE_VERT, "line vert"),
             (ShaderKind::Fragment, LINE_FRAG, "line frag"),
             (ShaderKind::Vertex, UI_VERT, "ui vert"),
@@ -5532,63 +5029,25 @@ mod tests {
     }
 
     #[test]
-    fn flat_mvp_centers_unit_square() {
-        // Wide viewport: square fit by height, u centered.
-        let m = flat_mvp(Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 1020.0,
-            h: 692.0,
-        });
-        let project = |u: f32, v: f32| (m[0][0] * u + m[3][0], m[1][1] * v + m[3][1]);
-        let (cx0, cy0) = project(0.0, 0.0);
-        let (cx1, cy1) = project(1.0, 1.0);
-        // Centered: x symmetric, y spans full NDC (v=0 top → +1).
-        assert!((cx0 + cx1).abs() < 1e-5, "{cx0} {cx1}");
-        assert!((cy0 - 1.0).abs() < 1e-5, "{cy0}");
-        assert!((cy1 + 1.0).abs() < 1e-5, "{cy1}");
-        let (mx, my) = project(0.5, 0.5);
-        assert!(mx.abs() < 1e-5 && my.abs() < 1e-5, "{mx} {my}");
-        // Tall viewport: fit by width instead.
-        let t = flat_mvp(Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 244.0,
-            h: 500.0,
-        });
-        let tx = |u: f32| t[0][0] * u + t[3][0];
-        let ty = |v: f32| t[1][1] * v + t[3][1];
-        assert!((tx(0.0) + 1.0).abs() < 1e-5);
-        assert!((tx(1.0) - 1.0).abs() < 1e-5);
-        assert!((ty(0.0) + ty(1.0)).abs() < 1e-5, "v centered");
-    }
-
-    #[test]
     fn panel_plans_stay_inside_and_ordered() {
         for warn in [false, true] {
             for checker in [false, true] {
                 for player_active in [false, true] {
                     let layout = ui::layout(1280.0, 720.0);
-                    let sphere = sphere_left_plan(layout.left, 19.0, checker);
-                    let uv = uv_left_plan(layout.left, 19.0, checker);
+                    let planet = planet_left_plan(layout.left, 19.0, checker);
                     let right = right_panel_plan(layout.panel, 19.0, warn, player_active);
                     assert_eq!(right.warn_line.is_some(), warn);
                     // Player block shrinks to one "off" line when the player is off.
                     assert_eq!(right.player_lines.len(), if player_active { 4 } else { 1 });
                     // Density rows only exist in Checker mode.
-                    assert_eq!(sphere.rects.density_track.is_some(), checker);
-                    assert_eq!(sphere.density_label.is_some(), checker);
-                    assert_eq!(uv.rects.density_track.is_some(), checker);
-                    assert_eq!(uv.density_label.is_some(), checker);
+                    assert_eq!(planet.rects.density_track.is_some(), checker);
+                    assert_eq!(planet.density_label.is_some(), checker);
                     // Every widget rect stays inside its dock.
                     for rect in [
-                        sphere.rects.shader_button,
-                        sphere.rects.wire_box,
-                        sphere.rects.pent_box,
-                        sphere.rects.seam_box,
-                        uv.rects.shader_button,
-                        uv.rects.uvwire_box,
-                        uv.rects.seam_box,
+                        planet.rects.shader_button,
+                        planet.rects.wire_box,
+                        planet.rects.pent_box,
+                        planet.rects.seam_box,
                     ] {
                         assert!(rect.x >= layout.left.x, "{rect:?}");
                         assert!(
@@ -5596,12 +5055,7 @@ mod tests {
                             "{rect:?}"
                         );
                     }
-                    for rect in sphere
-                        .rects
-                        .density_track
-                        .into_iter()
-                        .chain(uv.rects.density_track)
-                    {
+                    for rect in planet.rects.density_track.into_iter() {
                         assert!(rect.x >= layout.left.x, "{rect:?}");
                         assert!(
                             rect.x + rect.w <= layout.left.x + layout.left.w + 1e-3,
@@ -5620,7 +5074,7 @@ mod tests {
                             "{rect:?}"
                         );
                     }
-                    for row in sphere.rects.preset_grid {
+                    for row in planet.rects.preset_grid {
                         for button in row {
                             assert!(button.x >= layout.left.x, "{button:?}");
                             assert!(
@@ -5629,22 +5083,16 @@ mod tests {
                             );
                         }
                     }
-                    // Sphere dock flows top-down: view, presets, shader, overlays.
-                    assert!(sphere.view_header.y < sphere.preset_hint.y);
-                    assert!(sphere.rects.shader_button.y > sphere.shader_header.y);
-                    assert!(sphere.shader_hint.y > sphere.rects.shader_button.y);
-                    assert!(sphere.overlay_header.y < sphere.rects.wire_box.y);
-                    assert!(sphere.rects.wire_box.y < sphere.rects.pent_box.y);
-                    assert!(sphere.rects.pent_box.y < sphere.rects.seam_box.y);
+                    // Planet dock flows top-down: view, presets, shader, overlays.
+                    assert!(planet.view_header.y < planet.preset_hint.y);
+                    assert!(planet.rects.shader_button.y > planet.shader_header.y);
+                    assert!(planet.shader_hint.y > planet.rects.shader_button.y);
+                    assert!(planet.overlay_header.y < planet.rects.wire_box.y);
+                    assert!(planet.rects.wire_box.y < planet.rects.pent_box.y);
+                    assert!(planet.rects.pent_box.y < planet.rects.seam_box.y);
                     // Preset grid: top row above bottom row, left column left of right.
-                    assert!(sphere.rects.preset_grid[0][0].y < sphere.rects.preset_grid[1][0].y);
-                    assert!(sphere.rects.preset_grid[0][0].x < sphere.rects.preset_grid[0][1].x);
-                    // UV dock flows top-down: info, shader, overlays.
-                    assert!(uv.uv_header.y < uv.uv_info.y);
-                    assert!(uv.uv_info.y < uv.shader_header.y);
-                    assert!(uv.shader_header.y < uv.rects.shader_button.y);
-                    assert!(uv.overlay_header.y < uv.rects.uvwire_box.y);
-                    assert!(uv.rects.uvwire_box.y < uv.rects.seam_box.y);
+                    assert!(planet.rects.preset_grid[0][0].y < planet.rects.preset_grid[1][0].y);
+                    assert!(planet.rects.preset_grid[0][0].x < planet.rects.preset_grid[0][1].x);
                     // Right dock flows top-down: inputs, selection, stats.
                     assert!(right.rects.subdiv_field.y < right.rects.subdiv_track.y);
                     assert!(right.rects.subdiv_track.y < right.rects.radius_field.y);
@@ -5666,7 +5114,7 @@ mod tests {
     #[test]
     fn viewer_ui_contains_panel_content() {
         let mut atlas = GlyphAtlas::new(UI_PX);
-        let viewer = SphereViewerState::new();
+        let viewer = PlanetViewerState::new();
         let layout = ui::layout(1280.0, 720.0);
         let joined = |items: &UiItems| {
             items
@@ -5676,12 +5124,13 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        // Sphere screen: presets + sphere overlays, no UV-only controls.
-        let sphere = joined(&build_sphere_ui(&mut atlas, &viewer, layout));
-        assert!(!sphere.is_empty());
+        // Planet screen: presets + planet overlays, nav shows all tabs.
+        let planet = joined(&build_planet_ui(&mut atlas, &viewer, layout));
+        assert!(!planet.is_empty());
         for needle in [
-            "Sphere Viewer",
-            "UV Net",
+            "Planet View",
+            "Galaxy Map",
+            "System Map",
             "INPUTS",
             "Subdivisions",
             "Radius",
@@ -5707,55 +5156,25 @@ mod tests {
             "view:",
             "click cycles",
         ] {
-            assert!(sphere.contains(needle), "sphere ui missing {needle}");
+            assert!(planet.contains(needle), "planet ui missing {needle}");
         }
         for absent in [
             "Swap view (V)",
             "click/V",
             "UV wire",
             "UV DEBUG",
+            "UV Net",
             "Checker density:",
             "move:     WASD",
             "cam:      P cycles",
         ] {
-            assert!(!sphere.contains(absent), "sphere ui leaks {absent}");
+            assert!(!planet.contains(absent), "planet ui leaks {absent}");
         }
-        // UV screen: net info + UV overlays, no sphere-only controls.
-        let uv = joined(&build_uv_ui(&mut atlas, &viewer, layout));
-        for needle in [
-            "Sphere Viewer",
-            "UV Net",
-            "UV NET",
-            "icosa net",
-            "SHADER",
-            "Shader: Lit",
-            "UV wire",
-            "Seams",
-            "OVERLAYS",
-            "INPUTS",
-            "SELECTION",
-            "STATS",
-            "click cycles",
-        ] {
-            assert!(uv.contains(needle), "uv ui missing {needle}");
-        }
-        for absent in [
-            "Swap view (V)",
-            "Wireframe",
-            "Pentagons",
-            "Camera presets",
-            "UV DEBUG",
-            "Checker density:",
-        ] {
-            assert!(!uv.contains(absent), "uv ui leaks {absent}");
-        }
-        // Checker mode reveals the density slider on both screens.
-        let mut checker_viewer = SphereViewerState::with_values(1, 1.0);
+        // Checker mode reveals the density slider on the planet screen.
+        let mut checker_viewer = PlanetViewerState::with_values(1, 1.0);
         checker_viewer.debug_mode = DebugMode::Checker;
-        let sphere_checker = joined(&build_sphere_ui(&mut atlas, &checker_viewer, layout));
-        let uv_checker = joined(&build_uv_ui(&mut atlas, &checker_viewer, layout));
-        assert!(sphere_checker.contains("Checker density:"));
-        assert!(uv_checker.contains("Checker density:"));
+        let planet_checker = joined(&build_planet_ui(&mut atlas, &checker_viewer, layout));
+        assert!(planet_checker.contains("Checker density:"));
     }
 
     #[test]
@@ -5849,7 +5268,7 @@ mod tests {
     fn follow_marker_arrow_visible_and_oriented() {
         use game_debug::player_view::MoveKeys;
 
-        let mut viewer = SphereViewerState::with_values(1, 1.0);
+        let mut viewer = PlanetViewerState::with_values(1, 1.0);
         viewer.player.toggle();
         assert_eq!(viewer.player.mode(), CameraMode::Follow);
         let layout = ui::layout(1280.0, 720.0);
@@ -5892,7 +5311,7 @@ mod tests {
 
     #[test]
     fn first_person_hides_marker_and_looks_along_heading() {
-        let mut viewer = SphereViewerState::with_values(1, 1.0);
+        let mut viewer = PlanetViewerState::with_values(1, 1.0);
         viewer.player.toggle();
         viewer.player.cycle_camera();
         assert_eq!(viewer.player.mode(), CameraMode::FirstPerson);
@@ -5921,7 +5340,7 @@ mod tests {
         use game_debug::player_view::MoveKeys;
 
         let mut atlas = GlyphAtlas::new(UI_PX);
-        let mut viewer = SphereViewerState::with_values(1, 1.0);
+        let mut viewer = PlanetViewerState::with_values(1, 1.0);
         viewer.player.toggle();
         viewer.player.set_keys(MoveKeys {
             east: true,
@@ -5930,7 +5349,7 @@ mod tests {
         let desired = visible_hemisphere(&viewer.mesh, viewer.player.position().to_array());
         viewer.player.update(0.05, &desired);
         let layout = ui::layout(1280.0, 720.0);
-        let items = build_sphere_ui(&mut atlas, &viewer, layout);
+        let items = build_planet_ui(&mut atlas, &viewer, layout);
         let joined = items
             .texts
             .iter()
@@ -5988,9 +5407,9 @@ mod tests {
     #[test]
     fn ui_vertices_cover_all_items() {
         let mut atlas = GlyphAtlas::new(UI_PX);
-        let viewer = SphereViewerState::new();
+        let viewer = PlanetViewerState::new();
         let layout = ui::layout(1280.0, 720.0);
-        let items = build_sphere_ui(&mut atlas, &viewer, layout);
+        let items = build_planet_ui(&mut atlas, &viewer, layout);
         let verts = ui_items_to_vertices(&items, &mut atlas);
         let text_quads: usize = items.texts.iter().map(|t| t.text.chars().count()).sum();
         assert_eq!(verts.len(), items.solids.len() * 6 + text_quads * 6);

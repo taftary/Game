@@ -1,4 +1,4 @@
-//! Sphere Viewer screen state: validated parameters, display toggles,
+//! Planet View screen state: validated parameters, display toggles,
 //! current mesh buffers (plain data) and read-only stats. Regeneration is
 //! synchronous: `generate` + both builders run on the calling thread and
 //! the measured wall time is stored in [`ViewerStats::gen_ms`].
@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use game_engine::hexsphere::{ChunkId, DEFAULT_SUBDIVISIONS, HexSphere};
-use game_engine::render::{FlatUnwrap, PlanetVertex};
+use game_engine::render::PlanetVertex;
 
 use crate::mesh::{
     FillDebug, ViewerStats, build_fill, build_fill_debug, build_wireframe, viewer_stats,
@@ -20,7 +20,7 @@ use crate::ui::{Checkbox, Slider, TextField};
 pub const DEFAULT_RADIUS: f32 = 1.0;
 /// Default radius field text.
 pub const DEFAULT_RADIUS_TEXT: &str = "1.0";
-/// Default checker density for the UV Checker debug mode.
+/// Default checker density for the Checker debug mode.
 pub const DEFAULT_CHECKER_DENSITY: u32 = 8;
 /// Checker density slider range.
 pub const MIN_CHECKER_DENSITY: u32 = 2;
@@ -38,8 +38,7 @@ pub enum DebugMode {
     /// Pentagon valence tint only.
     Tint,
     /// Cube-domain checker (Bourke cubemap + equiangular): only squares,
-    /// globally consistent grid (4 matched fault edges), shared by both
-    /// views.
+    /// globally consistent grid (4 matched fault edges).
     Checker,
     /// Seam highlight + island-id color.
     Seams,
@@ -89,23 +88,21 @@ impl DebugMode {
     }
 }
 
-/// Owned Sphere Viewer state (mesh + camera inputs + panel texts).
-pub struct SphereViewerState {
+/// Owned Planet View state (mesh + camera inputs + panel texts).
+pub struct PlanetViewerState {
     /// Subdivisions field (validated on regenerate).
     pub subdiv_field: TextField,
     /// Radius field (validated on regenerate).
     pub radius_field: TextField,
     /// Subdivisions slider (synced with the field; slider drags clamp).
     pub subdiv_slider: Slider,
-    /// Wireframe checkbox (synced to [`SphereViewerState::wireframe`]).
+    /// Wireframe checkbox (synced to [`PlanetViewerState::wireframe`]).
     pub wire_cb: Checkbox,
-    /// Pentagon-highlight checkbox (synced to [`SphereViewerState::pentagons`]).
+    /// Pentagon-highlight checkbox (synced to [`PlanetViewerState::pentagons`]).
     pub pent_cb: Checkbox,
-    /// Seam-highlight checkbox (synced to [`SphereViewerState::seams`]).
+    /// Seam-highlight checkbox (synced to [`PlanetViewerState::seams`]).
     pub seam_cb: Checkbox,
-    /// Wireframe-on-UV checkbox (synced to [`SphereViewerState::wire_on_uv`]).
-    pub uvwire_cb: Checkbox,
-    /// Checker density slider (synced to [`SphereViewerState::checker_density`]).
+    /// Checker density slider (synced to [`PlanetViewerState::checker_density`]).
     pub density_slider: Slider,
     /// Active debug shader visualization (default lit).
     pub debug_mode: DebugMode,
@@ -113,8 +110,6 @@ pub struct SphereViewerState {
     pub checker_density: u32,
     /// Seam highlight toggle (default on).
     pub seams: bool,
-    /// Wireframe overlay on the flat UV view (default on).
-    pub wire_on_uv: bool,
     /// Last successfully applied subdivisions.
     pub subdiv: u32,
     /// Last successfully applied radius.
@@ -132,15 +127,8 @@ pub struct SphereViewerState {
     pub fill_indices: Vec<u32>,
     /// Debug sidecar (seam/island per fill vertex, same order).
     pub fill_debug: FillDebug,
-    /// Flat-view buffers with seam duplication (`render::uv`): expanded
-    /// uv/island/seam + dedicated index buffer where every triangle stays
-    /// inside one island. `source` maps flat vertices back to
-    /// `fill_vertices` for attributes.
-    pub flat: FlatUnwrap,
     /// Wireframe position pairs (segment k = `lines[2k]` → `lines[2k+1]`).
     pub lines: Vec<[f32; 3]>,
-    /// Flat-view wireframe pairs in icosa-net UV space.
-    pub uv_lines: Vec<[f32; 2]>,
     /// Chunk under the cursor right now (set by the binary on cursor
     /// moves over a sphere-rendered rect; `None` elsewhere).
     pub hovered: Option<ChunkId>,
@@ -163,12 +151,12 @@ pub struct SphereViewerState {
     pub stats: ViewerStats,
 }
 
-impl SphereViewerState {
+impl PlanetViewerState {
     /// Default panel (N=6, R=1.0, both toggles on) with a built mesh.
     /// This is also the headless default: N=6 matches the engine pin, so
     /// the headless stats cross-check the committed mesh hash.
     pub fn new() -> Self {
-        SphereViewerState::with_values(DEFAULT_SUBDIVISIONS, DEFAULT_RADIUS)
+        PlanetViewerState::with_values(DEFAULT_SUBDIVISIONS, DEFAULT_RADIUS)
     }
 
     /// Panel with explicit values (both toggles on) and a built mesh.
@@ -179,7 +167,7 @@ impl SphereViewerState {
             radius.is_finite() && radius > 0.0,
             "viewer radius must be positive and finite, got {radius}"
         );
-        let mut state = SphereViewerState {
+        let mut state = PlanetViewerState {
             // Placeholder mesh: replaced by `regenerate()` below before
             // anyone can observe it (N=0 builds 12 cells in microseconds).
             mesh: HexSphere::generate(0, 1.0),
@@ -189,7 +177,6 @@ impl SphereViewerState {
             wire_cb: Checkbox { checked: true },
             pent_cb: Checkbox { checked: true },
             seam_cb: Checkbox { checked: true },
-            uvwire_cb: Checkbox { checked: true },
             density_slider: Slider::new(
                 MIN_CHECKER_DENSITY,
                 MAX_CHECKER_DENSITY,
@@ -198,7 +185,6 @@ impl SphereViewerState {
             debug_mode: DebugMode::Lit,
             checker_density: DEFAULT_CHECKER_DENSITY,
             seams: true,
-            wire_on_uv: true,
             subdiv: DEFAULT_SUBDIVISIONS,
             radius: DEFAULT_RADIUS,
             wireframe: true,
@@ -208,14 +194,6 @@ impl SphereViewerState {
             fill_debug: FillDebug {
                 seam: Vec::new(),
                 island: Vec::new(),
-            },
-            uv_lines: Vec::new(),
-            flat: FlatUnwrap {
-                uv: Vec::new(),
-                island: Vec::new(),
-                seam: Vec::new(),
-                indices: Vec::new(),
-                source: Vec::new(),
             },
             lines: Vec::new(),
             hovered: None,
@@ -245,9 +223,7 @@ impl SphereViewerState {
         let mesh = HexSphere::generate(applied.subdivisions, applied.radius);
         let (fill_vertices, fill_indices) = build_fill(&mesh);
         let fill_debug = build_fill_debug(&mesh);
-        let flat = game_engine::render::build_flat_unwrap(&mesh);
         let lines = build_wireframe(&mesh);
-        let uv_lines = game_engine::render::build_wireframe_uv_clipped(&mesh);
         let cell_sides = (0..mesh.cell_count() as u32)
             .map(|cell| mesh.cell_neighbor_count(cell) as u8)
             .collect();
@@ -257,9 +233,7 @@ impl SphereViewerState {
         self.fill_vertices = fill_vertices;
         self.fill_indices = fill_indices;
         self.fill_debug = fill_debug;
-        self.flat = flat;
         self.lines = lines;
-        self.uv_lines = uv_lines;
         self.cell_sides = cell_sides;
         // Fresh mesh, fresh pointing: hover never survives a rebuild,
         // and pins survive only if the id still names a real chunk.
@@ -304,7 +278,6 @@ impl SphereViewerState {
         self.wireframe = self.wire_cb.checked;
         self.pentagons = self.pent_cb.checked;
         self.seams = self.seam_cb.checked;
-        self.wire_on_uv = self.uvwire_cb.checked;
     }
 
     /// After a density slider drag: mirror into the checker density.
@@ -342,9 +315,9 @@ impl SphereViewerState {
     }
 }
 
-impl Default for SphereViewerState {
+impl Default for PlanetViewerState {
     fn default() -> Self {
-        SphereViewerState::new()
+        PlanetViewerState::new()
     }
 }
 
@@ -355,11 +328,11 @@ mod tests {
 
     #[test]
     fn defaults_build_high_tier_stats() {
-        let state = SphereViewerState::new();
+        let state = PlanetViewerState::new();
         assert_eq!(state.subdiv, 6);
         assert_eq!(state.radius, 1.0);
         assert!(state.wireframe && state.pentagons);
-        assert!(state.seams && state.wire_on_uv);
+        assert!(state.seams);
         assert_eq!(state.debug_mode, DebugMode::Lit);
         assert_eq!(state.checker_density, DEFAULT_CHECKER_DENSITY);
         assert_eq!(state.fill_debug.seam.len(), state.fill_vertices.len());
@@ -368,11 +341,6 @@ mod tests {
         assert_eq!(state.cell_sides.len(), state.stats.cells);
         assert_eq!(state.cell_sides.iter().filter(|&&s| s == 5).count(), 12);
         assert!(state.cell_sides.iter().all(|&s| s == 5 || s == 6));
-        assert_eq!(state.uv_lines.len() % 2, 0);
-        assert!(state.uv_lines.len() >= state.lines.len());
-        assert_eq!(state.flat.indices.len() % 3, 0);
-        assert!(state.flat.uv.len() >= state.fill_vertices.len());
-        assert_eq!(state.flat.source.len(), state.flat.uv.len());
         assert_eq!(state.stats.cells, 40962);
         assert_eq!(state.stats.corners, 81920);
         assert_eq!(state.stats.pentagons, 12);
@@ -383,7 +351,7 @@ mod tests {
 
     #[test]
     fn regenerate_applies_valid_edits() {
-        let mut state = SphereViewerState::new();
+        let mut state = PlanetViewerState::new();
         state.subdiv_field.text = "4".to_owned();
         state.radius_field.text = "2.0".to_owned();
         assert!(state.can_regenerate());
@@ -402,7 +370,7 @@ mod tests {
 
     #[test]
     fn regenerate_rejects_without_touching_mesh() {
-        let mut state = SphereViewerState::new();
+        let mut state = PlanetViewerState::new();
         let before = state.stats.clone();
         state.subdiv_field.text = "9".to_owned();
         state.radius_field.text = "0".to_owned();
@@ -417,7 +385,7 @@ mod tests {
 
     #[test]
     fn stats_hash_changes_with_params() {
-        let mut state = SphereViewerState::new();
+        let mut state = PlanetViewerState::new();
         let h6 = state.stats.hash8.clone();
         state.subdiv_field.text = "3".to_owned();
         state.regenerate().unwrap();
@@ -427,7 +395,7 @@ mod tests {
 
     #[test]
     fn widget_sync_roundtrips() {
-        let mut state = SphereViewerState::new();
+        let mut state = PlanetViewerState::new();
         state.subdiv_field.text = "4".to_owned();
         state.sync_slider_from_field();
         assert_eq!(state.subdiv_slider.value, 4);
@@ -441,9 +409,8 @@ mod tests {
         state.sync_toggles();
         assert!(!state.wireframe && state.pentagons);
         state.seam_cb.checked = false;
-        state.uvwire_cb.checked = false;
         state.sync_toggles();
-        assert!(!state.seams && !state.wire_on_uv);
+        assert!(!state.seams);
         state.density_slider.value = 16;
         state.sync_density_from_slider();
         assert_eq!(state.checker_density, 16);
@@ -451,7 +418,7 @@ mod tests {
 
     #[test]
     fn pin_toggles_with_hover_precedence() {
-        let mut state = SphereViewerState::with_values(1, 1.0);
+        let mut state = PlanetViewerState::with_values(1, 1.0);
         let a = HexSphere::generate(1, 1.0).chunk_id(5);
         let b = HexSphere::generate(1, 1.0).chunk_id(7);
         assert_eq!(state.shown_chunk(), None);
@@ -473,7 +440,7 @@ mod tests {
 
     #[test]
     fn regenerate_clears_hover_and_stale_pin() {
-        let mut state = SphereViewerState::new();
+        let mut state = PlanetViewerState::new();
         let mesh = HexSphere::generate(6, 1.0);
         state.hovered = Some(mesh.chunk_id(11));
         state.pinned = Some(mesh.chunk_id(40_000));
@@ -491,7 +458,7 @@ mod tests {
 
     #[test]
     fn chunk_sides_serves_panel_type_rows() {
-        let state = SphereViewerState::with_values(1, 1.0);
+        let state = PlanetViewerState::with_values(1, 1.0);
         let mesh = HexSphere::generate(1, 1.0);
         for cell in 0..mesh.cell_count() as u32 {
             let chunk = mesh.chunk_id(cell);
@@ -499,7 +466,7 @@ mod tests {
             assert_eq!(state.chunk_sides(chunk), Some(expected), "cell {cell}");
         }
         // A chunk id from a bigger mesh is out of range here, never a panic.
-        let big = SphereViewerState::with_values(2, 1.0);
+        let big = PlanetViewerState::with_values(2, 1.0);
         let stale = HexSphere::generate(2, 1.0).chunk_id(161);
         assert!(big.chunk_sides(stale).is_some());
         assert_eq!(state.chunk_sides(stale), None);
@@ -511,7 +478,7 @@ mod tests {
         // fan centers must upload first, in cell order. If `build_fill`
         // ever reorders vertices, the highlight (and the tint/seam/island
         // varyings riding the same provoking vertex) breaks silently.
-        let state = SphereViewerState::with_values(2, 1.0);
+        let state = PlanetViewerState::with_values(2, 1.0);
         assert_eq!(state.mesh.cell_count(), state.stats.cells);
         for cell in 0..state.mesh.cell_count() as u32 {
             assert_eq!(
@@ -524,7 +491,7 @@ mod tests {
 
     #[test]
     fn debug_mode_cycles_all_six_with_stable_ids() {
-        let mut state = SphereViewerState::new();
+        let mut state = PlanetViewerState::new();
         let mut seen = Vec::new();
         for _ in 0..DebugMode::ALL.len() {
             seen.push(state.debug_mode.index());

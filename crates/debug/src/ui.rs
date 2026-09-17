@@ -50,8 +50,7 @@ pub fn layout(win_w: f32, win_h: f32) -> Layout {
     layout_viewer(win_w, win_h)
 }
 
-/// Sphere Viewer / UV Net layout: left dock + center viewport +
-/// right data dock.
+/// Planet View layout: left dock + center viewport + right data dock.
 pub fn layout_viewer(win_w: f32, win_h: f32) -> Layout {
     let nav_h = NAV_H.min(win_h.max(0.0));
     let w = win_w.max(0.0);
@@ -153,10 +152,10 @@ pub fn split_row_4(row: Rect, gap: f32) -> [Rect; 4] {
     })
 }
 
-/// Map F1–F4 (as `1..=4`) to a viewer-window nav index; anything else
+/// Map F1–F3 (as `1..=3`) to a viewer-window nav index; anything else
 /// is `None`.
 pub fn nav_index_for_fkey(f: u8) -> Option<usize> {
-    (1..=4).contains(&f).then(|| (f - 1) as usize)
+    (1..=3).contains(&f).then(|| (f - 1) as usize)
 }
 
 /// Map `1`–`3` digit keys (as `1..=3`) to a tools-window nav index;
@@ -361,7 +360,7 @@ mod tests {
         assert_eq!(nav_index_for_fkey(1), Some(0));
         assert_eq!(nav_index_for_fkey(2), Some(1));
         assert_eq!(nav_index_for_fkey(3), Some(2));
-        assert_eq!(nav_index_for_fkey(4), Some(3));
+        assert_eq!(nav_index_for_fkey(4), None);
         assert_eq!(nav_index_for_fkey(0), None);
         assert_eq!(nav_index_for_fkey(5), None);
     }
