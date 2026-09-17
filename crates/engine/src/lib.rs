@@ -11,6 +11,8 @@
 //!   every spherical body (planets, stars, moons). Pure + deterministic.
 //! - [`physics`] — cheapest-correct physics model per scale (spec §5) +
 //!   symplectic integrator. Pure + headless.
+//! - [`seeding`] — hierarchical procedural seeds (spec §6): region
+//!   derivation, domain-separated layers, catalog overrides. Pure.
 //! - [`render`] — Vulkan renderer boot (1.1 floor), quality tiers, orbit
 //!   camera, seeded planet mesh. GPU calls live here; `game` never touches
 //!   `vulkano` directly.
@@ -27,4 +29,5 @@ pub mod frames;
 pub mod hexsphere;
 pub mod physics;
 pub mod render;
+pub mod seeding;
 pub mod universe;
