@@ -76,5 +76,7 @@ frames + persistence).
 
 ## Open questions
 
-- Exact "gravitationally significant radius" threshold per body (ties to
-  the ADR-014 10⁻³ acceleration rule — confirm shared constant).
+- Resolved (PO 2026-09-17): shared constant confirmed — the ADR-014
+  10⁻³ acceleration rule is the gravitationally-significant radius for
+  both handoff eligibility and compression transitions. See spec §10
+  addendum *Resolved for v0.1.0*.

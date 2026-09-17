@@ -93,7 +93,9 @@ construction (render + simulation + persistence).
 
 ## Open questions
 
-- Exact frame-boundary radii per celestial body (needs the validation
-  plan, spec §10 open item).
-- Player craft state vector layout (blocked on craft definition, spec
-  §10 open item).
+- Exact frame-boundary radii per celestial body (still open; needs
+  body data, not just tolerances).
+- Resolved (PO 2026-09-17): ship state layout = spec §10 persistence
+  list (active-frame ID, 6D state vector in that frame, orientation
+  quaternion, mass, fuel); precision target < 1 mm at facility scale
+  confirmed — see spec §10 addendum *Resolved for v0.1.0*.

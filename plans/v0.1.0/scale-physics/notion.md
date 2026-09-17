@@ -86,4 +86,6 @@ pending (simulation core).
 ## Open questions
 
 - High-precision ephemeris mode: runtime toggle or build-time?
-- Validation tolerances per scale (spec §10 open item).
+  (ARCHITECT call at plan time.)
+- Resolved (PO 2026-09-17): validation tolerances per scale decided —
+  see spec §10 addendum *Resolved for v0.1.0*.

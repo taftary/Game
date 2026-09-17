@@ -86,5 +86,5 @@ simulation + input + camera).
 
 ## Open questions
 
-- Craft parameter ranges (spec §10 open item).
-- Navigation assists scope (open item).
+- Resolved (PO 2026-09-17): craft envelope + assists scope decided for
+  v0.1.0 scope — see spec §10 addendum *Resolved for v0.1.0*.

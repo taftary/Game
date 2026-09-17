@@ -89,4 +89,7 @@ commit when it reaches `done` (workflow rule:
 
 Visual/rendering style (PBR vs stylized), facility anchor coordinates,
 player craft definition, terrain data policy, network/content policy,
-validation plan. These gate the notions above moving `draft → planned`.
+validation plan. The v0.1.0-scoped items — **player craft definition**
+and **validation plan** — are decided for v0.1.0 scope (PO decisions
+2026-09-17, spec §10 addendum); the remaining four gate the v0.2.0 /
+v0.3.0 notions moving `draft → planned`.
