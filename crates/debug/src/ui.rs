@@ -158,10 +158,10 @@ pub fn nav_index_for_fkey(f: u8) -> Option<usize> {
     (1..=3).contains(&f).then(|| (f - 1) as usize)
 }
 
-/// Map `1`–`3` digit keys (as `1..=3`) to a tools-window nav index;
+/// Map `1`–`5` digit keys (as `1..=5`) to a tools-window nav index;
 /// anything else is `None`.
 pub fn nav_index_for_digit(d: u8) -> Option<usize> {
-    (1..=3).contains(&d).then(|| (d - 1) as usize)
+    (1..=5).contains(&d).then(|| (d - 1) as usize)
 }
 
 /// Vertical cursor handing out panel rows.
@@ -369,8 +369,9 @@ mod tests {
     fn digits_map_to_tools_nav() {
         assert_eq!(nav_index_for_digit(1), Some(0));
         assert_eq!(nav_index_for_digit(3), Some(2));
+        assert_eq!(nav_index_for_digit(5), Some(4));
         assert_eq!(nav_index_for_digit(0), None);
-        assert_eq!(nav_index_for_digit(4), None);
+        assert_eq!(nav_index_for_digit(6), None);
     }
 
     #[test]

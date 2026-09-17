@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done`
 
 ## Context
 
@@ -13,7 +13,7 @@ PO requirement (2026-09-17): **one debug screen per dimension, plus one
 global screen grouping all dimensions and transitions.** Extends the
 `game_debug` tab model from
 [`../debug-screens/`](../../v0.0.1/debug-screens/) (done) and
-[`../debug-ui-reorganize/`](../../v0.0.1/debug-ui-reorganize/) (in-review: main
+[`../debug-ui-reorganize/`](../../v0.0.1/debug-ui-reorganize/) (done: main
 window F1–F3 tabs Galaxy Map / System Map / Planet View, tools window on
 F4).
 
@@ -26,8 +26,8 @@ F4).
 - Cross-dimension behavior (frame transitions, SOI handoffs, fly-to
   transitions) needs one global overview: which dimension is active,
   what transition is in flight, what happened last.
-- "Transactions" in the PO request is read as **transitions** (frame /
-  SOI / waypoint transitions, spec §9.3) — confirm at plan time.
+- "Transactions" in the PO request is resolved as **transitions** (frame /
+  SOI / waypoint transitions, spec §9.3).
 
 ## Goals
 
@@ -63,8 +63,9 @@ F4).
 
 Author: PO (2026-09-17). UX consulted (required if player-facing): n-a
 (dev tool, same precedent as `debug-ui-reorganize`). ARCHITECT consulted
-(required if cross-module): pending — consumes frame/SOI/time APIs across
-modules.
+(2026-09-17): approved read-only aggregation in `crates/debug`; public
+frame/SOI/time APIs remain the source of truth and no simulation mutation is
+introduced.
 
 ## Functional requirements
 
@@ -89,12 +90,12 @@ modules.
 
 ## Definition of Done
 
-- [ ] 10 per-dimension screens registered and reachable in `game_debug`,
+- [x] 10 per-dimension screens registered and reachable in `game_debug`,
   each showing live in-frame state (screenshot/headless evidence).
-- [ ] Global screen shows all dimensions + live transitions + event
+- [x] Global screen shows all dimensions + live transitions + event
   log; a scripted frame transition and SOI handoff appear in the log.
-- [ ] No simulation state mutated from debug UI (audit evidence).
-- [ ] Docs updated: `docs/techstack/architecture.md` (debug crate),
+- [x] No simulation state mutated from debug UI (audit evidence).
+- [x] Docs updated: `docs/techstack/architecture.md` (debug crate),
   `docs/game/controls.md` (new debug nav), techstack version bump.
 
 ## Constraints & Assumptions
@@ -104,10 +105,9 @@ modules.
 - Follows `game_debug` conventions: contextual panels, headless gate,
   no new third-party dependencies.
 
-## Open questions
+## Resolved design notes
 
-- Confirm "transactions" = transitions (not, e.g., resource/save
-  transactions) — if save transactions are also wanted, the autosave
-  event feed joins the log.
-- Tab budget: 11 new screens exceed the F-key model — nav scheme
-  (sub-tabs vs list) decided at plan time with ARCHITECT.
+- "Transactions" means frame, SOI, waypoint, and fly-to transitions. Save
+  transactions may join the log with `autosave-persistence` later.
+- The F-key budget is preserved: `Scale` is one tools tab with a two-column
+  selector for the ten dimension surfaces.

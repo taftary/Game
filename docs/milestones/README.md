@@ -70,7 +70,7 @@ commit when it reaches `done` (workflow rule:
 |---|---|---|
 | [`navigation-hud`](../../plans/v0.3.0/navigation-hud/) | draft notion | §10 HUD & overlay |
 | [`autosave-persistence`](../../plans/v0.3.0/autosave-persistence/) | draft notion | §10 Persistence |
-| [`scale-debug-screens`](../../plans/v0.3.0/scale-debug-screens/) | draft notion | spec §1 + §9.3 (dev tooling) |
+| [`scale-debug-screens`](../../plans/v0.3.0/scale-debug-screens/) | done | spec §1 + §9.3 (dev tooling) |
 
 ## Post-v0.3 (unscheduled)
 
@@ -91,5 +91,6 @@ Visual/rendering style (PBR vs stylized), facility anchor coordinates,
 player craft definition, terrain data policy, network/content policy,
 validation plan. The v0.1.0-scoped items — **player craft definition**
 and **validation plan** — are decided for v0.1.0 scope (PO decisions
-2026-09-17, spec §10 addendum); the remaining four gate the v0.2.0 /
-v0.3.0 notions moving `draft → planned`.
+2026-09-17, spec §10 addendum). Provisional v0.3.0 decisions in the spec
+§10 addendum unblock the current notions without closing the four remaining
+open items.

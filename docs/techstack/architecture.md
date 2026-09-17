@@ -64,7 +64,8 @@ crates/debug/    # `game_debug` lib (viewer screens: mesh/params/ui/
                    # highlight + click-to-pin with panel readout,
                    # 6 debug-shader modes, inputs panel, --headless CI
                    # mode with pick + player self-tests) + tools window
-                   # (FPS / console / inspector tabs); developer screens
+                    # (FPS / console / inspector + scale-dimension tabs);
+                    # developer screens
                    # never leak into the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
                  # planet preview / renderer smoke (M1: seeded planet, orbit

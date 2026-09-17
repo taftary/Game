@@ -22,6 +22,7 @@ pub mod params;
 pub mod picking;
 pub mod planet_viewer;
 pub mod player_view;
+pub mod scale_debug;
 pub mod sky;
 pub mod system_map;
 pub mod text;

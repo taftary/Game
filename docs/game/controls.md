@@ -45,8 +45,11 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   arms/withdraws the travel offer, `E` begins the timed transit
   (cancellable with `T`/`Q` before commit), `Q` ascends one journey
   layer. The player marker is a center dot plus a heading
-  arrow on the planet; the SELECTION panel shows `lon / lat /
-  cam + loaded / heading` plus the walk keys while the player is on.
+   arrow on the planet; the SELECTION panel shows `lon / lat /
+   cam + loaded / heading` plus the walk keys while the player is on.
+   Tools window: `1` FPS, `2` Console, `3` Inspector, `4` Transitions, `5`
+   Scale. The Scale screen opens a global ten-dimension matrix; click any
+   dimension card for its per-dimension state and transition log.
 
 ## Audio / UI
 

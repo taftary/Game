@@ -429,6 +429,35 @@ They do not close the four items still listed under *Still open* below.
   Cache-size cap stays provisional pending the network/content policy
   decision.
 
+### Resolved for v0.3.0 (PO decisions, 2026-09-17)
+
+These decisions are provisional and tunable. They unblock the v0.3.0 notions
+moving `draft -> planned`; they do not close the four product items that
+remain open below.
+
+#### HUD presentation (unblocks `navigation-hud`)
+
+- The v0.3.0 HUD uses a data-first flat overlay with minimal chrome and the
+  existing `fontdue` text path. Final visual direction and any perceptual
+  exaggeration remain governed by the visual/rendering-style open item.
+- ADR-005 remains open. The feature adds no UI framework dependency and the
+  overlay remains decoupled from simulation state.
+
+#### Save/content boundary (unblocks `autosave-persistence`)
+
+- Saves are offline-first and stored in the platform user-data directory; the
+  development build may use a workspace-local `saves/` directory.
+- Save metadata records catalog version identifiers per ADR-020. Save loading
+  never requires a network request; cache size and optional content streaming
+  remain governed by the network/content-policy open item.
+
+#### Scope exclusions
+
+- Facility anchors and terrain data are not consumed by the v0.3.0 features and
+  remain open without provisional decisions.
+- The v0.1.0 player-craft envelope remains in force: fuel is persisted but
+  consumption remains disabled.
+
 ### Still open
 
 The following items remain open and must not be silently dropped:

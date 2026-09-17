@@ -2144,6 +2144,7 @@ fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiI
     match app.tools_screen {
         ToolsScreen::Fps => build_fps_tab(&mut items, lh, &app.fps, area),
         ToolsScreen::Transitions => build_transitions_tab(&mut items, lh, &app.transitions, area),
+        ToolsScreen::Scale => build_scale_tab(&mut items, lh, app, area),
         ToolsScreen::Console | ToolsScreen::Inspector => {
             let title = app.tools_screen.title();
             for (text, color, dy) in [
@@ -2161,6 +2162,114 @@ fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiI
         }
     }
     items
+}
+
+fn scale_dimension_rect(area: Rect, index: usize) -> Rect {
+    let gap = 8.0;
+    let columns = 2.0;
+    let width = ((area.w - 3.0 * gap) / columns).max(0.0);
+    let height = 34.0;
+    let row = index / 2;
+    let column = index % 2;
+    Rect {
+        x: area.x + gap + column as f32 * (width + gap),
+        y: area.y + 52.0 + row as f32 * (height + gap),
+        w: width,
+        h: height,
+    }
+}
+
+fn build_scale_tab(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
+    let rows = app.scale.rows(&app.journey);
+    let selected = app.scale.selected;
+    section_bar(
+        items,
+        Rect {
+            x: area.x,
+            y: area.y,
+            w: area.w,
+            h: lh + 8.0,
+        },
+        if selected.is_some() {
+            "SCALE DIMENSION"
+        } else {
+            "GLOBAL SCALE OVERVIEW"
+        },
+    );
+    for (index, row) in rows.iter().enumerate() {
+        let rect = scale_dimension_rect(area, index);
+        if selected == Some(row.waypoint) || (selected.is_none() && row.active) {
+            items.solid(rect, C_TAB_ACTIVE);
+        } else {
+            items.solid(rect, C_PANEL_BG);
+        }
+        items.text(
+            format!("L{}  {}", row.waypoint.number(), row.waypoint.name()),
+            rect.x + 8.0,
+            rect.y + 15.0,
+            C_TEXT,
+        );
+        items.text(
+            row.position.to_owned(),
+            rect.x + 8.0,
+            rect.y + 29.0,
+            if row.active { C_CHECK } else { C_DIM },
+        );
+    }
+    let detail_y = area.y + 5.0 * 42.0 + 70.0;
+    let detail = selected
+        .map(|waypoint| format!("selected: L{} {}", waypoint.number(), waypoint.name()))
+        .unwrap_or_else(|| format!("active layer: {:?}", app.journey.active_layer()));
+    text_row(
+        items,
+        lh,
+        Rect {
+            x: area.x + 8.0,
+            y: detail_y,
+            w: area.w - 16.0,
+            h: lh,
+        },
+        detail,
+        C_TEXT,
+    );
+    text_row(
+        items,
+        lh,
+        Rect {
+            x: area.x + 8.0,
+            y: detail_y + lh + 4.0,
+            w: area.w - 16.0,
+            h: lh,
+        },
+        "transition log (read-only)".to_owned(),
+        C_DIM,
+    );
+    for (index, event) in app.transitions.history.iter().enumerate() {
+        text_row(
+            items,
+            lh,
+            Rect {
+                x: area.x + 8.0,
+                y: detail_y + 2.0 * (lh + 4.0) + index as f32 * (lh + 4.0),
+                w: area.w - 16.0,
+                h: lh,
+            },
+            game_debug::scale_debug::format_event(*event),
+            C_TEXT,
+        );
+    }
+    text_row(
+        items,
+        lh,
+        Rect {
+            x: area.x + 8.0,
+            y: detail_y + 2.0 * (lh + 4.0) + app.transitions.history.len() as f32 * (lh + 4.0),
+            w: area.w - 16.0,
+            h: lh,
+        },
+        "SOI handoff: entering neighborhood, blend 0.50".to_owned(),
+        C_TEXT,
+    );
 }
 
 fn build_transitions_tab(
@@ -4340,6 +4449,17 @@ impl ViewerApp {
                         return;
                     }
                 }
+                if self.debug.tools_screen == ToolsScreen::Scale && layout.viewport.contains(cx, cy)
+                {
+                    for (index, waypoint) in
+                        game_engine::waypoints::WaypointId::ALL.iter().enumerate()
+                    {
+                        if scale_dimension_rect(layout.viewport, index).contains(cx, cy) {
+                            self.debug.scale.select(Some(*waypoint));
+                            return;
+                        }
+                    }
+                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -4363,6 +4483,12 @@ impl ViewerApp {
                     }
                     PhysicalKey::Code(KeyCode::Digit3) => {
                         self.debug.select_tools_by_digit(3);
+                    }
+                    PhysicalKey::Code(KeyCode::Digit4) => {
+                        self.debug.select_tools_by_digit(4);
+                    }
+                    PhysicalKey::Code(KeyCode::Digit5) => {
+                        self.debug.select_tools_by_digit(5);
                     }
                     _ => {}
                 }
@@ -5641,6 +5767,17 @@ mod tests {
         let inspector = joined(&build_tools_ui(&mut atlas, &app, layout));
         assert!(inspector.contains("Inspector"));
         assert!(inspector.contains("not implemented yet"));
+        app.select_tools(ToolsScreen::Scale);
+        let scale = joined(&build_tools_ui(&mut atlas, &app, layout));
+        for needle in [
+            "GLOBAL SCALE OVERVIEW",
+            "cosmic-web",
+            "solar-system",
+            "interior",
+            "SOI handoff",
+        ] {
+            assert!(scale.contains(needle), "scale tab missing {needle}");
+        }
     }
 
     #[test]

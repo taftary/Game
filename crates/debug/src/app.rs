@@ -11,6 +11,7 @@
 use crate::fx::FxState;
 use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
 use crate::planet_viewer::PlanetViewerState;
+use crate::scale_debug::ScaleDebugState;
 use crate::system_map::{OrbitArrival, SystemMapView};
 use crate::transitions::TransitionPanel;
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
@@ -61,15 +62,17 @@ pub enum ToolsScreen {
     Console,
     Inspector,
     Transitions,
+    Scale,
 }
 
 impl ToolsScreen {
     /// Nav-bar order; index doubles as the digit key minus one.
-    pub const ALL: [ToolsScreen; 4] = [
+    pub const ALL: [ToolsScreen; 5] = [
         ToolsScreen::Fps,
         ToolsScreen::Console,
         ToolsScreen::Inspector,
         ToolsScreen::Transitions,
+        ToolsScreen::Scale,
     ];
 
     pub fn index(self) -> usize {
@@ -78,6 +81,7 @@ impl ToolsScreen {
             ToolsScreen::Console => 1,
             ToolsScreen::Inspector => 2,
             ToolsScreen::Transitions => 3,
+            ToolsScreen::Scale => 4,
         }
     }
 
@@ -92,6 +96,7 @@ impl ToolsScreen {
             ToolsScreen::Console => "Console",
             ToolsScreen::Inspector => "Inspector",
             ToolsScreen::Transitions => "Transitions",
+            ToolsScreen::Scale => "Scale",
         }
     }
 }
@@ -118,6 +123,7 @@ pub struct App {
     /// Backing state for the inspector placeholder (inspects nothing yet).
     pub inspector: StateInspector,
     pub transitions: TransitionPanel,
+    pub scale: ScaleDebugState,
 }
 
 impl App {
@@ -148,6 +154,7 @@ impl App {
                 panel.preview();
                 panel
             },
+            scale: ScaleDebugState::new(),
         }
     }
 
@@ -221,12 +228,12 @@ mod tests {
 
     #[test]
     fn tools_nav_order_matches_digits() {
-        assert_eq!(ToolsScreen::ALL.len(), 4);
+        assert_eq!(ToolsScreen::ALL.len(), 5);
         for (i, screen) in ToolsScreen::ALL.iter().enumerate() {
             assert_eq!(screen.index(), i);
             assert_eq!(ToolsScreen::from_index(i), Some(*screen));
         }
-        assert_eq!(ToolsScreen::from_index(4), None);
+        assert_eq!(ToolsScreen::from_index(4), Some(ToolsScreen::Scale));
     }
 
     #[test]
@@ -284,8 +291,10 @@ mod tests {
         assert_eq!(app.tools_screen, ToolsScreen::Inspector);
         assert!(app.select_tools_by_digit(1));
         assert_eq!(app.tools_screen, ToolsScreen::Fps);
-        assert!(!app.select_tools_by_digit(4));
-        assert_eq!(app.tools_screen, ToolsScreen::Fps);
+        assert!(app.select_tools_by_digit(4));
+        assert_eq!(app.tools_screen, ToolsScreen::Transitions);
+        assert!(app.select_tools_by_digit(5));
+        assert_eq!(app.tools_screen, ToolsScreen::Scale);
     }
 
     #[test]
