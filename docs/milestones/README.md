@@ -61,7 +61,7 @@ commit when it reaches `done` (workflow rule:
 | [`star-catalog-streaming`](../../plans/v0.2.0/star-catalog-streaming/) | draft notion | §4 LOD & streaming |
 | [`exposure-tone-mapping`](../../plans/v0.2.0/exposure-tone-mapping/) | draft notion | §9.2 Dynamic range |
 | [`depth-cueing`](../../plans/v0.2.0/depth-cueing/) | draft notion | §9.1 Depth cues |
-| [`zodiacal-light`](../../plans/v0.2.0/zodiacal-light/) | draft notion | §9.4 Zodiacal model |
+| [`zodiacal-light`](../../plans/v0.2.0/zodiacal-light/) | done | §9.4 Zodiacal model |
 | [`waypoint-transitions`](../../plans/v0.2.0/waypoint-transitions/) | draft notion | §9.3 Waypoint experience |
 
 ## v0.3.0 — Player-facing layer (spec §10 + debug tooling)

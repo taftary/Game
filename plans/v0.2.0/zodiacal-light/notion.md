@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done` (all DoD criteria checked in `plan.md`, ANALYST + SECURITY signed 2026-09-17)
 
 ## Context
 
@@ -46,8 +46,20 @@ scattered sunlight from interplanetary dust, **not** atmospheric haze.
 ## Roles
 
 Author: PO (2026-09-17). UX consulted (required if player-facing): n-a at
-draft (subtle visual, no interaction). ARCHITECT consulted (required if
-cross-module): pending (render interface contract).
+planned (pure source term, no UI — the glow becomes visible through
+`exposure-tone-mapping` later). ARCHITECT consulted (required if
+cross-module): yes — the `ZodiacalSource` interface is the contract
+`exposure-tone-mapping` and `depth-cueing` consume.
+PO sign-off for `draft → planned` (2026-09-17): checklist green —
+problem stated without prescribing implementation; non-goals explicit;
+DoD criteria verifiable (DoD-1 via pinned falloff values, DoD-2 via the
+documented validation hook, DoD-3 via the trait swap test); open
+question (final calibration) stays open, resolved photographically
+before release per spec §9.4. No spec §10 open item blocks this
+feature. Scope note (PO): no binary/GPU wiring in this feature — no
+solar-system sky renderer or exposure chain exists yet, and inventing
+one here would pre-empt `exposure-tone-mapping`; the deliverable is
+the pure model + stable interface + validation hook.
 
 ## Functional requirements
 

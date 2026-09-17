@@ -23,6 +23,7 @@ pub mod planet;
 pub mod shaders;
 pub mod tier;
 pub mod uv;
+pub mod zodiacal;
 
 pub use bands::{
     BandConfig, BandPass, ContentLayer, DepthMode, LayerKind, PassBucket, bucket_for, plan_passes,
@@ -50,4 +51,8 @@ pub use tier::{ParseTierError, QualityTier};
 pub use uv::{
     FlatUnwrap, UvData, UvScheme, build_debug_uv, build_debug_uv_for_scheme, build_flat_unwrap,
     build_wireframe_uv_clipped, island_coverage, walk_tree_edges,
+};
+pub use zodiacal::{
+    AnalyticZodiacal, ECLIPTIC_OBLIQUITY_DEG, MU_BRIGHTEST, MU_FAINTEST, ZodiacalParams,
+    ZodiacalSource, ecliptic_coords, radiance_relative, solar_elongation, surface_brightness_mag,
 };

@@ -122,6 +122,13 @@ UI is the trailing pass. The `game_tools` smoke demonstrates the plan
 on GPU behind `--log-depth`: Backdrop clear → Mid log planet (D32F) →
 Near linear quad (tight 0.05–10 projection, own depth clear).
 
+Interplanetary sky glow (v0.2.0, `plans/v0.2.0/zodiacal-light`,
+ADR-021 binding): the solar-system frame's real faint dust glow is the
+analytic spec §9.4 model in `engine::render::zodiacal` (per-pixel from
+the camera ray in ecliptic coordinates, linear radiance out). It feeds
+the exposure path owned by `exposure-tone-mapping`; no sky renderer
+consumes it yet.
+
 ## Quality tiers
 
 | Tier | Target | Resolution | Shadows | Terrain density | Atmosphere |
