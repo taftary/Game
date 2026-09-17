@@ -10,3 +10,6 @@
 
 /graphify-out
 /.opencode
+
+# Local autosave ring (ADR-004 dev location)
+/saves

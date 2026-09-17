@@ -38,6 +38,7 @@ pub mod handoff;
 pub mod hexsphere;
 pub mod physics;
 pub mod render;
+pub mod save;
 pub mod seeding;
 pub mod time;
 pub mod universe;

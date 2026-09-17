@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done`
 
 ## Context
 
@@ -45,10 +45,12 @@ metadata.
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— save indicators/interval setting are player-facing; consult before
-`draft → planned`. ARCHITECT consulted (required if cross-module): pending
-(persistence + all navigation state).
+Author: PO (2026-09-17). UX consulted (2026-09-17): approved save-indicator
+and interval behavior (notes below). ARCHITECT consulted (2026-09-17):
+approved `engine::save` (envelope codec + atomic writer + rotation, thin fs
+layer per `catalog::io` precedent) + `game::save` (trigger policy); invariants
+— procedural content never saved (ADR-019) and the corrupt-save contract
+(backup + clean error, never boot-loop).
 
 ## Functional requirements
 
@@ -66,18 +68,33 @@ Author: PO (2026-09-17). UX consulted (required if player-facing): pending
 
 ## Definition of Done
 
-- [ ] Round-trip tests: resume mid-flight, mid-fly-to, post-handoff —
+- [x] Round-trip tests: resume mid-flight, mid-fly-to, post-handoff —
   state identical.
-- [ ] Corruption test: truncated save rejected via checksum, recovery
+- [x] Corruption test: truncated save rejected via checksum, recovery
   snapshot loads.
-- [ ] Every ADR-004 trigger demonstrably fires (event log evidence).
+- [x] Every ADR-004 trigger demonstrably fires (event log evidence).
 
 ## Constraints & Assumptions
 
 - ADR-004 draft becomes binding here.
 - Save format documents catalog version IDs (ADR-020) so epoch-mismatched
   saves are detectable.
+- Integrity checksum is FNV-1a 64 (hand-rolled, zero new deps) — corruption
+  and truncation integrity, not an adversarial MAC. Decode order per ADR-004:
+  magic/length → checksum → version → parse.
+- The real-world timestamp is metadata only; it is excluded from resume
+  determinism (sim state derives from seed + sim fields alone).
+- UX notes (2026-09-17): periodic interval default **120 s**, clamped range
+  **30–600 s**, fed by the caller (no wall-clock in logic). A successful
+  autosave shows a transient single-line notice; a failure shows a distinct
+  persistent warning and never crashes or boot-loops. The quit trigger fires
+  on clean exit. The settings UI binds when the windowed shell lands — the
+  interval is a config field until then.
+- Non-goals recorded: JSON sidecar / `tools` converter, 3 manual save slots
+  (M1-era `persistence.md` aspiration superseded by the ADR-004 autosave
+  ring; the doc is updated accordingly), network/cloud saves.
 
-## Open questions
+## Resolved design notes
 
-- Configurable interval default + range (UX input at plan time).
+- Configurable interval: default 120 s, clamped to 30–600 s (UX decision
+  2026-09-17, recorded under Constraints & Assumptions).

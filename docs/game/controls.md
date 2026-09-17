@@ -60,6 +60,17 @@ ETA. The target uses its caller label or canonical frame coordinates. The
 current headless release binary prints a deterministic `hud-trace`; pixel
 placement binds when the windowed release shell lands.
 
+### Autosave
+
+Sessions autosave (ADR-004) on: confirmed frame transitions, completed SOI
+handoffs, fly-to start/completion, clean quit, and a periodic interval
+(default 120 s, configurable 30–600 s; `game --autosave-interval SECONDS`
+in the headless build). A successful save shows a transient notice; a
+failure shows a distinct warning and never blocks play. Corrupt saves are
+quarantined and the previous snapshot loads — never a boot-loop. Saves are
+local (`saves/` in dev) and hold ship + navigation + metadata only:
+procedural content regenerates from seeds.
+
 ## Audio / UI
 
 - Audio: ambient pad + UI + hazard stingers; full music/sfx pass is stretch. Mix buses with mute; no audio-codec crash on any target.

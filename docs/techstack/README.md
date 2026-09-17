@@ -1,7 +1,8 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.28.0 (2026-09-17, `navigation-hud` done: decoupled four-element
-  HUD view model, SOI hysteresis readout, and deterministic headless trace)
+- **Version:** 0.29.0 (2026-09-17, `autosave-persistence` done: ADR-004 binary
+  autosave envelope, atomic rotation ring with quarantine fallback, and
+  trigger policy with headless recovery evidence)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

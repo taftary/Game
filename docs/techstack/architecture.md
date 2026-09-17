@@ -50,12 +50,16 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
      hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
                   # cell-chunk identity (`ChunkId` = cell index, ADR-010)
     sim/         # colonies, robots, resources, tick
+    save/        # ADR-004 autosave: envelope codec (magic + metadata +
+                 # ShipSnapshot + FNV-1a checksum) and atomic store
+                 # (temp+rename, 3-slot rotation ring, quarantine fallback)
     assets/      # loading, caching, hot-reload (dev only)
     input/       # unified touch/mouse/keyboard/gamepad actions
     save/        # versioned save format
     core/        # math, units, time, RNG, error types
 crates/game/     # `game` binary: clean release entry — game states, camera
-                 # journey, pure HUD view model, UI wiring when windowed shell lands
+                 # journey, pure HUD view model, ADR-004 autosave trigger
+                 # policy, UI wiring when windowed shell lands
 crates/debug/    # `game_debug` lib (viewer screens: mesh/params/ui/
                    # text/app/planet_viewer/picking modules + live fps
                    # recorder + console/inspector stubs) + binary

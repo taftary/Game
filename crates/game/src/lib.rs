@@ -10,5 +10,6 @@ pub mod camera;
 pub mod hud;
 pub mod journey;
 pub mod player;
+pub mod save;
 pub mod streaming;
 pub mod transit;

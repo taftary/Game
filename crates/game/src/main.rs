@@ -12,14 +12,18 @@ use game::camera::{CameraMode, PlayerCamera};
 use game::hud::{Hud, HudInputs};
 use game::journey::{Journey, JourneyEvent};
 use game::player::{MoveInput, Player};
+use game::save::Autosave;
 use game::streaming::ChunkStreamer;
+use game_engine::catalog::format::CATALOG_VERSION_SYNTH;
 use game_engine::flight::{FlyToExec, ShipState, Target, plan_fly_to};
-use game_engine::frames::{BodyId, FrameChain, FrameId, FrameLink};
+use game_engine::frames::{BodyId, FrameChain, FrameId, FrameLink, TransitionReason};
 use game_engine::handoff::HandoffMonitor;
 use game_engine::hexsphere::HexSphere;
 use game_engine::render::{project_to_tangent, visible_hemisphere};
+use game_engine::save::{AutosaveRing, SaveEnvelope, SaveMetadata, decode, encode};
 use game_engine::time::CompressionClock;
 use glam::{DQuat, DVec3};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Demo planet radius in meters.
 const RADIUS: f32 = 100.0;
@@ -70,6 +74,41 @@ const LEGS: [(MoveInput, u64, CameraMode); 4] = [
 ];
 
 fn main() {
+    let interval = parse_interval_arg();
+    run_player_demo();
+    run_journey_trace();
+    run_hud_trace();
+    run_autosave_trace(interval);
+}
+
+/// `--autosave-interval SECONDS` (default 120, clamped 30–600 by
+/// `game::save`). Everything else is a usage error.
+fn parse_interval_arg() -> f64 {
+    let mut interval = game::save::DEFAULT_INTERVAL_S;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--autosave-interval" => match args.next().and_then(|v| v.parse::<f64>().ok()) {
+                Some(v) => interval = v,
+                None => {
+                    eprintln!("usage: game [--autosave-interval SECONDS]");
+                    std::process::exit(2);
+                }
+            },
+            "--help" | "-h" => {
+                println!("usage: game [--autosave-interval SECONDS]");
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown argument {other:?}\nusage: game [--autosave-interval SECONDS]");
+                std::process::exit(2);
+            }
+        }
+    }
+    interval
+}
+
+fn run_player_demo() {
     let mesh = HexSphere::generate(SUBDIVISIONS, RADIUS);
     let mut player = Player::new(0.0, 0.0, RADIUS, WALK_SPEED);
     let mut camera = PlayerCamera::new(RADIUS);
@@ -122,7 +161,9 @@ fn main() {
         player.heading().to_degrees(),
         streamer.loaded_count(),
     );
+}
 
+fn run_journey_trace() {
     // Journey top segment (UMAP-009): scripted GalaxyMap → SystemMap →
     // Orbit → back traversal. Same event script the lib regression pins;
     // the headless gate replays it and prints the state hashes.
@@ -149,8 +190,6 @@ fn main() {
             journey.state_hash(),
         );
     }
-
-    run_hud_trace();
 }
 
 fn run_hud_trace() {
@@ -210,4 +249,183 @@ fn run_hud_trace() {
             .set_position(ship.chain.position() + DVec3::new(0.01, 0.0, 0.0));
     }
     println!("hud-trace: end");
+}
+
+/// ADR-004 autosave evidence: every trigger fires, a truncated save is
+/// rejected, the recovery snapshot loads, and resume is state-identical.
+fn run_autosave_trace(interval_s: f64) {
+    let mut ship = ShipState {
+        chain: FrameChain::new(
+            FrameId::SolarSystem,
+            DVec3::new(2.0, 0.0, 0.0),
+            DQuat::IDENTITY,
+            vec![FrameLink::identity(); 4],
+        ),
+        vel: DVec3::new(0.0, 0.1, 0.0),
+        mass_kg: 5_000.0,
+        fuel: f64::INFINITY,
+    };
+    let mut clock = CompressionClock::default();
+    clock.slew(100.0, 1.0);
+    let target = Target::new(FrameId::SolarSystem, DVec3::new(5.0, 0.0, 0.0))
+        .expect("trace target is finite");
+    let plan = plan_fly_to(FrameId::SolarSystem, ship.chain.position(), &target, 0.0)
+        .expect("trace target is outside arrival sphere");
+    let mut executor = FlyToExec::new(plan);
+    let mut monitor = HandoffMonitor::new(BodyId::EARTH);
+    let ring = AutosaveRing::new("saves", 3);
+    let mut autosave = Autosave::new(interval_s);
+    let mut saved: Vec<(game::save::SaveReason, game_engine::flight::ShipSnapshot)> = Vec::new();
+    let mut sim = 0.0_f64;
+    let step =
+        |reason: game::save::SaveReason,
+         ship: &ShipState,
+         plan: Option<game_engine::flight::FlyToPlan>,
+         clock: &CompressionClock,
+         autosave: &Autosave,
+         sim_time_s: f64,
+         saved: &mut Vec<(game::save::SaveReason, game_engine::flight::ShipSnapshot)>| {
+            let snapshot = game_engine::flight::ShipSnapshot::capture(ship, plan, clock);
+            let envelope = SaveEnvelope {
+                metadata: SaveMetadata {
+                    master_seed: 99,
+                    real_unix_s: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                    sim_time_s,
+                    playtime_s: autosave.playtime_s(),
+                    catalog_versions: vec![CATALOG_VERSION_SYNTH.to_owned()],
+                },
+                ship: snapshot.clone(),
+            };
+            let bytes = encode(&envelope).expect("demo envelope encodes");
+            let path = ring.write(&bytes).expect("demo write succeeds");
+            println!(
+                "save: reason={} file={} bytes={}",
+                reason.name(),
+                path.display(),
+                bytes.len()
+            );
+            saved.push((reason, snapshot));
+        };
+
+    println!("autosave-trace: begin interval={}", autosave.interval_s());
+    // Periodic: one full interval of caller-fed dt.
+    sim += autosave.interval_s();
+    let reason = autosave
+        .tick(autosave.interval_s(), sim)
+        .expect("one full interval must fire periodic");
+    step(reason, &ship, None, &clock, &autosave, sim, &mut saved);
+    // Fly-to start (commit).
+    executor.commit().expect("trace fly-to commits once");
+    sim += 10.0;
+    let reason = autosave.on_fly_to_start(sim);
+    step(
+        reason,
+        &ship,
+        Some(executor.plan()),
+        &clock,
+        &autosave,
+        sim,
+        &mut saved,
+    );
+    // SOI handoff completed (Entered).
+    monitor.update(1.0);
+    assert!(
+        monitor
+            .events()
+            .iter()
+            .any(|e| matches!(e, game_engine::handoff::HandoffEvent::Entered { .. })),
+        "weight 1.0 must complete the handoff"
+    );
+    sim += 10.0;
+    let reason = autosave.on_soi_handoff(sim);
+    step(
+        reason,
+        &ship,
+        Some(executor.plan()),
+        &clock,
+        &autosave,
+        sim,
+        &mut saved,
+    );
+    // Confirmed frame transition (SolarSystem → StellarNeighborhood).
+    sim += 10.0;
+    ship.commit_to_parent(TransitionReason::BoundaryCrossing, sim)
+        .expect("solar -> neighborhood commit");
+    let reason = autosave.on_frame_transition(sim);
+    step(
+        reason,
+        &ship,
+        Some(executor.plan()),
+        &clock,
+        &autosave,
+        sim,
+        &mut saved,
+    );
+    // Fly-to complete (scripted sim time never runs backward).
+    let t_end = executor.plan().t_end_s();
+    assert!(executor.is_complete(t_end), "end time must complete");
+    sim = sim.max(t_end);
+    let reason = autosave.on_fly_to_complete(sim);
+    step(
+        reason,
+        &ship,
+        Some(executor.plan()),
+        &clock,
+        &autosave,
+        sim,
+        &mut saved,
+    );
+    // Clean quit.
+    sim += 10.0;
+    let reason = autosave.on_quit(sim);
+    step(
+        reason,
+        &ship,
+        Some(executor.plan()),
+        &clock,
+        &autosave,
+        sim,
+        &mut saved,
+    );
+    for event in autosave.events() {
+        println!("save-log: {}@{:.1}", event.reason.name(), event.sim_time_s);
+    }
+    // Corruption: truncate the newest slot (quit), rejection + fallback.
+    let slot0 = std::path::Path::new("saves/autosave.0.bin");
+    let mut corrupted = std::fs::read(slot0).expect("slot 0 exists");
+    corrupted.truncate(10);
+    std::fs::write(slot0, &corrupted).expect("rewrite truncated slot");
+    assert!(
+        decode(&corrupted).is_err(),
+        "truncated save must reject via length/checksum"
+    );
+    println!("corrupt: truncated save rejected ok");
+    let loaded = ring.load_latest().expect("recovery must succeed");
+    println!(
+        "recovery: slot={} quarantined={} ok",
+        loaded.slot, loaded.quarantined
+    );
+    // Resume: newest valid is the fly-to-complete snapshot (slot 1).
+    let (expected_reason, expected) = saved
+        .iter()
+        .rev()
+        .nth(1)
+        .expect("fly-to-complete snapshot saved");
+    assert_eq!(expected_reason.name(), "fly-to-complete");
+    assert_eq!(
+        loaded.envelope.ship, *expected,
+        "resumed state must be bit-identical"
+    );
+    println!(
+        "resume: frame={} pos=({:.3},{:.3},{:.3}) plan={} state-identical ok",
+        loaded.envelope.ship.frame.name(),
+        loaded.envelope.ship.position.x,
+        loaded.envelope.ship.position.y,
+        loaded.envelope.ship.position.z,
+        loaded.envelope.ship.plan.is_some()
+    );
+    println!("autosave-trace: end");
 }
