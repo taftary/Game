@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.25.0 (2026-09-17, `depth-cueing` done: per-regime physical cues, deterministic dust/web sources, Rayleigh/Mie fallback, and tiered raymarch reference)
+- **Version:** 0.26.0 (2026-09-17, `waypoint-transitions` done: deterministic ten-waypoint descriptors, atmospheric shell terms, bounded transition events, and debug transitions panel)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

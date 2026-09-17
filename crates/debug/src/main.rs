@@ -2129,7 +2129,7 @@ fn build_right_dock(
 }
 
 /// Tools window UI: tab nav + per-tab content. FPS shows the live
-/// recorder; Console/Inspector are placeholders.
+/// recorder; Transitions shows the waypoint descriptor/event surface.
 fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiItems {
     let lh = atlas.line_height();
     let mut items = UiItems::default();
@@ -2143,6 +2143,7 @@ fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiI
     let area = layout.viewport;
     match app.tools_screen {
         ToolsScreen::Fps => build_fps_tab(&mut items, lh, &app.fps, area),
+        ToolsScreen::Transitions => build_transitions_tab(&mut items, lh, &app.transitions, area),
         ToolsScreen::Console | ToolsScreen::Inspector => {
             let title = app.tools_screen.title();
             for (text, color, dy) in [
@@ -2160,6 +2161,43 @@ fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiI
         }
     }
     items
+}
+
+fn build_transitions_tab(
+    items: &mut UiItems,
+    lh: f32,
+    panel: &game_debug::transitions::TransitionPanel,
+    area: Rect,
+) {
+    let mut rows = ui::PanelRows::new(area, 8.0);
+    section_bar(items, rows.next(lh + 6.0, 4.0), "WAYPOINT TRANSITIONS");
+    let current = panel.current;
+    let lines = if let Some(descriptor) = current {
+        vec![
+            format!(
+                "leg:        {} -> {}",
+                descriptor.leg.from.name(),
+                descriptor.leg.to.name()
+            ),
+            format!("progress:   {:.3}", descriptor.progress),
+            format!("cue weight: {:.3}", descriptor.cue_weight),
+            format!("haze:       {:.3}", descriptor.haze),
+            format!("zodiacal:   {:.3}", descriptor.zodiacal_intensity),
+            format!("events:     {}", panel.history_len()),
+        ]
+    } else {
+        vec!["waiting for a waypoint leg".to_owned()]
+    };
+    for line in lines {
+        text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
+    }
+    text_row(
+        items,
+        lh,
+        rows.next(lh + 4.0, 4.0),
+        "10 -> 9 uses descriptor keys; no facility geometry".to_owned(),
+        C_DIM,
+    );
 }
 
 /// FPS tab: live numbers + a sparkline of the newest

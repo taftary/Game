@@ -40,8 +40,10 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
   src/
     lib.rs
     render/      # vulkano boot (1.1 floor) + tiers + orbit camera +
-                 # seeded planet mesh + naga shaders (M1 renderer smoke)
-                 # + icosa-net UV unwrap (uv) + flat chunk map (chunk_flat)
+                  # seeded planet mesh + naga shaders (M1 renderer smoke)
+                  # + icosa-net UV unwrap (uv) + flat chunk map (chunk_flat)
+    waypoints.rs # ten player-facing scale waypoints over FrameChain;
+                 # deterministic transition descriptors and event queue
     universe/    # seeds, galaxy/system/planet generation (M5 shipped
                  # stages 1–2: descriptors + hashes; stage 3 lands with
                  # descent/surface)
@@ -80,6 +82,9 @@ plans/           # per-feature notion -> plan -> implementation
   never leak into the release binary.
 - `engine::sim` is headless-testable: no window, no GPU handle required.
 - `engine::universe` is pure + deterministic: same seed + version → byte-identical descriptors.
+- `engine::waypoints` is pure + deterministic: it derives visual transition
+  descriptors from caller-owned frame/altitude/progress and emits bounded
+  events; it does not own frame commits, UI, GPU handles, or save I/O.
 - `engine::hexsphere` is pure + deterministic: same (N, radius, version) → bit-identical mesh (committed hash test). Chunk identity (`ChunkId` = cell index, ADR-010) is stable under the same triple — the key M2 streaming loads against.
 - `tools` may depend on `engine` with a `test-internals`-style feature, but `game` must not need dev-only features to run.
 - Platform code (`#[cfg(target_os = ...)]`) lives in `engine`, behind traits — `game` stays portable.

@@ -25,4 +25,5 @@ pub mod player_view;
 pub mod sky;
 pub mod system_map;
 pub mod text;
+pub mod transitions;
 pub mod ui;

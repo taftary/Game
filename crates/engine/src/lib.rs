@@ -41,3 +41,4 @@ pub mod render;
 pub mod seeding;
 pub mod time;
 pub mod universe;
+pub mod waypoints;

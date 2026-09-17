@@ -62,7 +62,7 @@ commit when it reaches `done` (workflow rule:
 | [`exposure-tone-mapping`](../../plans/v0.2.0/exposure-tone-mapping/) | done | §9.2 Dynamic range |
 | [`depth-cueing`](../../plans/v0.2.0/depth-cueing/) | done | §9.1 Depth cues |
 | [`zodiacal-light`](../../plans/v0.2.0/zodiacal-light/) | done | §9.4 Zodiacal model |
-| [`waypoint-transitions`](../../plans/v0.2.0/waypoint-transitions/) | draft notion | §9.3 Waypoint experience |
+| [`waypoint-transitions`](../../plans/v0.2.0/waypoint-transitions/) | done | §9.3 Waypoint experience |
 
 ## v0.3.0 — Player-facing layer (spec §10 + debug tooling)
 

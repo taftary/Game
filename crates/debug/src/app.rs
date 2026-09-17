@@ -12,6 +12,7 @@ use crate::fx::FxState;
 use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
 use crate::planet_viewer::PlanetViewerState;
 use crate::system_map::{OrbitArrival, SystemMapView};
+use crate::transitions::TransitionPanel;
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
 use game::journey::Journey;
 
@@ -59,14 +60,16 @@ pub enum ToolsScreen {
     Fps,
     Console,
     Inspector,
+    Transitions,
 }
 
 impl ToolsScreen {
     /// Nav-bar order; index doubles as the digit key minus one.
-    pub const ALL: [ToolsScreen; 3] = [
+    pub const ALL: [ToolsScreen; 4] = [
         ToolsScreen::Fps,
         ToolsScreen::Console,
         ToolsScreen::Inspector,
+        ToolsScreen::Transitions,
     ];
 
     pub fn index(self) -> usize {
@@ -74,6 +77,7 @@ impl ToolsScreen {
             ToolsScreen::Fps => 0,
             ToolsScreen::Console => 1,
             ToolsScreen::Inspector => 2,
+            ToolsScreen::Transitions => 3,
         }
     }
 
@@ -87,6 +91,7 @@ impl ToolsScreen {
             ToolsScreen::Fps => "FPS",
             ToolsScreen::Console => "Console",
             ToolsScreen::Inspector => "Inspector",
+            ToolsScreen::Transitions => "Transitions",
         }
     }
 }
@@ -112,6 +117,7 @@ pub struct App {
     pub console: LogConsole,
     /// Backing state for the inspector placeholder (inspects nothing yet).
     pub inspector: StateInspector,
+    pub transitions: TransitionPanel,
 }
 
 impl App {
@@ -137,6 +143,11 @@ impl App {
             fps: FpsOverlay::new(),
             console: LogConsole,
             inspector: StateInspector,
+            transitions: {
+                let mut panel = TransitionPanel::new();
+                panel.preview();
+                panel
+            },
         }
     }
 
@@ -210,12 +221,12 @@ mod tests {
 
     #[test]
     fn tools_nav_order_matches_digits() {
-        assert_eq!(ToolsScreen::ALL.len(), 3);
+        assert_eq!(ToolsScreen::ALL.len(), 4);
         for (i, screen) in ToolsScreen::ALL.iter().enumerate() {
             assert_eq!(screen.index(), i);
             assert_eq!(ToolsScreen::from_index(i), Some(*screen));
         }
-        assert_eq!(ToolsScreen::from_index(3), None);
+        assert_eq!(ToolsScreen::from_index(4), None);
     }
 
     #[test]

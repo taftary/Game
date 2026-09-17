@@ -18,6 +18,7 @@
 //! headless-testable format-selection + resolve-shader half (binaries
 //! own the HDR images and pipelines).
 
+pub mod atmosphere;
 pub mod bands;
 pub mod boot;
 pub mod camera;
@@ -34,6 +35,10 @@ pub mod tier;
 pub mod uv;
 pub mod zodiacal;
 
+pub use atmosphere::{
+    ATMOSPHERE_SHELL_FRAG, AtmosphereParams, KARMAN_FAI_M, KARMAN_REANALYSIS_M, haze_transmission,
+    limb_glow, sky_color,
+};
 pub use bands::{
     BandConfig, BandPass, ContentLayer, DepthMode, LayerKind, PassBucket, bucket_for, plan_passes,
     shares_depth_pass,

@@ -2,7 +2,7 @@
 
 ## Status
 
-`draft`
+`done`
 
 ## Context
 
@@ -46,12 +46,23 @@ Implement the spec §9.3 leg behaviors:
 9. 2 → 1 supercluster → cosmic web: Hubble-flow redshift becomes
    monotonic + raymarched volumetric filaments.
 
+The feature also owns the runtime coordination required to make those legs
+observable: a `WaypointId` layer over `FrameChain`, deterministic per-leg
+transition descriptors, an analytic GPU atmosphere shell for the atmospheric
+legs, and a debug transitions panel with an event queue shaped for the future
+ADR-004 autosave consumer.
+
 ## Non-goals
 
 - The underlying cue/exposure/zodiacal primitives (owned by their
   features).
 - The fly-to trajectory math (owned by `free-flight-navigation`).
-- Debug displays (owned by `scale-debug-screens`).
+- Facility interior rendering. Leg 10 → 9 is demonstrated at descriptor and
+  exposure-key level until a facility feature supplies interior geometry.
+- Autosave persistence and file I/O. This feature emits drainable events;
+  `autosave-persistence` owns the eventual consumer.
+- The final global visual policy (PBR versus stylized); parameters remain
+  tunable while that product decision stays open.
 
 ## Users / Stakeholders
 
@@ -60,18 +71,25 @@ Implement the spec §9.3 leg behaviors:
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— required before `draft → planned` (transition feel). ARCHITECT consulted
-(required if cross-module): pending (render + navigation + frames).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes —
+transition pacing, manual/select-to-focus reachability, and visible debug
+feedback (2026-09-17). ARCHITECT consulted (required if cross-module): yes —
+the waypoint layer coordinates render, flight, frames, and debug events
+(2026-09-17).
 
 ## Functional requirements
 
 - Per-leg transition descriptors driven by active-frame/waypoint
   changes (manual flight and select-to-focus both).
+- Ten `WaypointId` values map onto the seven existing `FrameId` values and
+  altitude bands without changing frame-coordinate conventions.
 - Kármán-line representation with the dual 100 km / ~80 km framing
   (spec §9.3).
-- Transition events emitted to the debug global screen and to autosave
-  triggers (ADR-004).
+- An analytic GPU atmosphere shell applies Rayleigh/Mie scattering, the
+  altitude sky ramp, and limb glow with a low-tier approximation.
+- Transition events are visible in the feature-owned `game_debug` transitions
+  panel and emitted through a queue compatible with autosave triggers
+  (ADR-004).
 
 ## Non-functional requirements
 
@@ -84,13 +102,19 @@ Author: PO (2026-09-17). UX consulted (required if player-facing): pending
   the spec §9.3 descriptions.
 - [ ] 6 → 5 exposure handoff smooth (joint evidence with
   `exposure-tone-mapping`).
-- [ ] Each leg emits events visible in the `scale-debug-screens`
-  global view.
+- [ ] Leg 10 → 9 demonstrates the interior-to-ambient exposure cut through
+  descriptor and headless key evidence; facility geometry is not required.
+- [ ] Atmospheric legs provide GPU-shell evidence for haze, sky deepening,
+  limb glow, and the dual Kármán-line framing on the supported tier paths.
+- [ ] Each leg emits events visible in the feature-owned `game_debug`
+  transitions panel and drainable by a future autosave consumer.
 
 ## Constraints & Assumptions
 
 - Lands after its primitive features; scheduling per
   `docs/milestones/README.md` v0.2.0.
+- The facility, terrain, and network/content product items remain outside this
+  feature; no new asset or network policy is introduced here.
 
 ## Open questions
 

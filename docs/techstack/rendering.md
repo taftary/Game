@@ -170,6 +170,28 @@ exposure. Cosmic-web raymarch budgets are tiered at 64x64/16 steps on Low,
 fallback. The active-frame switch harness is GPU-free and does not alter
 camera, projection, picking, ENU, winding, or culling conventions.
 
+## Waypoint transitions (v0.2.0)
+
+`engine::waypoints` maps the ten player-facing dimensions in spec §9.3 onto
+the seven stable `FrameId` values. Local ENU altitude bands provide the
+interior, exterior, aerial, and Earth waypoints without changing frame
+coordinates. `TransitionDescriptor` interpolates exposure keys, cue weight,
+zodiacal intensity, haze, sky depth, limb glow, and Sun-disk scale. The
+descriptor is pure and deterministic, so manual flight and select-to-focus
+can share it.
+
+`engine::render::atmosphere` supplies the atmospheric shell inputs: Rayleigh /
+Mie-compatible haze transmission, a blue-to-indigo-to-black altitude ramp,
+limb glow, and both the 100 km FAI and approximately 80 km reanalysis
+references. The shell shader is descriptor-driven and tiered; Low uses a
+bounded linear approximation. It preserves the un-flipped DirectX projection,
+NDC `+1` top-row convention, CCW front face, and back-face culling.
+
+The bounded `TransitionEvents` queue is a consumer boundary for the future
+ADR-004 autosave feature. The developer-only `game_debug` Transitions tab
+shows the current descriptor and event count; it is not linked into the
+release `game` binary.
+
 ## Quality tiers
 
 | Tier | Target | Resolution | Shadows | Terrain density | Atmosphere |

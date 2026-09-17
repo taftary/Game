@@ -45,6 +45,9 @@ use game_engine::render::{
     select_hdr_format, star_visibility, visual_extinction,
 };
 use game_engine::seeding::RegionId;
+use game_engine::waypoints::{
+    TransitionDescriptor, TransitionEvents, TransitionPhase, WaypointId, WaypointLeg,
+};
 use glam::Vec3;
 use glam::camera::rh::proj::directx::perspective;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -231,7 +234,84 @@ fn run_headless(args: &Args) -> i32 {
     ok &= run_twilight_selftest();
     ok &= run_tonemap_selftest();
     ok &= run_cue_selftest(args);
+    ok &= run_waypoint_selftest(args);
     if ok { 0 } else { 1 }
+}
+
+/// Waypoint-transitions DoD: exercise all nine descriptor legs, the 10 -> 9
+/// parameter cut, atmospheric terms, and the bounded event handoff.
+fn run_waypoint_selftest(args: &Args) -> bool {
+    let mut events = TransitionEvents::new(32);
+    let mut finite = true;
+    let mut legs = 0;
+    for pair in WaypointId::ALL.windows(2) {
+        let leg = WaypointLeg::new(pair[0], pair[1]).expect("ordered waypoint pair");
+        events.emit(game_engine::waypoints::TransitionEvent {
+            leg,
+            phase: TransitionPhase::Started,
+            progress: 0.0,
+            sim_time_s: legs as f64,
+        });
+        let descriptor = TransitionDescriptor::for_leg(leg, 0.5);
+        finite &= descriptor.exposure_keys.iter().all(|v| v.is_finite())
+            && descriptor.cue_weight.is_finite()
+            && descriptor.haze.is_finite();
+        events.emit(game_engine::waypoints::TransitionEvent {
+            leg,
+            phase: TransitionPhase::Completed,
+            progress: 1.0,
+            sim_time_s: legs as f64 + 1.0,
+        });
+        println!(
+            "waypoint_leg={}({}->{}) exposure={:.3}/{:.3}/{:.3} haze={:.3} pass={finite}",
+            leg.number(),
+            leg.from.name(),
+            leg.to.name(),
+            descriptor.exposure_keys[0],
+            descriptor.exposure_keys[1],
+            descriptor.exposure_keys[2],
+            descriptor.haze
+        );
+        legs += 1;
+    }
+    let first = TransitionDescriptor::for_leg(
+        WaypointLeg::new(WaypointId::Interior, WaypointId::Exterior).unwrap(),
+        0.5,
+    );
+    let last = TransitionDescriptor::for_leg(
+        WaypointLeg::new(WaypointId::SolarSystem, WaypointId::Neighborhood).unwrap(),
+        1.0,
+    );
+    let atmosphere = game_engine::render::AtmosphereParams::new(
+        game_engine::render::KARMAN_REANALYSIS_M,
+        first.haze,
+        first.sky_depth,
+        first.limb_glow,
+        args.tier,
+    );
+    let source_ok = game_engine::render::sky_color(atmosphere.altitude_m, atmosphere.sky_depth)
+        .iter()
+        .all(|value| value.is_finite())
+        && game_engine::render::haze_transmission(
+            100_000.0,
+            atmosphere.altitude_m,
+            atmosphere.haze,
+            atmosphere.low_tier,
+        )
+        .is_finite();
+    let pass = legs == 9
+        && finite
+        && source_ok
+        && first.exposure_keys[0] > 0.0
+        && last.sun_disk_scale < 0.1
+        && events.len() == 18;
+    println!(
+        "waypoint_summary=legs={legs} events={} karman={}m/{}m pass={pass}",
+        events.len(),
+        game_engine::render::KARMAN_REANALYSIS_M as u32,
+        game_engine::render::KARMAN_FAI_M as u32
+    );
+    pass
 }
 
 /// DoD-1: waypoint 6 → 5 rehearsal through the real adaptation loop at
