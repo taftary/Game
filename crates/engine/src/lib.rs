@@ -13,6 +13,8 @@
 //!   symplectic integrator. Pure + headless.
 //! - [`seeding`] — hierarchical procedural seeds (spec §6): region
 //!   derivation, domain-separated layers, catalog overrides. Pure.
+//! - [`handoff`] — soft patched-conic SOI handoff (spec §3): Laplace /
+//!   Hill radii, smoothstep blend band, hysteresis monitor. Pure.
 //! - [`render`] — Vulkan renderer boot (1.1 floor), quality tiers, orbit
 //!   camera, seeded planet mesh. GPU calls live here; `game` never touches
 //!   `vulkano` directly.
@@ -26,6 +28,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod core;
 pub mod frames;
+pub mod handoff;
 pub mod hexsphere;
 pub mod physics;
 pub mod render;

@@ -91,14 +91,15 @@ r_{\mathrm{SOI}} = a \left(\frac{m}{M}\right)^{2/5}
 
 where `a` is the secondary's semi-major axis about the primary, `m` is the secondary mass, and `M` is the primary mass.
 
-**Note on Laplace SOI vs Hill sphere:**  
+**Note on Laplace SOI vs Hill sphere (corrected 2026-09-17 — v0.4 had
+the ratio inverted):**
 The Laplace SOI is used for **patched-conic handoffs**. For **orbital stability analysis** (e.g., moon orbit limits, ring system boundaries), use the Hill sphere:
 
 \[
 r_{\mathrm{Hill}} = a \left(\frac{m}{3M}\right)^{1/3}
 \]
 
-The Hill sphere is typically ~0.5–0.7 × the Laplace SOI radius for planet–Sun systems.
+The Laplace SOI is typically ~0.5–0.7 × the Hill sphere radius for planet–Sun systems (Earth–Sun: 0.62×).
 
 ## 4. Rendering
 

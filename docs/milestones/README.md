@@ -49,7 +49,7 @@ commit when it reaches `done` (workflow rule:
 | [`frame-hierarchy`](../../plans/v0.1.0/frame-hierarchy/) | done | §3 Coordinate & precision |
 | [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | draft notion | §2 Navigation model |
 | [`time-compression`](../../plans/v0.1.0/time-compression/) | draft notion | §2 Time compression |
-| [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | draft notion | §3 SOI handoff |
+| [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | done | §3 SOI handoff |
 | [`scale-physics`](../../plans/v0.1.0/scale-physics/) | done | §5 Physics per scale |
 | [`hierarchical-seeding`](../../plans/v0.1.0/hierarchical-seeding/) | done | §6 Procedural seeding |
 
