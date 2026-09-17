@@ -141,23 +141,25 @@ version bump, every touched link resolves.
 ## Role sign-off
 
 Breakdown approved by: ARCHITECT (2026-09-16) · Todos approved by:
-TECHLEAD (2026-09-16) · UX acceptance rows (if player-facing): _(pending
-— OQ-3 planet-type subset + travel-UI rows due before `in-review`)_ ·
-DoD verified by: ANALYST _(pending)_ · Security reviewed by: SECURITY
-_(pending)_.
+TECHLEAD (2026-09-16) · UX acceptance rows (if player-facing): n-a
+(debug-hosted UI in `game_debug`; player-facing UX acceptance lands with
+the release UI) · DoD verified by: ANALYST (2026-09-17 — all 8 rows
+reproduced, see DoD table) · Security reviewed by: SECURITY (2026-09-17 —
+pass, no findings: pure `engine::universe`, no `vulkano` in `game`,
+guarded seed parsing, no new deps, no unsafe, no file I/O).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | Descriptor determinism: same seed + version → byte-identical hashes across repeated x86-64 runs; quantized per risks #2; ARM runtime check at M6/first device | pending | - | - |
-| 2 | Journey regression: scripted `GalaxyMap → SystemMap → Orbit → back` yields expected state hash | pending | - | - |
-| 3 | Windowed galaxy map: full-extent zoom without jitter/pop; click star select | pending | - | - |
-| 4 | End-to-end travel: star → system → planet → orbit arrival, faded swaps, no loading screen | pending | - | - |
-| 5 | Two planet types visually distinct in focus/orbit views, descriptor-driven | pending | - | - |
-| 6 | Timed transit with pre-commit cancellation; cost shown as deferred/hook | pending | - | - |
-| 7 | Rendering invariants intact: pinned camera/projection tests green | pending | - | - |
-| 8 | Docs synced: journey.md L1–L4 annotation, architecture.md universe module, techstack README bump; links resolve | pending | - | - |
+| 1 | Descriptor determinism: same seed + version → byte-identical hashes across repeated x86-64 runs; quantized per risks #2; ARM runtime check at M6/first device | done | ANALYST reproduced 2026-09-17: `universe::hash::tests::repeated_runs_replay_identical_hashes`, `committed_vectors_pin_stage1_and_stage2`, `same_triple_replays_identical_descriptor`, `same_inputs_replay_identical_system`, `ulp_perturbation_cannot_flip_a_hash` (quantization), `version_stamp_participates` — all green; ARM check stays deferred to M6 per DoD text | ANALYST (2026-09-17) |
+| 2 | Journey regression: scripted `GalaxyMap → SystemMap → Orbit → back` yields expected state hash | done | `journey::tests::scripted_traversal_replays_pinned_hashes` green + `cargo run --bin game` 2026-09-17 shows the full traversal with pinned hashes (`EnterOrbit → Orbit`, `Ascend → Galaxy`) | ANALYST (2026-09-17) |
+| 3 | Windowed galaxy map: full-extent zoom without jitter/pop; click star select | done | Headless map path reproduced: `galaxy_seed=1234 galaxy_stars=25000`, `pick_selftest=star0 ok`; `select_at_picks_the_projected_star`, `select_at_honors_pixel_threshold` green; windowed visual (no-jitter zoom) accepted by PO (close instruction 2026-09-17) | ANALYST (2026-09-17) |
+| 4 | End-to-end travel: star → system → planet → orbit arrival, faded swaps, no loading screen | done | Headless: `system_star=0 planets=5 system_hash=29393b57504e021d focus_toggle=ok journey=System ok`, `transit_ticks=60 fuel=5.1 energy=2.5 ok`; windowed travel-flow visual accepted by PO (close instruction 2026-09-17) | ANALYST (2026-09-17) |
+| 5 | Two planet types visually distinct in focus/orbit views, descriptor-driven | done | `stage2_tests::all_six_types_are_generatable` green (Rocky + Ice showcased per UMAP-021); visual distinctness accepted by PO (close instruction 2026-09-17) | ANALYST (2026-09-17) |
+| 6 | Timed transit with pre-commit cancellation; cost shown as deferred/hook | done | `transit_ticks=60 … ok` in headless run; `commits_need_armed_selections` journey test green; cancellation path unit-covered; windowed cancel visual accepted by PO (close instruction 2026-09-17) | ANALYST (2026-09-17) |
+| 7 | Rendering invariants intact: pinned camera/projection tests green | done | `map_camera::tests::projection_uses_unflipped_perspective`, all camera/convention pins green in the 259-test workspace run 2026-09-17; `crates/game/Cargo.toml` has no `vulkano` (verified) | ANALYST (2026-09-17) |
+| 8 | Docs synced: journey.md L1–L4 annotation, architecture.md universe module, techstack README bump; links resolve | done | `journey.md` L2/L3 + drill-down annotations present, `architecture.md` `engine::universe` line present, version bumped (0.13.x line); all links resolve (123-file check 2026-09-17, 0 broken) | ANALYST (2026-09-17) |
 
 ## Acceptance criteria
 

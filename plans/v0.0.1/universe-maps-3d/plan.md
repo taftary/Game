@@ -121,7 +121,7 @@ star→system→planet→orbit travel unchanged).
 | M3D-007 | done | `main.rs` input + UI rings/readouts + headless | FR-7, FR-8 |
 | M3D-008 | done | Gates green (test/clippy/fmt/mobile guards) | NFR |
 | M3D-009 | done | Docs sync + link check | DoD 7 |
-| M3D-010 | pending | Windowed manual pass (user): orbit/zoom/pan/pick/snap both maps; travel flow | DoD |
+| M3D-010 | done (windowed visual accepted by PO per 2026-09-17 close instruction; unit + headless coverage reproduced by ANALYST) | Windowed manual pass: orbit/zoom/pan/pick/snap both maps; travel flow | DoD |
 
 ## Role sign-off
 
@@ -130,21 +130,23 @@ user-approved 3D design)_ · Todos approved by: TECHLEAD _(executed
 2026-09-16 — M3D-001…M3D-009 done, M3D-010 windowed pass with the
 user)_ · UX acceptance rows (if player-facing): _(user-confirmed 2026-09-16 —
 left orbit / right pan, presentation inclinations, Home top-down snap)_ ·
-DoD verified by: ANALYST _(pending)_ · Security reviewed by: SECURITY
-_(pending)_.
+DoD verified by: ANALYST (2026-09-17 — all 8 rows reproduced, see DoD
+table) · Security reviewed by: SECURITY (2026-09-17 — pass, no findings:
+debug lib + binary only, zero `engine`/`game` edits git-verified, no new
+deps, no new unsafe, click-only pick path).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | Galaxy 3D: orbit/pan/zoom, real thickness | done | `map_camera` (11 tests) + `galaxy_map` (8 tests incl. `disk_thickness_separates_on_screen`); `upload_map` emits `position_ly[1]`; headless `pick_selftest=star0 ok` | DEV (tests) |
-| 2 | System 3D: inclined rings/planets, no hash drift | done | `system_map` (9 tests incl. `slots_keep_radius_and_sit_on_their_rings`, determinism/bounds); headless `system_hash=29393b57504e021d` unchanged path, `focus_toggle=ok` | DEV (tests) |
-| 3 | Click-select parity, headless round-trips | done | `select_at_picks_the_projected_star` (both maps), `select_at_honors_pixel_threshold`, picking round-trip tests, headless project-then-pick asserts | DEV (tests) |
-| 4 | Home top-down snap north-up/east-right, toggle | done | `top_down_toggle_snaps_and_restores` (camera) + `top_down_snap_keeps_conventions` (galaxy); `Home` handler + dock hints; windowed pass pending (M3D-010) | DEV (tests) |
-| 5 | Rendering invariants pinned, OrbitCamera untouched | done | `projection_uses_unflipped_perspective` (directx ==, vulkan !=), NDC+1-top pins in framing tests; `git status` shows no engine/`game` edits; `OrbitCamera` file untouched | DEV (tests) |
-| 6 | Descriptor determinism untouched | done | No `engine`/`game` edits; all pre-existing determinism/hash/journey tests green (`cargo test --workspace --all-targets`: 32+118+19+91 pass) | DEV (gates) |
-| 7 | Docs synced, links resolve | done | `rendering.md` universe-maps paragraph, `controls.md` map input, `journey.md` L2/L3, techstack README 0.12.0; all 13 touched links `Test-Path` verified | DEV |
-| 8 | Gates green + manual windowed pass | partial | Full `quality.md` list green (fmt/clippy/test/doc/`game` bin/debug+tools headless/android+ios guards); windowed manual pass pending user (M3D-010) | DEV (gates) |
+| 1 | Galaxy 3D: orbit/pan/zoom, real thickness | done | `map_camera` (11 tests) + `galaxy_map` (8 tests incl. `disk_thickness_separates_on_screen`) all green in workspace run 2026-09-17; `upload_map` emits `position_ly[1]`; headless `pick_selftest=star0 ok` | ANALYST (2026-09-17) |
+| 2 | System 3D: inclined rings/planets, no hash drift | done | `system_map` (9 tests incl. `slots_keep_radius_and_sit_on_their_rings`, determinism/bounds) green 2026-09-17; headless `system_hash=29393b57504e021d`, `focus_toggle=ok` — matches the pinned value | ANALYST (2026-09-17) |
+| 3 | Click-select parity, headless round-trips | done | `select_at_picks_the_projected_star` (both maps), `select_at_honors_pixel_threshold`, picking round-trip tests green; headless project-then-pick asserts pass 2026-09-17 | ANALYST (2026-09-17) |
+| 4 | Home top-down snap north-up/east-right, toggle | done | `top_down_toggle_snaps_and_restores` + `top_down_snap_keeps_conventions` green 2026-09-17; `Home` handler + dock hints present; snap visual accepted by PO (close instruction 2026-09-17, M3D-010) | ANALYST (2026-09-17) |
+| 5 | Rendering invariants pinned, OrbitCamera untouched | done | `projection_uses_unflipped_perspective` (directx ==, vulkan !=), NDC+1-top pins green; git-verified zero `engine`/`game` edits in the 3D commit; `OrbitCamera` suite green | ANALYST (2026-09-17) |
+| 6 | Descriptor determinism untouched | done | No `engine`/`game` edits; all pre-existing determinism/hash/journey tests green (259-test workspace run 2026-09-17) | ANALYST (2026-09-17) |
+| 7 | Docs synced, links resolve | done | `rendering.md` universe-maps paragraph, `controls.md` map input, `journey.md` L2/L3 annotations all present (verified 2026-09-17); version line current; links resolve (123-file check, 0 broken) | ANALYST (2026-09-17) |
+| 8 | Gates green + manual windowed pass | done | Full `quality.md` list reproduced green 2026-09-17 on commit `5365652` (fmt/clippy/build/test 259/doctests 20/`game` bin/debug+tools headless/android+ios guards); windowed manual pass accepted by PO (close instruction 2026-09-17, M3D-010) | ANALYST (2026-09-17) |
 
 ## Acceptance criteria
 

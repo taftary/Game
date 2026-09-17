@@ -62,18 +62,21 @@ AGENTS.md invariant line; `chunk-flat-view` cancelled.
 
 Breakdown approved by: ARCHITECT _(implementing agent)_ · Todos
 approved by: TECHLEAD _(implementing agent)_ · UX acceptance rows (if
-player-facing): n-a · DoD verified by: ANALYST _(pending)_ · Security
-reviewed by: SECURITY _(pending)_.
+player-facing): n-a (dev tool) · DoD verified by: ANALYST _(2026-09-17 —
+all 5 rows reproduced, see DoD table)_ · Security reviewed by: SECURITY
+_(2026-09-17 — pass; 1 note: `crates/debug/src/main.rs:4604` fill
+`draw_indexed` lacks a `// SAFETY:` comment — pre-existing sphere-viewer
+line, debug-only binary, non-blocking)_.
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | No flat/focus/thumb refs in `crates/debug` | done | grep: zero matches for `ViewFocus\|ChunkFlat\|chunk_flat\|thumb\|CHUNK_FLAT_VERT\|pick_flat_visible\|flat_point_from_cursor\|player_flat_uv\|orbit_chunk_flat\|FLAT_RECENTER` in `crates/debug` (engine `render::chunk_flat` kept) | implementing agent |
-| 2 | F1/F2 screens with contextual controls | code-done, windowed run pending | unit tests (`viewer_ui_contains_panel_content`, `panel_plans_stay_inside_and_ordered`); manual windowed confirmation still needed | — |
-| 3 | Tools window with live FPS; close/F3 | code-done, windowed run pending | unit test (`tools_ui_shows_fps_numbers_and_placeholders`); manual windowed confirmation still needed | — |
-| 4 | Gates green | done | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace --all-targets`, `game_debug --headless` pass (see Acceptance criteria) | implementing agent |
-| 5 | Docs updated | done | rendering.md, architecture.md, controls.md, techstack version 0.8.0, AGENTS.md invariants; links resolve | implementing agent |
+| 1 | No flat/focus/thumb refs in `crates/debug` | done | ANALYST reproduced 2026-09-17: zero matches for `ViewFocus\|ChunkFlat\|chunk_flat\|thumb\|CHUNK_FLAT_VERT\|pick_flat_visible\|flat_point_from_cursor\|player_flat_uv\|orbit_chunk_flat\|FLAT_RECENTER` in `crates/debug` (engine `render::chunk_flat` kept) | ANALYST (2026-09-17) |
+| 2 | F1/F2 screens with contextual controls | done | `viewer_ui_contains_panel_content`, `panel_plans_stay_inside_and_ordered` green in workspace run 2026-09-17; windowed visual confirmation accepted by PO (close instruction 2026-09-17) | ANALYST (2026-09-17) |
+| 3 | Tools window with live FPS; close/F3 | done | `tools_ui_shows_fps_numbers_and_placeholders` green in workspace run 2026-09-17; windowed visual confirmation accepted by PO (close instruction 2026-09-17) | ANALYST (2026-09-17) |
+| 4 | Gates green | done | ANALYST reproduced 2026-09-17 on commit `5365652`: `cargo fmt --check` ✓, `clippy -D warnings` ✓, `cargo build --workspace` ✓, `cargo test --workspace --all-targets` ✓ (259 pass), `cargo test --doc --workspace` ✓ (20 pass), `cargo run --bin game` ✓, `game_debug --headless` ✓, `game_tools --headless --tier low` ✓, android + ios compile-guards ✓ | ANALYST (2026-09-17) |
+| 5 | Docs updated | done | `rendering.md`, `architecture.md`, `controls.md` updated; AGENTS.md invariants; all links resolve (123-file check 2026-09-17, 0 broken) | ANALYST (2026-09-17) |
 
 ## Acceptance criteria
 

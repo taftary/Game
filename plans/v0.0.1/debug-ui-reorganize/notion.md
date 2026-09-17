@@ -2,9 +2,9 @@
 
 ## Status
 
-`in-review` (plan: [`plan.md`](plan.md) — all REORG todos implemented,
-local gates green; needs ANALYST DoD audit + SECURITY review, plus a
-manual windowed run for DoD 2–3)
+`done` (all 5 DoD criteria checked — ANALYST reproduced every row on
+commit `5365652`, SECURITY passed 2026-09-17 with 1 non-blocking note;
+windowed visual rows accepted by PO per 2026-09-17 close instruction)
 
 ## Context
 

@@ -2,9 +2,9 @@
 
 ## Status
 
-`in-review` (plan: [`plan.md`](plan.md) — all UMAP todos implemented,
-full gate list green incl. both mobile compile-guards; needs ANALYST DoD
-audit + SECURITY review, plus a manual windowed run for DoD 3–6)
+`done` (all 8 DoD criteria checked — ANALYST reproduced every row on
+commit `5365652`, SECURITY passed 2026-09-17 with no findings; windowed
+visual rows accepted by PO per 2026-09-17 close instruction)
 
 ## Context
 

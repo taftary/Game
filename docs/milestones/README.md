@@ -30,9 +30,9 @@ re-sequenced ahead of M2–M4 by ADR-011).
 | [`debug-player-view`](../../plans/v0.0.1/debug-player-view/) | done | M1 tooling |
 | [`player-sphere-movement`](../../plans/v0.0.1/player-sphere-movement/) | done | M1/M3 groundwork |
 | [`scale-hierarchy`](../../plans/v0.0.1/scale-hierarchy/) | done | docs contract (8 journey levels) |
-| [`universe-maps`](../../plans/v0.0.1/universe-maps/) | in-review | M5 |
-| [`universe-maps-3d`](../../plans/v0.0.1/universe-maps-3d/) | in-review | M5 |
-| [`debug-ui-reorganize`](../../plans/v0.0.1/debug-ui-reorganize/) | in-review | M1 tooling |
+| [`universe-maps`](../../plans/v0.0.1/universe-maps/) | done | M5 |
+| [`universe-maps-3d`](../../plans/v0.0.1/universe-maps-3d/) | done | M5 |
+| [`debug-ui-reorganize`](../../plans/v0.0.1/debug-ui-reorganize/) | done | M1 tooling |
 
 Cancelled, kept for the record: [`chunk-flat-view`](../../plans/v0.0.1/chunk-flat-view/)
 (visual-debug only; engine-side `render::chunk_flat` stays for player

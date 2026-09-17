@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.13.0 (2026-09-17, milestones reorganized into versioned releases — v0.0.1 foundations … v0.3.0 player layer; navigation-engine spec v0.4 adopted under `docs/techstack/`; ADR-004/006 filled + ADR-012–021 drafted; 15 draft notions incl. per-dimension debug screens)
+- **Version:** 0.13.1 (2026-09-17, v0.0.1 closed: `universe-maps`, `universe-maps-3d`, `debug-ui-reorganize` ANALYST + SECURITY signed to `done`; full gate list reproduced green)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

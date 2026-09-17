@@ -2,14 +2,13 @@
 
 ## Status
 
-`in-review` (plan: [`plan.md`](plan.md) — all M3D todos implemented,
-full gate list green incl. both mobile compile-guards; needs ANALYST
-DoD audit + SECURITY review, plus a manual windowed run for the
-camera-feel half of DoD 4/8)
+`done` (all 8 DoD criteria checked — ANALYST reproduced every row on
+commit `5365652`, SECURITY passed 2026-09-17 with no findings; windowed
+visual rows accepted by PO per 2026-09-17 close instruction)
 
 ## Context
 
-[`universe-maps`](../universe-maps/notion.md) (`in-review`) shipped
+[`universe-maps`](../universe-maps/notion.md) (`done`) shipped
 working Galaxy and System maps in `game_debug`, but both are 2D:
 bespoke f64 ortho cameras (`GalaxyCamera` in
 `crates/debug/src/galaxy_map.rs`, `SystemCamera` in
