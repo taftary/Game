@@ -119,3 +119,9 @@ Each version folder `vX.Y.Z` gets a same-named git branch, cut from
 - The version closes by merging the branch back into `main` when every
   feature in the version folder is `done`. No release tags on the
   branch name (the branch occupies it).
+
+Recorded deviation (PO decision 2026-09-17): v0.2.0 feature work lands
+directly on `main` — the `v0.2.0` branch holds only a duplicate of the
+log-depth commit (`b842bb7` ≈ `d72a545`) and is dropped; every other
+rule here (one commit per `done` feature, docs-only commits separate)
+still applies. The branch rule resumes for the next version.
