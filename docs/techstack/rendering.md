@@ -65,6 +65,15 @@ Pinning tests: `projection_uses_vulkan_ndc` (engine),
 
 ## Passes (v1)
 
+### Debug dimensions section
+
+The `game_debug` tools window has a read-only Dimensions section with L1
+Universe, L2 Galactic, L3 System, L4 Planetary, L5 Orbit, and Connections
+tabs. L1-L5 reuse the existing map, ring, and planet buffers and their pinned
+camera conventions. Connections uses the line and point pipelines for the ten
+waypoint nodes and nine adjacent legs. Selecting a tab owns only UI state; it
+does not update `Journey`, regenerate descriptors, or reload a system.
+
 - Planet far-field: `HexSphere` dual mesh (`engine::hexsphere`, ADR-002 in [`../decisions/`](../decisions/)) at a tier-chosen subdivision level, height-displaced.
 - Terrain near-field: chunked heightfield mesh, triplanar-ish texturing, no heavy PBR in low tier.
 - Atmosphere: analytic scattering shell (cheap approximation on mobile tier).

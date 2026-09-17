@@ -84,6 +84,12 @@ no underground player state.
 
 `GalaxyMap` (L2; L1 is backdrop) → `SystemMap` (L3; L4 planet focus) → `Orbit` (L5) → `Descent` (L6) → `Surface` (L7) ⇄ `Ascent` (L6) → `Orbit` (L5) → ...
 
+The debug tools Dimensions section visualizes the implemented L1-L5 views in
+six tabs: Universe, Galactic, System, Planetary, Orbit, and Connections. The
+Connections tab is read-only and shows the ten waypoint nodes plus their nine
+adjacent legs, along with the active journey layer. L6-L8 remain excluded until
+their runtime state exists.
+
 Each transition has explicit enter/exit, asset prefetch hints, and a fallback (fade + spinner) if streaming misses budget.
 
 Implementation (M5 universe maps, `plans/v0.0.1/universe-maps`): the top

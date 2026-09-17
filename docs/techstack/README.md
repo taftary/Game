@@ -1,6 +1,7 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.30.0 (2026-09-17, debug tools Scale tab discoverability and
+- **Version:** 0.31.0 (2026-09-17, read-only 3D Dimensions tabs and waypoint
+  Connections graph; debug tools Scale tab discoverability and
   deterministic headless routing check; `autosave-persistence` done: ADR-004 binary
   autosave envelope, atomic rotation ring with quarantine fallback, and
   trigger policy with headless recovery evidence)

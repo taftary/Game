@@ -29,8 +29,10 @@ use game::camera::CameraMode;
 use game::journey::{Journey, JourneyEvent, Layer};
 use game::transit::{SIM_DT_SECS, Transit, plan_cost};
 use game_debug::app::{App as DebugApp, MainScreen, ToolsScreen};
+use game_debug::dimensions::{self, DimensionTab};
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
+use game_debug::map_camera::{DEFAULT_PITCH, DEFAULT_YAW, MapOrbitCamera};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
 use game_debug::planet_viewer::{DebugMode, PlanetViewerState};
@@ -45,6 +47,7 @@ use game_engine::render::{
     compile_glsl_to_spirv, create_instance, device_score, log_physical_device,
     required_device_extensions, star_visibility, visible_hemisphere,
 };
+use game_engine::waypoints::WaypointId;
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -2149,6 +2152,7 @@ fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiI
         ToolsScreen::Fps => build_fps_tab(&mut items, lh, &app.fps, area),
         ToolsScreen::Transitions => build_transitions_tab(&mut items, lh, &app.transitions, area),
         ToolsScreen::Scale => build_scale_tab(&mut items, lh, app, area),
+        ToolsScreen::Dimensions => build_dimensions_ui(&mut items, lh, app, area),
         ToolsScreen::Console | ToolsScreen::Inspector => {
             let title = app.tools_screen.title();
             for (text, color, dy) in [
@@ -2166,6 +2170,64 @@ fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiI
         }
     }
     items
+}
+
+fn dimension_tab_rect(area: Rect, index: usize) -> Rect {
+    let gap = 6.0;
+    let width = ((area.w - 7.0 * gap) / 6.0).max(0.0);
+    Rect {
+        x: area.x + gap + index as f32 * (width + gap),
+        y: area.y + 10.0,
+        w: width,
+        h: 30.0,
+    }
+}
+
+fn build_dimensions_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
+    let tab = app.dimensions.tab;
+    for (index, dimension) in DimensionTab::ALL.iter().enumerate() {
+        let rect = dimension_tab_rect(area, index);
+        items.solid(
+            rect,
+            if *dimension == tab {
+                [0.12, 0.28, 0.42, 0.95]
+            } else {
+                [0.06, 0.09, 0.15, 0.95]
+            },
+        );
+        items.text(
+            dimension.title().to_owned(),
+            rect.x + 8.0,
+            rect.y + lh - 3.0,
+            C_TEXT,
+        );
+    }
+    let title = tab.title();
+    items.text(title.to_owned(), area.x + 14.0, area.y + 66.0, C_TEXT);
+    let detail = match tab {
+        DimensionTab::Universe => "Backdrop sprites · L1 is container-only in v1",
+        DimensionTab::Galactic => "Stars + nebulae · GalaxyMap 3D projection",
+        DimensionTab::System => "Star + orbit rings + planets · SystemMap",
+        DimensionTab::Planetary => "Selected planet focus · view-only framing",
+        DimensionTab::Orbit => "Planet mesh + arrival descriptor · Orbit holding layer",
+        DimensionTab::Connections => "10 waypoint nodes · 9 adjacent legs · journey state",
+    };
+    items.text(detail.to_owned(), area.x + 14.0, area.y + 66.0 + lh, C_DIM);
+    if tab == DimensionTab::Connections {
+        let active = dimensions::active_waypoint(&app.journey);
+        items.text(
+            format!("active: {}", active.name()),
+            area.x + 14.0,
+            area.y + 66.0 + lh * 2.0,
+            C_TEXT,
+        );
+        items.text(
+            format!("transitions: {}", app.transitions.history_len()),
+            area.x + 14.0,
+            area.y + 66.0 + lh * 3.0,
+            C_DIM,
+        );
+    }
 }
 
 fn scale_dimension_rect(area: Rect, index: usize) -> Rect {
@@ -2968,6 +3030,74 @@ fn upload_system_lines(
     .expect("system map wireframe buffer upload must succeed")
 }
 
+fn upload_dimension_points(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[MapVertex]> {
+    let verts = dimensions::graph_positions()
+        .into_iter()
+        .enumerate()
+        .map(|(index, position)| MapVertex {
+            map_pos: position.to_array(),
+            color: if index == 3 {
+                [1.0, 0.75, 0.25]
+            } else {
+                [0.35, 0.7, 0.95]
+            },
+            misc: [8.0, 1.0, 0.0],
+        });
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("dimension graph point buffer must create")
+}
+
+fn upload_dimension_lines(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[LineVertex]> {
+    let positions = dimensions::graph_positions();
+    let verts: Vec<LineVertex> = dimensions::graph_legs()
+        .into_iter()
+        .flat_map(|leg| {
+            let from = positions[WaypointId::ALL
+                .iter()
+                .position(|id| *id == leg.from)
+                .expect("leg source")];
+            let to = positions[WaypointId::ALL
+                .iter()
+                .position(|id| *id == leg.to)
+                .expect("leg target")];
+            [
+                LineVertex {
+                    position: from.to_array(),
+                },
+                LineVertex {
+                    position: to.to_array(),
+                },
+            ]
+        })
+        .collect();
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("dimension graph line buffer must create")
+}
+
 fn create_depth_view(allocator: &Arc<StandardMemoryAllocator>, extent: [u32; 2]) -> Arc<ImageView> {
     let image = Image::new(
         allocator.clone(),
@@ -3071,6 +3201,8 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
+    dimension_points: Subbuffer<[MapVertex]>,
+    dimension_lines: Subbuffer<[LineVertex]>,
     /// Catalog sky runtime (scheduler + loader + cache + fallback) and
     /// its Backdrop point buffer, drawn first in the Planet View.
     sky: CatalogSky,
@@ -3234,6 +3366,8 @@ impl ViewerApp {
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
+        let dimension_points = upload_dimension_points(&memory_allocator);
+        let dimension_lines = upload_dimension_lines(&memory_allocator);
         // Catalog sky over the cooker layout (`assets/catalog`); missing
         // manifest ⇒ procedural fallback sky (model-only, logged). The
         // sky shares the universe seed so fallback content is stable
@@ -3264,6 +3398,8 @@ impl ViewerApp {
             map_vertices,
             system_points,
             system_lines,
+            dimension_points,
+            dimension_lines,
             sky,
             sky_vertices,
             twilight_stage: 0,
@@ -4471,6 +4607,16 @@ impl ViewerApp {
                         }
                     }
                 }
+                if self.debug.tools_screen == ToolsScreen::Dimensions
+                    && layout.viewport.contains(cx, cy)
+                {
+                    for (index, tab) in DimensionTab::ALL.iter().enumerate() {
+                        if dimension_tab_rect(layout.viewport, index).contains(cx, cy) {
+                            self.debug.dimensions.select(*tab);
+                            return;
+                        }
+                    }
+                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -4500,6 +4646,9 @@ impl ViewerApp {
                     }
                     PhysicalKey::Code(KeyCode::Digit5) => {
                         self.debug.select_tools_by_digit(5);
+                    }
+                    PhysicalKey::Code(KeyCode::Digit6) => {
+                        self.debug.select_tools_by_digit(6);
                     }
                     _ => {}
                 }
@@ -5173,6 +5322,163 @@ impl ViewerApp {
                 },
             )
             .expect("render pass must begin");
+
+        if self.debug.tools_screen == ToolsScreen::Dimensions {
+            let vp = layout.viewport;
+            let viewport = Viewport {
+                offset: [vp.x, vp.y],
+                extent: [vp.w, vp.h],
+                depth_range: 0.0..=1.0,
+            };
+            let tab = self.debug.dimensions.tab;
+            let mvp = match tab {
+                DimensionTab::Orbit => {
+                    self.camera.projection_matrix(vp.w / vp.h) * self.camera.view_matrix()
+                }
+                DimensionTab::Universe | DimensionTab::Galactic => {
+                    self.debug.galaxy.camera.view_proj(vp.w / vp.h)
+                }
+                DimensionTab::System => self.debug.system.camera.view_proj(vp.w / vp.h),
+                DimensionTab::Planetary => {
+                    dimensions::planetary_camera(&self.debug.system).view_proj(vp.w / vp.h)
+                }
+                DimensionTab::Connections => MapOrbitCamera::new(
+                    Vec3::ZERO,
+                    12.0,
+                    DEFAULT_YAW,
+                    DEFAULT_PITCH,
+                    1.0,
+                    30.0,
+                    8.0,
+                )
+                .view_proj(vp.w / vp.h),
+            }
+            .to_cols_array_2d();
+            builder
+                .set_viewport(0, [viewport].into_iter().collect())
+                .expect("dimension viewport must set");
+            match tab {
+                DimensionTab::Universe | DimensionTab::Galactic => {
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("map pipeline must bind")
+                        .bind_vertex_buffers(0, self.map_vertices.clone())
+                        .expect("map buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            MapPush {
+                                mvp,
+                                px_scale: self.debug.galaxy.camera.px_scale(vp.h),
+                                exposure: if tab == DimensionTab::Universe {
+                                    0.35
+                                } else {
+                                    1.0
+                                },
+                            },
+                        )
+                        .expect("map constants must upload");
+                    unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
+                        .expect("dimension map draw must record");
+                }
+                DimensionTab::System | DimensionTab::Planetary => {
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
+                        .expect("line pipeline must bind")
+                        .bind_vertex_buffers(0, self.system_lines.clone())
+                        .expect("system lines must bind")
+                        .push_constants(
+                            ctx.pipelines.line.layout().clone(),
+                            0,
+                            LinePush { mvp, inflate: 0.0 },
+                        )
+                        .expect("line constants must upload");
+                    unsafe { builder.draw(self.system_lines.len() as u32, 1, 0, 0) }
+                        .expect("dimension rings draw must record");
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("map pipeline must bind")
+                        .bind_vertex_buffers(0, self.system_points.clone())
+                        .expect("system points must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            MapPush {
+                                mvp,
+                                px_scale: self.debug.system.camera.px_scale(vp.h),
+                                exposure: 1.0,
+                            },
+                        )
+                        .expect("system constants must upload");
+                    unsafe { builder.draw(self.system_points.len() as u32, 1, 0, 0) }
+                        .expect("dimension system draw must record");
+                }
+                DimensionTab::Orbit => {
+                    let viewer = &self.debug.viewer;
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.fill.clone())
+                        .expect("fill pipeline must bind")
+                        .bind_vertex_buffers(0, self.fill_vertices.clone())
+                        .expect("fill buffer must bind")
+                        .bind_index_buffer(self.fill_indices.clone())
+                        .expect("fill index buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.fill.layout().clone(),
+                            0,
+                            FillPush {
+                                mvp,
+                                tint_rgb: viewer
+                                    .arrival
+                                    .as_ref()
+                                    .map(|a| a.atmosphere.color)
+                                    .unwrap_or([0.0, 0.0, 0.0]),
+                                use_tint: f32::from(viewer.arrival.is_some()),
+                                highlight: 0.0,
+                                mode: viewer.debug_mode.index() as f32,
+                                density: viewer.checker_density as f32,
+                                seams_on: f32::from(viewer.seams),
+                                hover_cell: -1.0,
+                                pin_cell: -1.0,
+                            },
+                        )
+                        .expect("dimension fill constants must upload");
+                    unsafe { builder.draw_indexed(self.fill_indices.len() as u32, 1, 0, 0, 0) }
+                        .expect("dimension orbit draw must record");
+                }
+                DimensionTab::Connections => {
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
+                        .expect("line pipeline must bind")
+                        .bind_vertex_buffers(0, self.dimension_lines.clone())
+                        .expect("dimension lines must bind")
+                        .push_constants(
+                            ctx.pipelines.line.layout().clone(),
+                            0,
+                            LinePush { mvp, inflate: 0.0 },
+                        )
+                        .expect("graph line constants must upload");
+                    unsafe { builder.draw(self.dimension_lines.len() as u32, 1, 0, 0) }
+                        .expect("graph lines draw must record");
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("map pipeline must bind")
+                        .bind_vertex_buffers(0, self.dimension_points.clone())
+                        .expect("dimension points must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            MapPush {
+                                mvp,
+                                px_scale: 1.0,
+                                exposure: 1.0,
+                            },
+                        )
+                        .expect("graph point constants must upload");
+                    unsafe { builder.draw(self.dimension_points.len() as u32, 1, 0, 0) }
+                        .expect("graph points draw must record");
+                }
+            }
+        }
 
         // UI pass: full-window viewport, solids untextured, then text.
         let ui_viewport = Viewport {

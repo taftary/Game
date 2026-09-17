@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod console;
+pub mod dimensions;
 pub mod fps;
 pub mod fx;
 pub mod galaxy_map;

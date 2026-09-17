@@ -8,6 +8,7 @@
 //! [`ToolsScreen`] (FPS / console / inspector, window-local `1/2/3`)
 //! on the tools window.
 
+use crate::dimensions::{DimensionTab, DimensionsState};
 use crate::fx::FxState;
 use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
 use crate::planet_viewer::PlanetViewerState;
@@ -63,16 +64,18 @@ pub enum ToolsScreen {
     Inspector,
     Transitions,
     Scale,
+    Dimensions,
 }
 
 impl ToolsScreen {
     /// Nav-bar order; index doubles as the digit key minus one.
-    pub const ALL: [ToolsScreen; 5] = [
+    pub const ALL: [ToolsScreen; 6] = [
         ToolsScreen::Fps,
         ToolsScreen::Console,
         ToolsScreen::Inspector,
         ToolsScreen::Transitions,
         ToolsScreen::Scale,
+        ToolsScreen::Dimensions,
     ];
 
     pub fn index(self) -> usize {
@@ -82,6 +85,7 @@ impl ToolsScreen {
             ToolsScreen::Inspector => 2,
             ToolsScreen::Transitions => 3,
             ToolsScreen::Scale => 4,
+            ToolsScreen::Dimensions => 5,
         }
     }
 
@@ -97,6 +101,7 @@ impl ToolsScreen {
             ToolsScreen::Inspector => "Inspector",
             ToolsScreen::Transitions => "Transitions",
             ToolsScreen::Scale => "Scale",
+            ToolsScreen::Dimensions => "Dimensions",
         }
     }
 }
@@ -124,6 +129,7 @@ pub struct App {
     pub inspector: StateInspector,
     pub transitions: TransitionPanel,
     pub scale: ScaleDebugState,
+    pub dimensions: DimensionsState,
 }
 
 impl App {
@@ -155,6 +161,7 @@ impl App {
                 panel
             },
             scale: ScaleDebugState::new(),
+            dimensions: DimensionsState::new(),
         }
     }
 
@@ -204,6 +211,16 @@ impl App {
             None => false,
         }
     }
+
+    pub fn select_dimension_by_digit(&mut self, d: u8) -> bool {
+        match DimensionTab::from_index(d.saturating_sub(1) as usize) {
+            Some(tab) => {
+                self.dimensions.select(tab);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl Default for App {
@@ -228,12 +245,13 @@ mod tests {
 
     #[test]
     fn tools_nav_order_matches_digits() {
-        assert_eq!(ToolsScreen::ALL.len(), 5);
+        assert_eq!(ToolsScreen::ALL.len(), 6);
         for (i, screen) in ToolsScreen::ALL.iter().enumerate() {
             assert_eq!(screen.index(), i);
             assert_eq!(ToolsScreen::from_index(i), Some(*screen));
         }
         assert_eq!(ToolsScreen::from_index(4), Some(ToolsScreen::Scale));
+        assert_eq!(ToolsScreen::from_index(5), Some(ToolsScreen::Dimensions));
     }
 
     #[test]
