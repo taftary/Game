@@ -2,7 +2,10 @@
 
 ## Status
 
-`draft`
+`done`
+
+(2026-09-17: ANALYST DoD-verified + SECURITY reviewed; single commit
+on branch `v0.1.0` per `plans/README.md` § *7. Version branch*.)
 
 ## Context
 
@@ -50,10 +53,14 @@ ADR-012 (nested frames) and ADR-013 (floating origin) in
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— required before `draft → planned` for any player-visible frame readout.
-ARCHITECT consulted (required if cross-module): pending — cross-module by
-construction (render + simulation + persistence).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes
+(2026-09-17) — no player-facing surface in this feature (frame readout
+is developer-facing; debug-only, exempt from full UX review per UX
+gates). HUD acceptance deferred to `navigation-hud` (v0.3.0); this API
+must expose frame name + unit + primary body + distance/altitude to
+feed spec §10 HUD requirements. ARCHITECT consulted (required if
+cross-module): yes (2026-09-17) — breakdown in `plan.md`; cross-module
+(render + frames kernel + save-event hook).
 
 ## Functional requirements
 
@@ -70,9 +77,15 @@ construction (render + simulation + persistence).
 
 ## Non-functional requirements
 
-- No precision regression: position error < 1 mm at facility scale after
-  a full chain resolve from the cosmological frame (validation target,
-  spec §10 open item).
+- No precision regression at the active frame: every single-level
+  active ⇄ parent conversion ≤ 1e-9 relative (≈ µm absolute at facility
+  scale); the solar subtree (SolarSystem ⇄ Planetocentric ⇄ LocalEnu)
+  round-trips < 1 mm (validation target, spec §10 open item).
+- Cosmic-scale descents re-anchor via `soi-handoff` (C⁰/C¹ continuity),
+  never via absolute float conversion: f64 at 0.39 Mpc resolves ~2600 km,
+  so a literal cosmological → facility float resolve cannot hold
+  millimetres (DEV evidence 2026-09-17, 5.2e6 m measured; analysis in
+  `plan.md` Risks). PO amendment approved 2026-09-17.
 - Quality gates in `docs/techstack/quality.md` stay green.
 
 ## Definition of Done
@@ -93,7 +106,9 @@ construction (render + simulation + persistence).
 
 ## Open questions
 
-- Exact frame-boundary radii per celestial body (needs the validation
-  plan, spec §10 open item).
-- Player craft state vector layout (blocked on craft definition, spec
-  §10 open item).
+- Exact frame-boundary radii per celestial body (still open; needs
+  body data, not just tolerances).
+- Resolved (PO 2026-09-17): ship state layout = spec §10 persistence
+  list (active-frame ID, 6D state vector in that frame, orientation
+  quaternion, mass, fuel); precision target < 1 mm at facility scale
+  confirmed — see spec §10 addendum *Resolved for v0.1.0*.

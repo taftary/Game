@@ -5,8 +5,20 @@
 //!
 //! - [`core`] — shared kernel: seeded RNG + quantization (determinism
 //!   contract for all generation), later math/units/time/errors.
+//! - [`frames`] — hierarchical nested reference frames (ADR-012) +
+//!   floating-origin GPU upload (ADR-013). Pure + headless.
 //! - [`hexsphere`] — hex-dominant geodesic sphere, the geometry base for
 //!   every spherical body (planets, stars, moons). Pure + deterministic.
+//! - [`physics`] — cheapest-correct physics model per scale (spec §5) +
+//!   symplectic integrator. Pure + headless.
+//! - [`seeding`] — hierarchical procedural seeds (spec §6): region
+//!   derivation, domain-separated layers, catalog overrides. Pure.
+//! - [`handoff`] — soft patched-conic SOI handoff (spec §3): Laplace /
+//!   Hill radii, smoothstep blend band, hysteresis monitor. Pure.
+//! - [`time`] — explicit time-compression state machine (spec §2):
+//!   occupancy rule, slew clock, substep advance, snapshot codec. Pure.
+//! - [`flight`] — free-flight dynamics + select-to-focus (spec §2):
+//!   ship state, thrust, planner, executor, snapshots. Pure.
 //! - [`render`] — Vulkan renderer boot (1.1 floor), quality tiers, orbit
 //!   camera, seeded planet mesh. GPU calls live here; `game` never touches
 //!   `vulkano` directly.
@@ -19,6 +31,12 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod core;
+pub mod flight;
+pub mod frames;
+pub mod handoff;
 pub mod hexsphere;
+pub mod physics;
 pub mod render;
+pub mod seeding;
+pub mod time;
 pub mod universe;

@@ -21,7 +21,10 @@ before committing. Test policy and perf budgets: same file.
 ## Feature lifecycle (plans/)
 
 Canonical spec: [`plans/README.md`](plans/README.md) — read it before creating
-or changing any feature and follow it verbatim.
+or changing any feature and follow it verbatim. Branch rule
+(`plans/README.md` § *7. Version branch*): version work happens on a
+same-named branch (`v0.1.0`); each feature lands as exactly one commit
+when it reaches `done`.
 
 ## Roles
 

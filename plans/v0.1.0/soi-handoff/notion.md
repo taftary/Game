@@ -2,7 +2,10 @@
 
 ## Status
 
-`draft`
+`done`
+
+(2026-09-17: ANALYST DoD-verified + SECURITY reviewed; single commit
+on branch `v0.1.0` per `plans/README.md` § *7. Version branch*.)
 
 ## Context
 
@@ -41,10 +44,14 @@ Ships crossing between gravitational domains must switch dominant frames
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): pending
-— indicator subtlety is player-facing, consult before `draft → planned`.
-ARCHITECT consulted (required if cross-module): pending (physics + frames
-+ HUD events).
+Author: PO (2026-09-17). UX consulted (required if player-facing): yes
+(2026-09-17) — indicator subtlety is player-facing, but rendering
+belongs to `navigation-hud` (v0.3.0, explicit non-goal here). UX
+acceptance for THIS feature = event-payload completeness for the
+future HUD: blend weight + 0.2 threshold + hysteresis + body identity
+must all be observable from the API (spec §10). Confirmed in
+`plan.md`. ARCHITECT consulted (required if cross-module): yes
+(2026-09-17) — breakdown in `plan.md` (physics + frames + HUD events).
 
 ## Functional requirements
 
@@ -66,8 +73,8 @@ ARCHITECT consulted (required if cross-module): pending (physics + frames
 
 - [ ] Handoff integration test: crossing ship shows C⁰ position /
   ~C¹ velocity continuity within documented tolerance.
-- [ ] Laplace vs Hill helpers with regression values (spec §3 note:
-  Hill ≈ 0.5–0.7 × Laplace for planet–Sun).
+- [ ] Laplace vs Hill helpers with regression values (spec §3 note,
+  corrected 2026-09-17: Laplace ≈ 0.5–0.7 × Hill for planet–Sun).
 - [ ] Hysteresis event log demonstrably free of noisy repeats.
 
 ## Constraints & Assumptions
@@ -77,5 +84,6 @@ ARCHITECT consulted (required if cross-module): pending (physics + frames
 
 ## Open questions
 
-- Band-edge behavior during active select-to-focus fly-to (transition
-  plan vs blending precedence).
+- Resolved at plan time (ARCHITECT 2026-09-17, see `plan.md` HOF-007):
+  band-edge behavior during an active fly-to — blending always governs
+  acceleration; the fly-to plan subscribes to `Entered` and replans.

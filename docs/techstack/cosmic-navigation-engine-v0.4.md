@@ -91,14 +91,15 @@ r_{\mathrm{SOI}} = a \left(\frac{m}{M}\right)^{2/5}
 
 where `a` is the secondary's semi-major axis about the primary, `m` is the secondary mass, and `M` is the primary mass.
 
-**Note on Laplace SOI vs Hill sphere:**  
+**Note on Laplace SOI vs Hill sphere (corrected 2026-09-17 — v0.4 had
+the ratio inverted):**
 The Laplace SOI is used for **patched-conic handoffs**. For **orbital stability analysis** (e.g., moon orbit limits, ring system boundaries), use the Hill sphere:
 
 \[
 r_{\mathrm{Hill}} = a \left(\frac{m}{3M}\right)^{1/3}
 \]
 
-The Hill sphere is typically ~0.5–0.7 × the Laplace SOI radius for planet–Sun systems.
+The Laplace SOI is typically ~0.5–0.7 × the Hill sphere radius for planet–Sun systems (Earth–Sun: 0.62×).
 
 ## 4. Rendering
 
@@ -337,6 +338,56 @@ VSOP87 default for all planets (3000 BCE – 3000 CE); optional DE440-derived si
 #### Gaia proper-motion validity
 
 Linear proper-motion extrapolation valid for ±1000 years from Gaia DR3 reference epoch 2016.0; beyond this, display a warning and optionally switch to procedural jitter.
+
+### Resolved for v0.1.0 (PO decisions, 2026-09-17)
+
+Provisional and tunable — they unblock the v0.1.0 notions moving
+`draft → planned` and may be revised by later versions. They do not
+close the four items still listed under *Still open* below.
+
+#### Player craft envelope (unblocks `free-flight-navigation`)
+
+- Reference dry mass 5,000 kg; throttleable point thrust, max
+  acceleration 30 m/s² at reference mass. All numbers are runtime
+  parameters, not constants.
+- Propellant infinite in v0.1.0: the `fuel` field exists in ship state
+  (persistence list above) but consumption is disabled; tracked burn
+  lands with the colony milestones.
+- Assists: rotation stabilization ON (orientation hold); translation
+  damping OFF by default (preserves true-momentum free flight per
+  spec §2). Both toggleable.
+- Collision, landing, and atmospheric flight are OUT of scope for
+  v0.1.0 (deferred to M2–M4).
+- Fly-to duration stays constant time per decade per the §1
+  decade-gap table (no new number needed).
+
+#### Validation tolerances (unblock frame/physics/time/SOI notions)
+
+- Frame round-trip: per-boundary active ⇄ parent relative error ≤
+  1e-9 (`f64`); solar-subtree (SolarSystem ⇄ Planetocentric ⇄
+  LocalEnu) round trip error < 1 mm at facility scale.
+- Cosmic limit (PO amendment 2026-09-17): a literal cosmological →
+  facility float resolve cannot hold millimetres — `f64` at 0.39 Mpc
+  resolves ~2600 km (DEV measured 5.2e6 m on the literal resolve).
+  Cosmic descents re-anchor via `soi-handoff` C⁰/C¹ continuity instead
+  of absolute conversion.
+- Kepler solver: simulated orbital period within 0.1% of analytic.
+- Symplectic stability: relative energy drift < 1e-4 over 1,000
+  orbits; Euler baseline must visibly diverge in the same test.
+- Galactic potential: circular velocity within 1% of the closed-form
+  reference from the spec §5 formulas.
+- Proper motion: extrapolated displacement within 1% of reference
+  over the ±1000-year validity window.
+- Ephemeris: reference positions within 0.1% relative distance of
+  published VSOP87 test vectors.
+- Compression: SOI blend-weight trajectory identical within test
+  tolerance whether a crossing runs in real-time or compressed mode.
+- SOI handoff: position discontinuity < 1 m at planetary-scale
+  crossings; velocity discontinuity < 0.1% of local circular
+  velocity; hysteresis log shows no repeat events per crossing.
+- The ADR-014 10⁻³ acceleration rule is the shared constant for
+  `soi-handoff` eligibility and `time-compression`'s
+  gravitationally-significant radius.
 
 ### Still open
 

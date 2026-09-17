@@ -40,14 +40,18 @@ streaming).
 
 ## v0.1.0 — Navigation core (spec §2, §3, §5, §6)
 
+Work happens on branch `v0.1.0`; each feature lands as exactly one
+commit when it reaches `done` (workflow rule:
+[`plans/README.md`](../../plans/README.md) § *7. Version branch*).
+
 | Feature | Status | Spec section |
 |---|---|---|
-| [`frame-hierarchy`](../../plans/v0.1.0/frame-hierarchy/) | draft notion | §3 Coordinate & precision |
-| [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | draft notion | §2 Navigation model |
-| [`time-compression`](../../plans/v0.1.0/time-compression/) | draft notion | §2 Time compression |
-| [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | draft notion | §3 SOI handoff |
-| [`scale-physics`](../../plans/v0.1.0/scale-physics/) | draft notion | §5 Physics per scale |
-| [`hierarchical-seeding`](../../plans/v0.1.0/hierarchical-seeding/) | draft notion | §6 Procedural seeding |
+| [`frame-hierarchy`](../../plans/v0.1.0/frame-hierarchy/) | done | §3 Coordinate & precision |
+| [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | done | §2 Navigation model |
+| [`time-compression`](../../plans/v0.1.0/time-compression/) | done | §2 Time compression |
+| [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | done | §3 SOI handoff |
+| [`scale-physics`](../../plans/v0.1.0/scale-physics/) | done | §5 Physics per scale |
+| [`hierarchical-seeding`](../../plans/v0.1.0/hierarchical-seeding/) | done | §6 Procedural seeding |
 
 ## v0.2.0 — Scale rendering & visuals (spec §4, §9)
 
@@ -85,4 +89,7 @@ streaming).
 
 Visual/rendering style (PBR vs stylized), facility anchor coordinates,
 player craft definition, terrain data policy, network/content policy,
-validation plan. These gate the notions above moving `draft → planned`.
+validation plan. The v0.1.0-scoped items — **player craft definition**
+and **validation plan** — are decided for v0.1.0 scope (PO decisions
+2026-09-17, spec §10 addendum); the remaining four gate the v0.2.0 /
+v0.3.0 notions moving `draft → planned`.

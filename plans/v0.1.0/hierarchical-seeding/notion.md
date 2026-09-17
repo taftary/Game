@@ -2,7 +2,10 @@
 
 ## Status
 
-`draft`
+`done`
+
+(2026-09-17: ANALYST DoD-verified + SECURITY reviewed; single commit
+on branch `v0.1.0` per `plans/README.md` § *7. Version branch*.)
 
 ## Context
 
@@ -47,9 +50,10 @@ touching others.
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): n-a at
-draft (no UI). ARCHITECT consulted (required if cross-module): pending
-(touches generation + catalog + persistence metadata).
+Author: PO (2026-09-17). UX consulted (required if player-facing): n-a
+confirmed (2026-09-17) — no UI in this feature. ARCHITECT consulted
+(required if cross-module): yes (2026-09-17) — breakdown in `plan.md`
+(touches generation + catalog + persistence metadata shapes).
 
 ## Functional requirements
 

@@ -102,3 +102,20 @@ Single vocabulary everywhere (feature `notion.md`, update `notion.md`, issue `sp
   2. `report.md` (from `issue-report.md`) — added after investigation. `Status` moves to `in-review`.
   3. `plan.md` (from `issue-plan.md`) — added after investigation, fix tasks with IDs `ISS-YYYYMMDD-001`, … Only then implement.
 - Never rewrites parent feature/update files — cross-links only. Issue `done` requires `report.md` + `plan.md` present and all fix todos checked.
+
+### 7. Version branch
+
+Each version folder `vX.Y.Z` gets a same-named git branch, cut from
+`main` when version work starts.
+
+- The full lifecycle (notion → plan → implement → updates/issues) runs
+  on the version branch.
+- **Each feature = exactly one commit**, made only when the feature
+  reaches `done` (all gates green, ANALYST + SECURITY signed). Notion,
+  plan, code, and DoD evidence accumulate uncommitted in the working
+  tree until then.
+- Docs-only commits (`docs:` — workflow rules, PO decisions, ADRs) are
+  allowed as separate commits on the branch.
+- The version closes by merging the branch back into `main` when every
+  feature in the version folder is `done`. No release tags on the
+  branch name (the branch occupies it).
