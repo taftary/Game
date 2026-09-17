@@ -50,7 +50,7 @@ commit when it reaches `done` (workflow rule:
 | [`free-flight-navigation`](../../plans/v0.1.0/free-flight-navigation/) | draft notion | §2 Navigation model |
 | [`time-compression`](../../plans/v0.1.0/time-compression/) | draft notion | §2 Time compression |
 | [`soi-handoff`](../../plans/v0.1.0/soi-handoff/) | draft notion | §3 SOI handoff |
-| [`scale-physics`](../../plans/v0.1.0/scale-physics/) | draft notion | §5 Physics per scale |
+| [`scale-physics`](../../plans/v0.1.0/scale-physics/) | done | §5 Physics per scale |
 | [`hierarchical-seeding`](../../plans/v0.1.0/hierarchical-seeding/) | draft notion | §6 Procedural seeding |
 
 ## v0.2.0 — Scale rendering & visuals (spec §4, §9)

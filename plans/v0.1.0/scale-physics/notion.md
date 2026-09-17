@@ -2,7 +2,10 @@
 
 ## Status
 
-`draft`
+`done`
+
+(2026-09-17: ANALYST DoD-verified + SECURITY reviewed; single commit
+on branch `v0.1.0` per `plans/README.md` § *7. Version branch*.)
 
 ## Context
 
@@ -48,9 +51,11 @@ correct.
 
 ## Roles
 
-Author: PO (2026-09-17). UX consulted (required if player-facing): n-a at
-draft (no direct UI). ARCHITECT consulted (required if cross-module):
-pending (simulation core).
+Author: PO (2026-09-17). UX consulted (required if player-facing): n-a
+confirmed (2026-09-17) — no direct UI in this feature; HUD/persistence
+consumers (`navigation-hud`, `autosave-persistence`) own their UX.
+ARCHITECT consulted (required if cross-module): yes (2026-09-17) —
+breakdown in `plan.md` (simulation core, pure math).
 
 ## Functional requirements
 
