@@ -1,6 +1,6 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.14.1 (2026-09-17, PO decisions for v0.1.0 gating items: craft envelope + validation tolerances, spec §10 addendum)
+- **Version:** 0.15.0 (2026-09-17, `frame-hierarchy` done: `engine::frames` + floating-origin anchor, ADR-012/013 binding, cosmic-limit PO amendment)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

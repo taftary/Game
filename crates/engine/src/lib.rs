@@ -5,6 +5,8 @@
 //!
 //! - [`core`] — shared kernel: seeded RNG + quantization (determinism
 //!   contract for all generation), later math/units/time/errors.
+//! - [`frames`] — hierarchical nested reference frames (ADR-012) +
+//!   floating-origin GPU upload (ADR-013). Pure + headless.
 //! - [`hexsphere`] — hex-dominant geodesic sphere, the geometry base for
 //!   every spherical body (planets, stars, moons). Pure + deterministic.
 //! - [`render`] — Vulkan renderer boot (1.1 floor), quality tiers, orbit
@@ -19,6 +21,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod core;
+pub mod frames;
 pub mod hexsphere;
 pub mod render;
 pub mod universe;

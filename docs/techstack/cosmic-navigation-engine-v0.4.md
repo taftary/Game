@@ -363,8 +363,13 @@ close the four items still listed under *Still open* below.
 #### Validation tolerances (unblock frame/physics/time/SOI notions)
 
 - Frame round-trip: per-boundary active ⇄ parent relative error ≤
-  1e-9 (`f64`); full cosmological → facility chain resolve error <
-  1 mm at facility scale.
+  1e-9 (`f64`); solar-subtree (SolarSystem ⇄ Planetocentric ⇄
+  LocalEnu) round trip error < 1 mm at facility scale.
+- Cosmic limit (PO amendment 2026-09-17): a literal cosmological →
+  facility float resolve cannot hold millimetres — `f64` at 0.39 Mpc
+  resolves ~2600 km (DEV measured 5.2e6 m on the literal resolve).
+  Cosmic descents re-anchor via `soi-handoff` C⁰/C¹ continuity instead
+  of absolute conversion.
 - Kepler solver: simulated orbital period within 0.1% of analytic.
 - Symplectic stability: relative energy drift < 1e-4 over 1,000
   orbits; Euler baseline must visibly diverge in the same test.

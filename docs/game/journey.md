@@ -19,6 +19,29 @@ its child the row below. Real-world ranges are reference only.
 
 Real astronomical units are **not** simulated. Use compressed, game-feel distances with consistent meters internally per layer and a **floating origin** on the surface layer.
 
+## Waypoint ⇄ level ⇄ frame mapping
+
+Spec waypoints ([`cosmic-navigation-engine-v0.4.md`](../techstack/cosmic-navigation-engine-v0.4.md)
+§1, 10 named, 10²⁶ m → 10⁰ m) mapped onto the 8 journey levels above
+and the navigation frame chain (`plans/v0.1.0/frame-hierarchy`).
+
+| WP | Waypoint (spec §1) | Journey level | Frame |
+|---|---|---|---|
+| W1 | Cosmic Web, 10²⁶ m | L1 Universe (backdrop, not traversable) | Cosmological |
+| W2 | Supercluster, 10²⁴ m | L1 Universe (backdrop) | Cosmological |
+| W3 | Local Group, 10²³ m | L2 Galactic | LocalGroup |
+| W4 | Milky Way, 10²¹ m | L2 Galactic | Galactocentric |
+| W5 | Solar Neighborhood, 10¹⁷ m | L3 Stellar System | StellarNeighborhood |
+| W6 | Solar System, 10¹⁴ m | L3 Stellar System | SolarSystem |
+| W7 | Planetary Surface / Earth, 10⁶ m | L4 Planetary System / L5 Orbit | Planetocentric |
+| W8 | Regional Aerial, 10³ m | L6 Descent / L7 Surface | LocalEnu |
+| W9 | Facility Exterior, 10¹ m | L7 Surface | LocalEnu |
+| W10 | Facility Interior, 10⁰ m | L7 Surface | LocalEnu |
+
+Precision note (frame-hierarchy, 2026-09-17): millimetre truth holds
+inside the solar subtree (W6–W10) by float conversion; W1–W5 descents
+re-anchor at SOI handoffs, never by absolute float conversion.
+
 ## Drill-down (zoom order)
 
 ```text
