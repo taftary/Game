@@ -67,12 +67,14 @@ Pinning tests: `projection_uses_vulkan_ndc` (engine),
 
 ### Debug dimensions section
 
-The `game_debug` tools window has a read-only Dimensions section with L1
-Universe, L2 Galactic, L3 System, L4 Planetary, L5 Orbit, and Connections
-tabs. L1-L5 reuse the existing map, ring, and planet buffers and their pinned
-camera conventions. Connections uses the line and point pipelines for the ten
-waypoint nodes and nine adjacent legs. Selecting a tab owns only UI state; it
-does not update `Journey`, regenerate descriptors, or reload a system.
+The `game_debug` single window (ADR-022,
+[`../../plans/v0.3.1/unified-debug-view/`](../../plans/v0.3.1/unified-debug-view/))
+mounts dimension content per waypoint tab: the Milky Way tab mounts
+the Galaxy Map point buffer, the Solar System tab the system rings +
+points, the Earth tab the planet fill + wireframe; the other seven
+waypoint tabs are placeholders (no 3D pass). Selecting a tab owns
+only UI state; it does not update `Journey`, regenerate descriptors,
+or reload a system.
 
 - Planet far-field: `HexSphere` dual mesh (`engine::hexsphere`, ADR-002 in [`../decisions/`](../decisions/)) at a tier-chosen subdivision level, height-displaced.
 - Terrain near-field: chunked heightfield mesh, triplanar-ish texturing, no heavy PBR in low tier.
@@ -197,9 +199,9 @@ bounded linear approximation. It preserves the un-flipped DirectX projection,
 NDC `+1` top-row convention, CCW front face, and back-face culling.
 
 The bounded `TransitionEvents` queue is a consumer boundary for the future
-ADR-004 autosave feature. The developer-only `game_debug` Transitions tab
-shows the current descriptor and event count; it is not linked into the
-release `game` binary.
+ADR-004 autosave feature. The developer-only `game_debug` transition pill
+shows the in-flight descriptor bottom-center and the widget Console tab carries the event
+log; neither is linked into the release `game` binary.
 
 ## Quality tiers
 
@@ -241,17 +243,32 @@ CI-gated headlessly.
 
 ## Debug planet view (`game_debug`)
 
-The `game_debug` viewer is the mesh-inspection tool, spread over two
-OS windows sharing one Vulkan device (`plans/v0.0.1/debug-ui-reorganize`,
-2026-09-16). The viewer window hosts the Galaxy Map (`F1`), the System
-Map (`F2`) and the Planet View (`F3`: current `HexSphere` as dual-cell
-fans with the shared `OrbitCamera`, a wireframe overlay and a pentagon
+The `game_debug` viewer is the mesh-inspection tool in one OS window
+sharing one Vulkan device (ADR-022,
+[`../../plans/v0.3.1/unified-debug-view/`](../../plans/v0.3.1/unified-debug-view/),
+reversing the `plans/v0.0.1/debug-ui-reorganize` two-window model).
+The top bar hosts the Game Demo tab (`F1`), the Dimensions dropdown
+(`F2`: ten waypoints on `1`–`0`) and Settings (`F3`). UI draw order is
+push order with all solids emitted before any text
+(`ui_items_to_vertices`), so overlay menus must be appended **last**:
+the Dimensions dropdown composes into its own `UiItems`
+(`compose_overlay_ui`), uploaded to a separate vertex buffer and drawn
+after every other UI surface with the same pipeline — topmost by GPU
+command order, not just push order. It is a
+solid-black panel with drop shadow, border, hover lift,
+row separators and right-aligned status, hit-tested first for the same
+reason (topmost surface wins). The Milky Way /
+Solar System / Earth dimension tabs mount the absorbed Galaxy Map,
+System Map and Planet View (current `HexSphere` as dual-cell fans
+with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
-stats). The tools window hosts FPS (live frame-health), Console and
-Inspector (placeholders), on window-local `1/2/3` tabs; closing it
-hides it, `F4` on the viewer window reopens it. Viewer state is
-preserved across screen switches.
+stats). The dev widget (`` ` `` toggle, `F6`–`F8` sub-tabs) hosts FPS
+(live frame-health), the Console (transition-event log feed) and the
+Inspector (journey summary); a transition pill floats bottom-center
+while a waypoint transition is in flight, and three toggle buttons
+live inside the always-visible top bar (left dock, right dock, dev
+widget with FPS value). Viewer state is preserved across screen switches.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
@@ -302,22 +319,25 @@ naga compile helper, 1.1-floor boot).
   it flows across the icosa seam overlay.
    `PlanetVertex` grew its `uv` attribute; the engine planet shader ignores
    it, so the `game_tools` smoke is unaffected.
-- Panel UX (`plans/v0.0.1/debug-ui-reorganize`): inputs appear only when
-  needed. The planet screen uses a left dock (VIEW section with the 2×2
-  camera presets, SHADER section with the mode selector, OVERLAYS with
+- Panel UX (`plans/v0.0.1/debug-ui-reorganize`; shell unified by
+  [`../../plans/v0.3.1/unified-debug-view/`](../../plans/v0.3.1/unified-debug-view/)):
+  inputs appear only when needed, and hidden docks draw nothing. The
+  Earth tab uses a left dock (VIEW section with the 2×2 camera
+  presets, SHADER section with the mode selector, OVERLAYS with
   wireframe/pentagons/seams) and the right data dock (INPUTS
   with subdivisions/radius + Regenerate, SELECTION merging the chunk +
   player readouts, read-only STATS), each group under its own section
   bar. The checker-density slider only
   exists in Checker mode, the walk/cam key hints only exist when the
-  player is on, and the preset keys only work on the planet screen.
-- Tools window (`plans/v0.0.1/debug-ui-reorganize`, 2026-09-16): a second OS
-  window hosts the FPS / Console / Inspector tabs (window-local `1/2/3`
-  + click nav). The FPS tab shows the live `FpsOverlay` recorder (one
-  sample per event-loop iteration): fps, mean/max frame ms, sample
-  count, and a 120-sample sparkline (right = newest, green <20 ms,
-  yellow <34 ms, red above). Console and Inspector stay placeholders
-  (console direction is still ADR-009's `tracing` layer).
+  player is on, and the preset keys only work with planet content.
+- Dev widget (ADR-022, replacing the 2026-09-16 tools window): one
+  fixed overlay with FPS / Console / Inspector sub-tabs (`` ` ``
+  toggle, `F6`–`F8` + click nav). The FPS body shows the live
+  `FpsOverlay` recorder (one sample per event-loop iteration): fps,
+  mean/max frame ms, sample count, and a 120-sample sparkline (right
+  = newest, green <20 ms, yellow <34 ms, red above). Console carries
+  the transition-event log feed; Inspector shows the journey summary
+  (console direction stays ADR-009's `tracing` layer).
 - Flat chunk map (`plans/v0.0.1/chunk-flat-view`, CANCELLED 2026-09-16 by
   `plans/v0.0.1/debug-ui-reorganize`): the viewer flat view (third
   `ViewFocus::ChunkFlat` mode, `CHUNK_FLAT_VERT` pipeline, arrow-key

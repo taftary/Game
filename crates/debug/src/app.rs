@@ -1,135 +1,165 @@
-//! App shell: per-window screen navigation + owned screen state.
-//! Switching screens only flips the screen field; the
-//! [`PlanetViewerState`] (mesh + camera inputs + panel texts) is never
-//! reset, so viewer state survives switching by construction.
+//! App shell: single-window screen navigation + owned screen state.
+//! Switching screens only flips the [`Screen`] field; content state
+//! (viewer, galaxy, system, journey) is never reset, so state
+//! survives switching by construction (ADR-022).
 //!
-//! Two OS windows, one screen enum each: [`MainScreen`] (galaxy /
-//! system / planet, `F1`/`F2`/`F3`) on the viewer window,
-//! [`ToolsScreen`] (FPS / console / inspector, window-local `1/2/3`)
-//! on the tools window.
+//! One OS window, one [`Screen`]: [`Screen::GameDemo`] (default
+//! landing tab), [`Screen::Dimensions`] (one of the ten waypoints,
+//! picked from the dropdown), [`Screen::Settings`]. The top bar is
+//! always visible; docks and the dev widget toggle independently.
 
-use crate::dimensions::{DimensionTab, DimensionsState};
+use crate::actions::{DROPDOWN_ORDER, dimension_index_for_digit};
 use crate::fx::FxState;
 use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
 use crate::planet_viewer::PlanetViewerState;
-use crate::scale_debug::ScaleDebugState;
 use crate::system_map::{OrbitArrival, SystemMapView};
 use crate::transitions::TransitionPanel;
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
-use game::journey::Journey;
+use game::journey::{Journey, Layer};
+use game_engine::waypoints::WaypointId;
 
-/// Viewer-window screens in nav-bar order.
+/// Top-level screens in nav-bar order (`F1`–`F3`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MainScreen {
+pub enum Screen {
+    GameDemo,
+    Dimensions(WaypointId),
+    Settings,
+}
+
+impl Screen {
+    /// F-key number (1–3) for the top-level item.
+    pub const fn fkey(self) -> u8 {
+        match self {
+            Screen::GameDemo => 1,
+            Screen::Dimensions(_) => 2,
+            Screen::Settings => 3,
+        }
+    }
+
+    /// Top bar label; the Dimensions label carries the live
+    /// breadcrumb (S1: the active selection is always visible).
+    pub fn title(self, active: WaypointId) -> String {
+        match self {
+            Screen::GameDemo => "GAME DEMO".to_owned(),
+            Screen::Dimensions(selected) => {
+                let mark = if selected == active { " ●" } else { "" };
+                format!("DIMENSIONS: {}{mark}", selected.name())
+            }
+            Screen::Settings => "SETTINGS".to_owned(),
+        }
+    }
+}
+
+/// 3D content mounted in the viewport (`None` = flat UI only).
+/// Replaces the old viewer-window screen enum: the same three
+/// renders, now addressed by the unified [`Screen`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewContent {
     GalaxyMap,
     SystemMap,
     PlanetView,
 }
 
-impl MainScreen {
-    /// Nav-bar order; index doubles as the F-key number minus one.
-    pub const ALL: [MainScreen; 3] = [
-        MainScreen::GalaxyMap,
-        MainScreen::SystemMap,
-        MainScreen::PlanetView,
-    ];
-
-    pub fn index(self) -> usize {
-        match self {
-            MainScreen::GalaxyMap => 0,
-            MainScreen::SystemMap => 1,
-            MainScreen::PlanetView => 2,
-        }
-    }
-
-    pub fn from_index(index: usize) -> Option<MainScreen> {
-        MainScreen::ALL.get(index).copied()
-    }
-
-    /// Nav-bar label.
-    pub fn title(self) -> &'static str {
-        match self {
-            MainScreen::GalaxyMap => "Galaxy Map",
-            MainScreen::SystemMap => "System Map",
-            MainScreen::PlanetView => "Planet View",
-        }
-    }
-}
-
-/// Tools-window screens in nav-bar order.
+/// Dev-widget sub-tabs in order (`F6`–`F8`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolsScreen {
+pub enum WidgetTab {
     Fps,
     Console,
     Inspector,
-    Transitions,
-    Scale,
-    Dimensions,
 }
 
-impl ToolsScreen {
-    /// Nav-bar order; index doubles as the digit key minus one.
-    pub const ALL: [ToolsScreen; 6] = [
-        ToolsScreen::Fps,
-        ToolsScreen::Console,
-        ToolsScreen::Inspector,
-        ToolsScreen::Transitions,
-        ToolsScreen::Scale,
-        ToolsScreen::Dimensions,
-    ];
+impl WidgetTab {
+    pub const ALL: [WidgetTab; 3] = [WidgetTab::Fps, WidgetTab::Console, WidgetTab::Inspector];
 
-    pub fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         match self {
-            ToolsScreen::Fps => 0,
-            ToolsScreen::Console => 1,
-            ToolsScreen::Inspector => 2,
-            ToolsScreen::Transitions => 3,
-            ToolsScreen::Scale => 4,
-            ToolsScreen::Dimensions => 5,
+            WidgetTab::Fps => 0,
+            WidgetTab::Console => 1,
+            WidgetTab::Inspector => 2,
         }
     }
 
-    pub fn from_index(index: usize) -> Option<ToolsScreen> {
-        ToolsScreen::ALL.get(index).copied()
+    pub const fn from_index(index: usize) -> Option<WidgetTab> {
+        match index {
+            0 => Some(WidgetTab::Fps),
+            1 => Some(WidgetTab::Console),
+            2 => Some(WidgetTab::Inspector),
+            _ => None,
+        }
     }
 
-    /// Nav-bar label.
-    pub fn title(self) -> &'static str {
+    /// F-key selecting this sub-tab (also opens the widget).
+    pub const fn fkey(self) -> u8 {
         match self {
-            ToolsScreen::Fps => "FPS",
-            ToolsScreen::Console => "Console",
-            ToolsScreen::Inspector => "Inspector",
-            ToolsScreen::Transitions => "Transitions",
-            ToolsScreen::Scale => "Scale",
-            ToolsScreen::Dimensions => "Dimensions",
+            WidgetTab::Fps => 6,
+            WidgetTab::Console => 7,
+            WidgetTab::Inspector => 8,
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            WidgetTab::Fps => "FPS",
+            WidgetTab::Console => "Console",
+            WidgetTab::Inspector => "Inspector",
+        }
+    }
+}
+
+/// Independent dock visibility: left dock, right dock. The top bar
+/// is always visible (no toggle); the dev widget has its own
+/// visibility on [`App`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeState {
+    pub left_dock: bool,
+    pub right_dock: bool,
+}
+
+impl ChromeState {
+    pub const fn all_visible() -> Self {
+        ChromeState {
+            left_dock: true,
+            right_dock: true,
+        }
+    }
+
+    pub const fn all_hidden() -> Self {
+        ChromeState {
+            left_dock: false,
+            right_dock: false,
         }
     }
 }
 
 /// Whole debug-tool state.
 pub struct App {
-    pub main_screen: MainScreen,
-    pub tools_screen: ToolsScreen,
+    pub screen: Screen,
+    pub chrome: ChromeState,
+    /// Dev-widget overlay: visible on every tab when set.
+    pub widget_visible: bool,
+    pub widget_tab: WidgetTab,
+    /// Click-to-focus for the widget (keyboard `Esc` unwinds it).
+    pub widget_focused: bool,
+    /// Dimensions dropdown open (captures digit keys).
+    pub dropdown_open: bool,
     pub viewer: PlanetViewerState,
     /// Galaxy-map screen state (camera + selection survive switching,
     /// same as the viewer state).
     pub galaxy: GalaxyMapView,
     /// System-map screen state (loaded system + focus + selection).
     pub system: SystemMapView,
-    /// Journey machine both map screens drive (UMAP-015): selections
-    /// arm it, E/T/Q commit travel and layer changes.
+    /// Journey machine the demo tab and map screens drive:
+    /// selections arm it, E/T/Q commit travel and layer changes.
     pub journey: Journey,
-    /// Transition fades + notice banner (UMAP-017).
+    /// Transition fades + notice banner.
     pub fx: FxState,
     /// Frame-health recorder (fed once per event-loop iteration).
     pub fps: FpsOverlay,
-    /// Backing state for the console placeholder (captures nothing yet).
+    /// Console log feed (transition events drained per frame).
     pub console: LogConsole,
-    /// Backing state for the inspector placeholder (inspects nothing yet).
+    /// Backing state for the inspector (journey summary).
     pub inspector: StateInspector,
     pub transitions: TransitionPanel,
-    pub scale: ScaleDebugState,
-    pub dimensions: DimensionsState,
 }
 
 impl App {
@@ -145,28 +175,30 @@ impl App {
         let star0 = galaxy.galaxy.stars[0].clone();
         let system = SystemMapView::new(DEFAULT_GALAXY_SEED, &star0);
         App {
-            main_screen: MainScreen::GalaxyMap,
-            tools_screen: ToolsScreen::Fps,
+            screen: Screen::GameDemo,
+            chrome: ChromeState::all_hidden(),
+            widget_visible: false,
+            widget_tab: WidgetTab::Fps,
+            widget_focused: false,
+            dropdown_open: false,
             viewer,
             galaxy,
             system,
             journey: Journey::new(DEFAULT_GALAXY_SEED),
             fx: FxState::default(),
             fps: FpsOverlay::new(),
-            console: LogConsole,
+            console: LogConsole::new(),
             inspector: StateInspector,
             transitions: {
                 let mut panel = TransitionPanel::new();
                 panel.preview();
                 panel
             },
-            scale: ScaleDebugState::new(),
-            dimensions: DimensionsState::new(),
         }
     }
 
-    /// Bind an orbit arrival (UMAP-020): the planet view rebuilds at
-    /// the descriptor radius (subdivisions unchanged) holding the
+    /// Bind an orbit arrival: the planet view rebuilds at the
+    /// descriptor radius (subdivisions unchanged) holding the
     /// arrival tint + seeded planet. Returns the applied radius for the
     /// arrival notice. Generator radii always validate, so the rebuild
     /// cannot fail — a manual regenerate later clears the binding.
@@ -180,46 +212,157 @@ impl App {
         radius
     }
 
-    /// Switch viewer screens; viewer state is preserved (field never touched).
-    pub fn select_main(&mut self, screen: MainScreen) {
-        self.main_screen = screen;
-    }
-
-    /// Switch tools screens.
-    pub fn select_tools(&mut self, screen: ToolsScreen) {
-        self.tools_screen = screen;
-    }
-
-    /// F1–F3 routing (`f` is 1–3); returns false for other keys.
-    pub fn select_main_by_fkey(&mut self, f: u8) -> bool {
-        match crate::ui::nav_index_for_fkey(f).and_then(MainScreen::from_index) {
-            Some(screen) => {
-                self.select_main(screen);
-                true
-            }
-            None => false,
+    /// Active waypoint for the current journey layer (breadcrumb +
+    /// dropdown marker source).
+    pub fn active_waypoint(&self) -> WaypointId {
+        match self.journey.active_layer() {
+            Layer::Galaxy => WaypointId::MilkyWay,
+            Layer::System => WaypointId::SolarSystem,
+            Layer::Orbit => WaypointId::Earth,
         }
     }
 
-    /// `1`–`3` routing (`d` is 1–3); returns false for other keys.
-    pub fn select_tools_by_digit(&mut self, d: u8) -> bool {
-        match crate::ui::nav_index_for_digit(d).and_then(ToolsScreen::from_index) {
-            Some(screen) => {
-                self.select_tools(screen);
-                true
-            }
-            None => false,
+    /// 3D content for the current screen (`None` = flat UI only).
+    /// The demo tab follows the journey layer; absorbed dimension
+    /// tabs mount their view; everything else is flat UI.
+    pub fn screen_content(&self) -> Option<ViewContent> {
+        match self.screen {
+            Screen::GameDemo => match self.journey.active_layer() {
+                Layer::Galaxy => Some(ViewContent::GalaxyMap),
+                Layer::System => Some(ViewContent::SystemMap),
+                Layer::Orbit => Some(ViewContent::PlanetView),
+            },
+            Screen::Dimensions(WaypointId::MilkyWay) => Some(ViewContent::GalaxyMap),
+            Screen::Dimensions(WaypointId::SolarSystem) => Some(ViewContent::SystemMap),
+            Screen::Dimensions(WaypointId::Earth) => Some(ViewContent::PlanetView),
+            Screen::Dimensions(_) | Screen::Settings => None,
         }
     }
 
+    /// Dropdown rows in display order with the active flag.
+    pub fn dropdown_rows(&self) -> [(WaypointId, bool); 10] {
+        let active = self.active_waypoint();
+        DROPDOWN_ORDER.map(|waypoint| (waypoint, waypoint == active))
+    }
+
+    /// Switch screens; per-tab chrome defaults apply (the demo tab
+    /// opens clean — presentation-accurate with zero debug data).
+    /// Content state is preserved (fields never touched).
+    pub fn select_screen(&mut self, screen: Screen) {
+        self.screen = screen;
+        self.chrome = match screen {
+            Screen::GameDemo => ChromeState::all_hidden(),
+            Screen::Dimensions(_) | Screen::Settings => ChromeState::all_visible(),
+        };
+        self.widget_visible = !matches!(screen, Screen::GameDemo);
+        self.dropdown_open = false;
+        self.widget_focused = false;
+    }
+
+    /// `F1`–`F3` routing; returns false for other keys. `F2` lands on
+    /// the active waypoint with the dropdown open.
+    pub fn select_top_by_fkey(&mut self, f: u8) -> bool {
+        match f {
+            1 => {
+                self.select_screen(Screen::GameDemo);
+                true
+            }
+            2 => {
+                let active = self.active_waypoint();
+                self.select_screen(Screen::Dimensions(active));
+                self.dropdown_open = true;
+                true
+            }
+            3 => {
+                self.select_screen(Screen::Settings);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Dropdown digit routing (`1`–`9` → entries 0–8, `0` → entry 9);
+    /// selects the dimension and closes the dropdown. Returns false
+    /// for other digits.
     pub fn select_dimension_by_digit(&mut self, d: u8) -> bool {
-        match DimensionTab::from_index(d.saturating_sub(1) as usize) {
-            Some(tab) => {
-                self.dimensions.select(tab);
-                true
-            }
+        match dimension_index_for_digit(d) {
+            Some(index) => match DROPDOWN_ORDER.get(index) {
+                Some(&waypoint) => {
+                    self.select_screen(Screen::Dimensions(waypoint));
+                    true
+                }
+                None => false,
+            },
             None => false,
         }
+    }
+
+    pub fn toggle_dropdown(&mut self) {
+        self.dropdown_open = !self.dropdown_open;
+    }
+
+    pub fn close_dropdown(&mut self) {
+        self.dropdown_open = false;
+    }
+
+    pub fn toggle_left_dock(&mut self) {
+        self.chrome.left_dock = !self.chrome.left_dock;
+    }
+
+    pub fn toggle_right_dock(&mut self) {
+        self.chrome.right_dock = !self.chrome.right_dock;
+    }
+
+    pub fn toggle_widget(&mut self) {
+        self.widget_visible = !self.widget_visible;
+        if !self.widget_visible {
+            self.widget_focused = false;
+        }
+    }
+
+    /// Show the widget on `tab` (also unfocus-safe: keeps focus as-is).
+    pub fn select_widget_tab(&mut self, tab: WidgetTab) {
+        self.widget_tab = tab;
+        self.widget_visible = true;
+    }
+
+    /// `F6`–`F8` routing; returns false for other keys.
+    pub fn select_widget_tab_by_fkey(&mut self, f: u8) -> bool {
+        match f {
+            6 => {
+                self.select_widget_tab(WidgetTab::Fps);
+                true
+            }
+            7 => {
+                self.select_widget_tab(WidgetTab::Console);
+                true
+            }
+            8 => {
+                self.select_widget_tab(WidgetTab::Inspector);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `Esc` unwind: close the dropdown first, then unfocus the
+    /// widget. Returns true when something changed (never quits).
+    pub fn esc_unwind(&mut self) -> bool {
+        if self.dropdown_open {
+            self.dropdown_open = false;
+            true
+        } else if self.widget_focused {
+            self.widget_focused = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drain new transition history into the console feed. Returns
+    /// lines added.
+    pub fn sync_console(&mut self) -> usize {
+        self.console.feed_transitions(&self.transitions.history)
     }
 }
 
@@ -234,24 +377,130 @@ mod tests {
     use super::*;
 
     #[test]
-    fn main_nav_order_matches_fkeys() {
-        assert_eq!(MainScreen::ALL.len(), 3);
-        for (i, screen) in MainScreen::ALL.iter().enumerate() {
-            assert_eq!(screen.index(), i);
-            assert_eq!(MainScreen::from_index(i), Some(*screen));
-        }
-        assert_eq!(MainScreen::from_index(3), None);
+    fn fkey_routing() {
+        let mut app = App::new();
+        assert!(app.select_top_by_fkey(1));
+        assert_eq!(app.screen, Screen::GameDemo);
+        assert!(app.select_top_by_fkey(3));
+        assert_eq!(app.screen, Screen::Settings);
+        assert!(app.select_top_by_fkey(2));
+        assert_eq!(app.screen, Screen::Dimensions(WaypointId::MilkyWay));
+        assert!(app.dropdown_open);
+        assert!(!app.select_top_by_fkey(4));
+        assert!(!app.select_top_by_fkey(0));
     }
 
     #[test]
-    fn tools_nav_order_matches_digits() {
-        assert_eq!(ToolsScreen::ALL.len(), 6);
-        for (i, screen) in ToolsScreen::ALL.iter().enumerate() {
-            assert_eq!(screen.index(), i);
-            assert_eq!(ToolsScreen::from_index(i), Some(*screen));
+    fn digit_routing_selects_dropdown_entries_and_closes() {
+        let mut app = App::new();
+        app.dropdown_open = true;
+        assert!(app.select_dimension_by_digit(1));
+        assert_eq!(app.screen, Screen::Dimensions(WaypointId::CosmicWeb));
+        assert!(!app.dropdown_open);
+        assert!(app.select_dimension_by_digit(0));
+        assert_eq!(app.screen, Screen::Dimensions(WaypointId::Interior));
+        assert!(app.select_dimension_by_digit(4));
+        assert_eq!(app.screen, Screen::Dimensions(WaypointId::MilkyWay));
+        assert!(!app.select_dimension_by_digit(10));
+    }
+
+    #[test]
+    fn widget_fkey_routing() {
+        let mut app = App::new();
+        assert!(!app.widget_visible);
+        assert!(app.select_widget_tab_by_fkey(7));
+        assert!(app.widget_visible);
+        assert_eq!(app.widget_tab, WidgetTab::Console);
+        assert!(app.select_widget_tab_by_fkey(6));
+        assert_eq!(app.widget_tab, WidgetTab::Fps);
+        assert!(app.select_widget_tab_by_fkey(8));
+        assert_eq!(app.widget_tab, WidgetTab::Inspector);
+        assert!(!app.select_widget_tab_by_fkey(9));
+    }
+
+    #[test]
+    fn widget_tab_order_matches_fkeys() {
+        assert_eq!(WidgetTab::ALL.len(), 3);
+        for (i, tab) in WidgetTab::ALL.iter().enumerate() {
+            assert_eq!(tab.index(), i);
+            assert_eq!(WidgetTab::from_index(i), Some(*tab));
         }
-        assert_eq!(ToolsScreen::from_index(4), Some(ToolsScreen::Scale));
-        assert_eq!(ToolsScreen::from_index(5), Some(ToolsScreen::Dimensions));
+        assert_eq!(WidgetTab::from_index(3), None);
+        assert_eq!(WidgetTab::Fps.fkey(), 6);
+        assert_eq!(WidgetTab::Console.fkey(), 7);
+        assert_eq!(WidgetTab::Inspector.fkey(), 8);
+    }
+
+    #[test]
+    fn esc_unwind_order() {
+        let mut app = App::new();
+        app.dropdown_open = true;
+        app.widget_focused = true;
+        assert!(app.esc_unwind());
+        assert!(!app.dropdown_open);
+        assert!(app.widget_focused);
+        assert!(app.esc_unwind());
+        assert!(!app.widget_focused);
+        assert!(!app.esc_unwind());
+    }
+
+    #[test]
+    fn toggles_are_independent() {
+        let mut app = App::new();
+        app.select_screen(Screen::Settings);
+        app.toggle_left_dock();
+        assert!(!app.chrome.left_dock);
+        assert!(app.chrome.right_dock);
+        app.toggle_widget();
+        assert!(!app.widget_visible);
+        app.toggle_widget();
+        assert!(app.widget_visible);
+        assert!(!app.chrome.left_dock);
+        app.toggle_right_dock();
+        assert!(!app.chrome.right_dock);
+    }
+
+    #[test]
+    fn demo_tab_defaults_to_hidden_chrome() {
+        let mut app = App::new();
+        // Fresh app boots on the demo tab, clean.
+        assert_eq!(app.screen, Screen::GameDemo);
+        assert_eq!(app.chrome, ChromeState::all_hidden());
+        assert!(!app.widget_visible);
+        app.select_screen(Screen::Settings);
+        assert_eq!(app.chrome, ChromeState::all_visible());
+        assert!(app.widget_visible);
+        app.select_screen(Screen::GameDemo);
+        assert_eq!(app.chrome, ChromeState::all_hidden());
+        assert!(!app.widget_visible);
+    }
+
+    #[test]
+    fn dropdown_rows_mark_exactly_one_active() {
+        let app = App::new();
+        let rows = app.dropdown_rows();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.iter().filter(|(_, active)| *active).count(), 1);
+        assert_eq!(
+            rows.iter().find(|(_, active)| *active).map(|(w, _)| *w),
+            Some(WaypointId::MilkyWay)
+        );
+        assert_eq!(rows[0].0, WaypointId::CosmicWeb);
+    }
+
+    #[test]
+    fn screen_content_mapping() {
+        let mut app = App::new();
+        // Demo follows the journey layer (fresh journey = Galaxy).
+        assert_eq!(app.screen_content(), Some(ViewContent::GalaxyMap));
+        app.select_screen(Screen::Dimensions(WaypointId::SolarSystem));
+        assert_eq!(app.screen_content(), Some(ViewContent::SystemMap));
+        app.select_screen(Screen::Dimensions(WaypointId::Earth));
+        assert_eq!(app.screen_content(), Some(ViewContent::PlanetView));
+        app.select_screen(Screen::Dimensions(WaypointId::CosmicWeb));
+        assert_eq!(app.screen_content(), None);
+        app.select_screen(Screen::Settings);
+        assert_eq!(app.screen_content(), None);
     }
 
     #[test]
@@ -276,48 +525,27 @@ mod tests {
         let mut app = App::new();
         app.viewer.subdiv_field.text = "4".to_owned();
         app.viewer.wireframe = false;
-        app.select_main(MainScreen::SystemMap);
-        assert_eq!(app.main_screen, MainScreen::SystemMap);
-        app.select_main(MainScreen::PlanetView);
+        app.select_screen(Screen::Dimensions(WaypointId::SolarSystem));
+        assert_eq!(app.screen, Screen::Dimensions(WaypointId::SolarSystem));
+        app.select_screen(Screen::GameDemo);
         assert_eq!(app.viewer.subdiv_field.text, "4");
         assert!(!app.viewer.wireframe);
-        app.select_tools(ToolsScreen::Console);
-        assert_eq!(app.tools_screen, ToolsScreen::Console);
-        app.select_tools(ToolsScreen::Fps);
+        app.select_widget_tab(WidgetTab::Console);
+        assert_eq!(app.widget_tab, WidgetTab::Console);
+        app.select_widget_tab(WidgetTab::Fps);
         assert_eq!(app.viewer.subdiv_field.text, "4");
     }
 
     #[test]
-    fn fkey_routing() {
+    fn console_sync_drains_transition_history() {
         let mut app = App::new();
-        assert!(app.select_main_by_fkey(1));
-        assert_eq!(app.main_screen, MainScreen::GalaxyMap);
-        assert!(app.select_main_by_fkey(2));
-        assert_eq!(app.main_screen, MainScreen::SystemMap);
-        assert!(app.select_main_by_fkey(3));
-        assert_eq!(app.main_screen, MainScreen::PlanetView);
-        assert!(!app.select_main_by_fkey(4));
-        assert_eq!(app.main_screen, MainScreen::PlanetView);
-    }
-
-    #[test]
-    fn digit_routing() {
-        let mut app = App::new();
-        assert!(app.select_tools_by_digit(2));
-        assert_eq!(app.tools_screen, ToolsScreen::Console);
-        assert!(app.select_tools_by_digit(3));
-        assert_eq!(app.tools_screen, ToolsScreen::Inspector);
-        assert!(app.select_tools_by_digit(1));
-        assert_eq!(app.tools_screen, ToolsScreen::Fps);
-        assert!(app.select_tools_by_digit(4));
-        assert_eq!(app.tools_screen, ToolsScreen::Transitions);
-        assert!(app.select_tools_by_digit(5));
-        assert_eq!(app.tools_screen, ToolsScreen::Scale);
-    }
-
-    #[test]
-    fn starts_on_galaxy_and_fps() {
-        assert_eq!(App::new().main_screen, MainScreen::GalaxyMap);
-        assert_eq!(App::new().tools_screen, ToolsScreen::Fps);
+        // The fresh panel carries the preview history.
+        let history_len = app.transitions.history.len();
+        assert!(history_len > 0);
+        let added = app.sync_console();
+        assert_eq!(added, history_len);
+        assert!(!app.console.is_empty());
+        // Second sync adds nothing (already drained).
+        assert_eq!(app.sync_console(), 0);
     }
 }

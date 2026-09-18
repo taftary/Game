@@ -1,18 +1,17 @@
 //! Developer debug screens: monitor, debug, and check the running application.
 //!
-//! Two OS windows, owned by the `game_debug` binary: the viewer window
-//! (`app::MainScreen` — Galaxy Map + System Map + Planet View over
-//! `planet_viewer` state: orbit camera, wireframe and pentagon-highlight
-//! toggles, validated subdivision/radius inputs and read-only stats)
-//! and the tools window (`app::ToolsScreen` — `fps` live frame-health
-//! plus the `console` / `inspector` placeholder stubs). All screen logic
-//! here is window- and GPU-free — the `game_debug` binary owns the
-//! winit + vulkano shell.
+//! One OS window, owned by the `game_debug` binary: [`app::Screen`] —
+//! the Game Demo tab, the ten dimension tabs behind the Dimensions
+//! dropdown, and Settings — over the shared content state (journey,
+//! galaxy/system maps, planet viewer). The dev widget
+//! ([`fps`]/[`console`]/[`inspector`]) floats over every tab. All
+//! screen logic here is window- and GPU-free — the `game_debug`
+//! binary owns the winit + vulkano shell.
 //! Never player-facing; strip or gate before any release.
 
+pub mod actions;
 pub mod app;
 pub mod console;
-pub mod dimensions;
 pub mod fps;
 pub mod fx;
 pub mod galaxy_map;
@@ -23,7 +22,6 @@ pub mod params;
 pub mod picking;
 pub mod planet_viewer;
 pub mod player_view;
-pub mod scale_debug;
 pub mod sky;
 pub mod system_map;
 pub mod text;

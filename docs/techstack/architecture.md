@@ -13,11 +13,12 @@ crates/
   engine/     - library crate game_engine (empty modules, src/lib.rs is empty)
   game/       - clean release game binary + pure player HUD view model
   tools/      - tooling binary, empty fn main() {} (not a default member)
-   debug/      - game_debug lib (Galaxy Map + System Map + Planet View
-                   screens, tools window with live FPS +
-                   console/inspector stubs) + game_debug binary:
-                   windowed planet viewer with developer tools (not a
-                   default member)
+   debug/      - game_debug lib (unified single-window shell, ADR-022:
+                    Game Demo tab + Dimensions dropdown (10 waypoints) +
+                    Settings; absorbed Galaxy/System/Planet views; dev
+                    widget with FPS/console/inspector sub-tabs) +
+                    game_debug binary: windowed viewer with developer
+                    tools (not a default member)
 docs/         - project docs (game overview + techstack/game/milestones/risks/decisions)
 plans/        - feature lifecycle: notion -> plan -> implement (see plans/README.md)
 tests/        - consolidated test package; every target is empty
@@ -60,17 +61,19 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
 crates/game/     # `game` binary: clean release entry — game states, camera
                  # journey, pure HUD view model, ADR-004 autosave trigger
                  # policy, UI wiring when windowed shell lands
-crates/debug/    # `game_debug` lib (viewer screens: mesh/params/ui/
-                   # text/app/planet_viewer/picking modules + live fps
-                   # recorder + console/inspector stubs) + binary
-                   # (non-default member): viewer window (Galaxy Map +
-                   # System Map + Planet View with orbit camera, fill +
-                   # wireframe + pentagon highlight, cell-chunk hover
-                   # highlight + click-to-pin with panel readout,
+crates/debug/    # `game_debug` lib (unified shell: actions/app/ui/
+                   # console/fps/inspector modules + galaxy/system maps +
+                   # planet_viewer/picking + transitions feed) + binary
+                   # (non-default member): single window (Game Demo tab
+                   # with shipping HUD + Dimensions dropdown mounting the
+                   # absorbed Galaxy Map (Milky Way) / System Map (Solar
+                   # System) / Planet View (Earth) with orbit camera,
+                   # fill + wireframe + pentagon highlight, cell-chunk
+                   # hover highlight + click-to-pin with panel readout,
                    # 6 debug-shader modes, inputs panel, --headless CI
-                   # mode with pick + player self-tests) + tools window
-                    # (FPS / console / inspector + scale-dimension tabs);
-                    # developer screens
+                   # mode with pick + player self-tests) + dev widget
+                   # (FPS / console fed by the transition log / inspector
+                   # + bottom-center transition pill); developer screens
                    # never leak into the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
                  # planet preview / renderer smoke (M1: seeded planet, orbit

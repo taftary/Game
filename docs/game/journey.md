@@ -84,11 +84,11 @@ no underground player state.
 
 `GalaxyMap` (L2; L1 is backdrop) → `SystemMap` (L3; L4 planet focus) → `Orbit` (L5) → `Descent` (L6) → `Surface` (L7) ⇄ `Ascent` (L6) → `Orbit` (L5) → ...
 
-The debug tools Dimensions section visualizes the implemented L1-L5 views in
-six tabs: Universe, Galactic, System, Planetary, Orbit, and Connections. The
-Connections tab is read-only and shows the ten waypoint nodes plus their nine
-adjacent legs, along with the active journey layer. L6-L8 remain excluded until
-their runtime state exists.
+The debug Dimensions dropdown lists the ten waypoint tabs with the
+active journey layer marked. Milky Way / Solar System / Earth mount the
+absorbed Galaxy Map / System Map / Planet View; the other seven tabs
+are placeholders (S7: last state + `INACTIVE` badge, never blank)
+until their runtime state exists.
 
 Each transition has explicit enter/exit, asset prefetch hints, and a fallback (fade + spinner) if streaming misses budget.
 
@@ -98,13 +98,16 @@ with selection/event transitions, fade + prefetch/evict effects, and a
 pinned-hash fixed-step regression; `game::transit` adds the timed,
 pre-commit-cancellable interplanetary hop (60 ticks @ 20 Hz, deferred
 fuel/energy hook); `engine::universe` generates stages 1–2 with
-quantized cross-platform hashes; `game_debug` hosts the Galaxy Map
-(F1: star points + nebula impostors + L1 backdrop, 3D orbit/pan/log
+quantized cross-platform hashes; `game_debug` mounts the Galaxy Map
+on the Milky Way dimension tab (`F2` dropdown, digit `4`: star points
++ nebula impostors + L1 backdrop, 3D orbit/pan/log
 zoom/click, `Home` top-down snap — `plans/v0.0.1/universe-maps-3d`)
-and System Map (F2: inclined orbit rings + planets + L4 focus +
-travel offer)
-screens plus the orbit arrival binding (viewer rebuilds at descriptor
-radius with the atmosphere tint). `Descent`/`Surface` (L6–L7) land with
-the descent milestone (M2).
+and the System Map on the Solar System tab (digit `6`: inclined orbit
+rings + planets + L4 focus + travel offer)
+plus the orbit arrival binding (viewer rebuilds at descriptor
+radius with the atmosphere tint). The Game Demo tab (`F1`, default)
+renders the current journey layer presentation-accurately with the
+shipping HUD and drives the same `Journey` the debug tabs inspect.
+`Descent`/`Surface` (L6–L7) land with the descent milestone (M2).
 
 Rendering side: [`../techstack/rendering.md`](../techstack/rendering.md). Budgets: [`../techstack/quality.md`](../techstack/quality.md).

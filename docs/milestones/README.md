@@ -72,6 +72,16 @@ commit when it reaches `done` (workflow rule:
 | [`autosave-persistence`](../../plans/v0.3.0/autosave-persistence/) | done | §10 Persistence |
 | [`scale-debug-screens`](../../plans/v0.3.0/scale-debug-screens/) | done | spec §1 + §9.3 (dev tooling) |
 
+## v0.3.1 — Debug shell unification (dev tooling)
+
+Work happens on branch `v0.3.1`; each feature lands as exactly one
+commit when it reaches `done` (workflow rule:
+[`plans/README.md`](../../plans/README.md) § *7. Version branch*).
+
+| Feature | Status | Spec section |
+|---|---|---|
+| [`unified-debug-view`](../../plans/v0.3.1/unified-debug-view/) | planned | dev tooling (ADR-022) |
+
 ## Post-v0.3 (unscheduled)
 
 - **Colony milestones (historical labels):** M2 descent slice, M3 surface

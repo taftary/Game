@@ -26,32 +26,44 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
 - Headless demo: `cargo run -p game` runs a scripted 20 Hz walk
   (straight leg, curving leg, turn-in-place leg, idle) through all four
   modes, logging lon/lat/heading (interactive `winit` binding deferred).
-- Debug viewer (`cargo run -p game_debug`, two windows): viewer window
-  `F1` = Galaxy Map, `F2` = System Map, `F3` = Planet View, `F4` reopens
-  the tools window
-  (FPS / Console / Inspector tabs on window-local `1/2/3`); `U`
-  toggles player mode, `WASD`/arrows drive thrust/turn on the planet,
-  `P` cycles Follow → First-person → Third-person, `1`–`6` select the
-  debug-shader mode, `G`/`T`/`B` snap the global camera to
-  Perspective/Top/Bottom (planet screen only, same as the panel VIEW
-   buttons; `R` = Right preset there). Map screens (`plans/v0.0.1/universe-maps`,
-   `plans/v0.0.1/universe-maps-3d`): 3D perspective views — wheel = log zoom,
-   left-drag = orbit, right/middle-drag = pan, click = select
-   star/planet, `Home` = top-down snap toggle (classic north-up /
-   east-right framing); Galaxy Map
-   `E` drills into the selected star's system, `R` re-rolls the seed, seed
+- Debug viewer (`cargo run -p game_debug`, one window, ADR-022): top
+  bar `F1` = Game Demo (default tab — interactive, presentation-
+  accurate, HUD on, chrome hidden), `F2` = Dimensions dropdown (ten
+  waypoints, digits `1`–`0` pick while open, `●` marks the active
+  journey layer), `F3` = Settings (Controls section lists every
+  action with its key; every row is clickable). Milky Way / Solar
+  System / Earth dimension tabs mount the absorbed Galaxy Map /
+  System Map / Planet View with their docks (260/300 px + padding)
+  and content keys; other
+  dimension tabs are placeholders with `INACTIVE` badges.
+- Dev widget (`` ` `` toggle; `F6`/`F7`/`F8` = FPS/Console/Inspector
+  sub-tabs): floats over every tab. Console carries the transition-
+  event log; a transition pill floats bottom-center while a waypoint
+  transition is in flight. `F9`/`F10` toggle left dock / right dock;
+  the tab bar is always visible and hosts three toggle buttons at its
+  right end (left dock, right dock, dev widget with FPS value).
+  `Esc` unwinds UI focus (dropdown → widget); closing the window exits.
+- Every key has a button showing that key and vice versa (Controls
+  section is the full registry). Chrome keys never shadow content
+  keys: `U` toggles player mode, `WASD`/arrows drive thrust/turn on
+  the planet, `P` cycles Follow → First-person → Third-person, `1`–`6`
+  select the debug-shader mode (planet content), `F5` cycles the
+  twilight stage, `G`/`T`/`B` snap the global camera to
+  Perspective/Top/Bottom (planet content only, same as the panel VIEW
+  buttons; `R` = Right preset there). Map content
+  (`plans/v0.0.1/universe-maps`,
+  `plans/v0.0.1/universe-maps-3d`): 3D perspective views — wheel = log zoom,
+  left-drag = orbit, right/middle-drag = pan, click = select
+  star/planet, `Home` = top-down snap toggle (classic north-up /
+  east-right framing); Milky Way tab
+  `E` drills into the selected star's system, `R` re-rolls the seed, seed
   field + Load (or Enter) loads a typed universe (`--seed N` flag does
-  the same at startup); System Map `F` toggles L4 planet focus, `T`
+  the same at startup); Solar System tab `F` toggles L4 planet focus, `T`
   arms/withdraws the travel offer, `E` begins the timed transit
   (cancellable with `T`/`Q` before commit), `Q` ascends one journey
   layer. The player marker is a center dot plus a heading
-   arrow on the planet; the SELECTION panel shows `lon / lat /
-   cam + loaded / heading` plus the walk keys while the player is on.
-   Tools window: focus the `PlanetCrafter — debug tools` window, then use
-   `1` FPS, `2` Console, `3` Inspector, `4` Transitions, `5` Scale (or click
-   the tabs). The Scale screen opens a global ten-dimension matrix; click any
-   dimension card for its per-dimension state and transition log. The tools
-   window opens at 900x720 so all five tabs are visible.
+  arrow on the planet; the SELECTION panel shows `lon / lat /
+  cam + loaded / heading` plus the walk keys while the player is on.
 
 ### Navigation HUD
 

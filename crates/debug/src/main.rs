@@ -4,23 +4,26 @@
 //! loader): builds the default N=6/R=1.0 viewer mesh through the
 //! `game_debug` lib and prints stats.
 //!
-//! Windowed (default) opens two `winit` windows sharing one `vulkano`
-//! device. The viewer window hosts the Galaxy Map (F1), System Map (F2)
-//! and Planet View (F3: orbit camera, filled dual-cell mesh, wireframe
-//! overlay, pentagon highlight, cell-chunk hover highlight +
-//! click-to-pin with panel readout, inputs panel, read-only stats). The
-//! tools window hosts the FPS / Console / Inspector / Transitions / Scale
-//! tabs (window-local `1/2/3/4/5`; Console/Inspector are placeholders).
-//! Closing the tools
-//! window hides it (`F4` on the viewer window reopens); closing the
-//! viewer window (or `Esc`) exits.
+//! Windowed (default) opens one `winit` window (ADR-022): the top bar
+//! hosts GAME DEMO (`F1`), DIMENSIONS (`F2`, dropdown of the ten
+//! waypoints on `1`–`0`) and SETTINGS (`F3`). The demo tab renders the
+//! current journey layer presentation-accurately with the shipping
+//! HUD; the Milky Way / Solar System / Earth dimension tabs mount the
+//! absorbed Galaxy Map / System Map / Planet View (orbit camera,
+//! filled dual-cell mesh, wireframe overlay, pentagon highlight,
+//! cell-chunk hover highlight + click-to-pin, inputs panel,
+//! read-only stats). A transition strip shows in-flight waypoint
+//! transitions; the dev widget (`` ` ``, `F6`–`F8` sub-tabs
+//! FPS/Console/Inspector) and the corner strip float over every tab.
+//! `F9`–`F11` toggle tab bar / left dock / right dock; `Esc` unwinds
+//! UI focus (closing the window exits).
 //!
 //! All screen logic lives in the `game_debug` lib (window- and GPU-free);
 //! this binary owns the winit event loop, the graphics pipelines (fill,
 //! wireframe lines, UI quads), the depth buffers and the
 //! font-atlas texture. `game_engine` and `game` are untouched.
 //!
-//! Usage: `game_debug [--headless]`.
+//! Usage: `game_debug [--headless] [--seed N]`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,11 +31,10 @@ use std::time::{Duration, Instant};
 use game::camera::CameraMode;
 use game::journey::{Journey, JourneyEvent, Layer};
 use game::transit::{SIM_DT_SECS, Transit, plan_cost};
-use game_debug::app::{App as DebugApp, MainScreen, ToolsScreen};
-use game_debug::dimensions::{self, DimensionTab};
+use game_debug::actions::{Action, ActionGroup, DROPDOWN_ORDER, digit_for_dimension_index};
+use game_debug::app::{App as DebugApp, ChromeState, Screen, ViewContent, WidgetTab};
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
-use game_debug::map_camera::{DEFAULT_PITCH, DEFAULT_YAW, MapOrbitCamera};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
 use game_debug::planet_viewer::{DebugMode, PlanetViewerState};
@@ -512,20 +514,28 @@ const C_KNOB: Color = [0.55, 0.65, 0.90, 1.0];
 const C_CHECK: Color = [0.45, 0.75, 0.45, 1.0];
 /// Section header bar behind VIEW / INPUTS / SELECTION / STATS titles.
 const C_SECTION_BG: Color = [0.11, 0.13, 0.19, 1.0];
+/// Dimensions dropdown panel: solid black so nothing behind the menu
+/// can ever show through.
+const C_DROPDOWN_BG: Color = [0.00, 0.00, 0.00, 1.0];
+/// Dropdown border outline.
+const C_DROPDOWN_BORDER: Color = [0.35, 0.45, 0.65, 1.0];
+/// Dropdown drop shadow (soft offset slab behind the panel).
+const C_DROPDOWN_SHADOW: Color = [0.00, 0.00, 0.00, 0.55];
+/// Hovered dropdown row lift (under the cursor, below selection).
+const C_DROPDOWN_HOVER: Color = [0.22, 0.30, 0.52, 0.45];
+/// Dropdown row separator hairline.
+const C_DROPDOWN_SEP: Color = [0.35, 0.45, 0.65, 0.18];
+/// Transition pill background (semi-transparent dark).
+const C_PILL_BG: Color = [0.05, 0.06, 0.10, 0.92];
 /// FPS sparkline bars: <20 ms ok, <34 ms warm, above = hitch.
 const C_FPS_OK: Color = [0.30, 0.85, 0.45, 1.0];
 const C_FPS_WARN: Color = [1.00, 0.75, 0.25, 1.0];
 const C_FPS_HITCH: Color = [1.00, 0.35, 0.30, 1.0];
-/// Screen-aware layout: every viewer-window screen (galaxy, system,
-/// planet) gets the left dock + center viewport + right data dock; the
-/// tools window reclaims the full width so viewer inputs stay attached
-/// to the viewer window.
-fn app_layout(screen: MainScreen, win_w: f32, win_h: f32) -> Layout {
-    match screen {
-        MainScreen::GalaxyMap | MainScreen::SystemMap | MainScreen::PlanetView => {
-            ui::layout_viewer(win_w, win_h)
-        }
-    }
+/// Screen-aware layout: the unified single-window shell reclaims
+/// hidden docks (left/right toggle independently — ADR-022), so the
+/// viewport grows when chrome hides. The top bar is always on.
+fn app_layout(chrome: ChromeState, win_w: f32, win_h: f32) -> Layout {
+    ui::layout_unified(win_w, win_h, chrome.left_dock, chrome.right_dock)
 }
 /// Player marker dot (planet view).
 const C_PLAYER: Color = [0.30, 1.00, 0.45, 1.0];
@@ -590,8 +600,20 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
 fn run_headless(seed: Option<u64>) -> i32 {
     let viewer = PlanetViewerState::new();
     let mut debug_app = DebugApp::new();
-    assert!(debug_app.select_tools_by_digit(5));
-    assert_eq!(debug_app.tools_screen, ToolsScreen::Scale);
+    // Unified shell smoke: F2 opens Dimensions on the active
+    // waypoint, digits pick dropdown entries, F-keys jump the
+    // widget to a sub-tab.
+    assert!(debug_app.select_top_by_fkey(2));
+    assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::MilkyWay));
+    assert!(debug_app.dropdown_open);
+    assert!(debug_app.select_dimension_by_digit(1));
+    assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::CosmicWeb));
+    // Placeholder dimension: flat UI, no 3D content.
+    assert!(debug_app.select_dimension_by_digit(8));
+    assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::Aerial));
+    assert_eq!(debug_app.screen_content(), None);
+    assert!(debug_app.select_widget_tab_by_fkey(7));
+    assert_eq!(debug_app.widget_tab, WidgetTab::Console);
     // Pick self-test (cell-chunks): aiming at cell 0's center from 5
     // radii out must resolve chunk 0 — fails loudly on picking or
     // mesh-ordering regressions.
@@ -985,7 +1007,7 @@ struct PlanetLeftPlan {
 }
 
 fn planet_left_plan(left: Rect, lh: f32, checker: bool) -> PlanetLeftPlan {
-    let mut rows = ui::PanelRows::new(left, 8.0);
+    let mut rows = ui::PanelRows::new(left, ui::DOCK_PAD);
     let view_header = rows.next(lh + 6.0, 4.0);
     let preset_hint = rows.next(lh, 4.0);
     let preset_row_top = rows.next(28.0, 6.0);
@@ -1054,7 +1076,7 @@ struct RightPlan {
 }
 
 fn right_panel_plan(panel: Rect, lh: f32, warn: bool, player_active: bool) -> RightPlan {
-    let mut rows = ui::PanelRows::new(panel, 8.0);
+    let mut rows = ui::PanelRows::new(panel, ui::DOCK_PAD);
     let inputs_header = rows.next(lh + 6.0, 4.0);
     let subdiv_label = rows.next(lh, 4.0);
     let subdiv_field = rows.next(24.0, 4.0);
@@ -1152,19 +1174,148 @@ impl UiItems {
     }
 }
 
-/// Nav bar shared by every screen of a window: `titles` in order,
-/// `active` highlighted.
-fn build_nav(items: &mut UiItems, layout: Layout, titles: &[&str], active: usize, lh: f32) {
-    items.solid(layout.nav, C_NAV_BG);
-    for (i, title) in titles.iter().enumerate() {
-        let rect = ui::nav_button(layout.nav, i);
-        if i == active {
-            items.solid(rect, C_TAB_ACTIVE);
+/// Game Demo tab body: presentation-accurate player HUD lines for
+/// the current journey layer — frame/waypoint, time state
+/// (real-time: the debug shell owns no compression clock), and the
+/// SOI/target readouts, hidden until travel features feed them.
+/// Zero debug data by construction (the chrome builders run
+/// separately and only when their toggles are on).
+fn build_demo_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
+    let mut rows = ui::PanelRows::new(area, 12.0);
+    section_bar(items, rows.next(lh + 6.0, 4.0), "GAME DEMO");
+    for (line, color) in [
+        (
+            format!(
+                "frame:  {:?} · {} (L{})",
+                app.journey.active_layer(),
+                app.active_waypoint().name(),
+                app.active_waypoint().number()
+            ),
+            C_TEXT,
+        ),
+        ("time:   real-time".to_owned(), C_TEXT),
+        ("soi:    —".to_owned(), C_DIM),
+        ("target: —".to_owned(), C_DIM),
+    ] {
+        text_row(items, lh, rows.next(lh, 6.0), line, color);
+    }
+    text_row(
+        items,
+        lh,
+        rows.next(lh, 6.0),
+        "WASD walk · P camera · E/T/Q travel".to_owned(),
+        C_DIM,
+    );
+}
+
+/// Placeholder dimension tab (S7): waypoint identity + live status,
+/// never a blank page. Periodically re-rendered, so the
+/// `INACTIVE` badge always reflects the journey layer.
+fn build_placeholder_ui(
+    items: &mut UiItems,
+    lh: f32,
+    app: &DebugApp,
+    waypoint: WaypointId,
+    area: Rect,
+) {
+    let mut rows = ui::PanelRows::new(area, 12.0);
+    section_bar(
+        items,
+        rows.next(lh + 6.0, 4.0),
+        &format!("DIMENSION: {} (L{})", waypoint.name(), waypoint.number()),
+    );
+    let is_active = app.active_waypoint() == waypoint;
+    for (line, color) in [
+        (
+            if is_active {
+                "INACTIVE badge withheld: this is the active layer".to_owned()
+            } else {
+                "INACTIVE · showing last state".to_owned()
+            },
+            if is_active { C_CHECK } else { C_WARN },
+        ),
+        (
+            "no 3D content at this scale yet — placeholder".to_owned(),
+            C_DIM,
+        ),
+        (
+            "per-dimension content lands with its feature".to_owned(),
+            C_DIM,
+        ),
+    ] {
+        text_row(items, lh, rows.next(lh, 6.0), line, color);
+    }
+}
+
+/// One clickable Controls row: screen rect + the action it fires.
+pub struct ControlsRow {
+    pub rect: Rect,
+    pub action: Action,
+}
+
+/// Settings → Controls section plan (S5): every registry action as
+/// a clickable row in two columns (Chrome+Navigate left,
+/// Camera+Travel right). Pure function of `(area, lh)` — the click
+/// router rebuilds the identical plan, so hit rects match by
+/// construction.
+pub struct ControlsPlan {
+    pub rows: Vec<ControlsRow>,
+}
+
+fn controls_plan(area: Rect, lh: f32) -> ControlsPlan {
+    use game_debug::actions::{ActionGroup, all_actions};
+    let row_h = lh + 4.0;
+    let col_w = ((area.w - 24.0) / 2.0).max(0.0);
+    let mut rows = Vec::new();
+    for (col, groups) in [
+        vec![ActionGroup::Chrome, ActionGroup::Navigate],
+        vec![ActionGroup::Camera, ActionGroup::Travel],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut y = area.y + 8.0;
+        for group in groups {
+            // Reserve the group header row above the group's rows.
+            y += lh + 14.0;
+            for action in all_actions().into_iter().filter(|a| &a.group() == group) {
+                let rect = Rect {
+                    x: area.x + 8.0 + col as f32 * (col_w + 8.0),
+                    y,
+                    w: col_w,
+                    h: row_h,
+                };
+                rows.push(ControlsRow { rect, action });
+                y += row_h + 2.0;
+            }
         }
+    }
+    ControlsPlan { rows }
+}
+
+/// Settings tab body: Controls section rendering the registry.
+fn build_settings_ui(items: &mut UiItems, lh: f32, area: Rect) {
+    let plan = controls_plan(area, lh);
+    let mut last_group: Option<ActionGroup> = None;
+    for row in &plan.rows {
+        if Some(row.action.group()) != last_group {
+            last_group = Some(row.action.group());
+            section_bar(
+                items,
+                Rect {
+                    x: row.rect.x,
+                    y: row.rect.y - lh - 10.0,
+                    w: row.rect.w,
+                    h: lh + 6.0,
+                },
+                row.action.group().title(),
+            );
+        }
+        items.solid(row.rect, C_FIELD_BG);
         items.text(
-            (*title).to_owned(),
-            rect.x + 12.0,
-            rect.y + (rect.h + lh) / 2.0 - 3.0,
+            row.action.button_label(),
+            row.rect.x + 8.0,
+            row.rect.y + lh - 3.0,
             C_TEXT,
         );
     }
@@ -1271,81 +1422,82 @@ fn shader_rows(items: &mut UiItems, lh: f32, viewer: &PlanetViewerState, rects: 
 /// undifferentiated column.
 fn build_planet_ui(
     atlas: &mut GlyphAtlas,
-    viewer: &PlanetViewerState,
+    app: &DebugApp,
     sky: &SkySummary,
     layout: Layout,
 ) -> UiItems {
+    let viewer = &app.viewer;
     let lh = atlas.line_height();
     let mut items = UiItems::default();
-    build_nav(
-        &mut items,
-        layout,
-        &MainScreen::ALL.map(|s| s.title()),
-        MainScreen::PlanetView.index(),
-        lh,
-    );
+    build_topbar(&mut items, lh, app, layout);
 
-    // ---- Left dock: VIEW (camera presets — planet screen only) ----
-    let checker = viewer.debug_mode == DebugMode::Checker;
-    let left = planet_left_plan(layout.left, lh, checker);
-    items.solid(layout.left, C_PANEL_BG);
-    section_bar(&mut items, left.view_header, "VIEW");
-    text_row(
-        &mut items,
-        lh,
-        left.preset_hint,
-        "Camera presets (G/T/B/R)".to_owned(),
-        C_DIM,
-    );
-    // Global camera presets as a 2×2 grid: bigger hit targets than the
-    // old 4-in-a-row strip (`G`/`T`/`B`/`R` do the same).
-    let preset_labels = [GlobalPreset::ALL[0].1, GlobalPreset::ALL[1].1];
-    let preset_labels_bot = [GlobalPreset::ALL[2].1, GlobalPreset::ALL[3].1];
-    for (row, labels) in left
-        .rects
-        .preset_grid
-        .iter()
-        .zip([preset_labels, preset_labels_bot])
-    {
-        for (rect, label) in row.iter().zip(labels) {
-            items.solid(*rect, C_BTN);
-            items.text(label.to_owned(), rect.x + 8.0, rect.y + 19.0, C_TEXT);
+    // ---- Left dock: VIEW (camera presets — planet content only) ----
+    // Hidden docks draw nothing (zero-width rects would otherwise leak
+    // text rows over the viewport).
+    if layout.left.w >= 1.0 {
+        let checker = viewer.debug_mode == DebugMode::Checker;
+        let left = planet_left_plan(layout.left, lh, checker);
+        items.solid(layout.left, C_PANEL_BG);
+        section_bar(&mut items, left.view_header, "VIEW");
+        text_row(
+            &mut items,
+            lh,
+            left.preset_hint,
+            "Camera presets (G/T/B/R)".to_owned(),
+            C_DIM,
+        );
+        // Global camera presets as a 2×2 grid: bigger hit targets than the
+        // old 4-in-a-row strip (`G`/`T`/`B`/`R` do the same).
+        let preset_labels = [GlobalPreset::ALL[0].1, GlobalPreset::ALL[1].1];
+        let preset_labels_bot = [GlobalPreset::ALL[2].1, GlobalPreset::ALL[3].1];
+        for (row, labels) in left
+            .rects
+            .preset_grid
+            .iter()
+            .zip([preset_labels, preset_labels_bot])
+        {
+            for (rect, label) in row.iter().zip(labels) {
+                items.solid(*rect, C_BTN);
+                items.text(label.to_owned(), rect.x + 8.0, rect.y + 19.0, C_TEXT);
+            }
+        }
+
+        // ---- Left dock: SHADER + OVERLAYS (planet-relevant only) ----
+        shader_rows(
+            &mut items,
+            lh,
+            viewer,
+            &ShaderRowRects {
+                header: left.shader_header,
+                hint: left.shader_hint,
+                button: left.rects.shader_button,
+                density_label: left.density_label,
+                density_track: left.rects.density_track,
+            },
+        );
+        section_bar(&mut items, left.overlay_header, "OVERLAYS");
+        for (box_rect, label_row, label, checked) in [
+            (
+                left.rects.wire_box,
+                left.wire_label,
+                "Wireframe",
+                viewer.wireframe,
+            ),
+            (
+                left.rects.pent_box,
+                left.pent_label,
+                "Pentagons",
+                viewer.pentagons,
+            ),
+            (left.rects.seam_box, left.seam_label, "Seams", viewer.seams),
+        ] {
+            checkbox_row(&mut items, lh, box_rect, label_row, label, checked);
         }
     }
 
-    // ---- Left dock: SHADER + OVERLAYS (planet-relevant only) ----
-    shader_rows(
-        &mut items,
-        lh,
-        viewer,
-        &ShaderRowRects {
-            header: left.shader_header,
-            hint: left.shader_hint,
-            button: left.rects.shader_button,
-            density_label: left.density_label,
-            density_track: left.rects.density_track,
-        },
-    );
-    section_bar(&mut items, left.overlay_header, "OVERLAYS");
-    for (box_rect, label_row, label, checked) in [
-        (
-            left.rects.wire_box,
-            left.wire_label,
-            "Wireframe",
-            viewer.wireframe,
-        ),
-        (
-            left.rects.pent_box,
-            left.pent_label,
-            "Pentagons",
-            viewer.pentagons,
-        ),
-        (left.rects.seam_box, left.seam_label, "Seams", viewer.seams),
-    ] {
-        checkbox_row(&mut items, lh, box_rect, label_row, label, checked);
+    if layout.panel.w >= 1.0 {
+        build_right_dock(&mut items, lh, viewer, sky, layout.panel);
     }
-
-    build_right_dock(&mut items, lh, viewer, sky, layout.panel);
     items
 }
 
@@ -1373,12 +1525,13 @@ struct GalaxyLeftPlan {
 /// (`left`, `lh`) alone — the UI builder and the click router share
 /// this, so hit rects match drawn widgets by construction.
 fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
-    let mut y = left.y + 8.0;
+    let pad = ui::DOCK_PAD;
+    let mut y = left.y + pad;
     let row = |y: &mut f32| {
         let rect = Rect {
-            x: left.x + 8.0,
+            x: left.x + pad,
             y: *y,
-            w: (left.w - 16.0).max(0.0),
+            w: (left.w - 2.0 * pad).max(0.0),
             h: lh,
         };
         *y += lh + 4.0;
@@ -1410,9 +1563,9 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
     ];
     y += 4.0;
     let seed_header = bar(&mut y);
-    let field_w = ((left.w - 16.0) * 0.62).max(0.0);
+    let field_w = ((left.w - 2.0 * pad) * 0.62).max(0.0);
     let field = Rect {
-        x: left.x + 8.0,
+        x: left.x + pad,
         y,
         w: field_w,
         h: lh + 6.0,
@@ -1420,7 +1573,7 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
     let load = Rect {
         x: field.x + field.w + 6.0,
         y,
-        w: (left.x + left.w - 8.0 - (field.x + field.w + 6.0)).max(0.0),
+        w: (left.x + left.w - pad - (field.x + field.w + 6.0)).max(0.0),
         h: lh + 6.0,
     };
     GalaxyLeftPlan {
@@ -1435,144 +1588,144 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
     }
 }
 
-fn build_galaxy_ui(atlas: &mut GlyphAtlas, galaxy: &GalaxyMapView, layout: Layout) -> UiItems {
+fn build_galaxy_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiItems {
+    let galaxy = &app.galaxy;
     let lh = atlas.line_height();
     let mut items = UiItems::default();
-    build_nav(
-        &mut items,
-        layout,
-        &MainScreen::ALL.map(|s| s.title()),
-        MainScreen::GalaxyMap.index(),
-        lh,
-    );
+    build_topbar(&mut items, lh, app, layout);
 
-    // ---- Left dock: MAP ----
-    items.solid(layout.left, C_PANEL_BG);
-    let plan = galaxy_left_plan(layout.left, lh);
-    section_bar(&mut items, plan.header, "GALAXY MAP");
-    text_row(
-        &mut items,
-        lh,
-        plan.seed_row,
-        format!("seed {}", galaxy.seed),
-        C_TEXT,
-    );
-    text_row(
-        &mut items,
-        lh,
-        plan.stats_row,
-        format!(
-            "{} stars · {} nebulae",
-            galaxy.galaxy.stars.len(),
-            galaxy.nebulae.len()
-        ),
-        C_DIM,
-    );
-    text_row(
-        &mut items,
-        lh,
-        plan.cam_row,
-        format!(
-            "target {:+.0},{:+.0},{:+.0} D {:.0} ly",
-            galaxy.camera.target().x,
-            galaxy.camera.target().y,
-            galaxy.camera.target().z,
-            galaxy.camera.distance()
-        ),
-        C_DIM,
-    );
-    section_bar(&mut items, plan.cam_header, "CAMERA");
-    for (rect, hint) in plan.hints.iter().zip([
-        "wheel: zoom (log)",
-        "left-drag: orbit",
-        "right-drag: pan",
-        "click: select star",
-        "Home: top-down",
-        "R: re-roll seed",
-    ]) {
-        text_row(&mut items, lh, *rect, hint.to_owned(), C_DIM);
+    // ---- Left dock: MAP ---- (hidden docks draw nothing)
+    if layout.left.w >= 1.0 {
+        items.solid(layout.left, C_PANEL_BG);
+        let plan = galaxy_left_plan(layout.left, lh);
+        section_bar(&mut items, plan.header, "GALAXY MAP");
+        text_row(
+            &mut items,
+            lh,
+            plan.seed_row,
+            format!("seed {}", galaxy.seed),
+            C_TEXT,
+        );
+        text_row(
+            &mut items,
+            lh,
+            plan.stats_row,
+            format!(
+                "{} stars · {} nebulae",
+                galaxy.galaxy.stars.len(),
+                galaxy.nebulae.len()
+            ),
+            C_DIM,
+        );
+        text_row(
+            &mut items,
+            lh,
+            plan.cam_row,
+            format!(
+                "target {:+.0},{:+.0},{:+.0} D {:.0} ly",
+                galaxy.camera.target().x,
+                galaxy.camera.target().y,
+                galaxy.camera.target().z,
+                galaxy.camera.distance()
+            ),
+            C_DIM,
+        );
+        section_bar(&mut items, plan.cam_header, "CAMERA");
+        for (rect, hint) in plan.hints.iter().zip([
+            "wheel: zoom (log)",
+            "left-drag: orbit",
+            "right-drag: pan",
+            "click: select star",
+            "Home: top-down",
+            "R: re-roll seed",
+        ]) {
+            text_row(&mut items, lh, *rect, hint.to_owned(), C_DIM);
+        }
+        // ---- Left dock: SEED (runtime plumbing) ----
+        section_bar(&mut items, plan.seed_header, "SEED");
+        items.solid(plan.rects.field, C_FIELD_BG);
+        text_row(
+            &mut items,
+            lh,
+            plan.rects.field,
+            galaxy.seed_field.text.clone(),
+            C_TEXT,
+        );
+        let load_ok = galaxy.seed_field.text.parse::<u64>().is_ok();
+        items.solid(plan.rects.load, if load_ok { C_BTN } else { C_BTN_OFF });
+        items.text(
+            "Load".to_owned(),
+            plan.rects.load.x + 8.0,
+            plan.rects.load.y + lh - 2.0,
+            if load_ok { C_TEXT } else { C_DIM },
+        );
     }
-    // ---- Left dock: SEED (runtime plumbing, UMAP-016) ----
-    section_bar(&mut items, plan.seed_header, "SEED");
-    items.solid(plan.rects.field, C_FIELD_BG);
-    text_row(
-        &mut items,
-        lh,
-        plan.rects.field,
-        galaxy.seed_field.text.clone(),
-        C_TEXT,
-    );
-    let load_ok = galaxy.seed_field.text.parse::<u64>().is_ok();
-    items.solid(plan.rects.load, if load_ok { C_BTN } else { C_BTN_OFF });
-    items.text(
-        "Load".to_owned(),
-        plan.rects.load.x + 8.0,
-        plan.rects.load.y + lh - 2.0,
-        if load_ok { C_TEXT } else { C_DIM },
-    );
 
     // ---- Right dock: SELECTION ----
-    items.solid(layout.panel, C_PANEL_BG);
-    let mut py = layout.panel.y + 8.0;
-    let prow = |py: &mut f32| {
-        let rect = Rect {
-            x: layout.panel.x + 8.0,
-            y: *py,
-            w: (layout.panel.w - 16.0).max(0.0),
-            h: lh,
+    if layout.panel.w >= 1.0 {
+        let pad = ui::DOCK_PAD;
+        items.solid(layout.panel, C_PANEL_BG);
+        let mut py = layout.panel.y + pad;
+        let prow = |py: &mut f32| {
+            let rect = Rect {
+                x: layout.panel.x + pad,
+                y: *py,
+                w: (layout.panel.w - 2.0 * pad).max(0.0),
+                h: lh,
+            };
+            *py += lh + 4.0;
+            rect
         };
-        *py += lh + 4.0;
-        rect
-    };
-    section_bar(
-        &mut items,
-        Rect {
-            x: layout.panel.x,
-            y: layout.panel.y,
-            w: layout.panel.w,
-            h: lh + 8.0,
-        },
-        "SELECTION",
-    );
-    py += lh + 12.0;
-    match galaxy
-        .selected
-        .and_then(|i| galaxy.galaxy.stars.get(i as usize))
-    {
-        Some(star) => {
-            text_row(
-                &mut items,
-                lh,
-                prow(&mut py),
-                format!("star {} · {:?}", star.star_index, star.spectral_class),
-                C_TEXT,
-            );
-            text_row(
-                &mut items,
-                lh,
-                prow(&mut py),
-                format!(
-                    "pos {:+.0},{:+.0},{:+.0} ly",
-                    star.position_ly[0], star.position_ly[1], star.position_ly[2]
-                ),
-                C_DIM,
-            );
-            text_row(
-                &mut items,
-                lh,
-                prow(&mut py),
-                format!("companions {}", star.companion_count),
-                C_DIM,
-            );
-        }
-        None => {
-            text_row(
-                &mut items,
-                lh,
-                prow(&mut py),
-                "click a star".to_owned(),
-                C_DIM,
-            );
+        section_bar(
+            &mut items,
+            Rect {
+                x: layout.panel.x,
+                y: layout.panel.y,
+                w: layout.panel.w,
+                h: lh + 8.0,
+            },
+            "SELECTION",
+        );
+        py += lh + 12.0;
+        match galaxy
+            .selected
+            .and_then(|i| galaxy.galaxy.stars.get(i as usize))
+        {
+            Some(star) => {
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!("star {} · {:?}", star.star_index, star.spectral_class),
+                    C_TEXT,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!(
+                        "pos {:+.0},{:+.0},{:+.0} ly",
+                        star.position_ly[0], star.position_ly[1], star.position_ly[2]
+                    ),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    format!("companions {}", star.companion_count),
+                    C_DIM,
+                );
+            }
+            None => {
+                text_row(
+                    &mut items,
+                    lh,
+                    prow(&mut py),
+                    "click a star".to_owned(),
+                    C_DIM,
+                );
+            }
         }
     }
 
@@ -1628,270 +1781,267 @@ fn build_galaxy_ui(atlas: &mut GlyphAtlas, galaxy: &GalaxyMapView, layout: Layou
 /// journey layer + hints) + selection/focus ring overlays in the
 /// viewport. Right dock shows the selected planet, or the travel offer
 /// while one is armed.
-fn build_system_ui(
-    atlas: &mut GlyphAtlas,
-    system: &SystemMapView,
-    journey: &game::journey::Journey,
-    layout: Layout,
-) -> UiItems {
+fn build_system_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiItems {
+    let system = &app.system;
+    let journey = &app.journey;
     let lh = atlas.line_height();
     let mut items = UiItems::default();
-    build_nav(
-        &mut items,
-        layout,
-        &MainScreen::ALL.map(|s| s.title()),
-        MainScreen::SystemMap.index(),
-        lh,
-    );
+    build_topbar(&mut items, lh, app, layout);
 
-    // ---- Left dock: SYSTEM ----
-    items.solid(layout.left, C_PANEL_BG);
-    let mut y = layout.left.y + 8.0;
-    let row = |y: &mut f32| {
-        let rect = Rect {
-            x: layout.left.x + 8.0,
-            y: *y,
-            w: (layout.left.w - 16.0).max(0.0),
-            h: lh,
+    // ---- Left dock: SYSTEM ---- (hidden docks draw nothing)
+    if layout.left.w >= 1.0 {
+        let pad = ui::DOCK_PAD;
+        items.solid(layout.left, C_PANEL_BG);
+        let mut y = layout.left.y + pad;
+        let row = |y: &mut f32| {
+            let rect = Rect {
+                x: layout.left.x + pad,
+                y: *y,
+                w: (layout.left.w - 2.0 * pad).max(0.0),
+                h: lh,
+            };
+            *y += lh + 4.0;
+            rect
         };
-        *y += lh + 4.0;
-        rect
-    };
-    section_bar(
-        &mut items,
-        Rect {
-            x: layout.left.x,
-            y: layout.left.y,
-            w: layout.left.w,
-            h: lh + 8.0,
-        },
-        "SYSTEM MAP",
-    );
-    y += lh + 12.0;
-    let star = &system.system.star;
-    text_row(
-        &mut items,
-        lh,
-        row(&mut y),
-        format!("star {} · {:?}", star.star_index, star.spectral_class),
-        C_TEXT,
-    );
-    text_row(
-        &mut items,
-        lh,
-        row(&mut y),
-        format!(
-            "{} planets · seed {}",
-            system.system.planets.len(),
-            system.seed
-        ),
-        C_DIM,
-    );
-    text_row(
-        &mut items,
-        lh,
-        row(&mut y),
-        format!(
-            "target {:+.2},{:+.2},{:+.2} D {:.2} AU",
-            system.camera.target().x,
-            system.camera.target().y,
-            system.camera.target().z,
-            system.camera.distance()
-        ),
-        C_DIM,
-    );
-    text_row(
-        &mut items,
-        lh,
-        row(&mut y),
-        format!("journey: {:?}", journey.active_layer()),
-        C_DIM,
-    );
-    if let Some(focus) = system.focus {
+        section_bar(
+            &mut items,
+            Rect {
+                x: layout.left.x,
+                y: layout.left.y,
+                w: layout.left.w,
+                h: lh + 8.0,
+            },
+            "SYSTEM MAP",
+        );
+        y += lh + 12.0;
+        let star = &system.system.star;
         text_row(
             &mut items,
             lh,
             row(&mut y),
-            format!("FOCUS planet {focus} (L4)"),
-            C_CHECK,
-        );
-    }
-    y += 4.0;
-    section_bar(
-        &mut items,
-        Rect {
-            x: layout.left.x,
-            y,
-            w: layout.left.w,
-            h: lh + 8.0,
-        },
-        "TRAVEL",
-    );
-    y += lh + 12.0;
-    for hint in [
-        "wheel: zoom (log)",
-        "left-drag: orbit",
-        "right-drag: pan",
-        "click: select planet",
-        "Home: top-down",
-        "F: focus planet (L4)",
-        "T: offer / cancel",
-        "E: begin transit",
-        "Q: back to galaxy",
-    ] {
-        text_row(&mut items, lh, row(&mut y), hint.to_owned(), C_DIM);
-    }
-
-    // ---- Right dock: SELECTION / travel offer ----
-    items.solid(layout.panel, C_PANEL_BG);
-    let mut py = layout.panel.y + 8.0;
-    let prow = |py: &mut f32| {
-        let rect = Rect {
-            x: layout.panel.x + 8.0,
-            y: *py,
-            w: (layout.panel.w - 16.0).max(0.0),
-            h: lh,
-        };
-        *py += lh + 4.0;
-        rect
-    };
-    section_bar(
-        &mut items,
-        Rect {
-            x: layout.panel.x,
-            y: layout.panel.y,
-            w: layout.panel.w,
-            h: lh + 8.0,
-        },
-        "SELECTION",
-    );
-    py += lh + 12.0;
-    if let Some(offer) = system.travel_offer {
-        text_row(
-            &mut items,
-            lh,
-            prow(&mut py),
-            format!("TRAVEL OFFER - planet {offer}"),
+            format!("star {} · {:?}", star.star_index, star.spectral_class),
             C_TEXT,
         );
-        // Deferred cost hook (UMAP-019): computed off the target orbit,
-        // displayed, never deducted — the M4 resource model consumes it.
-        let orbit = system
-            .system
-            .planets
-            .get(offer as usize)
-            .map(|p| p.orbit_radius_au)
-            .unwrap_or(0.0);
-        let cost = plan_cost(orbit);
         text_row(
             &mut items,
             lh,
-            prow(&mut py),
+            row(&mut y),
             format!(
-                "fuel {:.1} · energy {:.1} (deferred M4)",
-                cost.fuel, cost.energy
+                "{} planets · seed {}",
+                system.system.planets.len(),
+                system.seed
             ),
             C_DIM,
         );
-        match system.transit.as_ref() {
-            Some(transit) => {
-                let secs = transit.remaining_ticks() as f32 * SIM_DT_SECS;
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    format!("TRANSIT {secs:.1}s · [T] cancel"),
-                    C_TEXT,
-                );
-                let bar = Rect {
-                    x: layout.panel.x + 8.0,
-                    y: py,
-                    w: (layout.panel.w - 16.0).max(0.0),
-                    h: 8.0,
-                };
-                items.solid(bar, C_TRACK);
-                items.solid(
-                    Rect {
-                        w: bar.w * transit.progress(),
-                        ..bar
-                    },
-                    C_KNOB,
-                );
-            }
-            None => {
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    "[E] begin · [T] withdraw".to_owned(),
-                    C_DIM,
-                );
-            }
+        text_row(
+            &mut items,
+            lh,
+            row(&mut y),
+            format!(
+                "target {:+.2},{:+.2},{:+.2} D {:.2} AU",
+                system.camera.target().x,
+                system.camera.target().y,
+                system.camera.target().z,
+                system.camera.distance()
+            ),
+            C_DIM,
+        );
+        text_row(
+            &mut items,
+            lh,
+            row(&mut y),
+            format!("journey: {:?}", journey.active_layer()),
+            C_DIM,
+        );
+        if let Some(focus) = system.focus {
+            text_row(
+                &mut items,
+                lh,
+                row(&mut y),
+                format!("FOCUS planet {focus} (L4)"),
+                C_CHECK,
+            );
         }
-    } else {
-        match system
-            .selected
-            .and_then(|i| system.system.planets.get(i as usize))
-        {
-            Some(planet) => {
-                let d = &planet.descriptor;
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    format!("planet {} · {:?}", d.id.planet_index(), d.planet_type),
-                    C_TEXT,
-                );
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    format!(
-                        "orbit {:.2} AU · R {:.1} km",
-                        planet.orbit_radius_au, d.radius_km
-                    ),
-                    C_DIM,
-                );
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    format!(
-                        "g {:.2} · atm {:.2} · moons {}",
-                        d.gravity_g, d.atmosphere.density, d.companion_count
-                    ),
-                    C_DIM,
-                );
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    format!(
-                        "E {:.1} M {:.1} W {:.1} O {:.1} R {:.1}",
-                        d.resource_bias.energy,
-                        d.resource_bias.metal,
-                        d.resource_bias.water_ice,
-                        d.resource_bias.organics,
-                        d.resource_bias.rare
-                    ),
-                    C_DIM,
-                );
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    "[T] travel offer".to_owned(),
-                    C_DIM,
-                );
+        y += 4.0;
+        section_bar(
+            &mut items,
+            Rect {
+                x: layout.left.x,
+                y,
+                w: layout.left.w,
+                h: lh + 8.0,
+            },
+            "TRAVEL",
+        );
+        y += lh + 12.0;
+        for hint in [
+            "wheel: zoom (log)",
+            "left-drag: orbit",
+            "right-drag: pan",
+            "click: select planet",
+            "Home: top-down",
+            "F: focus planet (L4)",
+            "T: offer / cancel",
+            "E: begin transit",
+            "Q: back to galaxy",
+        ] {
+            text_row(&mut items, lh, row(&mut y), hint.to_owned(), C_DIM);
+        }
+    }
+
+    // ---- Right dock: SELECTION / travel offer ----
+    if layout.panel.w >= 1.0 {
+        let pad = ui::DOCK_PAD;
+        items.solid(layout.panel, C_PANEL_BG);
+        let mut py = layout.panel.y + pad;
+        let prow = |py: &mut f32| {
+            let rect = Rect {
+                x: layout.panel.x + pad,
+                y: *py,
+                w: (layout.panel.w - 2.0 * pad).max(0.0),
+                h: lh,
+            };
+            *py += lh + 4.0;
+            rect
+        };
+        section_bar(
+            &mut items,
+            Rect {
+                x: layout.panel.x,
+                y: layout.panel.y,
+                w: layout.panel.w,
+                h: lh + 8.0,
+            },
+            "SELECTION",
+        );
+        py += lh + 12.0;
+        if let Some(offer) = system.travel_offer {
+            text_row(
+                &mut items,
+                lh,
+                prow(&mut py),
+                format!("TRAVEL OFFER - planet {offer}"),
+                C_TEXT,
+            );
+            // Deferred cost hook (UMAP-019): computed off the target orbit,
+            // displayed, never deducted — the M4 resource model consumes it.
+            let orbit = system
+                .system
+                .planets
+                .get(offer as usize)
+                .map(|p| p.orbit_radius_au)
+                .unwrap_or(0.0);
+            let cost = plan_cost(orbit);
+            text_row(
+                &mut items,
+                lh,
+                prow(&mut py),
+                format!(
+                    "fuel {:.1} · energy {:.1} (deferred M4)",
+                    cost.fuel, cost.energy
+                ),
+                C_DIM,
+            );
+            match system.transit.as_ref() {
+                Some(transit) => {
+                    let secs = transit.remaining_ticks() as f32 * SIM_DT_SECS;
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        format!("TRANSIT {secs:.1}s · [T] cancel"),
+                        C_TEXT,
+                    );
+                    let bar = Rect {
+                        x: layout.panel.x + pad,
+                        y: py,
+                        w: (layout.panel.w - 2.0 * pad).max(0.0),
+                        h: 8.0,
+                    };
+                    items.solid(bar, C_TRACK);
+                    items.solid(
+                        Rect {
+                            w: bar.w * transit.progress(),
+                            ..bar
+                        },
+                        C_KNOB,
+                    );
+                }
+                None => {
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        "[E] begin · [T] withdraw".to_owned(),
+                        C_DIM,
+                    );
+                }
             }
-            None => {
-                text_row(
-                    &mut items,
-                    lh,
-                    prow(&mut py),
-                    "click a planet".to_owned(),
-                    C_DIM,
-                );
+        } else {
+            match system
+                .selected
+                .and_then(|i| system.system.planets.get(i as usize))
+            {
+                Some(planet) => {
+                    let d = &planet.descriptor;
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        format!("planet {} · {:?}", d.id.planet_index(), d.planet_type),
+                        C_TEXT,
+                    );
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        format!(
+                            "orbit {:.2} AU · R {:.1} km",
+                            planet.orbit_radius_au, d.radius_km
+                        ),
+                        C_DIM,
+                    );
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        format!(
+                            "g {:.2} · atm {:.2} · moons {}",
+                            d.gravity_g, d.atmosphere.density, d.companion_count
+                        ),
+                        C_DIM,
+                    );
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        format!(
+                            "E {:.1} M {:.1} W {:.1} O {:.1} R {:.1}",
+                            d.resource_bias.energy,
+                            d.resource_bias.metal,
+                            d.resource_bias.water_ice,
+                            d.resource_bias.organics,
+                            d.resource_bias.rare
+                        ),
+                        C_DIM,
+                    );
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        "[T] travel offer".to_owned(),
+                        C_DIM,
+                    );
+                }
+                None => {
+                    text_row(
+                        &mut items,
+                        lh,
+                        prow(&mut py),
+                        "click a planet".to_owned(),
+                        C_DIM,
+                    );
+                }
             }
         }
     }
@@ -2137,248 +2287,350 @@ fn build_right_dock(
 
 /// Tools window UI: tab nav + per-tab content. FPS shows the live
 /// recorder; Transitions shows the waypoint descriptor/event surface.
-fn build_tools_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiItems {
-    let lh = atlas.line_height();
-    let mut items = UiItems::default();
-    build_nav(
-        &mut items,
-        layout,
-        &ToolsScreen::ALL.map(|s| s.title()),
-        app.tools_screen.index(),
-        lh,
-    );
-    let area = layout.viewport;
-    match app.tools_screen {
-        ToolsScreen::Fps => build_fps_tab(&mut items, lh, &app.fps, area),
-        ToolsScreen::Transitions => build_transitions_tab(&mut items, lh, &app.transitions, area),
-        ToolsScreen::Scale => build_scale_tab(&mut items, lh, app, area),
-        ToolsScreen::Dimensions => build_dimensions_ui(&mut items, lh, app, area),
-        ToolsScreen::Console | ToolsScreen::Inspector => {
-            let title = app.tools_screen.title();
-            for (text, color, dy) in [
-                (title.to_owned(), C_TEXT, -lh),
-                ("not implemented yet".to_owned(), C_DIM, lh),
-            ] {
-                let (w, _) = atlas.measure(&text);
-                items.text(
-                    text,
-                    area.x + (area.w - w) / 2.0,
-                    area.y + area.h / 2.0 + dy,
-                    color,
-                );
-            }
-        }
-    }
-    items
-}
-
-fn dimension_tab_rect(area: Rect, index: usize) -> Rect {
-    let gap = 6.0;
-    let width = ((area.w - 7.0 * gap) / 6.0).max(0.0);
-    Rect {
-        x: area.x + gap + index as f32 * (width + gap),
-        y: area.y + 10.0,
-        w: width,
-        h: 30.0,
-    }
-}
-
-fn build_dimensions_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
-    let tab = app.dimensions.tab;
-    for (index, dimension) in DimensionTab::ALL.iter().enumerate() {
-        let rect = dimension_tab_rect(area, index);
-        items.solid(
-            rect,
-            if *dimension == tab {
-                [0.12, 0.28, 0.42, 0.95]
-            } else {
-                [0.06, 0.09, 0.15, 0.95]
-            },
-        );
-        items.text(
-            dimension.title().to_owned(),
-            rect.x + 8.0,
-            rect.y + lh - 3.0,
-            C_TEXT,
-        );
-    }
-    let title = tab.title();
-    items.text(title.to_owned(), area.x + 14.0, area.y + 66.0, C_TEXT);
-    let detail = match tab {
-        DimensionTab::Universe => "Backdrop sprites · L1 is container-only in v1",
-        DimensionTab::Galactic => "Stars + nebulae · GalaxyMap 3D projection",
-        DimensionTab::System => "Star + orbit rings + planets · SystemMap",
-        DimensionTab::Planetary => "Selected planet focus · view-only framing",
-        DimensionTab::Orbit => "Planet mesh + arrival descriptor · Orbit holding layer",
-        DimensionTab::Connections => "10 waypoint nodes · 9 adjacent legs · journey state",
+/// Unified top bar (ADR-022): three items — Game Demo, Dimensions
+/// (live breadcrumb of the active journey layer), Settings. Always
+/// visible. Pure builder: the click router shares
+/// [`ui::topbar_button`], so hit rects match drawn buttons by
+/// construction.
+fn build_topbar(items: &mut UiItems, lh: f32, app: &DebugApp, layout: Layout) {
+    items.solid(layout.nav, C_NAV_BG);
+    let active = app.active_waypoint();
+    let titles = [
+        "GAME DEMO".to_owned(),
+        format!("DIMENSIONS: {} ●", active.name()),
+        "SETTINGS".to_owned(),
+    ];
+    let current = match app.screen {
+        Screen::GameDemo => 0,
+        Screen::Dimensions(_) => 1,
+        Screen::Settings => 2,
     };
-    items.text(detail.to_owned(), area.x + 14.0, area.y + 66.0 + lh, C_DIM);
-    if tab == DimensionTab::Connections {
-        let active = dimensions::active_waypoint(&app.journey);
-        items.text(
-            format!("active: {}", active.name()),
-            area.x + 14.0,
-            area.y + 66.0 + lh * 2.0,
-            C_TEXT,
-        );
-        items.text(
-            format!("transitions: {}", app.transitions.history_len()),
-            area.x + 14.0,
-            area.y + 66.0 + lh * 3.0,
-            C_DIM,
-        );
-    }
-}
-
-fn scale_dimension_rect(area: Rect, index: usize) -> Rect {
-    let gap = 8.0;
-    let columns = 2.0;
-    let width = ((area.w - 3.0 * gap) / columns).max(0.0);
-    let height = 34.0;
-    let row = index / 2;
-    let column = index % 2;
-    Rect {
-        x: area.x + gap + column as f32 * (width + gap),
-        y: area.y + 52.0 + row as f32 * (height + gap),
-        w: width,
-        h: height,
-    }
-}
-
-fn build_scale_tab(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
-    let rows = app.scale.rows(&app.journey);
-    let selected = app.scale.selected;
-    section_bar(
-        items,
-        Rect {
-            x: area.x,
-            y: area.y,
-            w: area.w,
-            h: lh + 8.0,
-        },
-        if selected.is_some() {
-            "SCALE DIMENSION"
-        } else {
-            "GLOBAL SCALE OVERVIEW"
-        },
-    );
-    for (index, row) in rows.iter().enumerate() {
-        let rect = scale_dimension_rect(area, index);
-        if selected == Some(row.waypoint) || (selected.is_none() && row.active) {
+    for (i, title) in titles.iter().enumerate() {
+        let rect = ui::topbar_button(layout.nav, i);
+        if i == current {
             items.solid(rect, C_TAB_ACTIVE);
-        } else {
-            items.solid(rect, C_PANEL_BG);
         }
         items.text(
-            format!("L{}  {}", row.waypoint.number(), row.waypoint.name()),
-            rect.x + 8.0,
-            rect.y + 15.0,
+            title.clone(),
+            rect.x + ui::TOP_PAD,
+            rect.y + (rect.h + lh) / 2.0 - 3.0,
             C_TEXT,
         );
+    }
+    // Corner strip lives inside the bar, right-aligned.
+    build_corner_strip_in_bar(items, lh, app, layout.nav.w);
+    // The dropdown is NOT built here: `ui_items_to_vertices` draws all
+    // solids in push order before any text, so a menu emitted with the
+    // bar would land UNDER the dock/content solids pushed after it.
+    // `draw_main` appends it dead last instead (topmost chrome — the
+    // click handler tests it first for the same reason).
+}
+
+/// Dimensions dropdown: the ten waypoints largest-first with the
+/// active-layer marker, the selected entry highlighted, the hovered
+/// row lifted, row separators, and the digit key per row (S1/S5).
+/// `draw_main` appends these items after every other chrome surface,
+/// so the near-opaque alpha-blended panel + drop shadow always sit on
+/// top — matching the click handler, which hit-tests the dropdown
+/// first (topmost surface wins).
+fn build_dropdown(
+    items: &mut UiItems,
+    atlas: &mut GlyphAtlas,
+    app: &DebugApp,
+    nav: Rect,
+    cursor: Option<(f32, f32)>,
+) {
+    let lh = atlas.line_height();
+    let panel = ui::dropdown_panel(nav);
+    // Drop shadow: a soft dark slab offset down-right behind the panel,
+    // so the menu reads as floating above the scene.
+    items.solid(
+        Rect {
+            x: panel.x + 4.0,
+            y: panel.y + 6.0,
+            w: panel.w,
+            h: panel.h,
+        },
+        C_DROPDOWN_SHADOW,
+    );
+    items.solid(panel, C_DROPDOWN_BG);
+    // 1px border outline (four thin rects).
+    for rect in [
+        Rect {
+            x: panel.x,
+            y: panel.y,
+            w: panel.w,
+            h: 1.5,
+        },
+        Rect {
+            x: panel.x,
+            y: panel.y + panel.h - 1.5,
+            w: panel.w,
+            h: 1.5,
+        },
+        Rect {
+            x: panel.x,
+            y: panel.y,
+            w: 1.5,
+            h: panel.h,
+        },
+        Rect {
+            x: panel.x + panel.w - 1.5,
+            y: panel.y,
+            w: 1.5,
+            h: panel.h,
+        },
+    ] {
+        items.solid(rect, C_DROPDOWN_BORDER);
+    }
+    let hovered = cursor.and_then(|(cx, cy)| {
+        (0..10).find(|&index| ui::dropdown_row(panel, index).contains(cx, cy))
+    });
+    for (index, (waypoint, is_active)) in app.dropdown_rows().iter().enumerate() {
+        let rect = ui::dropdown_row(panel, index);
+        let selected = app.screen == Screen::Dimensions(*waypoint);
+        if selected {
+            items.solid(rect, C_TAB_ACTIVE);
+        } else if hovered == Some(index) {
+            items.solid(rect, C_DROPDOWN_HOVER);
+        }
+        // Hairline separator between rows (not above the first).
+        if index > 0 {
+            items.solid(
+                Rect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: 1.0,
+                },
+                C_DROPDOWN_SEP,
+            );
+        }
+        let digit = match digit_for_dimension_index(index) {
+            Some(0) => "0".to_owned(),
+            Some(d) => d.to_string(),
+            None => "?".to_owned(),
+        };
+        let status = if *is_active {
+            "active frame ●"
+        } else {
+            "inactive · last state"
+        };
+        let baseline = rect.y + (rect.h + lh) / 2.0 - 3.0;
+        // Column layout: digit key (dim) · waypoint name · right-aligned
+        // status. The active frame row goes green; the rest stay neutral.
+        let ink = if *is_active { C_CHECK } else { C_TEXT };
+        items.text(digit, rect.x + 2.0, baseline, C_DIM);
+        items.text(waypoint.name().to_owned(), rect.x + 26.0, baseline, ink);
+        let status_x = rect.x + rect.w - atlas.measure(status).0 - 4.0;
         items.text(
-            row.position.to_owned(),
-            rect.x + 8.0,
-            rect.y + 29.0,
-            if row.active { C_CHECK } else { C_DIM },
+            status.to_owned(),
+            status_x,
+            baseline,
+            if *is_active { C_CHECK } else { C_DIM },
         );
     }
-    let detail_y = area.y + 5.0 * 42.0 + 70.0;
-    let detail = selected
-        .map(|waypoint| format!("selected: L{} {}", waypoint.number(), waypoint.name()))
-        .unwrap_or_else(|| format!("active layer: {:?}", app.journey.active_layer()));
-    text_row(
-        items,
-        lh,
-        Rect {
-            x: area.x + 8.0,
-            y: detail_y,
-            w: area.w - 16.0,
-            h: lh,
-        },
-        detail,
-        C_TEXT,
+}
+
+/// Overlay chrome shared by every tab: transition strip + dev widget
+/// go into `items`; the Dimensions dropdown goes into the separate
+/// `drop` buffer, which `draw_main` uploads and draws after ALL other
+/// UI — so the menu is topmost by GPU command order, not just by push
+/// order within one buffer (no later content can ever cover it).
+/// This matches the click handler, which hit-tests the dropdown first
+/// (topmost surface wins). Extracted from `draw_main` so tests can
+/// assert the composition headlessly.
+fn compose_overlay_ui(
+    items: &mut UiItems,
+    drop: &mut UiItems,
+    atlas: &mut GlyphAtlas,
+    app: &DebugApp,
+    layout: Layout,
+    win: (f32, f32),
+    cursor: Option<(f32, f32)>,
+) {
+    let (win_w, win_h) = win;
+    let lh = atlas.line_height();
+    build_transition_strip(items, lh, app, win_w, win_h);
+    build_widget(items, lh, app, win_w, win_h);
+    if app.dropdown_open {
+        build_dropdown(drop, atlas, app, layout.nav, cursor);
+    }
+    // Player dot: the walker projected through the main-view matrices
+    // (planet content only).
+    if app.viewer.player.active && app.screen_content() == Some(ViewContent::PlanetView) {
+        let player = &app.viewer.player;
+        let vp = layout.viewport;
+        let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
+        // Facing tip sized to a readable pixel length (eye-distance
+        // proportional, then clamped).
+        if let Some(origin) = world_to_pixels(main_vp, player.position(), vp) {
+            let tip = world_to_pixels(main_vp, sphere_tip_world(player, player.position()), vp);
+            draw_player_marker(items, origin, tip);
+        }
+    }
+    // Transition fade + notice banner (UMAP-017): a fullscreen black
+    // ramp over the fresh layer, then a banner pill top-center of
+    // the viewport. Both ride the UI pass (alpha-blended).
+    let fade = app.fx.fade_alpha();
+    if fade > 0.0 {
+        items.solid(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: win_w,
+                h: win_h,
+            },
+            [0.0, 0.0, 0.0, fade],
+        );
+    }
+    if let Some(text) = app.fx.notice_text() {
+        let lh = atlas.line_height();
+        let vp = layout.viewport;
+        let pill_w = (text.len() as f32 * 8.0 + 24.0).min(vp.w).max(0.0);
+        let pill = Rect {
+            x: vp.x + (vp.w - pill_w) * 0.5,
+            y: vp.y + 10.0,
+            w: pill_w,
+            h: lh + 10.0,
+        };
+        items.solid(pill, [0.05, 0.06, 0.10, 0.92]);
+        items.text(text.to_owned(), pill.x + 12.0, pill.y + lh - 2.0, C_TEXT);
+    }
+}
+
+/// Transition pill (S2): floating bottom-center overlay, drawn only
+/// while a transition is in flight. Overlays content — layout never
+/// shifts.
+fn build_transition_strip(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32, win_h: f32) {
+    let Some(descriptor) = app.transitions.current else {
+        return;
+    };
+    let pill = ui::transition_strip(win_w, win_h);
+    items.solid(pill, C_PILL_BG);
+    items.text(
+        format!(
+            "▶ {} → {} · {:.0}%",
+            descriptor.leg.from.name(),
+            descriptor.leg.to.name(),
+            descriptor.progress * 100.0
+        ),
+        pill.x + ui::TOP_PAD,
+        pill.y + (pill.h + lh) / 2.0 - 3.0,
+        C_WARN,
     );
-    text_row(
-        items,
-        lh,
-        Rect {
-            x: area.x + 8.0,
-            y: detail_y + lh + 4.0,
-            w: area.w - 16.0,
-            h: lh,
-        },
-        "transition log (read-only)".to_owned(),
-        C_DIM,
-    );
-    for (index, event) in app.transitions.history.iter().enumerate() {
+}
+
+/// Corner strip (parity anchor): toggle buttons living inside the
+/// top bar, right-aligned — always visible because the bar is.
+/// Three buttons: left dock, right dock, dev widget. The widget
+/// button carries the live FPS value (S3: glanceable without opening
+/// the widget). Pure builder sharing [`ui::corner_button`] with the
+/// click router.
+fn build_corner_strip_in_bar(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32) {
+    let strip = ui::corner_strip(win_w);
+    let states = [
+        ("DOCK-L [F9]".to_owned(), app.chrome.left_dock),
+        ("DOCK-R [F10]".to_owned(), app.chrome.right_dock),
+        (format!("DEV {:.0} [`]", app.fps.fps()), app.widget_visible),
+    ];
+    for (i, (label, on)) in states.iter().enumerate() {
+        let rect = ui::corner_button(strip, i);
+        items.solid(rect, if *on { C_BTN } else { C_BTN_OFF });
+        items.text(
+            label.clone(),
+            rect.x + 8.0,
+            rect.y + (rect.h + lh) / 2.0 - 3.0,
+            C_TEXT,
+        );
+    }
+}
+
+/// Dev widget: fixed bottom-right overlay, header sub-tabs
+/// (FPS/Console/Inspector) + body for the active sub-tab. Clicking
+/// anywhere inside focuses the widget.
+fn build_widget(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32, win_h: f32) {
+    if !app.widget_visible {
+        return;
+    }
+    let widget = ui::widget_rect(win_w, win_h);
+    items.solid(widget, C_PANEL_BG);
+    for (i, tab) in WidgetTab::ALL.iter().enumerate() {
+        let rect = ui::widget_tab_button(widget, i);
+        if *tab == app.widget_tab {
+            items.solid(rect, C_TAB_ACTIVE);
+        }
+        items.text(
+            tab.title().to_owned(),
+            rect.x + 8.0,
+            rect.y + (rect.h + lh) / 2.0 - 3.0,
+            C_TEXT,
+        );
+    }
+    let body = Rect {
+        x: widget.x + ui::DOCK_PAD,
+        y: widget.y + ui::WIDGET_TAB_H + 4.0,
+        w: (widget.w - 2.0 * ui::DOCK_PAD).max(0.0),
+        h: (widget.h - ui::WIDGET_TAB_H - 12.0).max(0.0),
+    };
+    match app.widget_tab {
+        WidgetTab::Fps => build_widget_fps(items, lh, app, body),
+        WidgetTab::Console => build_widget_console(items, lh, app, body),
+        WidgetTab::Inspector => build_widget_inspector(items, lh, app, body),
+    }
+}
+
+/// Widget FPS body: the frame-health tab, drawn into the widget
+/// body rect (it already lays out into any area).
+fn build_widget_fps(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
+    build_fps_tab(items, lh, &app.fps, body);
+}
+
+/// Widget Console body: the transition-event log feed (newest last,
+/// clipped to the body).
+fn build_widget_console(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
+    let row_h = lh + 4.0;
+    let capacity = (body.h / row_h.max(1.0)).floor().max(1.0) as usize;
+    let lines = &app.console.lines()[app.console.len().saturating_sub(capacity)..];
+    let mut y = body.y + body.h - lines.len() as f32 * row_h;
+    for line in lines {
         text_row(
             items,
             lh,
             Rect {
-                x: area.x + 8.0,
-                y: detail_y + 2.0 * (lh + 4.0) + index as f32 * (lh + 4.0),
-                w: area.w - 16.0,
+                x: body.x,
+                y,
+                w: body.w,
                 h: lh,
             },
-            game_debug::scale_debug::format_event(*event),
+            line.clone(),
             C_TEXT,
         );
+        y += row_h;
     }
-    text_row(
-        items,
-        lh,
-        Rect {
-            x: area.x + 8.0,
-            y: detail_y + 2.0 * (lh + 4.0) + app.transitions.history.len() as f32 * (lh + 4.0),
-            w: area.w - 16.0,
-            h: lh,
-        },
-        "SOI handoff: entering neighborhood, blend 0.50".to_owned(),
-        C_TEXT,
-    );
+    if app.console.is_empty() {
+        text_row(items, lh, body, "no events yet".to_owned(), C_DIM);
+    }
 }
 
-fn build_transitions_tab(
-    items: &mut UiItems,
-    lh: f32,
-    panel: &game_debug::transitions::TransitionPanel,
-    area: Rect,
-) {
-    let mut rows = ui::PanelRows::new(area, 8.0);
-    section_bar(items, rows.next(lh + 6.0, 4.0), "WAYPOINT TRANSITIONS");
-    let current = panel.current;
-    let lines = if let Some(descriptor) = current {
-        vec![
-            format!(
-                "leg:        {} -> {}",
-                descriptor.leg.from.name(),
-                descriptor.leg.to.name()
-            ),
-            format!("progress:   {:.3}", descriptor.progress),
-            format!("cue weight: {:.3}", descriptor.cue_weight),
-            format!("haze:       {:.3}", descriptor.haze),
-            format!("zodiacal:   {:.3}", descriptor.zodiacal_intensity),
-            format!("events:     {}", panel.history_len()),
-        ]
-    } else {
-        vec!["waiting for a waypoint leg".to_owned()]
-    };
-    for line in lines {
+/// Widget Inspector body: read-only journey summary (no simulation
+/// state is touched).
+fn build_widget_inspector(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
+    let mut rows = ui::PanelRows::new(body, 0.0);
+    for line in [
+        format!("layer:      {:?}", app.journey.active_layer()),
+        format!("waypoint:   {}", app.active_waypoint().name()),
+        format!("transitions: {}", app.transitions.history_len()),
+        format!("console:     {} lines", app.console.len()),
+    ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
     }
-    text_row(
-        items,
-        lh,
-        rows.next(lh + 4.0, 4.0),
-        "10 -> 9 uses descriptor keys; no facility geometry".to_owned(),
-        C_DIM,
-    );
 }
 
-/// FPS tab: live numbers + a sparkline of the newest
+/// Widget FPS body: live numbers + a sparkline of the newest
 /// [`FPS_SPARKLINE`] samples (right = newest, 0–50 ms full height).
 fn build_fps_tab(items: &mut UiItems, lh: f32, fps: &FpsOverlay, area: Rect) {
-    let mut rows = ui::PanelRows::new(area, 8.0);
+    let mut rows = ui::PanelRows::new(area, ui::DOCK_PAD);
     section_bar(items, rows.next(lh + 6.0, 4.0), "FRAME HEALTH");
     for line in [
         format!("fps:       {:5.1}", fps.fps()),
@@ -3030,74 +3282,6 @@ fn upload_system_lines(
     .expect("system map wireframe buffer upload must succeed")
 }
 
-fn upload_dimension_points(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[MapVertex]> {
-    let verts = dimensions::graph_positions()
-        .into_iter()
-        .enumerate()
-        .map(|(index, position)| MapVertex {
-            map_pos: position.to_array(),
-            color: if index == 3 {
-                [1.0, 0.75, 0.25]
-            } else {
-                [0.35, 0.7, 0.95]
-            },
-            misc: [8.0, 1.0, 0.0],
-        });
-    Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        verts,
-    )
-    .expect("dimension graph point buffer must create")
-}
-
-fn upload_dimension_lines(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[LineVertex]> {
-    let positions = dimensions::graph_positions();
-    let verts: Vec<LineVertex> = dimensions::graph_legs()
-        .into_iter()
-        .flat_map(|leg| {
-            let from = positions[WaypointId::ALL
-                .iter()
-                .position(|id| *id == leg.from)
-                .expect("leg source")];
-            let to = positions[WaypointId::ALL
-                .iter()
-                .position(|id| *id == leg.to)
-                .expect("leg target")];
-            [
-                LineVertex {
-                    position: from.to_array(),
-                },
-                LineVertex {
-                    position: to.to_array(),
-                },
-            ]
-        })
-        .collect();
-    Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        verts,
-    )
-    .expect("dimension graph line buffer must create")
-}
-
 fn create_depth_view(allocator: &Arc<StandardMemoryAllocator>, extent: [u32; 2]) -> Arc<ImageView> {
     let image = Image::new(
         allocator.clone(),
@@ -3201,8 +3385,6 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
-    dimension_points: Subbuffer<[MapVertex]>,
-    dimension_lines: Subbuffer<[LineVertex]>,
     /// Catalog sky runtime (scheduler + loader + cache + fallback) and
     /// its Backdrop point buffer, drawn first in the Planet View.
     sky: CatalogSky,
@@ -3233,19 +3415,22 @@ struct ViewerApp {
     /// only): release within [`CLICK_MAX_DRAG_PX`] of it counts as a click
     /// (chunk pin) rather than an orbit drag.
     press_cursor: Option<(f32, f32)>,
-    /// Last FPS sample: the tools-window frame-rate clock (once per
-    /// event-loop iteration — both windows present once per iteration,
-    /// so this is the true per-window rate).
+    /// Last FPS sample: the frame-rate clock (once per event-loop
+    /// iteration on the single window).
     last_fps_tick: Option<Instant>,
     main: Option<WindowContext>,
-    tools: Option<WindowContext>,
+    /// Mouse-held walk direction from a Settings Controls row
+    /// (hold-to-press parity for WASD): cleared on mouse release.
+    mouse_walk: Option<WalkDir>,
 }
 
-/// Which OS window a context belongs to.
+/// Hold-to-press walk direction (mouse parity for the WASD keys).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowKind {
-    Main,
-    Tools,
+enum WalkDir {
+    North,
+    South,
+    West,
+    East,
 }
 
 /// Per-window GPU state: surface/swapchain/framebuffers/depth +
@@ -3344,13 +3529,14 @@ impl ViewerApp {
             WINDOWED_RADIUS,
         ));
         // `--seed N` opens the viewer on universe N (galaxy + journey +
-        // system star 0, Galaxy Map screen) instead of the default seed.
+        // system star 0, Milky Way dimension tab) instead of the
+        // default seed.
         if let Some(seed) = seed {
             debug.galaxy.regenerate(seed);
             debug.journey = Journey::new(seed);
             let star0 = debug.galaxy.galaxy.stars[0].clone();
             debug.system.load(seed, &star0);
-            debug.select_main(MainScreen::GalaxyMap);
+            debug.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
             debug.fx.notify(format!("Seed {seed} · --seed flag"));
         }
         let viewer = &debug.viewer;
@@ -3366,8 +3552,6 @@ impl ViewerApp {
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
-        let dimension_points = upload_dimension_points(&memory_allocator);
-        let dimension_lines = upload_dimension_lines(&memory_allocator);
         // Catalog sky over the cooker layout (`assets/catalog`); missing
         // manifest ⇒ procedural fallback sky (model-only, logged). The
         // sky shares the universe seed so fallback content is stable
@@ -3398,8 +3582,6 @@ impl ViewerApp {
             map_vertices,
             system_points,
             system_lines,
-            dimension_points,
-            dimension_lines,
             sky,
             sky_vertices,
             twilight_stage: 0,
@@ -3415,7 +3597,7 @@ impl ViewerApp {
             press_cursor: None,
             last_fps_tick: None,
             main: None,
-            tools: None,
+            mouse_walk: None,
         }
     }
 
@@ -3476,10 +3658,10 @@ impl ViewerApp {
         self.debug.viewer.sync_slider_from_field();
     }
 
-    /// Load a full universe for `seed` (UMAP-016 seed plumbing, shared by
-    /// the `--seed` flag, the panel Load button, Enter, and `R`):
-    /// galaxy + buffers, journey reset, system back to star 0, screen
-    /// back to the Galaxy Map.
+    /// Load a full universe for `seed` (seed plumbing, shared by the
+    /// `--seed` flag, the panel Load button, Enter, and `R`): galaxy +
+    /// buffers, journey reset, system back to star 0, screen back to
+    /// the Milky Way dimension tab.
     fn load_galaxy_seed(&mut self, seed: u64) {
         self.debug.galaxy.regenerate(seed);
         self.debug.journey = Journey::new(seed);
@@ -3488,7 +3670,8 @@ impl ViewerApp {
         self.transit_acc = 0.0;
         self.refresh_map();
         self.refresh_system();
-        self.debug.select_main(MainScreen::GalaxyMap);
+        self.debug
+            .select_screen(Screen::Dimensions(WaypointId::MilkyWay));
         self.debug.fx.trigger_fade();
         self.debug.fx.notify(format!(
             "Seed {seed} · {} stars",
@@ -3497,20 +3680,20 @@ impl ViewerApp {
         tracing::info!(seed, "universe seed loaded");
     }
 
-    /// Recompute the hovered chunk from the current cursor: only on the
-    /// Planet View screen with the cursor inside the main viewport. A
-    /// miss (cursor over empty space, panel, or nav) clears the hover.
-    /// Hover feeds the fill highlight + panel CHUNK readout; it never
-    /// touches the mesh. Callers refresh after every cursor or camera
-    /// move so the highlight tracks within one frame.
+    /// Recompute the hovered chunk from the current cursor: only with
+    /// planet 3D content mounted and the cursor inside the main
+    /// viewport. A miss (cursor over empty space, panel, or nav)
+    /// clears the hover. Hover feeds the fill highlight + panel CHUNK
+    /// readout; it never touches the mesh. Callers refresh after every
+    /// cursor or camera move so the highlight tracks within one frame.
     fn update_hover(&mut self) {
         let hovered = self
             .main
             .as_ref()
             .and_then(|ctx| ctx.last_cursor.map(|cursor| (cursor, ctx.size())))
-            .filter(|_| self.debug.main_screen == MainScreen::PlanetView)
+            .filter(|_| self.debug.screen_content() == Some(ViewContent::PlanetView))
             .and_then(|((cx, cy), (w, h))| {
-                let layout = app_layout(self.debug.main_screen, w, h);
+                let layout = app_layout(self.debug.chrome, w, h);
                 let rect = layout.viewport;
                 if !rect.contains(cx, cy) || rect.w < 1.0 || rect.h < 1.0 {
                     return None;
@@ -3531,11 +3714,9 @@ impl ViewerApp {
         self.debug.viewer.hovered = hovered;
     }
 
-    /// (Re)build the atlas image + this window's descriptor set when the
-    /// atlas grew; upload texels when the version changed. The image is
-    /// shared, but each window owns its descriptor set (allocated from
-    /// its own UI pipeline layout, so binding is always compatible).
-    fn sync_atlas(&mut self, kind: WindowKind) {
+    /// (Re)build the atlas image + the window's descriptor set when the
+    /// atlas grew; upload texels when the version changed.
+    fn sync_atlas(&mut self) {
         let extent = self.atlas.extent();
         let grown = self
             .atlas_image
@@ -3546,10 +3727,7 @@ impl ViewerApp {
             self.atlas_image = Some(image);
             self.uploaded_atlas_version = None;
         }
-        let ctx = match kind {
-            WindowKind::Main => self.main.as_mut().expect("main window must exist"),
-            WindowKind::Tools => self.tools.as_mut().expect("tools window must exist"),
-        };
+        let ctx = self.main.as_mut().expect("main window must exist");
         if ctx.atlas_set.is_none() || ctx.atlas_set_extent != extent {
             let set_layout = ctx.pipelines.ui.layout().set_layouts()[0].clone();
             let view =
@@ -3643,26 +3821,11 @@ fn window_size_dependent_setup(
 }
 
 impl ViewerApp {
-    /// Create one OS window + swapchain + per-window GPU state.
-    /// `position` offsets the window (the tools window opens beside the
-    /// viewer instead of on top of it).
-    fn create_window(
-        &self,
-        event_loop: &ActiveEventLoop,
-        title: &str,
-        position: Option<winit::dpi::PhysicalPosition<i32>>,
-    ) -> WindowContext {
-        let mut attrs = Window::default_attributes().with_title(title);
-        if title.ends_with("debug tools") {
-            // Five 140 px tabs need at least 700 px; keep the full Scale tab
-            // visible on first launch instead of relying on platform defaults.
-            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(900, 720));
-        } else {
-            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
-        }
-        if let Some(pos) = position {
-            attrs = attrs.with_position(pos);
-        }
+    /// Create the OS window + swapchain + per-window GPU state.
+    fn create_window(&self, event_loop: &ActiveEventLoop, title: &str) -> WindowContext {
+        let attrs = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720));
         let window = Arc::new(event_loop.create_window(attrs).expect("window must create"));
         let surface = Surface::from_window(self.instance.clone(), window.clone())
             .expect("surface must create");
@@ -3714,42 +3877,23 @@ impl ViewerApp {
         }
     }
 
-    /// Look up which window an event belongs to (`None` for stale ids
-    /// after a window closed).
-    fn window_kind(&self, window_id: WindowId) -> Option<WindowKind> {
-        if self
-            .main
+    /// Whether an event belongs to the window (`false` for stale ids
+    /// after the window closed).
+    fn is_main_window(&self, window_id: WindowId) -> bool {
+        self.main
             .as_ref()
             .is_some_and(|ctx| ctx.window.id() == window_id)
-        {
-            Some(WindowKind::Main)
-        } else if self
-            .tools
-            .as_ref()
-            .is_some_and(|ctx| ctx.window.id() == window_id)
-        {
-            Some(WindowKind::Tools)
-        } else {
-            None
-        }
     }
 }
 
 impl ApplicationHandler for ViewerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // `resumed` can fire more than once: only create windows that
-        // don't have a live context yet.
+        // `resumed` can fire more than once: only create the window
+        // when no live context exists yet.
         if self.main.is_none() {
-            self.main = Some(self.create_window(event_loop, "PlanetCrafter — planet view", None));
+            self.main = Some(self.create_window(event_loop, "PlanetCrafter — debug"));
         }
-        if self.tools.is_none() {
-            self.tools = Some(self.create_window(
-                event_loop,
-                "PlanetCrafter — debug tools",
-                Some(winit::dpi::PhysicalPosition::new(60, 60)),
-            ));
-        }
-        // Atlas image + descriptor sets need the UI pipelines: built
+        // Atlas image + descriptor set need the UI pipeline: built
         // lazily on the first frame via `sync_atlas`.
     }
 
@@ -3759,31 +3903,28 @@ impl ApplicationHandler for ViewerApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        match self.window_kind(window_id) {
-            Some(WindowKind::Main) => self.main_window_event(event_loop, event),
-            Some(WindowKind::Tools) => self.tools_window_event(event_loop, event),
-            None => {}
+        if self.is_main_window(window_id) {
+            self.main_window_event(event_loop, event);
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // One FPS sample per event-loop iteration (both windows present
-        // once per iteration, so this is the true per-window rate).
+        // One FPS sample per event-loop iteration on the single window.
         let now = Instant::now();
         if let Some(last) = self.last_fps_tick {
             self.debug.fps.record((now - last).as_secs_f32());
         }
         self.last_fps_tick = Some(now);
+        // Drain new transition history into the console feed once per
+        // iteration (the widget Console tab reads it).
+        self.debug.sync_console();
         if let Some(ctx) = self.main.as_ref() {
-            ctx.window.request_redraw();
-        }
-        if let Some(ctx) = self.tools.as_ref() {
             ctx.window.request_redraw();
         }
     }
 }
 impl ViewerApp {
-    /// Viewer-window events (galaxy / system / planet screens).
+    /// Single-window events (demo / dimension / settings screens).
     fn main_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -3794,7 +3935,7 @@ impl ViewerApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x as f32, position.y as f32);
-                let screen = self.debug.main_screen;
+                let content = self.debug.screen_content();
                 if self.dragging_slider {
                     if let Some(ctx) = self.main.as_ref() {
                         let (w, h) = ctx.size();
@@ -3802,7 +3943,7 @@ impl ViewerApp {
                         let lh = self.atlas.line_height();
                         let warn =
                             parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
-                        let layout = app_layout(screen, w, h);
+                        let layout = app_layout(self.debug.chrome, w, h);
                         let track = right_panel_plan(layout.panel, lh, warn, viewer.player.active)
                             .rects
                             .subdiv_track;
@@ -3814,16 +3955,16 @@ impl ViewerApp {
                         let (w, h) = ctx.size();
                         let viewer = &mut self.debug.viewer;
                         let lh = self.atlas.line_height();
-                        let layout = app_layout(screen, w, h);
+                        let layout = app_layout(self.debug.chrome, w, h);
                         let checker = viewer.debug_mode == DebugMode::Checker;
-                        let track = match screen {
-                            MainScreen::PlanetView => {
+                        let track = match content {
+                            Some(ViewContent::PlanetView) => {
                                 planet_left_plan(layout.left, lh, checker)
                                     .rects
                                     .density_track
                             }
                             // No density slider on the map screens.
-                            MainScreen::GalaxyMap | MainScreen::SystemMap => None,
+                            _ => None,
                         };
                         if let Some(track) = track {
                             viewer.density_slider.drag_to(track, cursor.0);
@@ -3834,11 +3975,13 @@ impl ViewerApp {
                     let last = self.main.as_ref().and_then(|ctx| ctx.last_cursor);
                     if let Some(last) = last {
                         let (dx, dy) = (cursor.0 - last.0, cursor.1 - last.1);
-                        if screen == MainScreen::GalaxyMap || screen == MainScreen::SystemMap {
+                        if content == Some(ViewContent::GalaxyMap)
+                            || content == Some(ViewContent::SystemMap)
+                        {
                             // Map orbit: left-drag rotates the 3D map
                             // camera (universe-maps-3d; right/middle
                             // drag pans, below).
-                            if screen == MainScreen::GalaxyMap {
+                            if content == Some(ViewContent::GalaxyMap) {
                                 self.debug.galaxy.camera.rotate(dx, dy);
                             } else {
                                 self.debug.system.camera.rotate(dx, dy);
@@ -3855,17 +3998,17 @@ impl ViewerApp {
                 } else if self.dragging_pan {
                     // Map pan: right/middle-drag moves the 3D map camera
                     // target in the view plane (content follows the
-                    // cursor). The planet screen never sets this flag.
+                    // cursor). The planet content never sets this flag.
                     let last = self.main.as_ref().and_then(|ctx| ctx.last_cursor);
                     if let Some(last) = last
                         && let Some(ctx) = self.main.as_ref()
                     {
                         let (dx, dy) = (cursor.0 - last.0, cursor.1 - last.1);
                         let (w, h) = ctx.size();
-                        let vp = app_layout(screen, w, h).viewport;
-                        if screen == MainScreen::GalaxyMap {
+                        let vp = app_layout(self.debug.chrome, w, h).viewport;
+                        if content == Some(ViewContent::GalaxyMap) {
                             self.debug.galaxy.camera.pan_screen(dx, dy, vp.h);
-                        } else if screen == MainScreen::SystemMap {
+                        } else if content == Some(ViewContent::SystemMap) {
                             self.debug.system.camera.pan_screen(dx, dy, vp.h);
                         }
                     }
@@ -3879,18 +4022,22 @@ impl ViewerApp {
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressed = state == ElementState::Pressed;
-                let screen = self.debug.main_screen;
+                let content = self.debug.screen_content();
                 // Right/middle buttons pan the 3D map cameras
                 // (universe-maps-3d; left-drag orbits there). Other
                 // buttons are ignored.
                 if matches!(button, MouseButton::Right | MouseButton::Middle) {
                     if !pressed {
                         self.dragging_pan = false;
-                    } else if screen == MainScreen::GalaxyMap || screen == MainScreen::SystemMap {
+                    } else if content == Some(ViewContent::GalaxyMap)
+                        || content == Some(ViewContent::SystemMap)
+                    {
                         let in_viewport = self.main.as_ref().is_some_and(|ctx| {
                             let (w, h) = ctx.size();
                             ctx.last_cursor.is_some_and(|(cx, cy)| {
-                                app_layout(screen, w, h).viewport.contains(cx, cy)
+                                app_layout(self.debug.chrome, w, h)
+                                    .viewport
+                                    .contains(cx, cy)
                             })
                         });
                         if in_viewport {
@@ -3903,14 +4050,26 @@ impl ViewerApp {
                     return;
                 }
                 if !pressed {
-                    // Release: a press that barely traveled counts as a
+                    // Release: clear a mouse-held walk flag first
+                    // (Settings Controls hold-to-press parity).
+                    if self.mouse_walk.take().is_some() {
+                        let viewer = &mut self.debug.viewer;
+                        let mut keys = viewer.player.keys();
+                        keys.north = false;
+                        keys.south = false;
+                        keys.west = false;
+                        keys.east = false;
+                        viewer.player.set_keys(keys);
+                        return;
+                    }
+                    // A press that barely traveled counts as a
                     // click — pin the hovered chunk. The release must
                     // still land in the planet viewport (pinning only
-                    // exists on the planet screen).
+                    // exists with planet content).
                     let (cursor, in_viewport) = match self.main.as_ref() {
                         Some(ctx) => {
                             let (w, h) = ctx.size();
-                            let layout = app_layout(screen, w, h);
+                            let layout = app_layout(self.debug.chrome, w, h);
                             (
                                 ctx.last_cursor,
                                 ctx.last_cursor
@@ -3930,7 +4089,7 @@ impl ViewerApp {
                     self.dragging_density = false;
                     self.press_cursor = None;
                     if click
-                        && screen == MainScreen::PlanetView
+                        && content == Some(ViewContent::PlanetView)
                         && in_viewport
                         && let Some(chunk) = self.debug.viewer.hovered
                     {
@@ -3940,14 +4099,14 @@ impl ViewerApp {
                     // nearest star into the SELECTION dock + arm the
                     // journey machine.
                     if click
-                        && screen == MainScreen::GalaxyMap
+                        && content == Some(ViewContent::GalaxyMap)
                         && in_viewport
                         && let Some((cx, cy)) = cursor
                     {
                         let layout = match self.main.as_ref() {
                             Some(ctx) => {
                                 let (w, h) = ctx.size();
-                                app_layout(screen, w, h)
+                                app_layout(self.debug.chrome, w, h)
                             }
                             None => return,
                         };
@@ -3958,14 +4117,14 @@ impl ViewerApp {
                     }
                     // System click: pick the nearest planet the same way.
                     if click
-                        && screen == MainScreen::SystemMap
+                        && content == Some(ViewContent::SystemMap)
                         && in_viewport
                         && let Some((cx, cy)) = cursor
                     {
                         let layout = match self.main.as_ref() {
                             Some(ctx) => {
                                 let (w, h) = ctx.size();
-                                app_layout(screen, w, h)
+                                app_layout(self.debug.chrome, w, h)
                             }
                             None => return,
                         };
@@ -3974,9 +4133,9 @@ impl ViewerApp {
                             self.debug.journey.update(JourneyEvent::SelectPlanet(i));
                         }
                         // A miss clears the screen selection; the machine
-                        // keeps its armed planet — the transit UI (UMAP-018)
-                        // re-arms from screen state before committing, so
-                        // the stale arm can never fire.
+                        // keeps its armed planet — the transit UI re-arms
+                        // from screen state before committing, so the
+                        // stale arm can never fire.
                     }
                     return;
                 }
@@ -3990,12 +4149,69 @@ impl ViewerApp {
                     },
                     None => return,
                 };
-                let layout = app_layout(screen, w, h);
-                // Nav bar first.
-                for (i, screen) in MainScreen::ALL.iter().enumerate() {
-                    if ui::nav_button(layout.nav, i).contains(cx, cy) {
-                        self.debug.select_main(*screen);
+                let layout = app_layout(self.debug.chrome, w, h);
+                let lh = self.atlas.line_height();
+                // Chrome first, topmost surface wins: dropdown panel,
+                // top bar, corner strip, dev widget, settings rows.
+                if self.debug.dropdown_open {
+                    let panel = ui::dropdown_panel(layout.nav);
+                    for (index, waypoint) in DROPDOWN_ORDER.iter().enumerate() {
+                        if ui::dropdown_row(panel, index).contains(cx, cy) {
+                            self.debug.select_screen(Screen::Dimensions(*waypoint));
+                            return;
+                        }
+                    }
+                    // Click outside the panel dismisses it — unless the
+                    // click hits the Dimensions button itself, which
+                    // toggles below.
+                    if !panel.contains(cx, cy) && !ui::topbar_button(layout.nav, 1).contains(cx, cy)
+                    {
+                        self.debug.close_dropdown();
+                    }
+                }
+                // Top bar is always visible: check its buttons first.
+                for i in 0..3 {
+                    if ui::topbar_button(layout.nav, i).contains(cx, cy) {
+                        match i {
+                            0 => self.debug.select_screen(Screen::GameDemo),
+                            1 => self.debug.toggle_dropdown(),
+                            _ => self.debug.select_screen(Screen::Settings),
+                        }
                         return;
+                    }
+                }
+                {
+                    let strip = ui::corner_strip(w);
+                    for i in 0..3 {
+                        if ui::corner_button(strip, i).contains(cx, cy) {
+                            match i {
+                                0 => self.debug.toggle_left_dock(),
+                                1 => self.debug.toggle_right_dock(),
+                                _ => self.debug.toggle_widget(),
+                            }
+                            return;
+                        }
+                    }
+                }
+                if self.debug.widget_visible {
+                    let widget = ui::widget_rect(w, h);
+                    if widget.contains(cx, cy) {
+                        self.debug.widget_focused = true;
+                        for (i, tab) in WidgetTab::ALL.iter().enumerate() {
+                            if ui::widget_tab_button(widget, i).contains(cx, cy) {
+                                self.debug.select_widget_tab(*tab);
+                            }
+                        }
+                        return;
+                    }
+                }
+                if self.debug.screen == Screen::Settings {
+                    let plan = controls_plan(layout.viewport, lh);
+                    for row in &plan.rows {
+                        if row.rect.contains(cx, cy) {
+                            self.fire_action(row.action);
+                            return;
+                        }
                     }
                 }
                 // Viewport drag starts an orbit drag (left button
@@ -4003,13 +4219,10 @@ impl ViewerApp {
                 // pan on right/middle).
                 if layout.viewport.contains(cx, cy) {
                     self.dragging_orbit = true;
-                    // A planet-screen press may end as a chunk-pin click,
-                    // a map-screen press as a star/planet-pick click (all
+                    // A planet-content press may end as a chunk-pin click,
+                    // a map-content press as a star/planet-pick click (all
                     // decided on release by travel distance).
-                    if screen == MainScreen::PlanetView
-                        || screen == MainScreen::GalaxyMap
-                        || screen == MainScreen::SystemMap
-                    {
+                    if content.is_some() {
                         self.press_cursor = Some((cx, cy));
                     }
                     return;
@@ -4025,9 +4238,9 @@ impl ViewerApp {
                     let warn =
                         parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
                     let checker = viewer.debug_mode == DebugMode::Checker;
-                    // Screen-specific left dock first.
-                    match screen {
-                        MainScreen::PlanetView => {
+                    // Content-specific left dock first.
+                    match content {
+                        Some(ViewContent::PlanetView) => {
                             let lrects = &planet_left_plan(layout.left, lh, checker).rects;
                             if lrects.shader_button.contains(cx, cy) {
                                 viewer.cycle_debug_mode();
@@ -4044,10 +4257,10 @@ impl ViewerApp {
                             viewer.seam_cb.click(lrects.seam_box, cx, cy);
                             viewer.sync_toggles();
                         }
-                        // Seed widgets on the galaxy screen: click focuses
+                        // Seed widgets with galaxy content: click focuses
                         // the field, Load stages a seed (applied after
                         // the viewer borrow ends, below).
-                        MainScreen::GalaxyMap => {
+                        Some(ViewContent::GalaxyMap) => {
                             let plan = galaxy_left_plan(layout.left, lh);
                             self.debug.galaxy.seed_field.click(plan.rects.field, cx, cy);
                             if plan.rects.load.contains(cx, cy)
@@ -4056,7 +4269,7 @@ impl ViewerApp {
                                 pending_seed = Some(seed);
                             }
                         }
-                        MainScreen::SystemMap => {}
+                        _ => {}
                     }
                     // Shared right dock.
                     let rrects =
@@ -4079,10 +4292,10 @@ impl ViewerApp {
                     self.load_galaxy_seed(seed);
                 }
                 // Global camera presets: 2×2 VIEW grid retargets the free
-                // orbit camera (same as G/T/B/R) — planet screen only.
+                // orbit camera (same as G/T/B/R) — planet content only.
                 // Grid order is [[Top, Bot], [Right, Persp]] matching
                 // `GlobalPreset::ALL`.
-                let preset = if screen == MainScreen::PlanetView {
+                let preset = if content == Some(ViewContent::PlanetView) {
                     let lh = self.atlas.line_height();
                     let checker = self.debug.viewer.debug_mode == DebugMode::Checker;
                     planet_left_plan(layout.left, lh, checker)
@@ -4107,7 +4320,7 @@ impl ViewerApp {
                 let in_viewport = self.main.as_ref().is_some_and(|ctx| {
                     let (w, h) = ctx.size();
                     ctx.last_cursor.is_some_and(|(cx, cy)| {
-                        app_layout(self.debug.main_screen, w, h)
+                        app_layout(self.debug.chrome, w, h)
                             .viewport
                             .contains(cx, cy)
                     })
@@ -4117,12 +4330,13 @@ impl ViewerApp {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
                     };
-                    if self.debug.main_screen == MainScreen::GalaxyMap {
+                    let content = self.debug.screen_content();
+                    if content == Some(ViewContent::GalaxyMap) {
                         // Log zoom on the map: wheel-up (positive scroll)
                         // shrinks the camera distance.
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.galaxy.camera.zoom_by(factor);
-                    } else if self.debug.main_screen == MainScreen::SystemMap {
+                    } else if content == Some(ViewContent::SystemMap) {
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.system.camera.zoom_by(factor);
                     } else if self.debug.viewer.player.active {
@@ -4196,7 +4410,11 @@ impl ViewerApp {
                     return;
                 }
                 match physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
+                    // Esc unwinds UI focus (dropdown → widget); it never
+                    // quits — closing the window exits.
+                    PhysicalKey::Code(KeyCode::Escape) => {
+                        self.debug.esc_unwind();
+                    }
                     PhysicalKey::Code(KeyCode::Enter) => {
                         // Enter confirms the focused field: seed field
                         // loads the typed universe (or surfaces the miss),
@@ -4224,24 +4442,31 @@ impl ViewerApp {
                         self.debug.galaxy.seed_field.backspace();
                     }
                     PhysicalKey::Code(KeyCode::F1) => {
-                        self.debug.select_main_by_fkey(1);
+                        self.debug.select_top_by_fkey(1);
                     }
                     PhysicalKey::Code(KeyCode::F2) => {
-                        self.debug.select_main_by_fkey(2);
+                        self.debug.select_top_by_fkey(2);
                     }
                     PhysicalKey::Code(KeyCode::F3) => {
-                        self.debug.select_main_by_fkey(3);
+                        self.debug.select_top_by_fkey(3);
                     }
-                    PhysicalKey::Code(KeyCode::F4) => {
-                        // Reopen the tools window if the user closed it
-                        // (F-keys follow nav order: F1–F3 screens, F4 tools).
-                        if self.tools.is_none() {
-                            self.tools = Some(self.create_window(
-                                event_loop,
-                                "PlanetCrafter — debug tools",
-                                Some(winit::dpi::PhysicalPosition::new(60, 60)),
-                            ));
-                        }
+                    PhysicalKey::Code(KeyCode::Backquote) => {
+                        self.debug.toggle_widget();
+                    }
+                    PhysicalKey::Code(KeyCode::F6) => {
+                        self.debug.select_widget_tab_by_fkey(6);
+                    }
+                    PhysicalKey::Code(KeyCode::F7) => {
+                        self.debug.select_widget_tab_by_fkey(7);
+                    }
+                    PhysicalKey::Code(KeyCode::F8) => {
+                        self.debug.select_widget_tab_by_fkey(8);
+                    }
+                    PhysicalKey::Code(KeyCode::F9) => {
+                        self.debug.toggle_left_dock();
+                    }
+                    PhysicalKey::Code(KeyCode::F10) => {
+                        self.debug.toggle_right_dock();
                     }
                     PhysicalKey::Code(KeyCode::F5) => {
                         // Twilight stage demo (exposure-tone-mapping
@@ -4252,18 +4477,41 @@ impl ViewerApp {
                         self.debug.fx.notify(format!("Twilight {name}"));
                     }
                     PhysicalKey::Code(
-                        KeyCode::Digit1
+                        KeyCode::Digit0
+                        | KeyCode::Digit1
                         | KeyCode::Digit2
                         | KeyCode::Digit3
                         | KeyCode::Digit4
                         | KeyCode::Digit5
-                        | KeyCode::Digit6,
+                        | KeyCode::Digit6
+                        | KeyCode::Digit7
+                        | KeyCode::Digit8
+                        | KeyCode::Digit9,
                     ) => {
-                        // Direct debug-mode select (fields unfocused only).
+                        // Open dropdown captures digits for dimension
+                        // select; otherwise digits are planet-content
+                        // debug-mode selects (fields unfocused only).
+                        if self.debug.dropdown_open {
+                            let d = match physical_key {
+                                PhysicalKey::Code(KeyCode::Digit0) => 0,
+                                PhysicalKey::Code(KeyCode::Digit1) => 1,
+                                PhysicalKey::Code(KeyCode::Digit2) => 2,
+                                PhysicalKey::Code(KeyCode::Digit3) => 3,
+                                PhysicalKey::Code(KeyCode::Digit4) => 4,
+                                PhysicalKey::Code(KeyCode::Digit5) => 5,
+                                PhysicalKey::Code(KeyCode::Digit6) => 6,
+                                PhysicalKey::Code(KeyCode::Digit7) => 7,
+                                PhysicalKey::Code(KeyCode::Digit8) => 8,
+                                _ => 9,
+                            };
+                            self.debug.select_dimension_by_digit(d);
+                            return;
+                        }
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.galaxy.seed_field.focused
+                            && self.debug.screen_content() == Some(ViewContent::PlanetView)
                         {
                             let i = match physical_key {
                                 PhysicalKey::Code(KeyCode::Digit1) => 0,
@@ -4271,7 +4519,8 @@ impl ViewerApp {
                                 PhysicalKey::Code(KeyCode::Digit3) => 2,
                                 PhysicalKey::Code(KeyCode::Digit4) => 3,
                                 PhysicalKey::Code(KeyCode::Digit5) => 4,
-                                _ => 5,
+                                PhysicalKey::Code(KeyCode::Digit6) => 5,
+                                _ => return,
                             };
                             if let Some(&mode) = DebugMode::ALL.get(i) {
                                 self.debug.viewer.debug_mode = mode;
@@ -4310,8 +4559,8 @@ impl ViewerApp {
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyR) => {
-                        // R re-rolls the galaxy seed on the map screen;
-                        // the planet screen keeps R = Right preset.
+                        // R re-rolls the galaxy seed with galaxy content;
+                        // planet content keeps R = Right preset.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
@@ -4319,9 +4568,10 @@ impl ViewerApp {
                                 && !self.debug.galaxy.seed_field.focused
                         };
                         if fields_free {
-                            if self.debug.main_screen == MainScreen::GalaxyMap {
+                            let content = self.debug.screen_content();
+                            if content == Some(ViewContent::GalaxyMap) {
                                 self.load_galaxy_seed(self.debug.galaxy.seed + 1);
-                            } else if self.debug.main_screen == MainScreen::PlanetView {
+                            } else if content == Some(ViewContent::PlanetView) {
                                 let radius = self.debug.viewer.radius;
                                 snap_global_camera(&mut self.camera, GlobalPreset::Right, radius);
                                 self.update_hover();
@@ -4341,7 +4591,7 @@ impl ViewerApp {
                                 && !self.debug.galaxy.seed_field.focused
                         };
                         if fields_free
-                            && self.debug.main_screen == MainScreen::GalaxyMap
+                            && self.debug.screen_content() == Some(ViewContent::GalaxyMap)
                             && let Some(i) = self.debug.galaxy.selected
                         {
                             self.debug.journey.update(JourneyEvent::SelectStar(i));
@@ -4354,56 +4604,27 @@ impl ViewerApp {
                                 let star = self.debug.galaxy.galaxy.stars[i as usize].clone();
                                 self.debug.system.load(seed, &star);
                                 self.refresh_system();
-                                self.debug.select_main(MainScreen::SystemMap);
+                                self.debug
+                                    .select_screen(Screen::Dimensions(WaypointId::SolarSystem));
                                 self.debug.fx.trigger_fade();
                                 self.debug.fx.notify(format!(
                                     "System star {i} · {} planets",
                                     self.debug.system.system.planets.len()
                                 ));
                             }
-                        } else if fields_free && self.debug.main_screen == MainScreen::SystemMap {
-                            // Begin the transit countdown on the armed
-                            // travel offer (UMAP-018). The journey must
-                            // already sit on this layer (normal flow:
-                            // galaxy E drills down first); a direct F2
-                            // jump without it gets an honest surface, not
-                            // a silent desync.
-                            if self.debug.journey.active_layer() != Layer::System {
-                                self.debug.fx.notify(
-                                    "Journey out of sync — re-enter via galaxy [E]".to_owned(),
-                                );
-                            } else if let Some(i) = self.debug.system.travel_offer {
-                                if self.debug.system.transit.is_none() {
-                                    let star = self.debug.system.system.id.star_index();
-                                    self.debug.system.transit = Some(Transit::begin(star, i));
-                                    self.transit_acc = 0.0;
-                                    let orbit = self
-                                        .debug
-                                        .system
-                                        .system
-                                        .planets
-                                        .get(i as usize)
-                                        .map(|p| p.orbit_radius_au)
-                                        .unwrap_or(0.0);
-                                    let cost = plan_cost(orbit);
-                                    self.debug.fx.notify(format!(
-                                        "Transit underway → planet {i} · fuel {:.1} (deferred)",
-                                        cost.fuel
-                                    ));
-                                }
-                            } else {
-                                self.debug
-                                    .fx
-                                    .notify("Arm a travel offer first [T]".to_owned());
-                            }
+                        } else if fields_free
+                            && self.debug.screen_content() == Some(ViewContent::SystemMap)
+                        {
+                            // Shared with the Controls row button.
+                            self.travel_begin();
                         } else if !fields_free && let Some(text) = text {
                             self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyQ) => {
-                        // Back one journey layer (map screens only). An
+                        // Back one journey layer (map content only). An
                         // underway transit cancels first — leaving
-                        // abandons the hop.
+                        // abandons the hop. Shared with Controls.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
@@ -4412,82 +4633,49 @@ impl ViewerApp {
                         };
                         if fields_free
                             && matches!(
-                                self.debug.main_screen,
-                                MainScreen::GalaxyMap | MainScreen::SystemMap
+                                self.debug.screen_content(),
+                                Some(ViewContent::GalaxyMap | ViewContent::SystemMap)
                             )
                         {
-                            if self.debug.system.transit.is_some() {
-                                self.debug.system.transit = None;
-                                self.transit_acc = 0.0;
-                                self.debug.fx.notify("Transit cancelled".to_owned());
-                            }
-                            let _fx = self.debug.journey.update(JourneyEvent::Ascend);
-                            if self.debug.journey.active_layer() == Layer::Galaxy {
-                                self.debug.select_main(MainScreen::GalaxyMap);
-                                self.debug.fx.trigger_fade();
-                                self.debug.fx.notify("Galaxy map".to_owned());
-                            }
+                            self.ascend_layer();
                         } else if !fields_free && let Some(text) = text {
                             self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyF) => {
-                        // L4 planet-focus toggle (system screen only) +
-                        // journey mirror.
+                        // L4 planet-focus toggle (system content only) +
+                        // journey mirror. Shared with Controls.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
                                 && !self.debug.galaxy.seed_field.focused
                         };
-                        if fields_free && self.debug.main_screen == MainScreen::SystemMap {
-                            self.debug.system.toggle_focus();
-                            let focus = self.debug.system.focus;
-                            self.debug.journey.update(JourneyEvent::FocusPlanet(focus));
-                            match focus {
-                                Some(i) => self
-                                    .debug
-                                    .fx
-                                    .notify(format!("Focus planet {i} · [F] unfocus")),
-                                None => self.debug.fx.notify("Focus cleared".to_owned()),
-                            }
+                        if fields_free
+                            && self.debug.screen_content() == Some(ViewContent::SystemMap)
+                        {
+                            self.focus_toggle();
                         } else if !fields_free && let Some(text) = text {
                             self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyT) => {
                         // Travel offer arm/withdraw + transit cancel
-                        // (system screen only).
+                        // (system content only). Shared with Controls.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
                                 && !self.debug.galaxy.seed_field.focused
                         };
-                        if fields_free && self.debug.main_screen == MainScreen::SystemMap {
-                            let had_transit = self.debug.system.transit.is_some();
-                            let selected = self.debug.system.selected;
-                            self.debug.system.travel_offer =
-                                match (self.debug.system.travel_offer, selected) {
-                                    (Some(_), _) => None,
-                                    (None, Some(i)) => Some(i),
-                                    (None, None) => None,
-                                };
-                            match (self.debug.system.travel_offer, had_transit) {
-                                (Some(i), _) => self.debug.fx.notify(format!(
-                                    "Travel offer: planet {i} · [E] begin transit"
-                                )),
-                                (None, true) => {
-                                    self.debug.system.transit = None;
-                                    self.transit_acc = 0.0;
-                                    self.debug.fx.notify("Transit cancelled".to_owned());
-                                }
-                                (None, false) => {
-                                    self.debug.fx.notify("Travel offer withdrawn".to_owned())
-                                }
-                            }
-                        } else if fields_free && self.debug.main_screen == MainScreen::PlanetView {
-                            // The planet screen keeps T = Top preset.
+                        if fields_free
+                            && self.debug.screen_content() == Some(ViewContent::SystemMap)
+                        {
+                            self.travel_offer_toggle();
+                        } else if fields_free
+                            && self.debug.screen_content() == Some(ViewContent::PlanetView)
+                        {
+                            // Planet content keeps T = Top preset.
                             let radius = self.debug.viewer.radius;
                             snap_global_camera(&mut self.camera, GlobalPreset::Top, radius);
                             self.update_hover();
@@ -4496,10 +4684,10 @@ impl ViewerApp {
                         }
                     }
                     PhysicalKey::Code(KeyCode::Home) => {
-                        // Top-down snap toggle (universe-maps-3d): map
-                        // screens only. First press frames the classic
-                        // 2D read (north up, east right); second press
-                        // restores the previous tilt.
+                        // Top-down snap toggle: map content only. First
+                        // press frames the classic 2D read (north up,
+                        // east right); second press restores the
+                        // previous tilt.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
@@ -4507,10 +4695,11 @@ impl ViewerApp {
                                 && !self.debug.galaxy.seed_field.focused
                         };
                         if fields_free {
-                            if self.debug.main_screen == MainScreen::GalaxyMap {
+                            let content = self.debug.screen_content();
+                            if content == Some(ViewContent::GalaxyMap) {
                                 self.debug.galaxy.camera.toggle_top_down();
                                 self.debug.fx.notify("Top-down · [Home] tilt".to_owned());
-                            } else if self.debug.main_screen == MainScreen::SystemMap {
+                            } else if content == Some(ViewContent::SystemMap) {
                                 self.debug.system.camera.toggle_top_down();
                                 self.debug.fx.notify("Top-down · [Home] tilt".to_owned());
                             }
@@ -4523,7 +4712,7 @@ impl ViewerApp {
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.galaxy.seed_field.focused
-                            && self.debug.main_screen == MainScreen::PlanetView
+                            && self.debug.screen_content() == Some(ViewContent::PlanetView)
                         {
                             let preset = match physical_key {
                                 PhysicalKey::Code(KeyCode::KeyB) => GlobalPreset::Bottom,
@@ -4562,99 +4751,223 @@ impl ViewerApp {
         }
     }
 
-    /// Tools-window events (FPS / Console / Inspector tabs).
-    fn tools_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
-        match event {
-            WindowEvent::CloseRequested => {
-                // Hide the tools window; F4 on the viewer window reopens it.
-                self.tools = None;
+    /// Fire a Settings Controls row action (parity: the row is the
+    /// button for the action's key). Discrete actions perform
+    /// immediately; walk actions arm hold-to-press until mouse
+    /// release (see the `MouseInput` release path).
+    fn fire_action(&mut self, action: Action) {
+        match action {
+            Action::ToggleLeftDock => self.debug.toggle_left_dock(),
+            Action::ToggleRightDock => self.debug.toggle_right_dock(),
+            Action::ToggleDevWidget => self.debug.toggle_widget(),
+            Action::ShowWidgetFps => self.debug.select_widget_tab(WidgetTab::Fps),
+            Action::ShowWidgetConsole => self.debug.select_widget_tab(WidgetTab::Console),
+            Action::ShowWidgetInspector => self.debug.select_widget_tab(WidgetTab::Inspector),
+            Action::UnwindUi => {
+                self.debug.esc_unwind();
             }
-            WindowEvent::Resized(_) => {
-                if let Some(ctx) = self.tools.as_mut() {
-                    ctx.recreate_swapchain = true;
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(ctx) = self.tools.as_mut() {
-                    ctx.last_cursor = Some((position.x as f32, position.y as f32));
-                }
-            }
-            WindowEvent::MouseInput { button, state, .. } => {
-                if button != MouseButton::Left || state != ElementState::Pressed {
-                    return;
-                }
-                let cursor = self.tools.as_ref().and_then(|ctx| ctx.last_cursor);
-                let Some((cx, cy)) = cursor else {
-                    return;
-                };
-                let ctx = self.tools.as_ref().expect("tools window must exist");
-                let (w, h) = ctx.size();
-                let layout = ui::layout_full(w, h);
-                for (i, screen) in ToolsScreen::ALL.iter().enumerate() {
-                    if ui::nav_button(layout.nav, i).contains(cx, cy) {
-                        self.debug.select_tools(*screen);
-                        return;
-                    }
-                }
-                if self.debug.tools_screen == ToolsScreen::Scale && layout.viewport.contains(cx, cy)
-                {
-                    for (index, waypoint) in
-                        game_engine::waypoints::WaypointId::ALL.iter().enumerate()
-                    {
-                        if scale_dimension_rect(layout.viewport, index).contains(cx, cy) {
-                            self.debug.scale.select(Some(*waypoint));
-                            return;
-                        }
-                    }
-                }
-                if self.debug.tools_screen == ToolsScreen::Dimensions
-                    && layout.viewport.contains(cx, cy)
-                {
-                    for (index, tab) in DimensionTab::ALL.iter().enumerate() {
-                        if dimension_tab_rect(layout.viewport, index).contains(cx, cy) {
-                            self.debug.dimensions.select(*tab);
-                            return;
-                        }
-                    }
+            Action::NavGameDemo => self.debug.select_screen(Screen::GameDemo),
+            Action::NavDimensions => self.debug.toggle_dropdown(),
+            Action::NavSettings => self.debug.select_screen(Screen::Settings),
+            Action::SelectDimension(i) => {
+                if let Some(&waypoint) = DROPDOWN_ORDER.get(i) {
+                    self.debug.select_screen(Screen::Dimensions(waypoint));
                 }
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key,
-                        state,
-                        ..
-                    },
-                ..
-            } => {
-                if state != ElementState::Pressed {
-                    return;
-                }
-                match physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
-                    PhysicalKey::Code(KeyCode::Digit1) => {
-                        self.debug.select_tools_by_digit(1);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit2) => {
-                        self.debug.select_tools_by_digit(2);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit3) => {
-                        self.debug.select_tools_by_digit(3);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit4) => {
-                        self.debug.select_tools_by_digit(4);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit5) => {
-                        self.debug.select_tools_by_digit(5);
-                    }
-                    PhysicalKey::Code(KeyCode::Digit6) => {
-                        self.debug.select_tools_by_digit(6);
-                    }
-                    _ => {}
+            Action::WalkNorth => self.hold_walk(WalkDir::North),
+            Action::WalkSouth => self.hold_walk(WalkDir::South),
+            Action::WalkWest => self.hold_walk(WalkDir::West),
+            Action::WalkEast => self.hold_walk(WalkDir::East),
+            Action::PlayerToggle => {
+                self.debug.viewer.player.toggle();
+                self.update_hover();
+            }
+            Action::CameraCycle => {
+                if self.debug.viewer.player.active {
+                    self.debug.viewer.player.cycle_camera();
                 }
             }
-            WindowEvent::RedrawRequested => self.draw_tools(),
-            _ => {}
+            Action::PresetPerspective => {
+                self.snap_preset(GlobalPreset::Perspective);
+            }
+            Action::PresetTop => self.snap_preset(GlobalPreset::Top),
+            Action::PresetBottom => self.snap_preset(GlobalPreset::Bottom),
+            Action::PresetRight => self.snap_preset(GlobalPreset::Right),
+            Action::RerollSeed => {
+                if self.debug.screen_content() == Some(ViewContent::GalaxyMap) {
+                    self.load_galaxy_seed(self.debug.galaxy.seed + 1);
+                }
+            }
+            Action::TopDownSnap => {
+                let content = self.debug.screen_content();
+                if content == Some(ViewContent::GalaxyMap) {
+                    self.debug.galaxy.camera.toggle_top_down();
+                } else if content == Some(ViewContent::SystemMap) {
+                    self.debug.system.camera.toggle_top_down();
+                }
+            }
+            Action::TwilightCycle => {
+                self.twilight_stage = (self.twilight_stage + 1) % 4;
+            }
+            Action::ShaderMode(i) => {
+                if let Some(&mode) = DebugMode::ALL.get(i) {
+                    self.debug.viewer.debug_mode = mode;
+                }
+            }
+            Action::TravelOffer => self.travel_offer_toggle(),
+            Action::TravelBegin => self.travel_begin(),
+            Action::AscendLayer => self.ascend_layer(),
+            Action::FocusToggle => self.focus_toggle(),
+            Action::ConfirmField => self.confirm_focused_field(),
+        }
+    }
+
+    /// Arm a mouse-held walk direction (player must be active; the
+    /// release path clears it).
+    fn hold_walk(&mut self, dir: WalkDir) {
+        if !self.debug.viewer.player.active {
+            return;
+        }
+        self.mouse_walk = Some(dir);
+        let viewer = &mut self.debug.viewer;
+        let mut keys = viewer.player.keys();
+        match dir {
+            WalkDir::North => keys.north = true,
+            WalkDir::South => keys.south = true,
+            WalkDir::West => keys.west = true,
+            WalkDir::East => keys.east = true,
+        }
+        viewer.player.set_keys(keys);
+    }
+
+    /// Snap the free orbit camera (planet content only).
+    fn snap_preset(&mut self, preset: GlobalPreset) {
+        if self.debug.screen_content() == Some(ViewContent::PlanetView) {
+            let radius = self.debug.viewer.radius;
+            snap_global_camera(&mut self.camera, preset, radius);
+            self.update_hover();
+        }
+    }
+
+    /// Confirm the focused field (Enter parity): the seed field loads
+    /// the typed universe, planet fields just unfocus.
+    fn confirm_focused_field(&mut self) {
+        if self.debug.galaxy.seed_field.focused {
+            match self.debug.galaxy.seed_field.text.parse::<u64>() {
+                Ok(seed) => self.load_galaxy_seed(seed),
+                Err(_) => self.debug.fx.notify(format!(
+                    "Invalid seed '{}'",
+                    self.debug.galaxy.seed_field.text
+                )),
+            }
+            self.debug.galaxy.seed_field.focused = false;
+        } else {
+            let viewer = &mut self.debug.viewer;
+            viewer.subdiv_field.focused = false;
+            viewer.radius_field.focused = false;
+        }
+    }
+
+    /// Travel offer arm/withdraw + transit cancel (system content).
+    fn travel_offer_toggle(&mut self) {
+        if self.debug.screen_content() != Some(ViewContent::SystemMap) {
+            return;
+        }
+        let had_transit = self.debug.system.transit.is_some();
+        let selected = self.debug.system.selected;
+        self.debug.system.travel_offer = match (self.debug.system.travel_offer, selected) {
+            (Some(_), _) => None,
+            (None, Some(i)) => Some(i),
+            (None, None) => None,
+        };
+        match (self.debug.system.travel_offer, had_transit) {
+            (Some(i), _) => self
+                .debug
+                .fx
+                .notify(format!("Travel offer: planet {i} · [E] begin transit")),
+            (None, true) => {
+                self.debug.system.transit = None;
+                self.transit_acc = 0.0;
+                self.debug.fx.notify("Transit cancelled".to_owned());
+            }
+            (None, false) => self.debug.fx.notify("Travel offer withdrawn".to_owned()),
+        }
+    }
+
+    /// Begin the transit countdown on the armed travel offer.
+    fn travel_begin(&mut self) {
+        if self.debug.screen_content() != Some(ViewContent::SystemMap) {
+            return;
+        }
+        if self.debug.journey.active_layer() != Layer::System {
+            self.debug
+                .fx
+                .notify("Journey out of sync — re-enter via galaxy [E]".to_owned());
+            return;
+        }
+        if let Some(i) = self.debug.system.travel_offer {
+            if self.debug.system.transit.is_none() {
+                let star = self.debug.system.system.id.star_index();
+                self.debug.system.transit = Some(Transit::begin(star, i));
+                self.transit_acc = 0.0;
+                let orbit = self
+                    .debug
+                    .system
+                    .system
+                    .planets
+                    .get(i as usize)
+                    .map(|p| p.orbit_radius_au)
+                    .unwrap_or(0.0);
+                let cost = plan_cost(orbit);
+                self.debug.fx.notify(format!(
+                    "Transit underway → planet {i} · fuel {:.1} (deferred)",
+                    cost.fuel
+                ));
+            }
+        } else {
+            self.debug
+                .fx
+                .notify("Arm a travel offer first [T]".to_owned());
+        }
+    }
+
+    /// Back one journey layer (map content); an underway transit
+    /// cancels first.
+    fn ascend_layer(&mut self) {
+        if !matches!(
+            self.debug.screen_content(),
+            Some(ViewContent::GalaxyMap | ViewContent::SystemMap)
+        ) {
+            return;
+        }
+        if self.debug.system.transit.is_some() {
+            self.debug.system.transit = None;
+            self.transit_acc = 0.0;
+            self.debug.fx.notify("Transit cancelled".to_owned());
+        }
+        let _fx = self.debug.journey.update(JourneyEvent::Ascend);
+        if self.debug.journey.active_layer() == Layer::Galaxy {
+            self.debug
+                .select_screen(Screen::Dimensions(WaypointId::MilkyWay));
+            self.debug.fx.trigger_fade();
+            self.debug.fx.notify("Galaxy map".to_owned());
+        }
+    }
+
+    /// L4 planet-focus toggle (system content) + journey mirror.
+    fn focus_toggle(&mut self) {
+        if self.debug.screen_content() != Some(ViewContent::SystemMap) {
+            return;
+        }
+        self.debug.system.toggle_focus();
+        let focus = self.debug.system.focus;
+        self.debug.journey.update(JourneyEvent::FocusPlanet(focus));
+        match focus {
+            Some(i) => self
+                .debug
+                .fx
+                .notify(format!("Focus planet {i} · [F] unfocus")),
+            None => self.debug.fx.notify("Focus cleared".to_owned()),
         }
     }
 }
@@ -4670,10 +4983,12 @@ impl ViewerApp {
             .unwrap_or(0.0)
             .clamp(0.0, 0.25);
         self.last_frame = Some(now);
-        // Transit countdown (UMAP-018): fixed-step accumulation of the
+        // Transit countdown: fixed-step accumulation of the
         // frame dt into sim ticks. Commit fires journey EnterOrbit at
-        // duration; the arrival view lands in UMAP-020.
-        if self.debug.main_screen == MainScreen::SystemMap && self.debug.system.transit.is_some() {
+        // duration; the arrival view lands bound to Earth.
+        if self.debug.screen_content() == Some(ViewContent::SystemMap)
+            && self.debug.system.transit.is_some()
+        {
             self.transit_acc += dt;
             while self.transit_acc >= SIM_DT_SECS {
                 self.transit_acc -= SIM_DT_SECS;
@@ -4707,13 +5022,14 @@ impl ViewerApp {
                         .fx
                         .notify("Arrival failed: journey left Orbit".to_owned());
                 } else if let Some(arrival) = arrival_for(&self.debug.system.system, planet) {
-                    // UMAP-020: bind the orbit view to the target
-                    // descriptor — the viewer rebuilds at descriptor
-                    // radius with the atmosphere tint; the mesh seed
-                    // rides the held SeededPlanet into M2/M3.
+                    // Bind the orbit view to the target descriptor —
+                    // the viewer rebuilds at descriptor radius with the
+                    // atmosphere tint; the mesh seed rides the held
+                    // SeededPlanet into M2/M3.
                     let radius = self.debug.arrive(arrival);
                     self.refresh_mesh();
-                    self.debug.select_main(MainScreen::PlanetView);
+                    self.debug
+                        .select_screen(Screen::Dimensions(WaypointId::Earth));
                     self.debug.fx.trigger_fade();
                     let bound = self.debug.viewer.arrival.as_ref().expect("just bound");
                     self.debug.fx.notify(format!(
@@ -4777,69 +5093,97 @@ impl ViewerApp {
             }
         }
 
-        let layout = app_layout(self.debug.main_screen, win_w, win_h);
+        let layout = app_layout(self.debug.chrome, win_w, win_h);
         let player_active = self.debug.viewer.player.active;
+        let content = self.debug.screen_content();
 
         // Build frame UI (atlas insertions happen here) and sync the GPU
-        // atlas before recording.
-        let mut items = match self.debug.main_screen {
-            MainScreen::PlanetView => {
+        // atlas before recording. The top bar + docks render inside the
+        // content builders; overlay chrome (strip, corner, widget)
+        // composes on top so it floats over every tab.
+        let mut items = match self.debug.screen {
+            Screen::GameDemo => {
+                let mut demo = UiItems::default();
+                build_topbar(&mut demo, self.atlas.line_height(), &self.debug, layout);
+                match content {
+                    Some(ViewContent::PlanetView) => {
+                        let sky_summary = self.sky.summary();
+                        let mut inner =
+                            build_planet_ui(&mut self.atlas, &self.debug, &sky_summary, layout);
+                        demo.solids.append(&mut inner.solids);
+                        demo.tris.append(&mut inner.tris);
+                        demo.texts.append(&mut inner.texts);
+                    }
+                    Some(ViewContent::GalaxyMap) => {
+                        let mut inner = build_galaxy_ui(&mut self.atlas, &self.debug, layout);
+                        demo.solids.append(&mut inner.solids);
+                        demo.tris.append(&mut inner.tris);
+                        demo.texts.append(&mut inner.texts);
+                    }
+                    Some(ViewContent::SystemMap) => {
+                        let mut inner = build_system_ui(&mut self.atlas, &self.debug, layout);
+                        demo.solids.append(&mut inner.solids);
+                        demo.tris.append(&mut inner.tris);
+                        demo.texts.append(&mut inner.texts);
+                    }
+                    None => {}
+                }
+                build_demo_ui(
+                    &mut demo,
+                    self.atlas.line_height(),
+                    &self.debug,
+                    layout.viewport,
+                );
+                demo
+            }
+            Screen::Dimensions(WaypointId::MilkyWay) => {
+                build_galaxy_ui(&mut self.atlas, &self.debug, layout)
+            }
+            Screen::Dimensions(WaypointId::SolarSystem) => {
+                build_system_ui(&mut self.atlas, &self.debug, layout)
+            }
+            Screen::Dimensions(WaypointId::Earth) => {
                 let sky_summary = self.sky.summary();
-                build_planet_ui(&mut self.atlas, &self.debug.viewer, &sky_summary, layout)
+                build_planet_ui(&mut self.atlas, &self.debug, &sky_summary, layout)
             }
-            MainScreen::GalaxyMap => build_galaxy_ui(&mut self.atlas, &self.debug.galaxy, layout),
-            MainScreen::SystemMap => build_system_ui(
-                &mut self.atlas,
-                &self.debug.system,
-                &self.debug.journey,
-                layout,
-            ),
+            Screen::Dimensions(waypoint) => {
+                let mut items = UiItems::default();
+                build_topbar(&mut items, self.atlas.line_height(), &self.debug, layout);
+                build_placeholder_ui(
+                    &mut items,
+                    self.atlas.line_height(),
+                    &self.debug,
+                    waypoint,
+                    layout.viewport,
+                );
+                items
+            }
+            Screen::Settings => {
+                let mut items = UiItems::default();
+                build_topbar(&mut items, self.atlas.line_height(), &self.debug, layout);
+                build_settings_ui(&mut items, self.atlas.line_height(), layout.viewport);
+                items
+            }
         };
-        // Player dot: the walker projected through the main-view matrices
-        // (planet screen only).
-        if player_active && self.debug.main_screen == MainScreen::PlanetView {
-            let player = &self.debug.viewer.player;
-            let vp = layout.viewport;
-            let main_vp = player.projection_matrix(vp.w / vp.h) * player.view_matrix();
-            // Facing tip sized to a readable pixel length (eye-distance
-            // proportional, then clamped).
-            if let Some(origin) = world_to_pixels(main_vp, player.position(), vp) {
-                let tip = world_to_pixels(main_vp, sphere_tip_world(player, player.position()), vp);
-                draw_player_marker(&mut items, origin, tip);
-            }
-        }
-        // Transition fade + notice banner (UMAP-017): a fullscreen black
-        // ramp over the fresh layer, then a banner pill top-center of
-        // the viewport. Both ride the UI pass (alpha-blended).
-        let fade = self.debug.fx.fade_alpha();
-        if fade > 0.0 {
-            items.solid(
-                Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: win_w,
-                    h: win_h,
-                },
-                [0.0, 0.0, 0.0, fade],
-            );
-        }
-        if let Some(text) = self.debug.fx.notice_text() {
-            let lh = self.atlas.line_height();
-            let vp = layout.viewport;
-            let pill_w = (text.len() as f32 * 8.0 + 24.0).min(vp.w).max(0.0);
-            let pill = Rect {
-                x: vp.x + (vp.w - pill_w) * 0.5,
-                y: vp.y + 10.0,
-                w: pill_w,
-                h: lh + 10.0,
-            };
-            items.solid(pill, [0.05, 0.06, 0.10, 0.92]);
-            items.text(text.to_owned(), pill.x + 12.0, pill.y + lh - 2.0, C_TEXT);
-        }
-        self.sync_atlas(WindowKind::Main);
+        // Overlay chrome over every tab (the corner strip rides
+        // inside the top bar). The dropdown gets its own buffer, drawn
+        // after all other UI — see `compose_overlay_ui`.
+        let cursor = self.main.as_ref().and_then(|ctx| ctx.last_cursor);
+        let mut drop_items = UiItems::default();
+        compose_overlay_ui(
+            &mut items,
+            &mut drop_items,
+            &mut self.atlas,
+            &self.debug,
+            layout,
+            (win_w, win_h),
+            cursor,
+        );
+        self.sync_atlas();
         let ui_verts = ui_items_to_vertices(&items, &mut self.atlas);
+        let drop_verts = ui_items_to_vertices(&drop_items, &mut self.atlas);
         assert!(
-            ui_verts.len() as u64 <= MAX_UI_VERTS,
+            ui_verts.len() as u64 + drop_verts.len() as u64 <= MAX_UI_VERTS,
             "ui vertex budget exceeded"
         );
         // Fresh upload per frame (same pattern as the mesh uploads): the
@@ -4859,6 +5203,29 @@ impl ViewerApp {
             ui_verts.iter().copied(),
         )
         .expect("ui vertex buffer upload must succeed");
+        // No upload while the menu is closed (zero-vertex buffers
+        // are not valid vertex sources).
+        let drop_buffer = if drop_verts.is_empty() {
+            None
+        } else {
+            Some(
+                Buffer::from_iter(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    drop_verts.iter().copied(),
+                )
+                .expect("dropdown vertex buffer upload must succeed"),
+            )
+        };
+        let drop_solid_count = (drop_items.solids.len() * 6) as u32;
 
         let ctx = self.main.as_mut().expect("main window must exist");
         let (image_index, suboptimal, acquire_future) =
@@ -4909,10 +5276,11 @@ impl ViewerApp {
             .expect("render pass must begin");
 
         {
-            // Single view: the active screen fills the main viewport.
-            // The viewport transform clips output to the rect, so no
+            // Single view: the active content fills the viewport (flat
+            // tabs skip the 3D pass — `content` is `None` there). The
+            // viewport transform clips output to the rect, so no
             // scissor state is needed.
-            let views = [(layout.viewport, self.debug.main_screen)];
+            let views = [(layout.viewport, content)];
             let mode = self.debug.viewer.debug_mode.index() as f32;
             let density = self.debug.viewer.checker_density as f32;
             let highlight = if self.debug.viewer.pentagons {
@@ -4937,12 +5305,13 @@ impl ViewerApp {
                 if vp.w < 1.0 || vp.h < 1.0 {
                     continue;
                 }
+                let Some(view) = view else { continue };
                 let viewport = Viewport {
                     offset: [vp.x, vp.y],
                     extent: [vp.w, vp.h],
                     depth_range: 0.0..=1.0,
                 };
-                if view == MainScreen::GalaxyMap {
+                if view == ViewContent::GalaxyMap {
                     // Galaxy map: one static point buffer (backdrop +
                     // impostors + stars); orbit/pan/zoom ride the
                     // view-projection push.
@@ -4971,7 +5340,7 @@ impl ViewerApp {
                     // no index buffer is bound for this `PointList` draw.
                     unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
                         .expect("map draw must record");
-                } else if view == MainScreen::SystemMap {
+                } else if view == ViewContent::SystemMap {
                     // System map: orbit rings through the line pipeline,
                     // star + planets through the map point pipeline — both
                     // under the perspective view-projection, rings first.
@@ -5014,7 +5383,7 @@ impl ViewerApp {
                     // SAFETY: same contract as the galaxy map draw.
                     unsafe { builder.draw(self.system_points.len() as u32, 1, 0, 0) }
                         .expect("system points draw must record");
-                } else if view == MainScreen::PlanetView {
+                } else if view == ViewContent::PlanetView {
                     let aspect = vp.w / vp.h;
                     // Player mode renders the planet through the player
                     // camera.
@@ -5196,349 +5565,47 @@ impl ViewerApp {
             unsafe { builder.draw(text_count, 1, solid_count, 0) }
                 .expect("ui text draw must record");
         }
+        // Dropdown menu: own buffer, drawn after every other UI surface
+        // with the same pipeline so it is topmost by command order.
+        if let Some(drop_buffer) = drop_buffer {
+            let drop_text_count = (drop_verts.len() as u32).saturating_sub(drop_solid_count);
+            builder
+                .bind_vertex_buffers(0, drop_buffer.clone())
+                .expect("dropdown buffer must bind")
+                .push_constants(
+                    ctx.pipelines.ui.layout().clone(),
+                    0,
+                    UiPush {
+                        ortho,
+                        use_tex: 0.0,
+                    },
+                )
+                .expect("ui push constants must upload");
+            if drop_solid_count > 0 {
+                unsafe { builder.draw(drop_solid_count, 1, 0, 0) }
+                    .expect("dropdown solids draw must record");
+            }
+            builder
+                .push_constants(
+                    ctx.pipelines.ui.layout().clone(),
+                    0,
+                    UiPush {
+                        ortho,
+                        use_tex: 1.0,
+                    },
+                )
+                .expect("ui push constants must upload");
+            if drop_text_count > 0 {
+                unsafe { builder.draw(drop_text_count, 1, drop_solid_count, 0) }
+                    .expect("dropdown text draw must record");
+            }
+        }
         builder
             .end_render_pass(Default::default())
             .expect("render pass must end");
         let command_buffer = builder.build().expect("command buffer must build");
 
         let ctx = self.main.as_mut().expect("main window must exist");
-        let future = ctx
-            .previous_frame_end
-            .take()
-            .expect("frame future")
-            .join(acquire_future)
-            .then_execute(self.queue.clone(), command_buffer)
-            .expect("command buffer must submit")
-            .then_swapchain_present(
-                self.queue.clone(),
-                SwapchainPresentInfo::swapchain_image_index(ctx.swapchain.clone(), image_index),
-            )
-            .then_signal_fence_and_flush();
-        match future.map_err(Validated::unwrap) {
-            Ok(future) => ctx.previous_frame_end = Some(future.boxed()),
-            Err(VulkanError::OutOfDate) => {
-                ctx.recreate_swapchain = true;
-                ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
-            }
-            Err(error) => panic!("frame flush failed: {error}"),
-        }
-    }
-
-    /// Draw the tools window: tab UI only (no 3D scene).
-    fn draw_tools(&mut self) {
-        let (win_w, win_h) = match self.tools.as_ref() {
-            Some(ctx) => ctx.size(),
-            None => return,
-        };
-        if win_w < 1.0 || win_h < 1.0 {
-            return;
-        }
-        {
-            let ctx = self.tools.as_mut().expect("tools window must exist");
-            ctx.previous_frame_end
-                .as_mut()
-                .expect("frame future")
-                .cleanup_finished();
-            if ctx.recreate_swapchain {
-                let window_size = ctx.window.inner_size();
-                let (new_swapchain, new_images) = ctx
-                    .swapchain
-                    .recreate(SwapchainCreateInfo {
-                        image_extent: window_size.into(),
-                        ..ctx.swapchain.create_info()
-                    })
-                    .expect("swapchain recreation must succeed");
-                ctx.swapchain = new_swapchain;
-                ctx.depth_view =
-                    create_depth_view(&self.memory_allocator, ctx.swapchain.image_extent());
-                ctx.framebuffers =
-                    window_size_dependent_setup(&new_images, &ctx.render_pass, &ctx.depth_view);
-                ctx.recreate_swapchain = false;
-            }
-        }
-
-        let layout = ui::layout_full(win_w, win_h);
-        // Build frame UI (atlas insertions happen here) and sync the GPU
-        // atlas before recording.
-        let items = build_tools_ui(&mut self.atlas, &self.debug, layout);
-        self.sync_atlas(WindowKind::Tools);
-        let ui_verts = ui_items_to_vertices(&items, &mut self.atlas);
-        assert!(
-            ui_verts.len() as u64 <= MAX_UI_VERTS,
-            "ui vertex budget exceeded"
-        );
-        // Fresh upload per frame (same pattern as the mesh uploads): the
-        // frame's command buffer may still be in flight next frame, so a
-        // persistent mapped buffer would hit access conflicts.
-        let ui_buffer = Buffer::from_iter(
-            self.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            ui_verts.iter().copied(),
-        )
-        .expect("ui vertex buffer upload must succeed");
-
-        let ctx = self.tools.as_mut().expect("tools window must exist");
-        let (image_index, suboptimal, acquire_future) =
-            match acquire_next_image(ctx.swapchain.clone(), None).map_err(Validated::unwrap) {
-                Ok(r) => r,
-                Err(VulkanError::OutOfDate) => {
-                    ctx.recreate_swapchain = true;
-                    return;
-                }
-                Err(error) => panic!("swapchain acquire failed: {error}"),
-            };
-        if suboptimal {
-            ctx.recreate_swapchain = true;
-        }
-
-        let mut builder = AutoCommandBufferBuilder::primary(
-            self.command_buffer_allocator.clone(),
-            self.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .expect("command buffer builder must create");
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![
-                        Some([0.02, 0.03, 0.08, 1.0].into()),
-                        Some(ClearValue::Depth(1.0)),
-                    ],
-                    ..RenderPassBeginInfo::framebuffer(
-                        ctx.framebuffers[image_index as usize].clone(),
-                    )
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .expect("render pass must begin");
-
-        if self.debug.tools_screen == ToolsScreen::Dimensions {
-            let vp = layout.viewport;
-            let viewport = Viewport {
-                offset: [vp.x, vp.y],
-                extent: [vp.w, vp.h],
-                depth_range: 0.0..=1.0,
-            };
-            let tab = self.debug.dimensions.tab;
-            let mvp = match tab {
-                DimensionTab::Orbit => {
-                    self.camera.projection_matrix(vp.w / vp.h) * self.camera.view_matrix()
-                }
-                DimensionTab::Universe | DimensionTab::Galactic => {
-                    self.debug.galaxy.camera.view_proj(vp.w / vp.h)
-                }
-                DimensionTab::System => self.debug.system.camera.view_proj(vp.w / vp.h),
-                DimensionTab::Planetary => {
-                    dimensions::planetary_camera(&self.debug.system).view_proj(vp.w / vp.h)
-                }
-                DimensionTab::Connections => MapOrbitCamera::new(
-                    Vec3::ZERO,
-                    12.0,
-                    DEFAULT_YAW,
-                    DEFAULT_PITCH,
-                    1.0,
-                    30.0,
-                    8.0,
-                )
-                .view_proj(vp.w / vp.h),
-            }
-            .to_cols_array_2d();
-            builder
-                .set_viewport(0, [viewport].into_iter().collect())
-                .expect("dimension viewport must set");
-            match tab {
-                DimensionTab::Universe | DimensionTab::Galactic => {
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
-                        .expect("map pipeline must bind")
-                        .bind_vertex_buffers(0, self.map_vertices.clone())
-                        .expect("map buffer must bind")
-                        .push_constants(
-                            ctx.pipelines.map.layout().clone(),
-                            0,
-                            MapPush {
-                                mvp,
-                                px_scale: self.debug.galaxy.camera.px_scale(vp.h),
-                                exposure: if tab == DimensionTab::Universe {
-                                    0.35
-                                } else {
-                                    1.0
-                                },
-                            },
-                        )
-                        .expect("map constants must upload");
-                    unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
-                        .expect("dimension map draw must record");
-                }
-                DimensionTab::System | DimensionTab::Planetary => {
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
-                        .expect("line pipeline must bind")
-                        .bind_vertex_buffers(0, self.system_lines.clone())
-                        .expect("system lines must bind")
-                        .push_constants(
-                            ctx.pipelines.line.layout().clone(),
-                            0,
-                            LinePush { mvp, inflate: 0.0 },
-                        )
-                        .expect("line constants must upload");
-                    unsafe { builder.draw(self.system_lines.len() as u32, 1, 0, 0) }
-                        .expect("dimension rings draw must record");
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
-                        .expect("map pipeline must bind")
-                        .bind_vertex_buffers(0, self.system_points.clone())
-                        .expect("system points must bind")
-                        .push_constants(
-                            ctx.pipelines.map.layout().clone(),
-                            0,
-                            MapPush {
-                                mvp,
-                                px_scale: self.debug.system.camera.px_scale(vp.h),
-                                exposure: 1.0,
-                            },
-                        )
-                        .expect("system constants must upload");
-                    unsafe { builder.draw(self.system_points.len() as u32, 1, 0, 0) }
-                        .expect("dimension system draw must record");
-                }
-                DimensionTab::Orbit => {
-                    let viewer = &self.debug.viewer;
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.fill.clone())
-                        .expect("fill pipeline must bind")
-                        .bind_vertex_buffers(0, self.fill_vertices.clone())
-                        .expect("fill buffer must bind")
-                        .bind_index_buffer(self.fill_indices.clone())
-                        .expect("fill index buffer must bind")
-                        .push_constants(
-                            ctx.pipelines.fill.layout().clone(),
-                            0,
-                            FillPush {
-                                mvp,
-                                tint_rgb: viewer
-                                    .arrival
-                                    .as_ref()
-                                    .map(|a| a.atmosphere.color)
-                                    .unwrap_or([0.0, 0.0, 0.0]),
-                                use_tint: f32::from(viewer.arrival.is_some()),
-                                highlight: 0.0,
-                                mode: viewer.debug_mode.index() as f32,
-                                density: viewer.checker_density as f32,
-                                seams_on: f32::from(viewer.seams),
-                                hover_cell: -1.0,
-                                pin_cell: -1.0,
-                            },
-                        )
-                        .expect("dimension fill constants must upload");
-                    unsafe { builder.draw_indexed(self.fill_indices.len() as u32, 1, 0, 0, 0) }
-                        .expect("dimension orbit draw must record");
-                }
-                DimensionTab::Connections => {
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
-                        .expect("line pipeline must bind")
-                        .bind_vertex_buffers(0, self.dimension_lines.clone())
-                        .expect("dimension lines must bind")
-                        .push_constants(
-                            ctx.pipelines.line.layout().clone(),
-                            0,
-                            LinePush { mvp, inflate: 0.0 },
-                        )
-                        .expect("graph line constants must upload");
-                    unsafe { builder.draw(self.dimension_lines.len() as u32, 1, 0, 0) }
-                        .expect("graph lines draw must record");
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
-                        .expect("map pipeline must bind")
-                        .bind_vertex_buffers(0, self.dimension_points.clone())
-                        .expect("dimension points must bind")
-                        .push_constants(
-                            ctx.pipelines.map.layout().clone(),
-                            0,
-                            MapPush {
-                                mvp,
-                                px_scale: 1.0,
-                                exposure: 1.0,
-                            },
-                        )
-                        .expect("graph point constants must upload");
-                    unsafe { builder.draw(self.dimension_points.len() as u32, 1, 0, 0) }
-                        .expect("graph points draw must record");
-                }
-            }
-        }
-
-        // UI pass: full-window viewport, solids untextured, then text.
-        let ui_viewport = Viewport {
-            offset: [0.0, 0.0],
-            extent: [win_w, win_h],
-            depth_range: 0.0..=1.0,
-        };
-        let ortho = ortho_matrix(win_w, win_h);
-        let solid_count = (items.solids.len() * 6) as u32;
-        let text_count = (ui_verts.len() as u32).saturating_sub(solid_count);
-        builder
-            .set_viewport(0, [ui_viewport].into_iter().collect())
-            .expect("viewport must set")
-            .bind_pipeline_graphics(ctx.pipelines.ui.clone())
-            .expect("pipeline must bind")
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                ctx.pipelines.ui.layout().clone(),
-                0,
-                ctx.atlas_set.clone().expect("atlas set must exist"),
-            )
-            .expect("descriptor set must bind")
-            .bind_vertex_buffers(0, ui_buffer.clone())
-            .expect("vertex buffer must bind")
-            .push_constants(
-                ctx.pipelines.ui.layout().clone(),
-                0,
-                UiPush {
-                    ortho,
-                    use_tex: 0.0,
-                },
-            )
-            .expect("ui push constants must upload");
-        if solid_count > 0 {
-            // SAFETY: solids are the first `solid_count` vertices of the
-            // uploaded UI buffer (see `ui_items_to_vertices` ordering).
-            unsafe { builder.draw(solid_count, 1, 0, 0) }.expect("ui solids draw must record");
-        }
-        builder
-            .push_constants(
-                ctx.pipelines.ui.layout().clone(),
-                0,
-                UiPush {
-                    ortho,
-                    use_tex: 1.0,
-                },
-            )
-            .expect("ui push constants must upload");
-        if text_count > 0 {
-            // SAFETY: text quads follow the solids in the uploaded UI
-            // buffer; `solid_count + text_count` is the uploaded length.
-            unsafe { builder.draw(text_count, 1, solid_count, 0) }
-                .expect("ui text draw must record");
-        }
-        builder
-            .end_render_pass(Default::default())
-            .expect("render pass must end");
-        let command_buffer = builder.build().expect("command buffer must build");
-
-        let ctx = self.tools.as_mut().expect("tools window must exist");
         let future = ctx
             .previous_frame_end
             .take()
@@ -5786,8 +5853,9 @@ mod tests {
     #[test]
     fn viewer_ui_contains_panel_content() {
         let mut atlas = GlyphAtlas::new(UI_PX);
-        let viewer = PlanetViewerState::new();
-        let layout = ui::layout(1280.0, 720.0);
+        let mut app = DebugApp::new();
+        app.select_screen(Screen::Dimensions(WaypointId::Earth));
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
         let joined = |items: &UiItems| {
             items
                 .texts
@@ -5796,18 +5864,18 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        // Planet screen: presets + planet overlays, nav shows all tabs.
+        // Earth tab: top bar + presets + planet overlays.
         let planet = joined(&build_planet_ui(
             &mut atlas,
-            &viewer,
+            &app,
             &SkySummary::default(),
             layout,
         ));
         assert!(!planet.is_empty());
         for needle in [
-            "Planet View",
-            "Galaxy Map",
-            "System Map",
+            "GAME DEMO",
+            "DIMENSIONS:",
+            "SETTINGS",
             "INPUTS",
             "Subdivisions",
             "Radius",
@@ -5847,12 +5915,14 @@ mod tests {
         ] {
             assert!(!planet.contains(absent), "planet ui leaks {absent}");
         }
-        // Checker mode reveals the density slider on the planet screen.
-        let mut checker_viewer = PlanetViewerState::with_values(1, 1.0);
-        checker_viewer.debug_mode = DebugMode::Checker;
+        // Checker mode reveals the density slider on the planet content.
+        let mut checker_app = DebugApp::with_viewer(PlanetViewerState::with_values(1, 1.0));
+        checker_app.select_screen(Screen::Dimensions(WaypointId::Earth));
+        checker_app.viewer.debug_mode = DebugMode::Checker;
+        let layout = app_layout(checker_app.chrome, 1280.0, 720.0);
         let planet_checker = joined(&build_planet_ui(
             &mut atlas,
-            &checker_viewer,
+            &checker_app,
             &SkySummary::default(),
             layout,
         ));
@@ -6030,8 +6100,10 @@ mod tests {
         });
         let desired = visible_hemisphere(&viewer.mesh, viewer.player.position().to_array());
         viewer.player.update(0.05, &desired);
-        let layout = ui::layout(1280.0, 720.0);
-        let items = build_planet_ui(&mut atlas, &viewer, &SkySummary::default(), layout);
+        let mut app = DebugApp::with_viewer(viewer);
+        app.select_screen(Screen::Dimensions(WaypointId::Earth));
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let items = build_planet_ui(&mut atlas, &app, &SkySummary::default(), layout);
         let joined = items
             .texts
             .iter()
@@ -6044,13 +6116,15 @@ mod tests {
     }
 
     #[test]
-    fn tools_ui_shows_fps_numbers_and_placeholders() {
-        let mut atlas = GlyphAtlas::new(UI_PX);
+    fn unified_chrome_shows_topbar_dropdown_widget_and_settings() {
+        let atlas = GlyphAtlas::new(UI_PX);
         let mut app = DebugApp::new();
         for _ in 0..120 {
             app.fps.record(1.0 / 60.0);
         }
-        let layout = ui::layout_full(1280.0, 720.0);
+        app.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let lh = atlas.line_height();
         let joined = |items: &UiItems| {
             items
                 .texts
@@ -6059,9 +6133,49 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        // FPS tab: live numbers + sparkline label; nav shows all tabs.
-        app.select_tools(ToolsScreen::Fps);
-        let fps_tab = joined(&build_tools_ui(&mut atlas, &app, layout));
+        // Top bar: three items with the live breadcrumb.
+        let mut top = UiItems::default();
+        build_topbar(&mut top, lh, &app, layout);
+        let top = joined(&top);
+        for needle in ["GAME DEMO", "DIMENSIONS: milky-way", "SETTINGS"] {
+            assert!(top.contains(needle), "top bar missing {needle}");
+        }
+        // Dropdown: ten waypoints with digits + active marker. Built by
+        // `draw_main` as the last chrome layer (topmost surface).
+        app.toggle_dropdown();
+        let mut drop_atlas = GlyphAtlas::new(UI_PX);
+        let mut drop = UiItems::default();
+        build_dropdown(&mut drop, &mut drop_atlas, &app, layout.nav, None);
+        // Panel + shadow + 4 border slabs + 9 separators + 1 selected row.
+        assert_eq!(drop.solids.len(), 1 + 1 + 4 + 9 + 1);
+        let drop_text = joined(&drop);
+        for needle in [
+            "cosmic-web",
+            "solar-system",
+            "interior",
+            "active frame",
+            "inactive · last state",
+        ] {
+            assert!(drop_text.contains(needle), "dropdown missing {needle}");
+        }
+        // Hovering a row adds exactly one highlight slab.
+        let panel = ui::dropdown_panel(layout.nav);
+        let row4 = ui::dropdown_row(panel, 4);
+        let before = drop.solids.len();
+        build_dropdown(
+            &mut drop,
+            &mut drop_atlas,
+            &app,
+            layout.nav,
+            Some((row4.x + 5.0, row4.y + 5.0)),
+        );
+        assert_eq!(drop.solids.len() - before, 1 + 1 + 4 + 9 + 1 + 1);
+        app.close_dropdown();
+        // Widget FPS body: live numbers + sparkline label.
+        app.select_widget_tab(WidgetTab::Fps);
+        let mut widget = UiItems::default();
+        build_widget(&mut widget, lh, &app, 1280.0, 720.0);
+        let widget = joined(&widget);
         for needle in [
             "FPS",
             "Console",
@@ -6073,36 +6187,134 @@ mod tests {
             "120",
             "last 120 frames",
         ] {
-            assert!(fps_tab.contains(needle), "fps tab missing {needle}");
+            assert!(widget.contains(needle), "widget fps missing {needle}");
         }
-        // Console / Inspector tabs are placeholders for now.
-        app.select_tools(ToolsScreen::Console);
-        let console = joined(&build_tools_ui(&mut atlas, &app, layout));
-        assert!(console.contains("Console"));
-        assert!(console.contains("not implemented yet"));
-        app.select_tools(ToolsScreen::Inspector);
-        let inspector = joined(&build_tools_ui(&mut atlas, &app, layout));
-        assert!(inspector.contains("Inspector"));
-        assert!(inspector.contains("not implemented yet"));
-        app.select_tools(ToolsScreen::Scale);
-        let scale = joined(&build_tools_ui(&mut atlas, &app, layout));
+        // Widget Console body: the transition-event log feed.
+        app.sync_console();
+        app.select_widget_tab(WidgetTab::Console);
+        let mut widget = UiItems::default();
+        build_widget(&mut widget, lh, &app, 1280.0, 720.0);
+        let console = joined(&widget);
+        assert!(console.contains("solar-system -> neighborhood"));
+        // Widget Inspector body: journey summary.
+        app.select_widget_tab(WidgetTab::Inspector);
+        let mut widget = UiItems::default();
+        build_widget(&mut widget, lh, &app, 1280.0, 720.0);
+        let inspector = joined(&widget);
+        for needle in ["layer:", "waypoint:", "transitions:"] {
+            assert!(inspector.contains(needle), "inspector missing {needle}");
+        }
+        // Corner strip lives inside the top bar: three toggles with
+        // keys + the FPS value on the widget one.
+        let mut strip = UiItems::default();
+        build_corner_strip_in_bar(&mut strip, lh, &app, 1280.0);
+        let strip = joined(&strip);
+        for needle in ["DOCK-L [F9]", "DOCK-R [F10]", "DEV 60 [`]"] {
+            assert!(strip.contains(needle), "corner strip missing {needle}");
+        }
+        // Transition pill: shows the in-flight preview leg…
+        let mut items = UiItems::default();
+        build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
+        let pill = joined(&items);
+        assert!(pill.contains("solar-system → neighborhood"));
+        // …and stays silent with no transition in flight.
+        app.transitions.current = None;
+        let mut items = UiItems::default();
+        build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
+        assert!(items.texts.is_empty());
+        // Settings Controls: every registry action as a labeled row.
+        let mut settings = UiItems::default();
+        build_settings_ui(&mut settings, lh, layout.viewport);
+        let settings = joined(&settings);
         for needle in [
-            "GLOBAL SCALE OVERVIEW",
-            "cosmic-web",
-            "solar-system",
-            "interior",
-            "SOI handoff",
+            "Chrome",
+            "Navigation",
+            "Camera & walk",
+            "Travel",
+            "Toggle left dock [F9]",
+            "Toggle right dock [F10]",
+            "Game Demo tab [F1]",
+            "Cycle twilight stage [F5]",
+            "Arm/withdraw travel [T]",
         ] {
-            assert!(scale.contains(needle), "scale tab missing {needle}");
+            assert!(settings.contains(needle), "settings missing {needle}");
         }
+        // Placeholder tab: badge, never blank.
+        let mut ph = UiItems::default();
+        build_placeholder_ui(&mut ph, lh, &app, WaypointId::CosmicWeb, layout.viewport);
+        let ph = joined(&ph);
+        assert!(ph.contains("cosmic-web"));
+        assert!(ph.contains("INACTIVE"));
+        // Demo tab: HUD lines, no debug data.
+        let mut demo = UiItems::default();
+        build_demo_ui(&mut demo, lh, &app, layout.viewport);
+        let demo = joined(&demo);
+        for needle in ["GAME DEMO", "frame:", "time:", "soi:", "target:"] {
+            assert!(demo.contains(needle), "demo missing {needle}");
+        }
+    }
+
+    #[test]
+    fn overlay_compose_isolates_dropdown_in_own_buffer() {
+        // Regression test for the Settings-screen bleed-through: the
+        // dropdown composes into its own `UiItems` (uploaded + drawn
+        // after all other UI), so no content solid or text can share
+        // its draw or cover it.
+        let mut atlas = GlyphAtlas::new(UI_PX);
+        let mut app = DebugApp::new();
+        app.select_screen(Screen::Settings);
+        app.toggle_dropdown();
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let lh = atlas.line_height();
+        let mut items = UiItems::default();
+        let mut drop = UiItems::default();
+        build_topbar(&mut items, lh, &app, layout);
+        build_settings_ui(&mut items, lh, layout.viewport);
+        compose_overlay_ui(
+            &mut items,
+            &mut drop,
+            &mut atlas,
+            &app,
+            layout,
+            (1280.0, 720.0),
+            None,
+        );
+        // Main buffer keeps the Settings body and zero menu content.
+        assert!(
+            items.texts.iter().any(|run| run.text == "Chrome"),
+            "settings header stays in the main buffer"
+        );
+        assert!(
+            !items.texts.iter().any(|run| run.text == "cosmic-web"),
+            "menu rows must not leak into the main buffer"
+        );
+        assert!(
+            !items
+                .solids
+                .iter()
+                .any(|(rect, _)| *rect == ui::dropdown_panel(layout.nav)),
+            "menu panel must not leak into the main buffer"
+        );
+        // Menu buffer: shadow + panel + 4 border + 9 separators (no row
+        // selected on the Settings screen, no hover without a cursor).
+        let panel = ui::dropdown_panel(layout.nav);
+        assert_eq!(drop.solids.len(), 1 + 1 + 4 + 9);
+        assert_eq!(drop.solids[1].0, panel);
+        // Menu texts: 10 rows x digit/name/status, starting at row 0
+        // (`DROPDOWN_ORDER[0]` = cosmic-web with digit 1).
+        assert_eq!(drop.texts.len(), 10 * 3);
+        assert_eq!(drop.texts[0].text, "1");
+        assert_eq!(drop.texts[1].text, "cosmic-web");
+        assert!(drop.texts.iter().any(|run| run.text == "active frame ●"));
     }
 
     #[test]
     fn ui_vertices_cover_all_items() {
         let mut atlas = GlyphAtlas::new(UI_PX);
-        let viewer = PlanetViewerState::new();
-        let layout = ui::layout(1280.0, 720.0);
-        let items = build_planet_ui(&mut atlas, &viewer, &SkySummary::default(), layout);
+        let mut app = DebugApp::new();
+        app.select_screen(Screen::Dimensions(WaypointId::Earth));
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let items = build_planet_ui(&mut atlas, &app, &SkySummary::default(), layout);
         let verts = ui_items_to_vertices(&items, &mut atlas);
         let text_quads: usize = items.texts.iter().map(|t| t.text.chars().count()).sum();
         assert_eq!(verts.len(), items.solids.len() * 6 + text_quads * 6);

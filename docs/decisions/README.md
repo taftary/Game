@@ -26,3 +26,4 @@ Navigation-engine ADRs (004, 006, 012–021) derive from the adopted spec
 - [x] ADR-019: procedural seeding — hierarchical seeds, domain separation, real-data override (spec §6) — draft in [`ADR-019.md`](ADR-019.md), lands with `plans/v0.1.0/hierarchical-seeding`.
 - [x] ADR-020: real-data policy — VSOP87/DE440 ephemeris, Gaia ±1000 yr window, WGS84 (spec §5/§8) — draft in [`ADR-020.md`](ADR-020.md).
 - [x] ADR-021: environment visuals — auto-exposure/ACES/dark adaptation, per-regime depth cueing, analytic zodiacal light (spec §9) — draft in [`ADR-021.md`](ADR-021.md).
+- [x] ADR-022: unified debug shell — single window (reverses `debug-ui-reorganize` two-window model), key↔button parity, chrome-never-shadows-game-keys — [`ADR-022.md`](ADR-022.md), lands with `plans/v0.3.1/unified-debug-view`.

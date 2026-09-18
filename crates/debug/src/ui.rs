@@ -3,19 +3,19 @@
 //! computes rects and mutates them through explicit events, so every
 //! behavior is unit-testable without a window.
 //!
-//! Layout: a top nav bar, a center viewport, a left dock (per-screen
+//! Layout: a top nav bar, a center viewport, a left dock (per-content
 //! controls) and a right data dock (INPUTS / SELECTION / STATS).
-//! The tools window uses the full width content area (no docks) so
-//! viewer inputs only ever appear on the viewer window.
+//! [`layout_unified`] collapses each region independently per the
+//! chrome toggles (ADR-022).
 
-/// Top nav bar height, pixels.
-pub const NAV_H: f32 = 28.0;
+/// Top nav bar height, pixels (always visible — ADR-022 polish).
+pub const NAV_H: f32 = 32.0;
 /// Right data dock width, pixels (INPUTS / SELECTION / STATS).
-pub const PANEL_W: f32 = 260.0;
-/// Left view dock width, pixels (per-screen controls + shader).
-pub const LEFT_PANEL_W: f32 = 220.0;
-/// Nav button width, pixels.
-pub const NAV_BTN_W: f32 = 140.0;
+pub const PANEL_W: f32 = 300.0;
+/// Left view dock width, pixels (per-content controls + shader).
+pub const LEFT_PANEL_W: f32 = 260.0;
+/// Dock content padding, pixels.
+pub const DOCK_PAD: f32 = 12.0;
 /// Screen-space rect, y-down pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
@@ -32,9 +32,9 @@ impl Rect {
 }
 
 /// Top-level window regions: nav bar, left dock, center
-/// viewport, right data dock (`panel`). The tools window collapses both
-/// docks to zero width (see [`layout_full`]) so the content area
-/// reclaims the full window.
+/// viewport, right data dock (`panel`). [`layout_unified`] collapses
+/// each region to zero width when its chrome toggle is off so the
+/// content area reclaims the window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     pub nav: Rect,
@@ -84,12 +84,18 @@ pub fn layout_viewer(win_w: f32, win_h: f32) -> Layout {
     }
 }
 
-/// Full-width layout for the tools window: both docks collapse so
-/// the content area (reported as `viewport`) fills the window. This
-/// keeps viewer inputs attached to the viewer window only.
-pub fn layout_full(win_w: f32, win_h: f32) -> Layout {
+/// Unified single-window layout (ADR-022): each dock collapses
+/// independently per the chrome toggles; hidden regions report zero
+/// size so content reclaims the space. The nav bar is always on.
+pub fn layout_unified(win_w: f32, win_h: f32, left_dock: bool, right_dock: bool) -> Layout {
     let nav_h = NAV_H.min(win_h.max(0.0));
     let w = win_w.max(0.0);
+    let left_w = if left_dock { LEFT_PANEL_W.min(w) } else { 0.0 };
+    let right_w = if right_dock {
+        PANEL_W.min((w - left_w).max(0.0))
+    } else {
+        0.0
+    };
     Layout {
         nav: Rect {
             x: 0.0,
@@ -100,31 +106,137 @@ pub fn layout_full(win_w: f32, win_h: f32) -> Layout {
         left: Rect {
             x: 0.0,
             y: nav_h,
-            w: 0.0,
+            w: left_w,
             h: (win_h - nav_h).max(0.0),
         },
         viewport: Rect {
-            x: 0.0,
+            x: left_w,
             y: nav_h,
-            w,
+            w: (w - left_w - right_w).max(0.0),
             h: (win_h - nav_h).max(0.0),
         },
         panel: Rect {
-            x: w,
+            x: (w - right_w).max(0.0),
             y: nav_h,
-            w: 0.0,
+            w: right_w,
             h: (win_h - nav_h).max(0.0),
         },
     }
 }
 
-/// Nav button rect for item `index` (0-based, left-aligned).
-pub fn nav_button(nav: Rect, index: usize) -> Rect {
+/// Top-bar item widths: Game Demo | Dimensions breadcrumb | Settings.
+pub const TOP_DEMO_W: f32 = 170.0;
+pub const TOP_DIM_W: f32 = 320.0;
+pub const TOP_SET_W: f32 = 170.0;
+/// Top-bar label inset, pixels.
+pub const TOP_PAD: f32 = 14.0;
+
+/// Top-bar button rect for item `index` (0 = demo, 1 = dimensions,
+/// 2 = settings).
+pub fn topbar_button(nav: Rect, index: usize) -> Rect {
+    let (x, w) = match index {
+        0 => (nav.x, TOP_DEMO_W),
+        1 => (nav.x + TOP_DEMO_W, TOP_DIM_W),
+        _ => (nav.x + TOP_DEMO_W + TOP_DIM_W, TOP_SET_W),
+    };
     Rect {
-        x: nav.x + index as f32 * NAV_BTN_W,
+        x,
         y: nav.y,
-        w: NAV_BTN_W,
+        w,
         h: nav.h,
+    }
+}
+
+/// Dimensions dropdown: opaque panel under the Dimensions item +
+/// one padded row per waypoint entry.
+pub const DROPDOWN_W: f32 = 360.0;
+pub const DROPDOWN_ROW_H: f32 = 30.0;
+pub const DROPDOWN_PAD: f32 = 12.0;
+
+pub fn dropdown_panel(nav: Rect) -> Rect {
+    Rect {
+        x: nav.x + TOP_DEMO_W,
+        y: nav.y + nav.h,
+        w: DROPDOWN_W,
+        h: 10.0 * DROPDOWN_ROW_H + 2.0 * DROPDOWN_PAD,
+    }
+}
+
+pub fn dropdown_row(panel: Rect, index: usize) -> Rect {
+    Rect {
+        x: panel.x + DROPDOWN_PAD,
+        y: panel.y + DROPDOWN_PAD + index as f32 * DROPDOWN_ROW_H,
+        w: (panel.w - 2.0 * DROPDOWN_PAD).max(0.0),
+        h: DROPDOWN_ROW_H,
+    }
+}
+
+/// Transition pill: floating bottom-center overlay, drawn only while
+/// a transition is in flight. Overlays content — layout never shifts.
+pub const TRANSITION_PILL_W: f32 = 460.0;
+pub const TRANSITION_PILL_H: f32 = 26.0;
+pub const TRANSITION_PILL_BOTTOM: f32 = 64.0;
+
+pub fn transition_strip(win_w: f32, win_h: f32) -> Rect {
+    let w = TRANSITION_PILL_W.min(win_w.max(0.0));
+    Rect {
+        x: ((win_w - w) / 2.0).max(0.0),
+        y: (win_h - TRANSITION_PILL_BOTTOM - TRANSITION_PILL_H).max(0.0),
+        w,
+        h: TRANSITION_PILL_H,
+    }
+}
+
+/// Dev widget: fixed bottom-right overlay above the docks.
+pub const WIDGET_W: f32 = 400.0;
+pub const WIDGET_H: f32 = 280.0;
+pub const WIDGET_MARGIN: f32 = 12.0;
+pub const WIDGET_TAB_H: f32 = 24.0;
+
+pub fn widget_rect(win_w: f32, win_h: f32) -> Rect {
+    Rect {
+        x: (win_w - WIDGET_W - WIDGET_MARGIN).max(0.0),
+        y: (win_h - WIDGET_H - WIDGET_MARGIN).max(0.0),
+        w: WIDGET_W.min(win_w.max(0.0)),
+        h: WIDGET_H.min(win_h.max(0.0)),
+    }
+}
+
+/// Widget sub-tab button (`index` 0–2) in the widget header row.
+pub fn widget_tab_button(widget: Rect, index: usize) -> Rect {
+    let w = (widget.w / 3.0).max(0.0);
+    Rect {
+        x: widget.x + index as f32 * w,
+        y: widget.y,
+        w,
+        h: WIDGET_TAB_H,
+    }
+}
+
+/// Corner strip: chrome toggle buttons living inside the top bar,
+/// right-aligned (always visible because the bar is). Three buttons:
+/// left dock, right dock, dev widget.
+pub const STRIP_BTN_W: f32 = 110.0;
+pub const STRIP_BTN_H: f32 = 24.0;
+
+pub fn corner_strip(win_w: f32) -> Rect {
+    let w = 3.0 * STRIP_BTN_W;
+    Rect {
+        x: (win_w - w - DOCK_PAD).max(0.0),
+        y: ((NAV_H - STRIP_BTN_H) / 2.0).max(0.0),
+        w,
+        h: STRIP_BTN_H,
+    }
+}
+
+/// Corner-strip toggle button (`index` 0–3: tab bar, left dock,
+/// right dock, dev widget).
+pub fn corner_button(strip: Rect, index: usize) -> Rect {
+    Rect {
+        x: strip.x + index as f32 * STRIP_BTN_W,
+        y: strip.y,
+        w: STRIP_BTN_W,
+        h: strip.h,
     }
 }
 
@@ -150,18 +262,6 @@ pub fn split_row_4(row: Rect, gap: f32) -> [Rect; 4] {
         w,
         h: row.h,
     })
-}
-
-/// Map F1–F3 (as `1..=3`) to a viewer-window nav index; anything else
-/// is `None`.
-pub fn nav_index_for_fkey(f: u8) -> Option<usize> {
-    (1..=3).contains(&f).then(|| (f - 1) as usize)
-}
-
-/// Map `1`–`5` digit keys (as `1..=5`) to a tools-window nav index;
-/// anything else is `None`.
-pub fn nav_index_for_digit(d: u8) -> Option<usize> {
-    (1..=5).contains(&d).then(|| (d - 1) as usize)
 }
 
 /// Vertical cursor handing out panel rows.
@@ -328,8 +428,15 @@ mod tests {
     }
 
     #[test]
-    fn layout_full_reclaims_docks() {
-        let l = layout_full(1280.0, 720.0);
+    fn layout_unified_matches_viewer_when_all_visible() {
+        let l = layout_unified(1280.0, 720.0, true, true);
+        assert_eq!(l, layout_viewer(1280.0, 720.0));
+    }
+
+    #[test]
+    fn layout_unified_reclaims_hidden_chrome() {
+        let l = layout_unified(1280.0, 720.0, false, false);
+        assert_eq!(l.nav.h, NAV_H);
         assert_eq!(l.left.w, 0.0);
         assert_eq!(l.panel.w, 0.0);
         assert_eq!(
@@ -341,37 +448,72 @@ mod tests {
                 h: 720.0 - NAV_H
             }
         );
+        // Docks visible, full width viewport split.
+        let l = layout_unified(1280.0, 720.0, true, true);
+        assert_eq!(l.nav.h, NAV_H);
+        assert_eq!(l.viewport.x, LEFT_PANEL_W);
+        assert_eq!(l.viewport.w, 1280.0 - LEFT_PANEL_W - PANEL_W);
     }
 
     #[test]
-    fn nav_buttons_tile_left() {
-        let l = layout(1280.0, 720.0);
-        let b0 = nav_button(l.nav, 0);
-        let b1 = nav_button(l.nav, 1);
-        assert_eq!(b0.x, 0.0);
-        assert_eq!(b1.x, NAV_BTN_W);
-        assert_eq!((b0.y, b0.h), (0.0, NAV_H));
+    fn topbar_buttons_tile_without_overlap() {
+        let nav = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1280.0,
+            h: NAV_H,
+        };
+        let b0 = topbar_button(nav, 0);
+        let b1 = topbar_button(nav, 1);
+        let b2 = topbar_button(nav, 2);
+        assert_eq!((b0.x, b0.w), (0.0, TOP_DEMO_W));
+        assert_eq!((b1.x, b1.w), (TOP_DEMO_W, TOP_DIM_W));
+        assert_eq!((b2.x, b2.w), (TOP_DEMO_W + TOP_DIM_W, TOP_SET_W));
         assert!(b0.contains(10.0, 10.0));
-        assert!(!b0.contains(NAV_BTN_W + 1.0, 10.0));
+        assert!(!b0.contains(TOP_DEMO_W + 1.0, 10.0));
     }
 
     #[test]
-    fn fkeys_map_to_nav() {
-        assert_eq!(nav_index_for_fkey(1), Some(0));
-        assert_eq!(nav_index_for_fkey(2), Some(1));
-        assert_eq!(nav_index_for_fkey(3), Some(2));
-        assert_eq!(nav_index_for_fkey(4), None);
-        assert_eq!(nav_index_for_fkey(0), None);
-        assert_eq!(nav_index_for_fkey(5), None);
+    fn dropdown_rows_stack_inside_panel() {
+        let nav = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1280.0,
+            h: NAV_H,
+        };
+        let panel = dropdown_panel(nav);
+        assert_eq!((panel.x, panel.y), (TOP_DEMO_W, NAV_H));
+        let r0 = dropdown_row(panel, 0);
+        let r9 = dropdown_row(panel, 9);
+        assert!(r0.y >= panel.y && r9.y + r9.h <= panel.y + panel.h);
+        assert!(r9.y > r0.y);
     }
 
     #[test]
-    fn digits_map_to_tools_nav() {
-        assert_eq!(nav_index_for_digit(1), Some(0));
-        assert_eq!(nav_index_for_digit(3), Some(2));
-        assert_eq!(nav_index_for_digit(5), Some(4));
-        assert_eq!(nav_index_for_digit(0), None);
-        assert_eq!(nav_index_for_digit(6), None);
+    fn widget_and_corner_rects_stay_on_screen() {
+        let widget = widget_rect(1280.0, 720.0);
+        assert!(widget.x + widget.w <= 1280.0 && widget.y + widget.h <= 720.0);
+        // Corner strip lives inside the always-visible top bar.
+        let strip = corner_strip(1280.0);
+        assert!(strip.x + strip.w <= 1280.0);
+        assert!(strip.y + strip.h <= NAV_H);
+        for i in 0..3 {
+            let b = corner_button(strip, i);
+            assert!(b.x >= strip.x && b.x + b.w <= strip.x + strip.w + 1e-3);
+        }
+        for i in 0..3 {
+            let t = widget_tab_button(widget, i);
+            assert!(t.x >= widget.x && t.x + t.w <= widget.x + widget.w + 1e-3);
+        }
+    }
+
+    #[test]
+    fn transition_pill_floats_bottom_center() {
+        let pill = transition_strip(1280.0, 720.0);
+        let center = pill.x + pill.w / 2.0;
+        assert!((center - 640.0).abs() < 1e-3);
+        assert!(pill.y + pill.h <= 720.0);
+        assert!(pill.y > 720.0 / 2.0);
     }
 
     #[test]

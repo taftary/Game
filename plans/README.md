@@ -35,6 +35,7 @@ Current version folders (contents + per-version scope:
 - `v0.1.0/` — Navigation core (navigation-engine spec §2, §3, §5, §6)
 - `v0.2.0/` — Scale rendering & visuals (spec §4, §9)
 - `v0.3.0/` — Player-facing layer (spec §10 + debug screens)
+- `v0.3.1/` — Debug shell unification (ADR-022: `unified-debug-view`)
 
 ## Role gates
 

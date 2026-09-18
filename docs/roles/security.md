@@ -18,8 +18,8 @@ through dependencies, or opens an input surface we did not deliberately design.
   sources, config — all attacker-controlled until proven otherwise
   (see [`../techstack/persistence.md`](../techstack/persistence.md): corrupt
   save → backup + clean error, never boot-loop).
-- *What new input surface does this add?* File pickers, text fields, console
-  commands (`game_debug` console), CLI flags.
+- *What new input surface does this add?* File pickers, text fields,
+  dev-widget console log (`game_debug` Console sub-tab), CLI flags.
 - *What new dependency or `unsafe` does this add?* Check against the locked
   stack in [`../techstack/stack.md`](../techstack/stack.md); unjustified
   additions are rejected.
