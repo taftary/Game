@@ -57,15 +57,25 @@ land as exactly one commit on `v0.3.1`.
 | UDV-041 | done | Unit tests: nav, dropdown capture, toggles, unwind, defaults | DoD |
 | UDV-042 | done | Gates green: test/clippy/fmt/headless | Non-functional |
 | UDV-050 | done | Docs sweep + `0.32.0` bump, links resolve | DoD |
-| UDV-051 | in-progress | DoD verification + one commit on `v0.3.1` | Constraints |
+| UDV-051 | done | DoD verification + one commit on `v0.3.1` | Constraints |
 
 ## Role sign-off
 
-Breakdown approved by: ARCHITECT _(pending)_ · Todos approved by: TECHLEAD
-_(pending)_ · UX acceptance rows: **UX consulted 2026-09-17** (S1, S2,
-S3, S4+S5, S7 adopted; S6 rejected — see Acceptance criteria) ·
-DoD verified by: ANALYST _(pending)_ · Security reviewed by: SECURITY
-_(pending)_.
+Breakdown approved by: ARCHITECT **2026-09-18** (all work in
+`crates/debug`, `game`/`game_engine` consumed read-only, zero
+`game`/`engine` source files in the commit, no Cargo changes,
+ADR-022 covers the redesign, rendering invariants untouched —
+checklist in `docs/roles/architect.md` green) · Todos approved by:
+TECHLEAD **2026-09-18** (UDV-001–UDV-051 independently verifiable
+with notion refs; dropdown follow-ups approved retroactively as
+user-directed polish deltas; +2 draws while the menu is open only,
+no budget risk; gates match `quality.md`) · UX acceptance rows: **UX
+consulted 2026-09-17** (S1, S2, S3, S4+S5, S7 adopted; S6 rejected —
+see Acceptance criteria) · DoD verified by: ANALYST **2026-09-18**
+(all 8 rows re-checked, gates re-run on the committed tree — see DoD
+verification) · Security reviewed by: SECURITY **2026-09-18**
+(pass, no findings — no new deps, no new `unsafe`, no new file I/O,
+no save-format touch; checklist in `docs/roles/security.md` green).
 
 DEV evidence (2026-09-17, branch `v0.3.1`, uncommitted working tree):
 `cargo fmt --check` clean; `cargo clippy --workspace --all-targets
@@ -85,14 +95,26 @@ game_debug -- --headless` prints all self-test `ok` lines.
 | 6 | Bar always visible; 2 dock toggles + in-bar strip; FPS on widget button | done | `app::toggles_are_independent` (no BAR toggle); corner-strip needles (`DOCK-L [F9]`, `DOCK-R [F10]`, `DEV 60 [\`]`) + `ui::widget_and_corner_rects_stay_on_screen` (strip inside bar) | DEV |
 | 7 | Parity test; Controls lists all; key audit | done | `actions::registry_size_is_pinned` (44) + `every_action_has_key_label_title_and_group`; `controls_plan` renders `all_actions()`; audit table in Acceptance criteria; F5 kept for twilight, sub-tabs on F6–F8, docks on F9–F10 | DEV |
 | 8 | Docs sweep; links resolve; 0.32.0 | done | `controls.md`, `architecture.md`, `rendering.md` (invariants untouched), `journey.md`, `roles/ux.md`, `roles/security.md`, techstack `0.32.0`, milestones v0.3.1, ADR-022; stale-reference grep clean; `Test-Path` on all touched links | DEV |
-| 1 | Single window; old enums gone; headless passes | pending | | |
-| 2 | 3 top-level items; dropdown 10 waypoints + active marker; digits select | pending | | |
-| 3 | Demo tab interactive + HUD, chrome hidden by default | pending | | |
-| 4 | MW/SS/Earth absorbed; badges; placeholders | pending | | |
-| 5 | Widget 3 sub-tabs fixed corner; console log; strip in-flight only | pending | | |
-| 6 | 4 toggles + corner strip; FPS on widget button | pending | | |
-| 7 | Parity test; Controls lists all; key audit | pending | | |
-| 8 | Docs sweep; links resolve; 0.32.0 | pending | | |
+| 1 | Single window; old enums gone; headless passes | done | Repo grep for `MainScreen`/`ToolsScreen`/`tools_window_event`/`draw_tools`/`WindowKind::Tools` clean (reproduced 2026-09-18); `--headless` prints all `ok` lines (chunk0, player, galaxy_hash, system, transit, sky) | ANALYST 2026-09-18 |
+| 2 | 3 top-level items; dropdown 10 waypoints + active marker; digits select | done | `overlay_compose_isolates_dropdown_in_own_buffer` (menu isolated in own buffer, 30 row texts) + `unified_chrome_…` needles; `app::digit_routing_selects_dropdown_entries_and_closes`, `actions::digits_round_trip_dimension_indices` — all green 2026-09-18 | ANALYST 2026-09-18 |
+| 3 | Demo tab interactive + HUD, chrome hidden by default | done | `app::demo_tab_defaults_to_hidden_chrome`; demo needles (`frame:`, `time:`, `soi:`, `target:`); content keys gated on `screen_content()` — green 2026-09-18 | ANALYST 2026-09-18 |
+| 4 | MW/SS/Earth absorbed; badges; placeholders | done | `app::screen_content_mapping`; builders reuse galaxy/system/planet UIs; placeholder `INACTIVE` needles — green 2026-09-18 | ANALYST 2026-09-18 |
+| 5 | Widget 3 sub-tabs fixed corner; console log; strip in-flight only | done | Widget FPS/Console/Inspector needles; `console::feed_drains_only_unseen_events`; pill preview-leg + silent-when-`None`; `ui::transition_pill_floats_bottom_center` — green 2026-09-18 | ANALYST 2026-09-18 |
+| 6 | Bar always visible; 2 dock toggles + in-bar strip; FPS on widget button | done | `app::toggles_are_independent`; corner-strip needles (`DOCK-L [F9]`, `DOCK-R [F10]`, `DEV 60 [\`]`) — green 2026-09-18 | ANALYST 2026-09-18 |
+| 7 | Parity test; Controls lists all; key audit | done | `actions::registry_size_is_pinned` (44, reproduced) + `every_action_has_key_label_title_and_group`; `controls_plan` renders `all_actions()` — green 2026-09-18 | ANALYST 2026-09-18 |
+| 8 | Docs sweep; links resolve; 0.32.0 | done | Techstack `Version: 0.32.0` (reproduced); `controls.md`, `architecture.md`, `rendering.md`, `journey.md`, `roles/ux.md`, `roles/security.md`, milestones v0.3.1, ADR-022 in commit `bb127a1` | ANALYST 2026-09-18 |
+
+ANALYST audit notes (2026-09-18, committed tree `bb127a1`, clean
+working tree): `cargo fmt --check` exit 0; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` exit 0; `cargo build
+--workspace` exit 0; `cargo test --workspace --all-targets` green
+(40 + 131 lib + 19 bin + 266 + 3 + 5, 0 failed); `cargo test --doc
+--workspace` green (6 + 76); `game_debug --headless` all `ok`;
+`game_tools --headless --tier low` all `pass=true`. E2E windowed
+smoke (`cargo run --bin game`, visual F2 check) is out-of-scope for
+this headless session with reason recorded — CI mirrors
+`quality.md` gates; the F2 menu-over-content check is user-verified
+visually. No findings; no follow-up issues filed.
 
 ## Acceptance criteria
 

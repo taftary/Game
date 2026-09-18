@@ -2,9 +2,10 @@
 
 ## Status
 
-`in-review` (DEV gates green + evidence in `plan.md`; awaiting
-ANALYST DoD verification + SECURITY review per `plans/README.md`
-role gates)
+`done` (all gates green, ANALYST DoD verified + SECURITY reviewed
+2026-09-18 per `plans/README.md` role gates; landed as commit
+`bb127a1` on branch `v0.3.1` — exactly one commit per the version
+branch rule)
 
 ## Context
 
@@ -125,22 +126,22 @@ engine waypoint APIs consumed read-only, no simulation mutation.
 
 ## Definition of Done
 
-- [ ] Single window; tools window + old screen enums gone; headless
+- [x] Single window; tools window + old screen enums gone; headless
   smoke passes on the new shell.
-- [ ] 3 top-level items; dropdown lists 10 waypoints with active
+- [x] 3 top-level items; dropdown lists 10 waypoints with active
   marker + text; digits select while open.
-- [ ] Game Demo tab interactive, presentation-accurate, HUD on,
+- [x] Game Demo tab interactive, presentation-accurate, HUD on,
   chrome hidden by default; travel there reflects in debug tabs.
-- [ ] MW/SS/Earth absorbed with docks/keys; inactive dims show
+- [x] MW/SS/Earth absorbed with docks/keys; inactive dims show
   badge; empty dims show placeholder (no blank pages).
-- [ ] Widget with 3 sub-tabs in fixed corner; console shows
+- [x] Widget with 3 sub-tabs in fixed corner; console shows
   transition log; pill shows in-flight transition only, bottom-center.
-- [ ] Top bar always visible with 3 in-bar toggle buttons; `F9`/`F10`
+- [x] Top bar always visible with 3 in-bar toggle buttons; `F9`/`F10`
   dock toggles; FPS on widget button; solid-black bordered dropdown
   drawn on top of all chrome (shadow, hover lift, separators).
-- [ ] Registry parity test green; Controls section lists every
+- [x] Registry parity test green; Controls section lists every
   action grouped with keys; chrome keys audited against game keys.
-- [ ] Docs sweep done (`controls.md`, `architecture.md`,
+- [x] Docs sweep done (`controls.md`, `architecture.md`,
   `rendering.md`, `journey.md`, `roles/ux.md`, `roles/security.md`,
   techstack version `0.32.0`, milestones v0.3.1 section, ADR-022);
   every touched link resolves.

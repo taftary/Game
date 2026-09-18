@@ -80,7 +80,7 @@ commit when it reaches `done` (workflow rule:
 
 | Feature | Status | Spec section |
 |---|---|---|
-| [`unified-debug-view`](../../plans/v0.3.1/unified-debug-view/) | planned | dev tooling (ADR-022) |
+| [`unified-debug-view`](../../plans/v0.3.1/unified-debug-view/) | done | dev tooling (ADR-022) |
 
 ## Post-v0.3 (unscheduled)
 
