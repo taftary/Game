@@ -12,6 +12,10 @@
 pub mod actions;
 pub mod app;
 pub mod console;
+pub mod cosmic_camera;
+pub mod cosmic_demo;
+pub mod cosmic_player;
+pub mod cosmic_web;
 pub mod fps;
 pub mod fx;
 pub mod galaxy_map;
@@ -25,5 +29,4 @@ pub mod player_view;
 pub mod sky;
 pub mod system_map;
 pub mod text;
-pub mod transitions;
 pub mod ui;

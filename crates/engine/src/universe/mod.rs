@@ -1,7 +1,9 @@
-//! Procedural universe generation: seeds → galaxy → systems → planets.
+//! Procedural universe generation: web → galaxy → systems → planets.
 //!
 //! Staged generation (see `docs/game/universe.md`):
 //!
+//! 0. Web seed → cosmic web: nodes (clusters/groups), filament links,
+//!    dwarf glow, home node (v0.3.2 `cosmic-scale-player`; [`web`]).
 //! 1. Galaxy seed → star systems: position, spectral class, companion count.
 //! 2. System seed → planets: count, orbits, type, gravity, atmosphere
 //!    density/color, resource bias, companions (moons/rings, visual-only
@@ -14,8 +16,9 @@
 //! output. Descriptors carry [`UNIVERSE_VERSION`] for forward
 //! compatibility (saves store it from M4 on); content IDs are stable
 //! strings safe to store in saves and links. [`generate`] holds the
-//! stage 1–2 generators, [`hash`] the cross-platform descriptor hashes,
-//! [`crate::core`] the seeded RNG and quantization they build on.
+//! stage 1–2 generators, [`web`] the stage-0 generator, [`hash`] the
+//! cross-platform descriptor hashes, [`crate::core`] the seeded RNG and
+//! quantization they build on.
 //!
 //! ```no_run
 //! use game_engine::universe::{PlanetId, UNIVERSE_VERSION};
@@ -29,6 +32,7 @@ pub mod descriptors;
 pub mod generate;
 pub mod hash;
 pub mod ids;
+pub mod web;
 
 pub use descriptors::{
     Atmosphere, GalaxyDescriptor, PlanetDescriptor, PlanetType, ResourceBias, SpectralClass,
@@ -38,10 +42,16 @@ pub use generate::{
     COMPRESSION_KNEE_LY, DEFAULT_STAR_COUNT, DISK_HALF_THICKNESS_LY, GALAXY_RADIUS_LY,
     generate_galaxy, generate_system,
 };
-pub use hash::{galaxy_hash, planet_hash, system_hash};
+pub use hash::{galaxy_hash, planet_hash, system_hash, web_hash};
 pub use ids::{GalaxyId, PlanetId, SystemId};
+pub use web::{CosmicWebParams, WebDescriptor, WebLink, WebNode, generate_cosmic_web};
 
 /// Universe format version. Bumped only with an intentional generation
 /// change; stamped into every descriptor. Version bump = migration or
 /// new game, never silent drift (see `docs/game/universe.md` rules).
-pub const UNIVERSE_VERSION: u32 = 1;
+///
+/// v2 (v0.3.2 `cosmic-scale-player`): adds the stage-0 cosmic web. Stage
+/// 1–2 streams are domain-separated and untouched, so galaxies and
+/// systems replay identically — only their hashes re-roll via the stamp
+/// (the migration signal working as designed).
+pub const UNIVERSE_VERSION: u32 = 2;

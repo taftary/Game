@@ -1,9 +1,10 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.32.0 (2026-09-17, unified debug shell per ADR-022:
-  single `game_debug` window — Game Demo tab + Dimensions dropdown +
-  Settings, dev widget with FPS/console/inspector sub-tabs,
-  key↔button parity registry; `unified-debug-view` planned)
+- **Version:** 0.33.0 (2026-09-18, cosmic-scale player per ADR-023:
+  stage-0 generated cosmic web, Game Demo rebuilt around the player
+  (marker + Chase/Orbit/FirstPerson camera + fly-to), Cosmic Web
+  inspector as the fourth absorbed view, real pill/console feed;
+  shell, registry (+1 action), and invariants preserved)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

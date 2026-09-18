@@ -26,16 +26,34 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
 - Headless demo: `cargo run -p game` runs a scripted 20 Hz walk
   (straight leg, curving leg, turn-in-place leg, idle) through all four
   modes, logging lon/lat/heading (interactive `winit` binding deferred).
-- Debug viewer (`cargo run -p game_debug`, one window, ADR-022): top
-  bar `F1` = Game Demo (default tab — interactive, presentation-
-  accurate, HUD on, chrome hidden), `F2` = Dimensions dropdown (ten
-  waypoints, digits `1`–`0` pick while open, `●` marks the active
-  journey layer), `F3` = Settings (Controls section lists every
-  action with its key; every row is clickable). Milky Way / Solar
-  System / Earth dimension tabs mount the absorbed Galaxy Map /
-  System Map / Planet View with their docks (260/300 px + padding)
-  and content keys; other
-  dimension tabs are placeholders with `INACTIVE` badges.
+- Debug viewer (`cargo run -p game_debug`, one window, ADR-022 as
+  extended by ADR-023): top bar `F1` = Game Demo (default tab —
+  interactive, presentation-accurate, HUD on, chrome hidden),
+  `F2` = Dimensions dropdown (ten waypoints, digits `1`–`0` pick
+  while open, `●` marks the active journey layer), `F3` = Settings
+  (Controls section lists every action with its key; every row is
+  clickable). Milky Way / Solar System / Earth dimension tabs mount
+  the absorbed Galaxy Map / System Map / Planet View with their
+  docks (260/300 px + padding) and content keys; the Cosmic Web tab
+  (digit `1`) mounts the absorbed cosmic-web inspector (orbit/pan/
+  log-zoom, click-node readout, live player point, `Home` top-down
+  snap); other dimension tabs are placeholders with `INACTIVE`
+  badges.
+- Game Demo tab (v0.3.2 `cosmic-scale-player` — the main game
+  notion: a player in space navigating the Cosmic Scale): the player
+  is a marker (`YOU` dot + heading arrow) with its own camera in the
+  generated cosmic web, spawned inside a filament near the home
+  galaxy. Mouse drag steers the nose; `W`/`S` = main thrust,
+  `A`/`D` = lateral thrust (arrows mirror WASD); `P` cycles Chase
+  (default) → Orbit (drag orbits, wheel zooms) → FirstPerson (marker
+  hidden); wheel zooms the Chase/Orbit camera; click a node to
+  target it, `E` engages/cancels the eased fly-to (any thrust also
+  cancels); `R` re-seeds the web. The shipping HUD shows frame
+  (cosmological/Mpc), time (real-time or compressed ratio), and the
+  fly-to target with distance + ETA; SOI stays `—` (no handoffs at
+  this scale). `E` is context-dependent by design: fly-to in the
+  demo, travel-begin on the galaxy/system tabs (the `T`
+  dual-binding precedent: travel offer / top preset).
 - Dev widget (`` ` `` toggle; `F6`/`F7`/`F8` = FPS/Console/Inspector
   sub-tabs): floats over every tab. Console carries the transition-
   event log; a transition pill floats bottom-center while a waypoint

@@ -2,6 +2,11 @@
 
 Deterministic, versioned, staged:
 
+0. **Web seed → cosmic web** (v0.3.2 `cosmic-scale-player`, ADR-023):
+   seeded Zel'dovich pipeline — Gaussian initial field → displacement
+   → T-web classification + Press–Schechter masses → descriptor (halo
+   nodes, filament links, dwarf glow, tagged home node). Explicitly
+   procedural (no literal catalog).
 1. **Galaxy seed → star systems:** position, spectral class, companion count.
 2. **System seed → planets:** count, orbits, type (rocky / desert / ice / volcanic / toxic / oceanic), gravity, atmosphere density/color, resource bias, companions (moons/rings, visual-only in v1 — [`journey.md`](journey.md) Level 4).
 3. **Planet seed → surface:** elevation, biomes, water table, POIs, colony site candidates, robot-relevant resources.

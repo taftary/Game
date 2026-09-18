@@ -12,8 +12,8 @@
 //! absorbed Galaxy Map / System Map / Planet View (orbit camera,
 //! filled dual-cell mesh, wireframe overlay, pentagon highlight,
 //! cell-chunk hover highlight + click-to-pin, inputs panel,
-//! read-only stats). A transition strip shows in-flight waypoint
-//! transitions; the dev widget (`` ` ``, `F6`–`F8` sub-tabs
+//! read-only stats). A transition strip shows in-flight fly-to
+//! easing progress; the dev widget (`` ` ``, `F6`–`F8` sub-tabs
 //! FPS/Console/Inspector) and the corner strip float over every tab.
 //! `F9`–`F11` toggle tab bar / left dock / right dock; `Esc` unwinds
 //! UI focus (closing the window exits).
@@ -29,10 +29,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use game::camera::CameraMode;
+use game::hud::HudInputs;
 use game::journey::{Journey, JourneyEvent, Layer};
 use game::transit::{SIM_DT_SECS, Transit, plan_cost};
 use game_debug::actions::{Action, ActionGroup, DROPDOWN_ORDER, digit_for_dimension_index};
 use game_debug::app::{App as DebugApp, ChromeState, Screen, ViewContent, WidgetTab};
+use game_debug::cosmic_camera::cosmic_tip_world;
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
@@ -44,11 +46,14 @@ use game_debug::system_map::{SystemMapView, arrival_for, orbit_ring_points, plan
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
 use game_engine::catalog::scheduler::SkyView;
+use game_engine::flight::{ShipMode, mode_of};
+use game_engine::frames::recenter;
 use game_engine::render::{
     ExposureParams, FOV_Y, MAX_PITCH, OrbitCamera, ShaderKind, WORLD_TO_EQUATORIAL,
     compile_glsl_to_spirv, create_instance, device_score, log_physical_device,
     required_device_extensions, star_visibility, visible_hemisphere,
 };
+use game_engine::universe::WebDescriptor;
 use game_engine::waypoints::WaypointId;
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -600,6 +605,16 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
 fn run_headless(seed: Option<u64>) -> i32 {
     let viewer = PlanetViewerState::new();
     let mut debug_app = DebugApp::new();
+    // Demo boot: the Game Demo tab mounts the cosmic player scene —
+    // generated web, spawned player, chase camera tracking it.
+    assert_eq!(debug_app.screen, Screen::GameDemo);
+    assert_eq!(debug_app.screen_content(), Some(ViewContent::CosmicWeb));
+    assert!(!debug_app.cosmic.web.nodes.is_empty());
+    assert!(!debug_app.cosmic.web.links.is_empty());
+    assert_eq!(
+        debug_app.cosmic.camera.render_origin(),
+        debug_app.cosmic.player.position_mpc()
+    );
     // Unified shell smoke: F2 opens Dimensions on the active
     // waypoint, digits pick dropdown entries, F-keys jump the
     // widget to a sub-tab.
@@ -608,6 +623,8 @@ fn run_headless(seed: Option<u64>) -> i32 {
     assert!(debug_app.dropdown_open);
     assert!(debug_app.select_dimension_by_digit(1));
     assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::CosmicWeb));
+    // Cosmic Web tab mounts the shared web (fourth absorbed view).
+    assert_eq!(debug_app.screen_content(), Some(ViewContent::CosmicWeb));
     // Placeholder dimension: flat UI, no 3D content.
     assert!(debug_app.select_dimension_by_digit(8));
     assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::Aerial));
@@ -1174,28 +1191,45 @@ impl UiItems {
     }
 }
 
-/// Game Demo tab body: presentation-accurate player HUD lines for
-/// the current journey layer — frame/waypoint, time state
-/// (real-time: the debug shell owns no compression clock), and the
-/// SOI/target readouts, hidden until travel features feed them.
-/// Zero debug data by construction (the chrome builders run
-/// separately and only when their toggles are on).
-fn build_demo_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
+/// Game Demo tab body: the shipping HUD fed by the live cosmic player
+/// (frame/time/target lines from `game::hud`; SOI stays `—` — no
+/// handoffs at this scale) plus the camera mode and the flight hint.
+/// Zero debug data by construction (the chrome builders run separately
+/// and only when their toggles are on). Takes `&mut` for the HUD's SOI
+/// hysteresis state.
+fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
+    let cosmic = &mut app.cosmic;
+    let target_label = cosmic.target_label();
+    let frame = cosmic.hud.update(&HudInputs {
+        ship: &cosmic.player.ship,
+        clock: &cosmic.player.clock,
+        executor: cosmic.player.exec.as_ref(),
+        target_label: target_label.as_deref(),
+        soi_weight: 0.0,
+        soi_events: &[],
+        body_label: None,
+    });
+    let mode_line = format!("cam:   {} · marker YOU", cosmic.camera.mode().label());
     let mut rows = ui::PanelRows::new(area, 12.0);
     section_bar(items, rows.next(lh + 6.0, 4.0), "GAME DEMO");
     for (line, color) in [
+        (frame.frame_line, C_TEXT),
+        (frame.time_line, C_TEXT),
         (
-            format!(
-                "frame:  {:?} · {} (L{})",
-                app.journey.active_layer(),
-                app.active_waypoint().name(),
-                app.active_waypoint().number()
-            ),
-            C_TEXT,
+            frame
+                .soi
+                .map(|soi| soi.message)
+                .unwrap_or_else(|| "soi:    —".to_owned()),
+            C_DIM,
         ),
-        ("time:   real-time".to_owned(), C_TEXT),
-        ("soi:    —".to_owned(), C_DIM),
-        ("target: —".to_owned(), C_DIM),
+        (
+            frame
+                .target
+                .map(|target| target.line)
+                .unwrap_or_else(|| "target: —".to_owned()),
+            C_DIM,
+        ),
+        (mode_line, C_TEXT),
     ] {
         text_row(items, lh, rows.next(lh, 6.0), line, color);
     }
@@ -1203,9 +1237,155 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
         items,
         lh,
         rows.next(lh, 6.0),
-        "WASD walk · P camera · E/T/Q travel".to_owned(),
+        "mouse steer · WASD thrust · click target · E fly-to · P camera".to_owned(),
         C_DIM,
     );
+}
+
+/// Cosmic Web dimension tab (WS5 — fourth absorbed view): web stats +
+/// camera hints on the left, node selection readout on the right. The
+/// viewport renders the shared web through the inspector camera (3D
+/// pass); this builder only draws chrome + docks. Read-only: no field
+/// here mutates journey, transit, or viewer state.
+fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiItems {
+    let cosmic = &app.cosmic;
+    let inspector = &app.cosmic_inspector;
+    let lh = atlas.line_height();
+    let mut items = UiItems::default();
+    build_topbar(&mut items, lh, app, layout);
+
+    // ---- Left dock: COSMIC WEB ----
+    if layout.left.w >= 1.0 {
+        items.solid(layout.left, C_PANEL_BG);
+        let mut rows = ui::PanelRows::new(layout.left, 12.0);
+        section_bar(&mut items, rows.next(lh + 6.0, 4.0), "COSMIC WEB");
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!("seed {}", cosmic.seed),
+            C_TEXT,
+        );
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!(
+                "{} nodes · {} links · {} glow",
+                cosmic.web.nodes.len(),
+                cosmic.web.links.len(),
+                cosmic.web.glow_mpc.len()
+            ),
+            C_DIM,
+        );
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!(
+                "voids {:.1}% · home node {}",
+                cosmic.web.void_fraction * 100.0,
+                cosmic.web.home_node
+            ),
+            C_DIM,
+        );
+        section_bar(&mut items, rows.next(lh + 6.0, 4.0), "CAMERA");
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!(
+                "target {:+.0},{:+.0},{:+.0} D {:.0} Mpc",
+                inspector.camera.target().x,
+                inspector.camera.target().y,
+                inspector.camera.target().z,
+                inspector.camera.distance()
+            ),
+            C_DIM,
+        );
+        for hint in [
+            "wheel: zoom (log)",
+            "left-drag: orbit",
+            "right-drag: pan",
+            "click: select node",
+            "Home: top-down",
+        ] {
+            text_row(&mut items, lh, rows.next(lh, 6.0), hint.to_owned(), C_DIM);
+        }
+    }
+
+    // ---- Right dock: SELECTION ----
+    if layout.panel.w >= 1.0 {
+        items.solid(layout.panel, C_PANEL_BG);
+        let mut rows = ui::PanelRows::new(layout.panel, 12.0);
+        section_bar(&mut items, rows.next(lh + 6.0, 4.0), "SELECTION");
+        match inspector
+            .selected
+            .and_then(|i| cosmic.web.nodes.get(i as usize))
+        {
+            Some(node) => {
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("node {}", node.node_index),
+                    C_TEXT,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("mass {:.3e} M☉", node.mass_msun),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("r_vir {:.2} Mpc", node.virial_radius_mpc),
+                    C_DIM,
+                );
+                let links = cosmic
+                    .web
+                    .links
+                    .iter()
+                    .filter(|l| l.a == node.node_index || l.b == node.node_index)
+                    .count();
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("{links} links"),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    cosmic.web.node_content_id(node.node_index),
+                    C_DIM,
+                );
+            }
+            None => {
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    "click a node".to_owned(),
+                    C_DIM,
+                );
+                let ship = cosmic.player.position_mpc();
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("player {:+.1},{:+.1},{:+.1} Mpc", ship.x, ship.y, ship.z),
+                    C_DIM,
+                );
+            }
+        }
+    }
+    items
 }
 
 /// Placeholder dimension tab (S7): waypoint identity + live status,
@@ -2469,6 +2649,24 @@ fn compose_overlay_ui(
             draw_player_marker(items, origin, tip);
         }
     }
+    // Cosmic marker: the ship projected through the player camera
+    // (demo tab only — the WS5 inspector shows the player point
+    // instead). Marker and scene share the upload-origin frame, so the
+    // dot rides the web with no relative jitter.
+    if app.screen == Screen::GameDemo {
+        let cosmic = &app.cosmic;
+        let vp = layout.viewport;
+        let main_vp = cosmic.camera.view_proj(vp.w / vp.h);
+        let ship_f64 = cosmic.player.position_mpc();
+        let ship = recenter(ship_f64, cosmic.upload_origin);
+        if let Some(dot) = world_to_pixels(main_vp, ship, vp) {
+            let eye_dist = (cosmic.camera.eye_world() - ship_f64).length() as f32;
+            let facing = cosmic.player.facing();
+            let facing_f32 = Vec3::new(facing.x as f32, facing.y as f32, facing.z as f32);
+            let tip = world_to_pixels(main_vp, cosmic_tip_world(ship, facing_f32, eye_dist), vp);
+            draw_player_marker(items, dot, tip);
+        }
+    }
     // Transition fade + notice banner (UMAP-017): a fullscreen black
     // ramp over the fresh layer, then a banner pill top-center of
     // the viewport. Both ride the UI pass (alpha-blended).
@@ -2500,21 +2698,25 @@ fn compose_overlay_ui(
 }
 
 /// Transition pill (S2): floating bottom-center overlay, drawn only
-/// while a transition is in flight. Overlays content — layout never
-/// shifts.
+/// while a fly-to leg is in flight (v0.3.2 — the journey-transition
+/// preview data is deleted; the pill shows live easing progress).
+/// Overlays content — layout never shifts.
 fn build_transition_strip(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32, win_h: f32) {
-    let Some(descriptor) = app.transitions.current else {
-        return;
+    let exec = match &app.cosmic.player.exec {
+        Some(exec) if mode_of(Some(exec)) == ShipMode::FlyTo => exec,
+        _ => return,
     };
+    let plan = exec.plan();
+    let now = app.cosmic.player.clock.sim_time_s();
+    let progress = ((now - plan.t_start_s) / plan.duration_s).clamp(0.0, 1.0);
+    let label = app
+        .cosmic
+        .target_label()
+        .unwrap_or_else(|| "node".to_owned());
     let pill = ui::transition_strip(win_w, win_h);
     items.solid(pill, C_PILL_BG);
     items.text(
-        format!(
-            "▶ {} → {} · {:.0}%",
-            descriptor.leg.from.name(),
-            descriptor.leg.to.name(),
-            descriptor.progress * 100.0
-        ),
+        format!("▶ FLY-TO {label} · {:.0}%", progress * 100.0),
         pill.x + ui::TOP_PAD,
         pill.y + (pill.h + lh) / 2.0 - 3.0,
         C_WARN,
@@ -2586,7 +2788,7 @@ fn build_widget_fps(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
     build_fps_tab(items, lh, &app.fps, body);
 }
 
-/// Widget Console body: the transition-event log feed (newest last,
+/// Widget Console body: the live fly-to event feed (newest last,
 /// clipped to the body).
 fn build_widget_console(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
     let row_h = lh + 4.0;
@@ -2617,10 +2819,25 @@ fn build_widget_console(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect
 /// state is touched).
 fn build_widget_inspector(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
     let mut rows = ui::PanelRows::new(body, 0.0);
+    let flyto = match &app.cosmic.player.exec {
+        Some(exec) if mode_of(Some(exec)) == ShipMode::FlyTo => {
+            let plan = exec.plan();
+            let now = app.cosmic.player.clock.sim_time_s();
+            let progress = ((now - plan.t_start_s) / plan.duration_s).clamp(0.0, 1.0);
+            format!(
+                "fly-to:     {} · {:.0}%",
+                app.cosmic
+                    .target_label()
+                    .unwrap_or_else(|| "node".to_owned()),
+                progress * 100.0
+            )
+        }
+        _ => "fly-to:     off".to_owned(),
+    };
     for line in [
         format!("layer:      {:?}", app.journey.active_layer()),
         format!("waypoint:   {}", app.active_waypoint().name()),
-        format!("transitions: {}", app.transitions.history_len()),
+        flyto,
         format!("console:     {} lines", app.console.len()),
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
@@ -3168,6 +3385,115 @@ fn upload_map(
     .expect("galaxy map vertex buffer upload must succeed")
 }
 
+/// Upload the cosmic-web point buffer (v0.3.2 `cosmic-scale-player`):
+/// halo nodes then dwarf glow, laid out by the shared [`cosmic_web`]
+/// helpers (one palette for both 3D surfaces). Positions are
+/// origin-relative Mpc; camera motion rides the MVP push, never this
+/// buffer. Rebuilt on reseed and on rebase (WS4 tick moves the upload
+/// origin back under the ship past 50 Mpc).
+fn upload_cosmic_points(
+    allocator: &Arc<StandardMemoryAllocator>,
+    web: &WebDescriptor,
+    origin: glam::DVec3,
+) -> Subbuffer<[MapVertex]> {
+    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::node_point_cloud(web, origin)
+        .iter()
+        .chain(game_debug::cosmic_web::glow_point_cloud(web, origin).iter())
+        .map(|(pos, color, misc)| MapVertex {
+            map_pos: *pos,
+            color: *color,
+            misc: *misc,
+        })
+        .collect();
+    if verts.is_empty() {
+        // Degenerate params guard (vulkano rejects zero-length vertex
+        // buffers): one transparent point, mirroring upload_sky_points.
+        verts.push(MapVertex {
+            map_pos: [0.0, 0.0, -900.0],
+            color: [0.0, 0.0, 0.0],
+            misc: [1.0, 0.0, 0.0],
+        });
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("cosmic web vertex buffer upload must succeed")
+}
+
+/// Upload the cosmic filament links as line segments (same origin frame
+/// as [`upload_cosmic_points`], layout from [`cosmic_web`]). A
+/// degenerate empty set uploads one zero-length segment (rasterizes
+/// nothing).
+fn upload_cosmic_lines(
+    allocator: &Arc<StandardMemoryAllocator>,
+    web: &WebDescriptor,
+    origin: glam::DVec3,
+) -> Subbuffer<[LineVertex]> {
+    let mut verts: Vec<LineVertex> = game_debug::cosmic_web::link_segments(web, origin)
+        .iter()
+        .map(|pos| LineVertex { position: *pos })
+        .collect();
+    if verts.is_empty() {
+        verts.push(LineVertex {
+            position: [0.0, 0.0, 0.0],
+        });
+        verts.push(LineVertex {
+            position: [0.0, 0.0, 0.0],
+        });
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("cosmic web wireframe buffer upload must succeed")
+}
+
+/// Upload the inspector player point: one origin-relative vertex (near-
+/// white, larger than any node sprite so it reads distinct). Rebuilt per
+/// frame while the Cosmic Web tab shows — the ship moves continuously.
+fn upload_cosmic_player_point(
+    allocator: &Arc<StandardMemoryAllocator>,
+    pos: [f32; 3],
+) -> Subbuffer<[MapVertex]> {
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        vec![MapVertex {
+            map_pos: pos,
+            color: [0.90, 0.96, 1.00],
+            misc: [6.0, 1.0, 0.0],
+        }],
+    )
+    .expect("cosmic player point upload must succeed")
+}
+
 /// Upload catalog-sky points as Backdrop sprites (`misc` = pixel size,
 /// alpha, kind 0). Re-uploaded only when the tile set changes —
 /// camera motion rides the MVP push, never this buffer. Empty sets
@@ -3385,6 +3711,19 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
+    /// Cosmic-web point buffer (nodes + dwarf glow, v0.3.2): uploaded
+    /// relative to the demo upload origin, rebuilt on reseed + rebase.
+    cosmic_points: Subbuffer<[MapVertex]>,
+    /// Cosmic filament links (LineList, same origin frame as points).
+    cosmic_lines: Subbuffer<[LineVertex]>,
+    /// Inspector point buffer (fixed web-center origin, rebuilt on
+    /// reseed only — the tab never rebases).
+    cosmic_tab_points: Subbuffer<[MapVertex]>,
+    /// Inspector filament links (fixed web-center origin).
+    cosmic_tab_lines: Subbuffer<[LineVertex]>,
+    /// Inspector player point (one vertex, rebuilt per frame while the
+    /// tab shows — the ship moves continuously).
+    cosmic_tab_player: Subbuffer<[MapVertex]>,
     /// Catalog sky runtime (scheduler + loader + cache + fallback) and
     /// its Backdrop point buffer, drawn first in the Planet View.
     sky: CatalogSky,
@@ -3536,6 +3875,8 @@ impl ViewerApp {
             debug.journey = Journey::new(seed);
             let star0 = debug.galaxy.galaxy.stars[0].clone();
             debug.system.load(seed, &star0);
+            // Same master seed drives stage 0 (v0.3.2).
+            debug.cosmic.reseed(seed);
             debug.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
             debug.fx.notify(format!("Seed {seed} · --seed flag"));
         }
@@ -3552,6 +3893,17 @@ impl ViewerApp {
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
+        // Cosmic web for the demo tab (same master seed as the maps).
+        let cosmic_origin = debug.cosmic.upload_origin;
+        let cosmic_points =
+            upload_cosmic_points(&memory_allocator, &debug.cosmic.web, cosmic_origin);
+        let cosmic_lines = upload_cosmic_lines(&memory_allocator, &debug.cosmic.web, cosmic_origin);
+        // Inspector buffers at the fixed web-center origin (WS5).
+        let cosmic_tab_points =
+            upload_cosmic_points(&memory_allocator, &debug.cosmic.web, glam::DVec3::ZERO);
+        let cosmic_tab_lines =
+            upload_cosmic_lines(&memory_allocator, &debug.cosmic.web, glam::DVec3::ZERO);
+        let cosmic_tab_player = upload_cosmic_player_point(&memory_allocator, [0.0, 0.0, 0.0]);
         // Catalog sky over the cooker layout (`assets/catalog`); missing
         // manifest ⇒ procedural fallback sky (model-only, logged). The
         // sky shares the universe seed so fallback content is stable
@@ -3582,6 +3934,11 @@ impl ViewerApp {
             map_vertices,
             system_points,
             system_lines,
+            cosmic_points,
+            cosmic_lines,
+            cosmic_tab_points,
+            cosmic_tab_lines,
+            cosmic_tab_player,
             sky,
             sky_vertices,
             twilight_stage: 0,
@@ -3598,6 +3955,22 @@ impl ViewerApp {
             last_fps_tick: None,
             main: None,
             mouse_walk: None,
+        }
+    }
+
+    /// Cosmic demo tick: integrate flight from held thrust intent,
+    /// track the camera, rebase the buffers past 50 Mpc of travel.
+    /// Parked tabs clear stale thrust (keys never stick across
+    /// switches). The dt floor keeps the flight assert (`dt > 0`)
+    /// green on the very first frame.
+    fn tick_cosmic(&mut self, dt: f32) {
+        if !matches!(self.debug.screen, Screen::GameDemo) {
+            self.debug.cosmic.held.clear();
+            return;
+        }
+        if self.debug.cosmic.tick(dt.max(1e-6) as f64) {
+            self.debug.cosmic.rebased();
+            self.refresh_cosmic();
         }
     }
 
@@ -3641,6 +4014,80 @@ impl ViewerApp {
         );
     }
 
+    /// Rebuild the cosmic-web buffers at the demo upload origin (after
+    /// a reseed or a rebase sail-past). Camera motion between rebuilds
+    /// rides the MVP push, never these buffers. The inspector buffers
+    /// (fixed web-center origin) rebuild on reseed only.
+    fn refresh_cosmic(&mut self) {
+        let origin = self.debug.cosmic.upload_origin;
+        self.cosmic_points =
+            upload_cosmic_points(&self.memory_allocator, &self.debug.cosmic.web, origin);
+        self.cosmic_lines =
+            upload_cosmic_lines(&self.memory_allocator, &self.debug.cosmic.web, origin);
+        self.cosmic_tab_points = upload_cosmic_points(
+            &self.memory_allocator,
+            &self.debug.cosmic.web,
+            glam::DVec3::ZERO,
+        );
+        self.cosmic_tab_lines = upload_cosmic_lines(
+            &self.memory_allocator,
+            &self.debug.cosmic.web,
+            glam::DVec3::ZERO,
+        );
+        tracing::info!(
+            seed = self.debug.cosmic.seed,
+            nodes = self.debug.cosmic.web.nodes.len(),
+            links = self.debug.cosmic.web.links.len(),
+            "cosmic web buffers rebuilt",
+        );
+    }
+
+    /// Reseed the cosmic demo (web + player + camera + HUD) and rebuild
+    /// its buffers: `R` in the demo, `--seed` / seed-field loads.
+    fn reseed_cosmic(&mut self, seed: u64) {
+        self.debug.cosmic.reseed(seed);
+        self.refresh_cosmic();
+        self.debug.fx.trigger_fade();
+        self.debug.fx.notify(format!(
+            "Cosmic web seed {seed} · {} nodes",
+            self.debug.cosmic.web.nodes.len()
+        ));
+        tracing::info!(seed, "cosmic web reseeded");
+    }
+
+    /// Toggle fly-to on the click-selected node (`E` in the demo,
+    /// shared with the Controls row): a committed leg cancels with a
+    /// continuous hand-back, otherwise the selection engages (or hints
+    /// when there is no target / the leg is rejected).
+    fn toggle_fly_to(&mut self) {
+        use game_debug::cosmic_demo::EngageOutcome;
+
+        if self.debug.cosmic.player.cancel_fly_to() {
+            self.debug.fx.notify("Fly-to cancelled".to_owned());
+            return;
+        }
+        match self.debug.cosmic.engage_fly_to() {
+            EngageOutcome::Engaged => {
+                let label = self
+                    .debug
+                    .cosmic
+                    .target_label()
+                    .unwrap_or_else(|| "node".to_owned());
+                self.debug.fx.notify(format!("Fly-to engaged → {label}"));
+            }
+            EngageOutcome::NoTarget => {
+                self.debug
+                    .fx
+                    .notify("Click a node to target first · [E] engages".to_owned());
+            }
+            EngageOutcome::Failed => {
+                self.debug
+                    .fx
+                    .notify("Fly-to rejected: target inside arrival sphere".to_owned());
+            }
+        }
+    }
+
     /// Route typed text into whichever field holds focus (seed field on
     /// the galaxy screen, subdiv/radius on the planet screen). Every
     /// `TextField::insert_char` guards on its own `focused` flag, so
@@ -3670,6 +4117,10 @@ impl ViewerApp {
         self.transit_acc = 0.0;
         self.refresh_map();
         self.refresh_system();
+        // Same master seed drives stage 0 (v0.3.2): the cosmic demo
+        // follows every seed load, wherever it navigates.
+        self.debug.cosmic.reseed(seed);
+        self.refresh_cosmic();
         self.debug
             .select_screen(Screen::Dimensions(WaypointId::MilkyWay));
         self.debug.fx.trigger_fade();
@@ -3986,6 +4437,17 @@ impl ViewerApp {
                             } else {
                                 self.debug.system.camera.rotate(dx, dy);
                             }
+                        } else if matches!(self.debug.screen, Screen::GameDemo) {
+                            // Cosmic demo: left-drag steers the ship nose
+                            // (Chase/FirstPerson follow it; Orbit keeps
+                            // its free-look angles). Checked before player
+                            // mode: on this tab there is no walker view,
+                            // so an armed walker must not swallow drags.
+                            self.debug.cosmic.steer(dx, dy);
+                        } else if content == Some(ViewContent::CosmicWeb) {
+                            // Cosmic inspector tab: left-drag orbits the
+                            // inspector camera (read-only).
+                            self.debug.cosmic_inspector.camera.rotate(dx, dy);
                         } else if self.debug.viewer.player.active {
                             // Player mode orbits the follow camera instead
                             // of the free global one (first/third person
@@ -4010,6 +4472,10 @@ impl ViewerApp {
                             self.debug.galaxy.camera.pan_screen(dx, dy, vp.h);
                         } else if content == Some(ViewContent::SystemMap) {
                             self.debug.system.camera.pan_screen(dx, dy, vp.h);
+                        } else if content == Some(ViewContent::CosmicWeb) {
+                            // Inspector pan (the demo tab never sets the
+                            // pan flag — it steers on left-drag).
+                            self.debug.cosmic_inspector.camera.pan_screen(dx, dy, vp.h);
                         }
                     }
                 }
@@ -4051,7 +4517,8 @@ impl ViewerApp {
                 }
                 if !pressed {
                     // Release: clear a mouse-held walk flag first
-                    // (Settings Controls hold-to-press parity).
+                    // (Settings Controls hold-to-press parity) — walker
+                    // and cosmic thrust alike, so neither sticks.
                     if self.mouse_walk.take().is_some() {
                         let viewer = &mut self.debug.viewer;
                         let mut keys = viewer.player.keys();
@@ -4060,6 +4527,7 @@ impl ViewerApp {
                         keys.west = false;
                         keys.east = false;
                         viewer.player.set_keys(keys);
+                        self.debug.cosmic.held.clear();
                         return;
                     }
                     // A press that barely traveled counts as a
@@ -4136,6 +4604,49 @@ impl ViewerApp {
                         // keeps its armed planet — the transit UI re-arms
                         // from screen state before committing, so the
                         // stale arm can never fire.
+                    }
+                    // Cosmic inspector click: pick the nearest node into
+                    // the readout (read-only — no journey mutation).
+                    // The demo tab targets fly-to instead (below).
+                    if click
+                        && content == Some(ViewContent::CosmicWeb)
+                        && !matches!(self.debug.screen, Screen::GameDemo)
+                        && in_viewport
+                        && let Some((cx, cy)) = cursor
+                    {
+                        let layout = match self.main.as_ref() {
+                            Some(ctx) => {
+                                let (w, h) = ctx.size();
+                                app_layout(self.debug.chrome, w, h)
+                            }
+                            None => return,
+                        };
+                        let vp = layout.viewport;
+                        let web = &self.debug.cosmic.web;
+                        self.debug
+                            .cosmic_inspector
+                            .select_at(web, glam::DVec3::ZERO, (cx, cy), vp);
+                    }
+                    // Cosmic demo click: pick the nearest node as the
+                    // fly-to target (a miss clears it).
+                    if click
+                        && matches!(self.debug.screen, Screen::GameDemo)
+                        && in_viewport
+                        && let Some((cx, cy)) = cursor
+                    {
+                        let layout = match self.main.as_ref() {
+                            Some(ctx) => {
+                                let (w, h) = ctx.size();
+                                app_layout(self.debug.chrome, w, h)
+                            }
+                            None => return,
+                        };
+                        let vp = layout.viewport;
+                        if let Some(i) = self.debug.cosmic.select_node_at((cx, cy), vp) {
+                            self.debug
+                                .fx
+                                .notify(format!("Target node {i} · [E] fly-to"));
+                        }
                     }
                     return;
                 }
@@ -4331,7 +4842,13 @@ impl ViewerApp {
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
                     };
                     let content = self.debug.screen_content();
-                    if content == Some(ViewContent::GalaxyMap) {
+                    if matches!(self.debug.screen, Screen::GameDemo) {
+                        // Cosmic zoom: wheel-up (positive scroll) moves
+                        // the player camera closer. Checked before player
+                        // mode for the same reason as drag-steer.
+                        let factor = (1.0 - 0.12 * scroll).max(0.05);
+                        self.debug.cosmic.camera.zoom(factor);
+                    } else if content == Some(ViewContent::GalaxyMap) {
                         // Log zoom on the map: wheel-up (positive scroll)
                         // shrinks the camera distance.
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
@@ -4339,6 +4856,10 @@ impl ViewerApp {
                     } else if content == Some(ViewContent::SystemMap) {
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.system.camera.zoom_by(factor);
+                    } else if content == Some(ViewContent::CosmicWeb) {
+                        // Inspector log-zoom (demo zoom handled above).
+                        let factor = (1.0 - 0.12 * scroll).max(0.05);
+                        self.debug.cosmic_inspector.camera.zoom_by(factor);
                     } else if self.debug.viewer.player.active {
                         self.debug.viewer.player.zoom_camera(scroll);
                     } else {
@@ -4376,6 +4897,22 @@ impl ViewerApp {
                     let fields_free = !viewer.subdiv_field.focused
                         && !viewer.radius_field.focused
                         && !self.debug.galaxy.seed_field.focused;
+                    // Cosmic demo: WASD/arrows are thrust intent (the tab
+                    // has no text fields; releases always clear).
+                    if matches!(self.debug.screen, Screen::GameDemo) {
+                        if fields_free || state == ElementState::Released {
+                            let pressed = state == ElementState::Pressed;
+                            let held = &mut self.debug.cosmic.held;
+                            match code {
+                                KeyCode::KeyW | KeyCode::ArrowUp => held.fwd = pressed,
+                                KeyCode::KeyS | KeyCode::ArrowDown => held.back = pressed,
+                                KeyCode::KeyA | KeyCode::ArrowLeft => held.left = pressed,
+                                KeyCode::KeyD | KeyCode::ArrowRight => held.right = pressed,
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
                     if viewer.player.active && fields_free {
                         let pressed = state == ElementState::Pressed;
                         let mut keys = viewer.player.keys();
@@ -4545,22 +5082,27 @@ impl ViewerApp {
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyP) => {
-                        // Player camera cycle (active player only).
+                        // Camera cycle: the cosmic camera on the demo tab,
+                        // else the player camera (active player only).
                         // A focused field keeps the keystroke instead.
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.galaxy.seed_field.focused
-                            && viewer.player.active
                         {
-                            self.debug.viewer.player.cycle_camera();
+                            if matches!(self.debug.screen, Screen::GameDemo) {
+                                self.debug.cosmic.camera.cycle();
+                            } else if viewer.player.active {
+                                self.debug.viewer.player.cycle_camera();
+                            }
                         } else if let Some(text) = text {
                             self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyR) => {
-                        // R re-rolls the galaxy seed with galaxy content;
-                        // planet content keeps R = Right preset.
+                        // R re-rolls the seed with galaxy content; the
+                        // demo tab re-rolls the cosmic web; planet
+                        // content keeps R = Right preset.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
@@ -4569,7 +5111,10 @@ impl ViewerApp {
                         };
                         if fields_free {
                             let content = self.debug.screen_content();
-                            if content == Some(ViewContent::GalaxyMap) {
+                            if matches!(self.debug.screen, Screen::GameDemo) {
+                                let seed = self.debug.cosmic.seed + 1;
+                                self.reseed_cosmic(seed);
+                            } else if content == Some(ViewContent::GalaxyMap) {
                                 self.load_galaxy_seed(self.debug.galaxy.seed + 1);
                             } else if content == Some(ViewContent::PlanetView) {
                                 let radius = self.debug.viewer.radius;
@@ -4590,7 +5135,11 @@ impl ViewerApp {
                                 && !viewer.radius_field.focused
                                 && !self.debug.galaxy.seed_field.focused
                         };
-                        if fields_free
+                        // Cosmic demo first: E toggles fly-to on the
+                        // click-selected node (shared with Controls).
+                        if fields_free && matches!(self.debug.screen, Screen::GameDemo) {
+                            self.toggle_fly_to();
+                        } else if fields_free
                             && self.debug.screen_content() == Some(ViewContent::GalaxyMap)
                             && let Some(i) = self.debug.galaxy.selected
                         {
@@ -4783,7 +5332,9 @@ impl ViewerApp {
                 self.update_hover();
             }
             Action::CameraCycle => {
-                if self.debug.viewer.player.active {
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    self.debug.cosmic.camera.cycle();
+                } else if self.debug.viewer.player.active {
                     self.debug.viewer.player.cycle_camera();
                 }
             }
@@ -4794,7 +5345,10 @@ impl ViewerApp {
             Action::PresetBottom => self.snap_preset(GlobalPreset::Bottom),
             Action::PresetRight => self.snap_preset(GlobalPreset::Right),
             Action::RerollSeed => {
-                if self.debug.screen_content() == Some(ViewContent::GalaxyMap) {
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    let seed = self.debug.cosmic.seed + 1;
+                    self.reseed_cosmic(seed);
+                } else if self.debug.screen_content() == Some(ViewContent::GalaxyMap) {
                     self.load_galaxy_seed(self.debug.galaxy.seed + 1);
                 }
             }
@@ -4804,6 +5358,10 @@ impl ViewerApp {
                     self.debug.galaxy.camera.toggle_top_down();
                 } else if content == Some(ViewContent::SystemMap) {
                     self.debug.system.camera.toggle_top_down();
+                } else if content == Some(ViewContent::CosmicWeb)
+                    && !matches!(self.debug.screen, Screen::GameDemo)
+                {
+                    self.debug.cosmic_inspector.camera.toggle_top_down();
                 }
             }
             Action::TwilightCycle => {
@@ -4816,6 +5374,7 @@ impl ViewerApp {
             }
             Action::TravelOffer => self.travel_offer_toggle(),
             Action::TravelBegin => self.travel_begin(),
+            Action::FlyToToggle => self.toggle_fly_to(),
             Action::AscendLayer => self.ascend_layer(),
             Action::FocusToggle => self.focus_toggle(),
             Action::ConfirmField => self.confirm_focused_field(),
@@ -4823,8 +5382,20 @@ impl ViewerApp {
     }
 
     /// Arm a mouse-held walk direction (player must be active; the
-    /// release path clears it).
+    /// release path clears it). On the demo tab the same parity rows
+    /// drive cosmic thrust instead.
     fn hold_walk(&mut self, dir: WalkDir) {
+        if matches!(self.debug.screen, Screen::GameDemo) {
+            self.mouse_walk = Some(dir);
+            let held = &mut self.debug.cosmic.held;
+            match dir {
+                WalkDir::North => held.fwd = true,
+                WalkDir::South => held.back = true,
+                WalkDir::West => held.left = true,
+                WalkDir::East => held.right = true,
+            }
+            return;
+        }
         if !self.debug.viewer.player.active {
             return;
         }
@@ -4983,6 +5554,7 @@ impl ViewerApp {
             .unwrap_or(0.0)
             .clamp(0.0, 0.25);
         self.last_frame = Some(now);
+        self.tick_cosmic(dt);
         // Transit countdown: fixed-step accumulation of the
         // frame dt into sim ticks. Commit fires journey EnterOrbit at
         // duration; the arrival view lands bound to Earth.
@@ -5103,41 +5675,23 @@ impl ViewerApp {
         // composes on top so it floats over every tab.
         let mut items = match self.debug.screen {
             Screen::GameDemo => {
+                // v0.3.2 rebuild: the demo mounts only the cosmic player
+                // scene (journey maps live on in their dimension tabs).
                 let mut demo = UiItems::default();
                 build_topbar(&mut demo, self.atlas.line_height(), &self.debug, layout);
-                match content {
-                    Some(ViewContent::PlanetView) => {
-                        let sky_summary = self.sky.summary();
-                        let mut inner =
-                            build_planet_ui(&mut self.atlas, &self.debug, &sky_summary, layout);
-                        demo.solids.append(&mut inner.solids);
-                        demo.tris.append(&mut inner.tris);
-                        demo.texts.append(&mut inner.texts);
-                    }
-                    Some(ViewContent::GalaxyMap) => {
-                        let mut inner = build_galaxy_ui(&mut self.atlas, &self.debug, layout);
-                        demo.solids.append(&mut inner.solids);
-                        demo.tris.append(&mut inner.tris);
-                        demo.texts.append(&mut inner.texts);
-                    }
-                    Some(ViewContent::SystemMap) => {
-                        let mut inner = build_system_ui(&mut self.atlas, &self.debug, layout);
-                        demo.solids.append(&mut inner.solids);
-                        demo.tris.append(&mut inner.tris);
-                        demo.texts.append(&mut inner.texts);
-                    }
-                    None => {}
-                }
                 build_demo_ui(
                     &mut demo,
                     self.atlas.line_height(),
-                    &self.debug,
+                    &mut self.debug,
                     layout.viewport,
                 );
                 demo
             }
             Screen::Dimensions(WaypointId::MilkyWay) => {
                 build_galaxy_ui(&mut self.atlas, &self.debug, layout)
+            }
+            Screen::Dimensions(WaypointId::CosmicWeb) => {
+                build_cosmic_web_ui(&mut self.atlas, &self.debug, layout)
             }
             Screen::Dimensions(WaypointId::SolarSystem) => {
                 build_system_ui(&mut self.atlas, &self.debug, layout)
@@ -5340,6 +5894,101 @@ impl ViewerApp {
                     // no index buffer is bound for this `PointList` draw.
                     unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
                         .expect("map draw must record");
+                } else if view == ViewContent::CosmicWeb {
+                    // Cosmic player scene (v0.3.2): web points (nodes +
+                    // dwarf glow) through the map pipeline, filament
+                    // links through the line pipeline — links first. The
+                    // demo tab renders the player-immersive view (demo
+                    // buffers + player camera); the Cosmic Web tab
+                    // renders the same web through the inspector camera
+                    // (fixed-center buffers + live player point).
+                    let (mvp, px_scale, is_demo) = if self.debug.screen == Screen::GameDemo {
+                        let camera = &self.debug.cosmic.camera;
+                        (
+                            camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                            camera.px_scale(vp.h),
+                            true,
+                        )
+                    } else {
+                        let inspector = &self.debug.cosmic_inspector;
+                        (
+                            inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                            inspector.camera.px_scale(vp.h),
+                            false,
+                        )
+                    };
+                    // Per-surface buffers: demo (ship-relative origin)
+                    // vs inspector (fixed web-center origin).
+                    let (lines, points) = if is_demo {
+                        (self.cosmic_lines.clone(), self.cosmic_points.clone())
+                    } else {
+                        (
+                            self.cosmic_tab_lines.clone(),
+                            self.cosmic_tab_points.clone(),
+                        )
+                    };
+                    let (lines_len, points_len) = (lines.len(), points.len());
+                    builder
+                        .set_viewport(0, [viewport].into_iter().collect())
+                        .expect("viewport must set")
+                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, lines)
+                        .expect("vertex buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.line.layout().clone(),
+                            0,
+                            LinePush { mvp, inflate: 0.0 },
+                        )
+                        .expect("line push constants must upload");
+                    // SAFETY: buffer holds exactly the uploaded link
+                    // segments, no index buffer bound.
+                    unsafe { builder.draw(lines_len as u32, 1, 0, 0) }
+                        .expect("cosmic links draw must record");
+                    builder
+                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                        .expect("pipeline must bind")
+                        .bind_vertex_buffers(0, points)
+                        .expect("vertex buffer must bind")
+                        .push_constants(
+                            ctx.pipelines.map.layout().clone(),
+                            0,
+                            MapPush {
+                                mvp,
+                                px_scale,
+                                exposure: 1.0,
+                            },
+                        )
+                        .expect("map push constants must upload");
+                    // SAFETY: same PointList contract as the galaxy map.
+                    unsafe { builder.draw(points_len as u32, 1, 0, 0) }
+                        .expect("cosmic points draw must record");
+                    if !is_demo {
+                        // Inspector player point: one vertex at the live
+                        // ship position (center-relative), rebuilt per
+                        // frame while the tab shows.
+                        let ship = self.debug.cosmic.player.position_mpc();
+                        self.cosmic_tab_player = upload_cosmic_player_point(
+                            &self.memory_allocator,
+                            [ship.x as f32, ship.y as f32, ship.z as f32],
+                        );
+                        builder
+                            .bind_vertex_buffers(0, self.cosmic_tab_player.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                ctx.pipelines.map.layout().clone(),
+                                0,
+                                MapPush {
+                                    mvp,
+                                    px_scale,
+                                    exposure: 1.0,
+                                },
+                            )
+                            .expect("map push constants must upload");
+                        // SAFETY: single-vertex PointList, no index buffer.
+                        unsafe { builder.draw(1, 1, 0, 0) }
+                            .expect("cosmic player point draw must record");
+                    }
                 } else if view == ViewContent::SystemMap {
                     // System map: orbit rings through the line pipeline,
                     // star + planets through the map point pipeline — both
@@ -6189,19 +6838,25 @@ mod tests {
         ] {
             assert!(widget.contains(needle), "widget fps missing {needle}");
         }
-        // Widget Console body: the transition-event log feed.
+        // Widget Console body: the real fly-to event feed.
+        use game_debug::cosmic_player::CosmicEvent;
+
+        app.cosmic
+            .player
+            .events
+            .push(CosmicEvent::TargetSelected { node: 5 });
         app.sync_console();
         app.select_widget_tab(WidgetTab::Console);
         let mut widget = UiItems::default();
         build_widget(&mut widget, lh, &app, 1280.0, 720.0);
         let console = joined(&widget);
-        assert!(console.contains("solar-system -> neighborhood"));
+        assert!(console.contains("web/seed:1234/node:5"));
         // Widget Inspector body: journey summary.
         app.select_widget_tab(WidgetTab::Inspector);
         let mut widget = UiItems::default();
         build_widget(&mut widget, lh, &app, 1280.0, 720.0);
         let inspector = joined(&widget);
-        for needle in ["layer:", "waypoint:", "transitions:"] {
+        for needle in ["layer:", "waypoint:", "fly-to:"] {
             assert!(inspector.contains(needle), "inspector missing {needle}");
         }
         // Corner strip lives inside the top bar: three toggles with
@@ -6212,16 +6867,32 @@ mod tests {
         for needle in ["DOCK-L [F9]", "DOCK-R [F10]", "DEV 60 [`]"] {
             assert!(strip.contains(needle), "corner strip missing {needle}");
         }
-        // Transition pill: shows the in-flight preview leg…
-        let mut items = UiItems::default();
-        build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
-        let pill = joined(&items);
-        assert!(pill.contains("solar-system → neighborhood"));
-        // …and stays silent with no transition in flight.
-        app.transitions.current = None;
+        // Transition pill: silent with no leg in flight…
         let mut items = UiItems::default();
         build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
         assert!(items.texts.is_empty());
+        // …and showing live easing progress once fly-to commits.
+        use game_engine::flight::{FlyToExec, Target, plan_fly_to};
+        use game_engine::frames::FrameId;
+
+        let home = DVec3::from(app.cosmic.web.home().position_mpc);
+        let target = Target::new(FrameId::Cosmological, home).expect("finite target");
+        let plan = plan_fly_to(
+            FrameId::Cosmological,
+            app.cosmic.player.position_mpc(),
+            &target,
+            0.0,
+        )
+        .expect("plannable leg");
+        let mut exec = FlyToExec::new(plan);
+        exec.commit().expect("commits once");
+        app.cosmic.player.exec = Some(exec);
+        app.cosmic.player.target_node = Some(app.cosmic.web.home_node);
+        let mut items = UiItems::default();
+        build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
+        let pill = joined(&items);
+        assert!(pill.contains("FLY-TO"), "pill missing fly-to: {pill}");
+        assert!(pill.contains('%'), "pill missing progress: {pill}");
         // Settings Controls: every registry action as a labeled row.
         let mut settings = UiItems::default();
         build_settings_ui(&mut settings, lh, layout.viewport);
@@ -6247,7 +6918,7 @@ mod tests {
         assert!(ph.contains("INACTIVE"));
         // Demo tab: HUD lines, no debug data.
         let mut demo = UiItems::default();
-        build_demo_ui(&mut demo, lh, &app, layout.viewport);
+        build_demo_ui(&mut demo, lh, &mut app, layout.viewport);
         let demo = joined(&demo);
         for needle in ["GAME DEMO", "frame:", "time:", "soi:", "target:"] {
             assert!(demo.contains(needle), "demo missing {needle}");

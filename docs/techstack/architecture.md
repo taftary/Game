@@ -14,11 +14,13 @@ crates/
   game/       - clean release game binary + pure player HUD view model
   tools/      - tooling binary, empty fn main() {} (not a default member)
    debug/      - game_debug lib (unified single-window shell, ADR-022:
-                    Game Demo tab + Dimensions dropdown (10 waypoints) +
-                    Settings; absorbed Galaxy/System/Planet views; dev
-                    widget with FPS/console/inspector sub-tabs) +
-                    game_debug binary: windowed viewer with developer
-                    tools (not a default member)
+                     Game Demo tab + Dimensions dropdown (10 waypoints) +
+                     Settings; absorbed Galaxy/System/Planet views; dev
+                     widget with FPS/console/inspector sub-tabs; v0.3.2
+                     ADR-023: Game Demo rebuilt around the cosmic player
+                     + Cosmic Web inspector as the fourth absorbed view) +
+                     game_debug binary: windowed viewer with developer
+                     tools (not a default member)
 docs/         - project docs (game overview + techstack/game/milestones/risks/decisions)
 plans/        - feature lifecycle: notion -> plan -> implement (see plans/README.md)
 tests/        - consolidated test package; every target is empty
@@ -45,9 +47,9 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
                   # + icosa-net UV unwrap (uv) + flat chunk map (chunk_flat)
     waypoints.rs # ten player-facing scale waypoints over FrameChain;
                  # deterministic transition descriptors and event queue
-    universe/    # seeds, galaxy/system/planet generation (M5 shipped
-                 # stages 1–2: descriptors + hashes; stage 3 lands with
-                 # descent/surface)
+    universe/    # seeds, web/nodes (stage 0, v0.3.2) + galaxy/system/planet
+                 # generation (M5 shipped stages 1–2: descriptors + hashes;
+                 # stage 3 lands with descent/surface)
      hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
                   # cell-chunk identity (`ChunkId` = cell index, ADR-010)
     sim/         # colonies, robots, resources, tick
@@ -63,18 +65,20 @@ crates/game/     # `game` binary: clean release entry — game states, camera
                  # policy, UI wiring when windowed shell lands
 crates/debug/    # `game_debug` lib (unified shell: actions/app/ui/
                    # console/fps/inspector modules + galaxy/system maps +
-                   # planet_viewer/picking + transitions feed) + binary
-                   # (non-default member): single window (Game Demo tab
-                   # with shipping HUD + Dimensions dropdown mounting the
-                   # absorbed Galaxy Map (Milky Way) / System Map (Solar
-                   # System) / Planet View (Earth) with orbit camera,
+                   # planet_viewer/picking + cosmic player/camera/demo/
+                   # web-inspector modules + live fly-to event feed) +
+                   # binary (non-default member): single window (Game Demo
+                   # tab with the cosmic player scene + shipping HUD +
+                   # Dimensions dropdown mounting the absorbed Galaxy Map
+                   # (Milky Way) / System Map (Solar System) / Planet View
+                   # (Earth) / Cosmic Web inspector with orbit camera,
                    # fill + wireframe + pentagon highlight, cell-chunk
                    # hover highlight + click-to-pin with panel readout,
                    # 6 debug-shader modes, inputs panel, --headless CI
-                   # mode with pick + player self-tests) + dev widget
-                   # (FPS / console fed by the transition log / inspector
-                   # + bottom-center transition pill); developer screens
-                   # never leak into the release binary
+                   # mode with pick + player + cosmic self-tests) + dev
+                   # widget (FPS / console fed by the fly-to event feed /
+                   # inspector + bottom-center fly-to pill); developer
+                   # screens never leak into the release binary
 crates/tools/    # `game_tools` binary (non-default member): seed inspector,
                  # planet preview / renderer smoke (M1: seeded planet, orbit
                  # camera, Low/Med/High tiers, --headless CI mode), save

@@ -102,8 +102,11 @@ commit when it reaches `done` (workflow rule:
 - **Audio:** deferred to navigation-engine spec v0.5 (spec §10, ADR-006
   in [`../decisions/`](../decisions/)).
 - **Post-v1 candidates:** subterranean geometry
-  ([`../game/journey.md`](../game/journey.md) L8), traversable universe
-  layer (L1), landable moons (L4).
+  ([`../game/journey.md`](../game/journey.md) L8), landable moons (L4).
+  (The traversable-universe-layer (L1) entry is retired: v0.3.2 lands
+  the player-traversable cosmic web as the demo's starting dimension;
+  region streaming, sheet rendering, and frame handoff stay follow-ups
+  per ADR-023.)
 
 ## Open product items (spec §10 — must not be silently dropped)
 

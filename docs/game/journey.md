@@ -8,7 +8,7 @@ its child the row below. Real-world ranges are reference only.
 
 | Lv | Name | Real-world reference | Game extent (compressed) | v1 representation | Key entities | Domain |
 |---|---|---|---|---|---|---|
-| 1 | Universe Level | $10^{26}\text{ m}$ | Container only: one generated galaxy per save | Cosmic-web backdrop in the galaxy map; not traversable | Cosmic web, superclusters | Deep Space |
+| 1 | Universe Level | $10^{26}\text{ m}$ | Container only: one generated galaxy per save | Generated cosmic web (stage 0, v0.3.2): player-traversable in the Game Demo; cosmic-web backdrop in the galaxy map | Cosmic web, superclusters | Deep Space |
 | 2 | Galactic Scale | $10^{21}\text{ m}$ | 10k–100k light-years (compressed) | Star points + nebula impostors, log/compressed space | Spiral arms, galactic core, interstellar medium | Deep Space |
 | 3 | Stellar System Level | $10^{13}\text{ m}$ | AU-scale (compressed) | Orbital map, patched positions | Central star, planetary orbits, Kuiper belt, heliosphere | Deep Space |
 | 4 | Planetary System Domain | $10^{7}\text{ m}$ – $10^{8}\text{ m}$ | 2–64 km gameplay radius (not real-Earth scale) + visual companions | Spherical LOD mesh, far view; moons/rings as backdrop | Main planet, moons, ring systems, probes, rockets | Orbital & Atmospheric |
@@ -46,7 +46,8 @@ re-anchor at SOI handoffs, never by absolute float conversion.
 
 ```text
 Deep Space
-  L1 Universe Level ............ backdrop only (no v1 state)
+  L1 Universe Level ............ cosmic web (stage 0, v0.3.2:
+                                 player-traversable in the Game Demo)
   L2 Galactic Scale ............ GalaxyMap
   L3 Stellar System Level ...... SystemMap
 Orbital & Atmospheric
@@ -86,7 +87,8 @@ no underground player state.
 
 The debug Dimensions dropdown lists the ten waypoint tabs with the
 active journey layer marked. Milky Way / Solar System / Earth mount the
-absorbed Galaxy Map / System Map / Planet View; the other seven tabs
+absorbed Galaxy Map / System Map / Planet View; the Cosmic Web tab
+mounts the absorbed cosmic-web inspector (v0.3.2); the other six tabs
 are placeholders (S7: last state + `INACTIVE` badge, never blank)
 until their runtime state exists.
 
@@ -97,17 +99,20 @@ segment is built — `game::journey` runs `GalaxyMap`/`SystemMap`/`Orbit`
 with selection/event transitions, fade + prefetch/evict effects, and a
 pinned-hash fixed-step regression; `game::transit` adds the timed,
 pre-commit-cancellable interplanetary hop (60 ticks @ 20 Hz, deferred
-fuel/energy hook); `engine::universe` generates stages 1–2 with
-quantized cross-platform hashes; `game_debug` mounts the Galaxy Map
-on the Milky Way dimension tab (`F2` dropdown, digit `4`: star points
-+ nebula impostors + L1 backdrop, 3D orbit/pan/log
-zoom/click, `Home` top-down snap — `plans/v0.0.1/universe-maps-3d`)
-and the System Map on the Solar System tab (digit `6`: inclined orbit
-rings + planets + L4 focus + travel offer)
+fuel/energy hook); `engine::universe` generates stage 0 (cosmic web,
+v0.3.2) then stages 1–2 with quantized cross-platform hashes;
+`game_debug` mounts the generated web twice from one descriptor — the
+Game Demo tab (`F1`, default) renders the player flying inside it
+(`ShipState` in `FrameId::Cosmological`, marker + Chase/Orbit/
+FirstPerson camera, physical thrust + click/`E` fly-to, shipping HUD)
+while the Cosmic Web dimension tab (`F2` dropdown, digit `1`) inspects
+it (orbit/pan/log-zoom, click-node readout, live player point,
+`Home` top-down snap) — plus the System Map on the Solar System tab
+(digit `6`: inclined orbit rings + planets + L4 focus + travel offer)
 plus the orbit arrival binding (viewer rebuilds at descriptor
-radius with the atmosphere tint). The Game Demo tab (`F1`, default)
-renders the current journey layer presentation-accurately with the
-shipping HUD and drives the same `Journey` the debug tabs inspect.
+radius with the atmosphere tint). The Game Demo tab drives the
+player directly (no journey-layer following); the dimension tabs keep
+their travel keys (`E` drills down, `T`/`Q` offer/ascend) verbatim.
 `Descent`/`Surface` (L6–L7) land with the descent milestone (M2).
 
 Rendering side: [`../techstack/rendering.md`](../techstack/rendering.md). Budgets: [`../techstack/quality.md`](../techstack/quality.md).

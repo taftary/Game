@@ -9,13 +9,16 @@
 //! always visible; docks and the dev widget toggle independently.
 
 use crate::actions::{DROPDOWN_ORDER, dimension_index_for_digit};
+use crate::cosmic_demo::CosmicDemoState;
+use crate::cosmic_player::CosmicEvent;
+use crate::cosmic_web::CosmicWebInspector;
 use crate::fx::FxState;
 use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
 use crate::planet_viewer::PlanetViewerState;
 use crate::system_map::{OrbitArrival, SystemMapView};
-use crate::transitions::TransitionPanel;
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
 use game::journey::{Journey, Layer};
+use game_engine::universe::WebDescriptor;
 use game_engine::waypoints::WaypointId;
 
 /// Top-level screens in nav-bar order (`F1`–`F3`).
@@ -51,10 +54,12 @@ impl Screen {
 }
 
 /// 3D content mounted in the viewport (`None` = flat UI only).
-/// Replaces the old viewer-window screen enum: the same three
-/// renders, now addressed by the unified [`Screen`].
+/// The demo tab mounts the cosmic player scene; the three absorbed
+/// dimension tabs mount their map views (the Cosmic Web inspector mounts
+/// here in WS5 — until then its tab stays a placeholder).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewContent {
+    CosmicWeb,
     GalaxyMap,
     SystemMap,
     PlanetView,
@@ -143,6 +148,14 @@ pub struct App {
     /// Dimensions dropdown open (captures digit keys).
     pub dropdown_open: bool,
     pub viewer: PlanetViewerState,
+    /// Game Demo cosmic scene: generated web + live player + camera +
+    /// HUD (v0.3.2 `cosmic-scale-player`). Survives screen switching
+    /// like every other content state.
+    pub cosmic: CosmicDemoState,
+    /// Cosmic Web dimension-tab inspector: own orbit camera + node
+    /// selection over the shared web (v0.3.2 fourth absorbed view).
+    /// Read-only by construction (see `selection_is_read_only`).
+    pub cosmic_inspector: CosmicWebInspector,
     /// Galaxy-map screen state (camera + selection survive switching,
     /// same as the viewer state).
     pub galaxy: GalaxyMapView,
@@ -159,7 +172,6 @@ pub struct App {
     pub console: LogConsole,
     /// Backing state for the inspector (journey summary).
     pub inspector: StateInspector,
-    pub transitions: TransitionPanel,
 }
 
 impl App {
@@ -182,6 +194,8 @@ impl App {
             widget_focused: false,
             dropdown_open: false,
             viewer,
+            cosmic: CosmicDemoState::new(DEFAULT_GALAXY_SEED),
+            cosmic_inspector: CosmicWebInspector::new(),
             galaxy,
             system,
             journey: Journey::new(DEFAULT_GALAXY_SEED),
@@ -189,11 +203,6 @@ impl App {
             fps: FpsOverlay::new(),
             console: LogConsole::new(),
             inspector: StateInspector,
-            transitions: {
-                let mut panel = TransitionPanel::new();
-                panel.preview();
-                panel
-            },
         }
     }
 
@@ -223,15 +232,14 @@ impl App {
     }
 
     /// 3D content for the current screen (`None` = flat UI only).
-    /// The demo tab follows the journey layer; absorbed dimension
-    /// tabs mount their view; everything else is flat UI.
+    /// The demo tab mounts the cosmic player scene (v0.3.2 rebuild —
+    /// it no longer follows the journey layer); absorbed dimension
+    /// tabs mount their view, including the Cosmic Web inspector;
+    /// everything else is flat UI.
     pub fn screen_content(&self) -> Option<ViewContent> {
         match self.screen {
-            Screen::GameDemo => match self.journey.active_layer() {
-                Layer::Galaxy => Some(ViewContent::GalaxyMap),
-                Layer::System => Some(ViewContent::SystemMap),
-                Layer::Orbit => Some(ViewContent::PlanetView),
-            },
+            Screen::GameDemo => Some(ViewContent::CosmicWeb),
+            Screen::Dimensions(WaypointId::CosmicWeb) => Some(ViewContent::CosmicWeb),
             Screen::Dimensions(WaypointId::MilkyWay) => Some(ViewContent::GalaxyMap),
             Screen::Dimensions(WaypointId::SolarSystem) => Some(ViewContent::SystemMap),
             Screen::Dimensions(WaypointId::Earth) => Some(ViewContent::PlanetView),
@@ -359,10 +367,36 @@ impl App {
         }
     }
 
-    /// Drain new transition history into the console feed. Returns
-    /// lines added.
+    /// Drain new flight events into the console feed. Returns lines
+    /// added. The WS6 feed is real pilot actions (select / engage /
+    /// cancel / arrive) — the fake `preview()` seed data is deleted,
+    /// and journey transitions never emitted console events.
     pub fn sync_console(&mut self) -> usize {
-        self.console.feed_transitions(&self.transitions.history)
+        let events = self.cosmic.player.drain_events();
+        let added = events.len();
+        for event in events {
+            self.console
+                .push(format_cosmic_event(&self.cosmic.web, event));
+        }
+        added
+    }
+}
+
+/// One console line per pilot action (dev readout, not a save format).
+fn format_cosmic_event(web: &WebDescriptor, event: CosmicEvent) -> String {
+    match event {
+        CosmicEvent::TargetSelected { node } => {
+            format!("fly-to target selected: {}", web.node_content_id(node))
+        }
+        CosmicEvent::FlyToStarted { node } => {
+            format!("fly-to engaged → {}", web.node_content_id(node))
+        }
+        CosmicEvent::FlyToCancelled { node } => {
+            format!("fly-to cancelled ({})", web.node_content_id(node))
+        }
+        CosmicEvent::FlyToCompleted { node } => {
+            format!("fly-to arrived {} · at rest", web.node_content_id(node))
+        }
     }
 }
 
@@ -491,16 +525,58 @@ mod tests {
     #[test]
     fn screen_content_mapping() {
         let mut app = App::new();
-        // Demo follows the journey layer (fresh journey = Galaxy).
-        assert_eq!(app.screen_content(), Some(ViewContent::GalaxyMap));
+        // Demo mounts the cosmic player scene (v0.3.2 rebuild — it no
+        // longer follows the journey layer).
+        assert_eq!(app.screen_content(), Some(ViewContent::CosmicWeb));
         app.select_screen(Screen::Dimensions(WaypointId::SolarSystem));
         assert_eq!(app.screen_content(), Some(ViewContent::SystemMap));
         app.select_screen(Screen::Dimensions(WaypointId::Earth));
         assert_eq!(app.screen_content(), Some(ViewContent::PlanetView));
+        // The Cosmic Web inspector mounts the shared web (WS5).
         app.select_screen(Screen::Dimensions(WaypointId::CosmicWeb));
-        assert_eq!(app.screen_content(), None);
+        assert_eq!(app.screen_content(), Some(ViewContent::CosmicWeb));
         app.select_screen(Screen::Settings);
         assert_eq!(app.screen_content(), None);
+    }
+
+    #[test]
+    fn demo_cosmic_state_survives_switching() {
+        let mut app = App::new();
+        assert_eq!(app.cosmic.seed, DEFAULT_GALAXY_SEED);
+        assert!(!app.cosmic.web.nodes.is_empty());
+        app.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
+        app.select_screen(Screen::GameDemo);
+        assert_eq!(app.screen_content(), Some(ViewContent::CosmicWeb));
+        assert_eq!(app.cosmic.seed, DEFAULT_GALAXY_SEED);
+    }
+
+    #[test]
+    fn inspector_selection_is_read_only() {
+        // CSP-015 / DoD 4: selecting and rendering the Cosmic Web tab
+        // never mutates Journey/System/Viewer state (the
+        // `dimension-debug` contract).
+        use crate::ui::Rect;
+
+        let mut app = App::new();
+        let journey_hash = app.journey.state_hash();
+        let galaxy_seed = app.galaxy.seed;
+        let viewer_stats = app.viewer.stats.clone();
+        app.select_screen(Screen::Dimensions(WaypointId::CosmicWeb));
+        let vp = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let picked =
+            app.cosmic_inspector
+                .select_at(&app.cosmic.web, glam::DVec3::ZERO, (400.0, 300.0), vp);
+        assert!(picked.is_none_or(|i| i < app.cosmic.web.nodes.len() as u32));
+        app.select_screen(Screen::GameDemo);
+        app.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
+        assert_eq!(app.journey.state_hash(), journey_hash);
+        assert_eq!(app.galaxy.seed, galaxy_seed);
+        assert_eq!(app.viewer.stats, viewer_stats);
     }
 
     #[test]
@@ -537,15 +613,43 @@ mod tests {
     }
 
     #[test]
-    fn console_sync_drains_transition_history() {
+    fn console_sync_drains_flight_events() {
         let mut app = App::new();
-        // The fresh panel carries the preview history.
-        let history_len = app.transitions.history.len();
-        assert!(history_len > 0);
-        let added = app.sync_console();
-        assert_eq!(added, history_len);
-        assert!(!app.console.is_empty());
-        // Second sync adds nothing (already drained).
+        // Fresh shell: no pilot actions yet, nothing to drain.
+        assert!(app.console.is_empty());
         assert_eq!(app.sync_console(), 0);
+        // Select + engage queue two events; one sync drains both into
+        // lines, the next sync finds nothing new.
+        app.cosmic
+            .player
+            .events
+            .push(CosmicEvent::TargetSelected { node: 3 });
+        app.cosmic
+            .player
+            .events
+            .push(CosmicEvent::FlyToStarted { node: 3 });
+        assert_eq!(app.sync_console(), 2);
+        let lines = app.console.lines().join("\n");
+        assert!(
+            lines.contains("target selected: web/seed:1234/node:3"),
+            "{lines}"
+        );
+        assert!(lines.contains("engaged → web/seed:1234/node:3"), "{lines}");
+        assert_eq!(app.sync_console(), 0);
+    }
+
+    #[test]
+    fn flight_event_lines_cover_all_phases() {
+        let app = App::new();
+        for (event, needle) in [
+            (CosmicEvent::TargetSelected { node: 1 }, "target selected"),
+            (CosmicEvent::FlyToStarted { node: 1 }, "engaged →"),
+            (CosmicEvent::FlyToCancelled { node: 1 }, "cancelled"),
+            (CosmicEvent::FlyToCompleted { node: 1 }, "arrived"),
+        ] {
+            let line = format_cosmic_event(&app.cosmic.web, event);
+            assert!(line.contains(needle), "{line}");
+            assert!(line.contains("web/seed:1234/node:1"), "{line}");
+        }
     }
 }

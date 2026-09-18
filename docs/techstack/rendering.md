@@ -263,12 +263,30 @@ System Map and Planet View (current `HexSphere` as dual-cell fans
 with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
-stats). The dev widget (`` ` `` toggle, `F6`–`F8` sub-tabs) hosts FPS
-(live frame-health), the Console (transition-event log feed) and the
-Inspector (journey summary); a transition pill floats bottom-center
-while a waypoint transition is in flight, and three toggle buttons
+stats); the Cosmic Web tab (v0.3.2, ADR-023) mounts the absorbed
+cosmic-web inspector (stage-0 nodes + dwarf glow through the map
+`PointList` pipeline, filament links through the line pipeline, own
+orbit/pan/zoom camera, live player point). The Game Demo tab renders
+the same web as the player-immersive scene (one point draw + one line
+draw per surface, buffers relative to an upload origin, camera
+recentered on the same origin with a 50 Mpc rebase). The dev widget
+(`` ` `` toggle, `F6`–`F8` sub-tabs) hosts FPS
+(live frame-health), the Console (fly-to event feed) and the
+Inspector (journey summary); a fly-to pill floats bottom-center
+while a fly-to leg is in flight (live easing progress, hidden
+otherwise), and three toggle buttons
 live inside the always-visible top bar (left dock, right dock, dev
 widget with FPS value). Viewer state is preserved across screen switches.
+
+Camera & screen-space contract, cosmic extension (v0.3.2, ADR-023):
+the space camera (`debug::cosmic_camera`: Chase/Orbit/FirstPerson)
+uses the un-flipped `directx::perspective` with MapOrbitCamera-style
+distance-derived near/far; the cosmic player marker goes through
+`world_to_pixels` + the shared dot/arrow/`YOU` path pin-for-pin with
+the sphere marker (FirstPerson hides it by construction — eye-plane
+`w ≤ 0`); the inspector player point is map content (one-vertex
+point draw), never the UI marker. Points/lines carry no faces, so no
+front-face/cull state is involved on either cosmic surface.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
