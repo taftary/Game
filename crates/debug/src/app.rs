@@ -14,8 +14,10 @@ use crate::cosmic_player::CosmicEvent;
 use crate::cosmic_web::CosmicWebInspector;
 use crate::fx::FxState;
 use crate::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView};
+use crate::loader::LoadPlan;
 use crate::planet_viewer::PlanetViewerState;
 use crate::system_map::{OrbitArrival, SystemMapView};
+use crate::ui::TextField;
 use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
 use game::journey::{Journey, Layer};
 use game_engine::universe::WebDescriptor;
@@ -136,6 +138,28 @@ impl ChromeState {
     }
 }
 
+/// Universe seed editing state (Settings screen): the single editable
+/// seed field in the shell (v0.3.2 `settings-seed-loader`). Always
+/// mirrors the loaded universe seed after construction / load /
+/// re-roll; the dimension docks show the seed read-only.
+#[derive(Clone, Debug)]
+pub struct UniverseSettings {
+    pub seed_field: TextField,
+}
+
+impl UniverseSettings {
+    pub fn new(seed: u64) -> Self {
+        UniverseSettings {
+            seed_field: TextField::new(&seed.to_string()),
+        }
+    }
+
+    /// Mirror a freshly loaded universe seed (text only; focus kept).
+    pub fn sync_seed(&mut self, seed: u64) {
+        self.seed_field.text = seed.to_string();
+    }
+}
+
 /// Whole debug-tool state.
 pub struct App {
     pub screen: Screen,
@@ -161,6 +185,12 @@ pub struct App {
     pub galaxy: GalaxyMapView,
     /// System-map screen state (loaded system + focus + selection).
     pub system: SystemMapView,
+    /// Universe seed editing state (Settings screen — the only
+    /// editable seed field; docks show the seed read-only).
+    pub settings: UniverseSettings,
+    /// Staged universe load in flight (one step runs per frame; the
+    /// modal overlay reads this). `None` at rest.
+    pub loading: Option<LoadPlan>,
     /// Journey machine the demo tab and map screens drive:
     /// selections arm it, E/T/Q commit travel and layer changes.
     pub journey: Journey,
@@ -198,6 +228,8 @@ impl App {
             cosmic_inspector: CosmicWebInspector::new(),
             galaxy,
             system,
+            settings: UniverseSettings::new(DEFAULT_GALAXY_SEED),
+            loading: None,
             journey: Journey::new(DEFAULT_GALAXY_SEED),
             fx: FxState::default(),
             fps: FpsOverlay::new(),
@@ -476,6 +508,18 @@ mod tests {
         assert!(app.esc_unwind());
         assert!(!app.widget_focused);
         assert!(!app.esc_unwind());
+    }
+
+    #[test]
+    fn settings_seed_field_mirrors_default_seed() {
+        let app = App::new();
+        assert_eq!(
+            app.settings.seed_field.text,
+            DEFAULT_GALAXY_SEED.to_string()
+        );
+        assert_eq!(app.galaxy.seed, DEFAULT_GALAXY_SEED);
+        assert_eq!(app.system.seed, DEFAULT_GALAXY_SEED);
+        assert_eq!(app.cosmic.seed, DEFAULT_GALAXY_SEED);
     }
 
     #[test]

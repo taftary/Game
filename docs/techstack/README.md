@@ -1,9 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.33.2 (2026-09-18, click-target highlight: amber UI-pass
-  ring on the selected node in the Game Demo + Cosmic Web tabs per
-  v0.3.2 issue-2026-09-18-2122-target-highlight-missing; picking /
-  flight / pipelines unchanged)
+- **Version:** 0.33.3 (2026-09-18, seed editing moves to Settings as the
+  single editable field + staged universe loader with a modal
+  determinate progress bar per v0.3.2 `settings-seed-loader`; Milky Way
+  dock keeps a read-only seed row, generation/simulation unchanged)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

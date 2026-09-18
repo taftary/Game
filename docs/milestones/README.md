@@ -91,6 +91,7 @@ commit when it reaches `done` (workflow rule:
 | Feature | Status | Spec section |
 |---|---|---|
 | [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | done | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
+| [`settings-seed-loader`](../../plans/v0.3.2/settings-seed-loader/) | done | dev tooling (single Settings seed editor + staged load progress) |
 
 ## Post-v0.3 (unscheduled)
 

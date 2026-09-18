@@ -31,8 +31,12 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   interactive, presentation-accurate, HUD on, chrome hidden),
   `F2` = Dimensions dropdown (ten waypoints, digits `1`–`0` pick
   while open, `●` marks the active journey layer), `F3` = Settings
-  (Controls section lists every action with its key; every row is
-  clickable). Milky Way / Solar System / Earth dimension tabs mount
+  (UNIVERSE section: the single editable seed field + `Load [Enter]`;
+  Controls section lists every action with its key; every row is
+  clickable). Loading a universe runs staged (one step per frame)
+  behind a modal determinate progress bar that floats above all UI;
+  the shell stays on the current screen. Milky Way / Solar System /
+  Earth dimension tabs mount
   the absorbed Galaxy Map / System Map / Planet View with their
   docks (260/300 px + padding) and content keys; the Cosmic Web tab
   (digit `1`) mounts the absorbed cosmic-web inspector (orbit/pan/
@@ -77,10 +81,12 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   `plans/v0.0.1/universe-maps-3d`): 3D perspective views — wheel = log zoom,
   left-drag = orbit, right/middle-drag = pan, click = select
   star/planet, `Home` = top-down snap toggle (classic north-up /
-  east-right framing); Milky Way tab
-  `E` drills into the selected star's system, `R` re-rolls the seed, seed
-  field + Load (or Enter) loads a typed universe (`--seed N` flag does
-  the same at startup); Solar System tab `F` toggles L4 planet focus, `T`
+   east-right framing); Milky Way tab
+   `E` drills into the selected star's system, `R` re-rolls the seed
+   through the staged loader, the seed itself is typed on the Settings
+   tab (`Load [Enter]` applies; `--seed N` flag shows the same loader
+   at startup and stays on the Game Demo tab); loads never switch
+   screens. Solar System tab `F` toggles L4 planet focus, `T`
   arms/withdraws the travel offer, `E` begins the timed transit
   (cancellable with `T`/`Q` before commit), `Q` ascends one journey
   layer. The player marker is a center dot plus a heading

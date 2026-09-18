@@ -38,6 +38,7 @@ use game_debug::cosmic_camera::cosmic_tip_world;
 use game_debug::cosmic_player::CRUISE_SPEED_NOTCH;
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
+use game_debug::loader::{LoadPlan, LoadSource, LoadStep};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
 use game_debug::planet_viewer::{DebugMode, PlanetViewerState};
@@ -1557,9 +1558,83 @@ fn controls_plan(area: Rect, lh: f32) -> ControlsPlan {
     ControlsPlan { rows }
 }
 
-/// Settings tab body: Controls section rendering the registry.
-fn build_settings_ui(items: &mut UiItems, lh: f32, area: Rect) {
-    let plan = controls_plan(area, lh);
+/// Settings → UNIVERSE section plan (v0.3.2 `settings-seed-loader`):
+/// the single editable seed field lives in the Settings left dock —
+/// full-width field, full-width Load button (touch-first targets),
+/// active-seed hint. Pure function of (`left`, `lh`) — the UI builder
+/// and the click router share this, so hit rects match drawn widgets
+/// by construction.
+pub struct SettingsLeftPlan {
+    pub header: Rect,
+    pub field: Rect,
+    pub load: Rect,
+    pub hint: Rect,
+}
+
+fn settings_left_plan(left: Rect, lh: f32) -> SettingsLeftPlan {
+    let pad = ui::DOCK_PAD;
+    let mut y = left.y + pad;
+    let header = Rect {
+        x: left.x,
+        y,
+        w: left.w,
+        h: lh + 8.0,
+    };
+    y += lh + 12.0;
+    let row = |y: &mut f32, h: f32| {
+        let rect = Rect {
+            x: left.x + pad,
+            y: *y,
+            w: (left.w - 2.0 * pad).max(0.0),
+            h,
+        };
+        *y += h + 4.0;
+        rect
+    };
+    let field = row(&mut y, lh + 6.0);
+    let load = row(&mut y, lh + 6.0);
+    let hint = row(&mut y, lh);
+    SettingsLeftPlan {
+        header,
+        field,
+        load,
+        hint,
+    }
+}
+
+/// Settings tab body: UNIVERSE seed editor (left dock — the single
+/// editable seed field in the shell) + Controls section rendering
+/// the registry in the viewport.
+fn build_settings_ui(items: &mut UiItems, lh: f32, app: &DebugApp, layout: Layout) {
+    if layout.left.w >= 1.0 {
+        items.solid(layout.left, C_PANEL_BG);
+        let dock = settings_left_plan(layout.left, lh);
+        section_bar(items, dock.header, "UNIVERSE");
+        items.solid(dock.field, C_FIELD_BG);
+        text_row(
+            items,
+            lh,
+            dock.field,
+            app.settings.seed_field.text.clone(),
+            C_TEXT,
+        );
+        let load_ok = app.settings.seed_field.text.parse::<u64>().is_ok();
+        items.solid(dock.load, if load_ok { C_BTN } else { C_BTN_OFF });
+        items.text(
+            "Load [Enter]".to_owned(),
+            dock.load.x + 8.0,
+            dock.load.y + lh - 2.0,
+            if load_ok { C_TEXT } else { C_DIM },
+        );
+        text_row(
+            items,
+            lh,
+            dock.hint,
+            format!("universe {} · R re-rolls · Enter applies", app.galaxy.seed),
+            C_DIM,
+        );
+    }
+    let plan = controls_plan(layout.viewport, lh);
     let mut last_group: Option<ActionGroup> = None;
     for row in &plan.rows {
         if Some(row.action.group()) != last_group {
@@ -1769,11 +1844,6 @@ fn build_planet_ui(
 /// readout + hints) + selection ring overlay in the viewport.
 /// `build_right_dock` stays sphere-specific; the map's right dock shows
 /// the selected star.
-struct GalaxyLeftRects {
-    field: Rect,
-    load: Rect,
-}
-
 struct GalaxyLeftPlan {
     header: Rect,
     seed_row: Rect,
@@ -1781,8 +1851,6 @@ struct GalaxyLeftPlan {
     cam_row: Rect,
     cam_header: Rect,
     hints: [Rect; 6],
-    seed_header: Rect,
-    rects: GalaxyLeftRects,
 }
 
 /// Left-dock row layout for the galaxy screen, derived from
@@ -1825,21 +1893,6 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
         row(&mut y),
         row(&mut y),
     ];
-    y += 4.0;
-    let seed_header = bar(&mut y);
-    let field_w = ((left.w - 2.0 * pad) * 0.62).max(0.0);
-    let field = Rect {
-        x: left.x + pad,
-        y,
-        w: field_w,
-        h: lh + 6.0,
-    };
-    let load = Rect {
-        x: field.x + field.w + 6.0,
-        y,
-        w: (left.x + left.w - pad - (field.x + field.w + 6.0)).max(0.0),
-        h: lh + 6.0,
-    };
     GalaxyLeftPlan {
         header,
         seed_row,
@@ -1847,8 +1900,6 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
         cam_row,
         cam_header,
         hints,
-        seed_header,
-        rects: GalaxyLeftRects { field, load },
     }
 }
 
@@ -1905,24 +1956,6 @@ fn build_galaxy_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> Ui
         ]) {
             text_row(&mut items, lh, *rect, hint.to_owned(), C_DIM);
         }
-        // ---- Left dock: SEED (runtime plumbing) ----
-        section_bar(&mut items, plan.seed_header, "SEED");
-        items.solid(plan.rects.field, C_FIELD_BG);
-        text_row(
-            &mut items,
-            lh,
-            plan.rects.field,
-            galaxy.seed_field.text.clone(),
-            C_TEXT,
-        );
-        let load_ok = galaxy.seed_field.text.parse::<u64>().is_ok();
-        items.solid(plan.rects.load, if load_ok { C_BTN } else { C_BTN_OFF });
-        items.text(
-            "Load".to_owned(),
-            plan.rects.load.x + 8.0,
-            plan.rects.load.y + lh - 2.0,
-            if load_ok { C_TEXT } else { C_DIM },
-        );
     }
 
     // ---- Right dock: SELECTION ----
@@ -2795,6 +2828,72 @@ fn compose_overlay_ui(
         };
         items.solid(pill, [0.05, 0.06, 0.10, 0.92]);
         items.text(text.to_owned(), pill.x + 12.0, pill.y + lh - 2.0, C_TEXT);
+    }
+    // Staged universe load (settings-seed-loader): modal determinate
+    // progress over every tab. Composed into the dropdown buffer
+    // (drawn after all other UI — topmost by command order): one
+    // buffer draws solids before text, so composing here is the only
+    // way panel solids sit above screen text (same isolation as the
+    // dropdown). Full-window dim, viewport-centered panel with the
+    // seed, bar + percent, and the live step label (text + bar, never
+    // color-only). Input stays blocked while this is up (event gates);
+    // there is no cancel in v1.
+    if let Some(plan) = &app.loading {
+        let total = LoadPlan::total();
+        let done = plan.done().min(total);
+        let step_label = if done == 0 {
+            "Starting"
+        } else {
+            LoadStep::ALL[(done - 1).min(total - 1)].label()
+        };
+        let frac = plan.progress();
+        let vp = layout.viewport;
+        drop.solid(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: win_w,
+                h: win_h,
+            },
+            [0.0, 0.0, 0.0, 0.55],
+        );
+        let panel_w = 340.0_f32.min(vp.w - 20.0).max(0.0);
+        let panel_h = lh * 4.0 + 30.0;
+        let panel = Rect {
+            x: vp.x + (vp.w - panel_w) * 0.5,
+            y: vp.y + (vp.h - panel_h) * 0.5,
+            w: panel_w,
+            h: panel_h,
+        };
+        drop.solid(panel, C_PANEL_BG);
+        drop.text(
+            format!("LOADING UNIVERSE · seed {}", plan.seed),
+            panel.x + 12.0,
+            panel.y + lh + 2.0,
+            C_TEXT,
+        );
+        let track = Rect {
+            x: panel.x + 12.0,
+            y: panel.y + lh * 2.0 + 8.0,
+            w: (panel.w - 24.0).max(0.0),
+            h: 10.0,
+        };
+        drop.solid(track, C_FIELD_BG);
+        drop.solid(
+            Rect {
+                x: track.x,
+                y: track.y,
+                w: track.w * frac,
+                h: track.h,
+            },
+            C_BTN,
+        );
+        drop.text(
+            format!("{}% · {step_label}", (frac * 100.0).round() as u32),
+            panel.x + 12.0,
+            panel.y + lh * 3.0 + 14.0,
+            C_DIM,
+        );
     }
 }
 
@@ -3971,18 +4070,13 @@ impl ViewerApp {
             WINDOWED_SUBDIV,
             WINDOWED_RADIUS,
         ));
-        // `--seed N` opens the viewer on universe N (galaxy + journey +
-        // system star 0, Milky Way dimension tab) instead of the
-        // default seed.
+        // `--seed N` opens the viewer on universe N: the staged
+        // loader runs on the first windowed frames (same machine as
+        // the Settings Load button) and the viewer stays on the
+        // default Game Demo tab, which shows the newly seeded cosmic
+        // web. The sky keeps the boot seed either way.
         if let Some(seed) = seed {
-            debug.galaxy.regenerate(seed);
-            debug.journey = Journey::new(seed);
-            let star0 = debug.galaxy.galaxy.stars[0].clone();
-            debug.system.load(seed, &star0);
-            // Same master seed drives stage 0 (v0.3.2).
-            debug.cosmic.reseed(seed);
-            debug.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
-            debug.fx.notify(format!("Seed {seed} · --seed flag"));
+            debug.loading = Some(LoadPlan::new(seed, LoadSource::Boot));
         }
         let viewer = &debug.viewer;
         tracing::info!(
@@ -4193,47 +4287,72 @@ impl ViewerApp {
         }
     }
 
-    /// Route typed text into whichever field holds focus (seed field on
-    /// the galaxy screen, subdiv/radius on the planet screen). Every
-    /// `TextField::insert_char` guards on its own `focused` flag, so
-    /// pushing to all three is safe — only the focused one accepts.
-    /// Without this, the shortcut arms below (digits, U, R, E, Q, F,
-    /// T, G/B) swallow keystrokes meant for the seed field: digits are
-    /// the whole u64 seed alphabet, so typing a seed appears to do
-    /// nothing.
+    /// Route typed text into whichever field holds focus (seed field
+    /// on the Settings screen, subdiv/radius on the planet screen).
+    /// Every `TextField::insert_char` guards on its own `focused`
+    /// flag, so pushing to all three is safe — only the focused one
+    /// accepts. Without this, the shortcut arms below (digits, U, R,
+    /// E, Q, F, T, G/B) swallow keystrokes meant for the seed field:
+    /// digits are the whole u64 seed alphabet, so typing a seed
+    /// appears to do nothing.
     fn type_into_focused_fields(&mut self, text: &str) {
         for ch in text.chars() {
-            self.debug.galaxy.seed_field.insert_char(ch);
+            self.debug.settings.seed_field.insert_char(ch);
             self.debug.viewer.subdiv_field.insert_char(ch);
             self.debug.viewer.radius_field.insert_char(ch);
         }
         self.debug.viewer.sync_slider_from_field();
     }
 
-    /// Load a full universe for `seed` (seed plumbing, shared by the
-    /// `--seed` flag, the panel Load button, Enter, and `R`): galaxy +
-    /// buffers, journey reset, system back to star 0, screen back to
-    /// the Milky Way dimension tab.
-    fn load_galaxy_seed(&mut self, seed: u64) {
-        self.debug.galaxy.regenerate(seed);
-        self.debug.journey = Journey::new(seed);
-        let star0 = self.debug.galaxy.galaxy.stars[0].clone();
-        self.debug.system.load(seed, &star0);
-        self.transit_acc = 0.0;
-        self.refresh_map();
-        self.refresh_system();
-        // Same master seed drives stage 0 (v0.3.2): the cosmic demo
-        // follows every seed load, wherever it navigates.
-        self.debug.cosmic.reseed(seed);
-        self.refresh_cosmic();
-        self.debug
-            .select_screen(Screen::Dimensions(WaypointId::MilkyWay));
-        self.debug.fx.trigger_fade();
-        self.debug.fx.notify(format!(
-            "Seed {seed} · {} stars",
-            self.debug.galaxy.galaxy.stars.len()
-        ));
-        tracing::info!(seed, "universe seed loaded");
+    /// Start a staged universe load for `seed` (single load path for
+    /// the Settings Load button, Enter-on-field, `R` re-roll, and the
+    /// `--seed` boot flag): one [`LoadStep`] runs per frame in
+    /// `draw_main`, so the modal progress bar stays alive. Ignored
+    /// while a load is already in flight.
+    fn begin_load(&mut self, seed: u64, source: LoadSource) {
+        if self.debug.loading.is_none() {
+            self.debug.loading = Some(LoadPlan::new(seed, source));
+        }
+    }
+
+    /// Execute one staged load step (CPU regen or GPU re-upload). The
+    /// Finalize step fades over the current screen — a load never
+    /// switches tabs — and the notify closes out in `finish_load`
+    /// once every step has run.
+    fn exec_load_step(&mut self, seed: u64, step: LoadStep) {
+        match step {
+            LoadStep::Galaxy => self.debug.galaxy.regenerate(seed),
+            LoadStep::Journey => self.debug.journey = Journey::new(seed),
+            LoadStep::System => {
+                let star0 = self.debug.galaxy.galaxy.stars[0].clone();
+                self.debug.system.load(seed, &star0);
+            }
+            LoadStep::Cosmic => self.debug.cosmic.reseed(seed),
+            LoadStep::UploadMap => self.refresh_map(),
+            LoadStep::UploadSystem => {
+                self.transit_acc = 0.0;
+                self.refresh_system();
+            }
+            LoadStep::UploadCosmic => self.refresh_cosmic(),
+            LoadStep::Finalize => {
+                // Stay on the current screen: a load never switches
+                // tabs (the fade + notify announce the swap).
+                self.debug.fx.trigger_fade();
+            }
+        }
+    }
+
+    /// Close out a staged load: the Settings field mirrors the new
+    /// universe seed, and the notify confirms it.
+    fn finish_load(&mut self, plan: LoadPlan) {
+        let stars = self.debug.galaxy.galaxy.stars.len();
+        self.debug.settings.sync_seed(plan.seed);
+        let suffix = match plan.source {
+            LoadSource::Panel => format!("Seed {} · {stars} stars", plan.seed),
+            LoadSource::Boot => format!("Seed {} · --seed flag", plan.seed),
+        };
+        self.debug.fx.notify(suffix);
+        tracing::info!(seed = plan.seed, "universe seed loaded");
     }
 
     /// Recompute the hovered chunk from the current cursor: only with
@@ -4772,6 +4891,11 @@ impl ViewerApp {
                 let lh = self.atlas.line_height();
                 // Chrome first, topmost surface wins: dropdown panel,
                 // top bar, corner strip, dev widget, settings rows.
+                // A staged universe load is modal: every click is
+                // ignored while it runs (no cancel in v1).
+                if self.debug.loading.is_some() {
+                    return;
+                }
                 if self.debug.dropdown_open {
                     let panel = ui::dropdown_panel(layout.nav);
                     for (index, waypoint) in DROPDOWN_ORDER.iter().enumerate() {
@@ -4825,6 +4949,16 @@ impl ViewerApp {
                     }
                 }
                 if self.debug.screen == Screen::Settings {
+                    // UNIVERSE editor (left dock): click focuses the
+                    // field, Load starts the staged load.
+                    let dock = settings_left_plan(layout.left, lh);
+                    self.debug.settings.seed_field.click(dock.field, cx, cy);
+                    if dock.load.contains(cx, cy)
+                        && let Ok(seed) = self.debug.settings.seed_field.text.parse::<u64>()
+                    {
+                        self.begin_load(seed, LoadSource::Panel);
+                        return;
+                    }
                     let plan = controls_plan(layout.viewport, lh);
                     for row in &plan.rows {
                         if row.rect.contains(cx, cy) {
@@ -4847,10 +4981,6 @@ impl ViewerApp {
                     return;
                 }
                 // Panel widgets (viewer window, both screens).
-                // A staged seed load (galaxy Load button) applies after
-                // this block: the block holds the viewer borrow, and the
-                // loader needs `&mut self`.
-                let mut pending_seed: Option<u64> = None;
                 let regenerated = {
                     let viewer = &mut self.debug.viewer;
                     let lh = self.atlas.line_height();
@@ -4858,37 +4988,22 @@ impl ViewerApp {
                         parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
                     let checker = viewer.debug_mode == DebugMode::Checker;
                     // Content-specific left dock first.
-                    match content {
-                        Some(ViewContent::PlanetView) => {
-                            let lrects = &planet_left_plan(layout.left, lh, checker).rects;
-                            if lrects.shader_button.contains(cx, cy) {
-                                viewer.cycle_debug_mode();
-                            }
-                            if let Some(track) = lrects.density_track
-                                && track.contains(cx, cy)
-                            {
-                                self.dragging_density = true;
-                                viewer.density_slider.drag_to(track, cx);
-                                viewer.sync_density_from_slider();
-                            }
-                            viewer.wire_cb.click(lrects.wire_box, cx, cy);
-                            viewer.pent_cb.click(lrects.pent_box, cx, cy);
-                            viewer.seam_cb.click(lrects.seam_box, cx, cy);
-                            viewer.sync_toggles();
+                    if let Some(ViewContent::PlanetView) = content {
+                        let lrects = &planet_left_plan(layout.left, lh, checker).rects;
+                        if lrects.shader_button.contains(cx, cy) {
+                            viewer.cycle_debug_mode();
                         }
-                        // Seed widgets with galaxy content: click focuses
-                        // the field, Load stages a seed (applied after
-                        // the viewer borrow ends, below).
-                        Some(ViewContent::GalaxyMap) => {
-                            let plan = galaxy_left_plan(layout.left, lh);
-                            self.debug.galaxy.seed_field.click(plan.rects.field, cx, cy);
-                            if plan.rects.load.contains(cx, cy)
-                                && let Ok(seed) = self.debug.galaxy.seed_field.text.parse::<u64>()
-                            {
-                                pending_seed = Some(seed);
-                            }
+                        if let Some(track) = lrects.density_track
+                            && track.contains(cx, cy)
+                        {
+                            self.dragging_density = true;
+                            viewer.density_slider.drag_to(track, cx);
+                            viewer.sync_density_from_slider();
                         }
-                        _ => {}
+                        viewer.wire_cb.click(lrects.wire_box, cx, cy);
+                        viewer.pent_cb.click(lrects.pent_box, cx, cy);
+                        viewer.seam_cb.click(lrects.seam_box, cx, cy);
+                        viewer.sync_toggles();
                     }
                     // Shared right dock.
                     let rrects =
@@ -4906,9 +5021,6 @@ impl ViewerApp {
                 };
                 if regenerated {
                     self.refresh_mesh();
-                }
-                if let Some(seed) = pending_seed {
-                    self.load_galaxy_seed(seed);
                 }
                 // Global camera presets: 2×2 VIEW grid retargets the free
                 // orbit camera (same as G/T/B/R) — planet content only.
@@ -4936,6 +5048,11 @@ impl ViewerApp {
                 self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // A staged universe load is modal: wheel input is
+                // ignored while it runs (no cancel in v1).
+                if self.debug.loading.is_some() {
+                    return;
+                }
                 let in_viewport = self.main.as_ref().is_some_and(|ctx| {
                     let (w, h) = ctx.size();
                     ctx.last_cursor.is_some_and(|(cx, cy)| {
@@ -5002,6 +5119,11 @@ impl ViewerApp {
                     },
                 ..
             } => {
+                // A staged universe load is modal: every key is
+                // ignored while it runs (no cancel in v1).
+                if self.debug.loading.is_some() {
+                    return;
+                }
                 // Player movement tracks press AND release so keys never
                 // stick; focused text fields keep every keystroke instead.
                 if let PhysicalKey::Code(code) = physical_key
@@ -5020,7 +5142,7 @@ impl ViewerApp {
                     let viewer = &mut self.debug.viewer;
                     let fields_free = !viewer.subdiv_field.focused
                         && !viewer.radius_field.focused
-                        && !self.debug.galaxy.seed_field.focused;
+                        && !self.debug.settings.seed_field.focused;
                     // Cosmic demo: WASD/arrows are cruise intent (the tab
                     // has no text fields; releases always clear).
                     if matches!(self.debug.screen, Screen::GameDemo) {
@@ -5077,18 +5199,18 @@ impl ViewerApp {
                         self.debug.esc_unwind();
                     }
                     PhysicalKey::Code(KeyCode::Enter) => {
-                        // Enter confirms the focused field: seed field
-                        // loads the typed universe (or surfaces the miss),
-                        // planet fields just unfocus.
-                        if self.debug.galaxy.seed_field.focused {
-                            match self.debug.galaxy.seed_field.text.parse::<u64>() {
-                                Ok(seed) => self.load_galaxy_seed(seed),
+                        // Enter confirms the focused field: the Settings
+                        // seed field starts the staged load (or surfaces
+                        // the miss), planet fields just unfocus.
+                        if self.debug.settings.seed_field.focused {
+                            match self.debug.settings.seed_field.text.parse::<u64>() {
+                                Ok(seed) => self.begin_load(seed, LoadSource::Panel),
                                 Err(_) => self.debug.fx.notify(format!(
                                     "Invalid seed '{}'",
-                                    self.debug.galaxy.seed_field.text
+                                    self.debug.settings.seed_field.text
                                 )),
                             }
-                            self.debug.galaxy.seed_field.focused = false;
+                            self.debug.settings.seed_field.focused = false;
                         } else {
                             let viewer = &mut self.debug.viewer;
                             viewer.subdiv_field.focused = false;
@@ -5100,7 +5222,7 @@ impl ViewerApp {
                         viewer.subdiv_field.backspace();
                         viewer.radius_field.backspace();
                         viewer.sync_slider_from_field();
-                        self.debug.galaxy.seed_field.backspace();
+                        self.debug.settings.seed_field.backspace();
                     }
                     PhysicalKey::Code(KeyCode::F1) => {
                         self.debug.select_top_by_fkey(1);
@@ -5171,7 +5293,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                             && self.debug.screen_content() == Some(ViewContent::PlanetView)
                         {
                             let i = match physical_key {
@@ -5197,7 +5319,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                         {
                             self.debug.viewer.player.toggle();
                             self.update_hover();
@@ -5212,7 +5334,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                         {
                             if matches!(self.debug.screen, Screen::GameDemo) {
                                 self.debug.cosmic.camera.cycle();
@@ -5231,7 +5353,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free {
                             let content = self.debug.screen_content();
@@ -5239,7 +5361,7 @@ impl ViewerApp {
                                 let seed = self.debug.cosmic.seed + 1;
                                 self.reseed_cosmic(seed);
                             } else if content == Some(ViewContent::GalaxyMap) {
-                                self.load_galaxy_seed(self.debug.galaxy.seed + 1);
+                                self.begin_load(self.debug.galaxy.seed + 1, LoadSource::Panel);
                             } else if content == Some(ViewContent::PlanetView) {
                                 let radius = self.debug.viewer.radius;
                                 snap_global_camera(&mut self.camera, GlobalPreset::Right, radius);
@@ -5257,7 +5379,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         // Cosmic demo first: E toggles fly-to on the
                         // click-selected node (shared with Controls).
@@ -5302,7 +5424,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free
                             && matches!(
@@ -5322,7 +5444,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free
                             && self.debug.screen_content() == Some(ViewContent::SystemMap)
@@ -5339,7 +5461,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free
                             && self.debug.screen_content() == Some(ViewContent::SystemMap)
@@ -5365,7 +5487,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free {
                             let content = self.debug.screen_content();
@@ -5384,7 +5506,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                             && self.debug.screen_content() == Some(ViewContent::PlanetView)
                         {
                             let preset = match physical_key {
@@ -5404,10 +5526,10 @@ impl ViewerApp {
                         // The focused seed field eats keystrokes first;
                         // otherwise printable input goes to the planet
                         // fields (their insert guards on focus).
-                        if self.debug.galaxy.seed_field.focused {
+                        if self.debug.settings.seed_field.focused {
                             if let Some(text) = text {
                                 for ch in text.chars() {
-                                    self.debug.galaxy.seed_field.insert_char(ch);
+                                    self.debug.settings.seed_field.insert_char(ch);
                                 }
                             }
                         } else if let Some(text) = text {
@@ -5473,7 +5595,7 @@ impl ViewerApp {
                     let seed = self.debug.cosmic.seed + 1;
                     self.reseed_cosmic(seed);
                 } else if self.debug.screen_content() == Some(ViewContent::GalaxyMap) {
-                    self.load_galaxy_seed(self.debug.galaxy.seed + 1);
+                    self.begin_load(self.debug.galaxy.seed + 1, LoadSource::Panel);
                 }
             }
             Action::TopDownSnap => {
@@ -5554,18 +5676,18 @@ impl ViewerApp {
         }
     }
 
-    /// Confirm the focused field (Enter parity): the seed field loads
-    /// the typed universe, planet fields just unfocus.
+    /// Confirm the focused field (Enter parity): the Settings seed
+    /// field starts the staged load, planet fields just unfocus.
     fn confirm_focused_field(&mut self) {
-        if self.debug.galaxy.seed_field.focused {
-            match self.debug.galaxy.seed_field.text.parse::<u64>() {
-                Ok(seed) => self.load_galaxy_seed(seed),
+        if self.debug.settings.seed_field.focused {
+            match self.debug.settings.seed_field.text.parse::<u64>() {
+                Ok(seed) => self.begin_load(seed, LoadSource::Panel),
                 Err(_) => self.debug.fx.notify(format!(
                     "Invalid seed '{}'",
-                    self.debug.galaxy.seed_field.text
+                    self.debug.settings.seed_field.text
                 )),
             }
-            self.debug.galaxy.seed_field.focused = false;
+            self.debug.settings.seed_field.focused = false;
         } else {
             let viewer = &mut self.debug.viewer;
             viewer.subdiv_field.focused = false;
@@ -5775,6 +5897,21 @@ impl ViewerApp {
         if win_w < 1.0 || win_h < 1.0 {
             return;
         }
+        // Staged universe load: one step per frame keeps the UI (and
+        // the modal progress bar) alive; a finished plan closes out
+        // with the field mirror + notify.
+        let next = self.debug.loading.as_mut().and_then(LoadPlan::advance);
+        if let Some(step) = next {
+            let seed = self
+                .debug
+                .loading
+                .as_ref()
+                .expect("plan outlives its step")
+                .seed;
+            self.exec_load_step(seed, step);
+        } else if let Some(plan) = self.debug.loading.take() {
+            self.finish_load(plan);
+        }
         {
             let ctx = self.main.as_mut().expect("main window must exist");
             ctx.previous_frame_end
@@ -5849,7 +5986,7 @@ impl ViewerApp {
             Screen::Settings => {
                 let mut items = UiItems::default();
                 build_topbar(&mut items, self.atlas.line_height(), &self.debug, layout);
-                build_settings_ui(&mut items, self.atlas.line_height(), layout.viewport);
+                build_settings_ui(&mut items, self.atlas.line_height(), &self.debug, layout);
                 items
             }
         };
@@ -7194,7 +7331,7 @@ mod tests {
         assert!(pill.contains('%'), "pill missing progress: {pill}");
         // Settings Controls: every registry action as a labeled row.
         let mut settings = UiItems::default();
-        build_settings_ui(&mut settings, lh, layout.viewport);
+        build_settings_ui(&mut settings, lh, &app, layout);
         let settings = joined(&settings);
         for needle in [
             "Chrome",
@@ -7239,7 +7376,7 @@ mod tests {
         let mut items = UiItems::default();
         let mut drop = UiItems::default();
         build_topbar(&mut items, lh, &app, layout);
-        build_settings_ui(&mut items, lh, layout.viewport);
+        build_settings_ui(&mut items, lh, &app, layout);
         compose_overlay_ui(
             &mut items,
             &mut drop,
@@ -7289,5 +7426,140 @@ mod tests {
         let text_quads: usize = items.texts.iter().map(|t| t.text.chars().count()).sum();
         assert_eq!(verts.len(), items.solids.len() * 6 + text_quads * 6);
         assert!((verts.len() as u64) < MAX_UI_VERTS);
+    }
+
+    #[test]
+    fn settings_seed_editor_lives_in_left_dock() {
+        let layout = ui::layout(1280.0, 720.0);
+        let dock = settings_left_plan(layout.left, 19.0);
+        // Full-width widgets inside the dock, flowing top-down.
+        for rect in [dock.field, dock.load, dock.hint] {
+            assert!(rect.x >= layout.left.x, "{rect:?}");
+            assert!(
+                rect.x + rect.w <= layout.left.x + layout.left.w + 1e-3,
+                "{rect:?}"
+            );
+        }
+        assert!(dock.header.y < dock.field.y);
+        assert!(dock.field.y < dock.load.y);
+        assert!(dock.load.y < dock.hint.y);
+        // The built screen carries the editor plus the registry.
+        let atlas = GlyphAtlas::new(UI_PX);
+        let lh = atlas.line_height();
+        let app = DebugApp::new();
+        let mut items = UiItems::default();
+        build_settings_ui(&mut items, lh, &app, layout);
+        let texts = items
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "UNIVERSE",
+            "Load [Enter]",
+            "universe 1234",
+            "Toggle left dock [F9]",
+        ] {
+            assert!(texts.contains(needle), "settings missing {needle}");
+        }
+        // The Milky Way dock keeps the seed read-only (no editor).
+        let mut galaxy = UiItems::default();
+        let galaxy_ui = build_galaxy_ui(&mut GlyphAtlas::new(UI_PX), &app, layout);
+        galaxy.texts = galaxy_ui.texts;
+        let dock_text = galaxy
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dock_text.contains("seed 1234"), "dock keeps read-only seed");
+        assert!(
+            !dock_text.contains("Load"),
+            "dock editor is gone: {dock_text}"
+        );
+    }
+
+    #[test]
+    fn settings_load_button_dims_on_invalid_seed() {
+        let layout = ui::layout(1280.0, 720.0);
+        let atlas = GlyphAtlas::new(UI_PX);
+        let lh = atlas.line_height();
+        let mut app = DebugApp::new();
+        app.settings.seed_field.text = "abc".to_owned();
+        let dock = settings_left_plan(layout.left, lh);
+        let mut items = UiItems::default();
+        build_settings_ui(&mut items, lh, &app, layout);
+        assert!(
+            items
+                .solids
+                .iter()
+                .any(|(rect, color)| *rect == dock.load && *color == C_BTN_OFF),
+            "invalid seed dims the Load button"
+        );
+    }
+
+    #[test]
+    fn loader_modal_overlays_seed_bar_and_step() {
+        let mut app = DebugApp::new();
+        app.loading = Some(LoadPlan::new(7, LoadSource::Panel));
+        // One step ran: progress is 1/8 with the first step's label.
+        let step = app
+            .loading
+            .as_mut()
+            .expect("plan")
+            .advance()
+            .expect("first step");
+        assert_eq!(step, LoadStep::Galaxy);
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let mut items = UiItems::default();
+        let mut drop = UiItems::default();
+        compose_overlay_ui(
+            &mut items,
+            &mut drop,
+            &mut GlyphAtlas::new(UI_PX),
+            &app,
+            layout,
+            (1280.0, 720.0),
+            None,
+        );
+        // Topmost isolation (same rule as the dropdown): the modal
+        // lives in the drop buffer, never in the main buffer.
+        let main_texts = items
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !main_texts.contains("LOADING"),
+            "modal must not leak into the main buffer"
+        );
+        let drop_texts = drop
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drop_texts.contains("LOADING UNIVERSE · seed 7"),
+            "modal titles the seed: {drop_texts}"
+        );
+        assert!(
+            drop_texts.contains("13%") && drop_texts.contains(LoadStep::Galaxy.label()),
+            "modal shows progress + step: {drop_texts}"
+        );
+        // Full-window dim + panel + track + fill ride the drop buffer.
+        assert!(!drop.solids.is_empty());
+        assert!(
+            drop.solids.iter().any(|(rect, _)| *rect
+                == Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1280.0,
+                    h: 720.0,
+                }),
+            "dim covers the full window"
+        );
     }
 }

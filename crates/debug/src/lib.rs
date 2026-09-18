@@ -20,6 +20,7 @@ pub mod fps;
 pub mod fx;
 pub mod galaxy_map;
 pub mod inspector;
+pub mod loader;
 pub mod map_camera;
 pub mod mesh;
 pub mod params;
