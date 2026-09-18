@@ -127,7 +127,7 @@ link check; ANALYST DoD audit + SECURITY review; single `done` commit.
 | CSP-017 | completed | Real pill/console feed from fly-to event queue; `transitions.preview()` deleted; pill hidden outside `FlyTo` | Goals §7, DoD 9 |
 | CSP-018 | completed | Headless rewrite (demo-content + cosmic asserts; dropdown/tab asserts preserved) + full gate suite green | NFR, DoD 1 |
 | CSP-019 | completed | Docs sweep + ADR-023 (extends ADR-022) + milestones v0.3.2 + version bump; link check | DoD 10 |
-| CSP-020 | pending | ANALYST DoD audit + SECURITY review; single `done` commit on `v0.3.2` | plans/README §7 |
+| CSP-020 | completed | ANALYST DoD audit + SECURITY review; single `done` commit on `v0.3.2` | plans/README §7 |
 
 ## Role sign-off
 
@@ -142,23 +142,34 @@ every todo independently verifiable with one row; budgets checked: +2
 draws/surface worst case, descriptor single-digit MB — inside Low tier;
 gate commands listed in WS7) · UX acceptance rows (player-facing):
 approved 2026-09-18 — see Acceptance criteria UX-1…UX-6 · DoD verified
-by: ANALYST _(pending — WS7)_ · Security reviewed by: SECURITY
-_(pending — WS7)_.
+by: ANALYST (2026-09-18 — all 10 rows re-checked against reproduced
+evidence above; gate suite green on this tree: fmt, clippy `-D
+warnings`, build, 521 workspace tests + 83 doc tests, `game` run,
+`game_debug --headless`, `game_tools --headless --tier low`, mobile
+android/ios compile guards; E2E = headless boot/seed/reseed flows;
+save round-trip N/A — autosave untouched, envelope unchanged; no
+findings → no issues filed) · Security reviewed by: SECURITY
+(2026-09-18 — no new dependencies (Cargo diff empty), no new `unsafe`
+(draws reuse the documented SAFETY pattern), no new file I/O or parse
+paths (seed flows consume existing validated u64 sources), console
+lines are internally generated content IDs only, save/migration paths
+untouched with the corrupt-save contract intact; verdict: pass, no
+findings).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | Demo rebuilt (`GameDemo → CosmicWeb`); tabs behave as v0.3.1 | pending | CSP-011, CSP-018 | ANALYST (WS7) |
-| 2 | Stage-0 generator deterministic; home tagged; hashes committed; `UNIVERSE_VERSION` 2 | pending | CSP-001…CSP-004 | ANALYST (WS7) |
-| 3 | Statistical-realism gates green | pending | CSP-005 | ANALYST (WS7) |
-| 4 | Cosmic Web tab renders web + player point; read-only (pinned) | pending | CSP-014, CSP-015 | ANALYST (WS7) |
-| 5 | Player = ShipState in Cosmological; fixed-step reproducible; 10⁹ ceiling | pending | CSP-006…CSP-008 | ANALYST (WS7) |
-| 6 | Marker via `world_to_pixels`; FirstPerson hides; pinned | pending | CSP-010 | ANALYST (WS7) |
-| 7 | 3-mode camera, derived near/far; no Mpc jitter | pending | CSP-009, CSP-010 | ANALYST (WS7) |
-| 8 | Fly-to select/engage/cancel; arrival at node center; HUD target line | pending | CSP-016 | ANALYST (WS7) |
-| 9 | `game::hud` live; pill/console real; `preview()` deleted | pending | CSP-012, CSP-017 | ANALYST (WS7) |
-| 10 | Docs sweep + ADR-023; links resolve | pending | CSP-019 | ANALYST (WS7) |
+| 1 | Demo rebuilt (`GameDemo → CosmicWeb`); tabs behave as v0.3.1 | ✅ done | CSP-011, CSP-018: `screen_content_mapping`, unified chrome demo HUD, headless CosmicWeb asserts; all tab tests green unchanged | ANALYST 2026-09-18 |
+| 2 | Stage-0 generator deterministic; home tagged; hashes committed; `UNIVERSE_VERSION` 2 | ✅ done | CSP-001…CSP-004: `nominal_descriptor_replays_identically`, committed vector 14062203475186774008, home asserts, re-rolled galaxy vector | ANALYST 2026-09-18 |
+| 3 | Statistical-realism gates green | ✅ done | CSP-005: void 0.629 ∈ [0.60,0.90], median Ø 12.0 ∈ [10,100], nodes 6000, links 22666, max link ≥ 50 Mpc, PS mass shape | ANALYST 2026-09-18 |
+| 4 | Cosmic Web tab renders web + player point; read-only (pinned) | ✅ done | CSP-014, CSP-015: `inspector_selection_is_read_only`, `select_at_*`, player-point draw; placeholders intact for others | ANALYST 2026-09-18 |
+| 5 | Player = ShipState in Cosmological; fixed-step reproducible; 10⁹ ceiling | ✅ done | CSP-006…CSP-008: coast bit-exact + replay, `compression_ceiling_is_1e9_at_cosmological`, thrust frame-unit convention | ANALYST 2026-09-18 |
+| 6 | Marker via `world_to_pixels`; FirstPerson hides; pinned | ✅ done | CSP-010: chase-centers incl. stale origin, FP eye-plane `w==0`, same-fn reuse in compose path (windowed visual = dev-tooling manual standard) | ANALYST 2026-09-18 |
+| 7 | 3-mode camera, derived near/far; no Mpc jitter | ✅ done | CSP-009, CSP-010: cycle, un-flipped projection pin, derived near/far, recenter + 50 Mpc rebase | ANALYST 2026-09-18 |
+| 8 | Fly-to select/engage/cancel; arrival at node center; HUD target line | ✅ done | CSP-016: full select/engage/cancel/thrust-cancel flow, arrival at rest, pill FLY-TO test, HUD target via live exec | ANALYST 2026-09-18 |
+| 9 | `game::hud` live; pill/console real; `preview()` deleted | ✅ done | CSP-012, CSP-017: unified chrome HUD needles, console feed test, pill tests; `transitions.rs` + `feed_transitions` deleted | ANALYST 2026-09-18 |
+| 10 | Docs sweep + ADR-023; links resolve | ✅ done | CSP-019: controls/journey/universe/architecture/rendering/ux/milestones/version + ADR-023; links verified resolving | ANALYST 2026-09-18 |
 
 ## Acceptance criteria
 

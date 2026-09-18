@@ -2,9 +2,9 @@
 
 ## Status
 
-`in-review` (DEV gates green + evidence in `plan.md`; awaiting
-ANALYST DoD verification + SECURITY review per `plans/README.md`
-role gates)
+`done` (all gates green, ANALYST DoD verified + SECURITY reviewed
+2026-09-18 per `plans/README.md` role gates; landed as exactly one
+commit on branch `v0.3.2` — one commit per the version branch rule)
 
 ## Context
 
@@ -240,36 +240,36 @@ recorded.
 
 ## Definition of Done
 
-- [ ] Demo rebuilt: `GameDemo → ViewContent::CosmicWeb`; journey content
+- [x] Demo rebuilt: `GameDemo → ViewContent::CosmicWeb`; journey content
       unmounted from the demo only; dimension tabs (content, keys, travel
       side-effects, dropdown, badges, placeholders for W2/W3 + 4 others)
       behave exactly as v0.3.1.
-- [ ] Stage-0 generator: 4-stage seeded Zel'dovich pipeline
+- [x] Stage-0 generator: 4-stage seeded Zel'dovich pipeline
       (A field → B displacement → C classification + masses → D
       descriptor); deterministic; home node tagged; hash vectors
       committed; `UNIVERSE_VERSION` 1 → 2 (`SEED_VERSION` unchanged —
       the `RegionId` grammar is untouched).
-- [ ] Statistical-realism gates green (headless, tolerance-banded): void
+- [x] Statistical-realism gates green (headless, tolerance-banded): void
       volume fraction ∈ [60, 90] %; void median diameter ∈ [10, 100]
       Mpc; filament lengths reach the 50–80 Mpc class; node mass function
       follows power-law + exponential-cutoff shape.
-- [ ] Cosmic Web tab: renders web + live player point; inspector camera
+- [x] Cosmic Web tab: renders web + live player point; inspector camera
       (orbit/pan/zoom/`Home`); left-dock stats + click-node readout; no
       placeholder; read-only — dimension selection and rendering never
       mutate Journey/System/Viewer state (pinned test).
-- [ ] Player = `ShipState` in `FrameId::Cosmological`; momentum flight
+- [x] Player = `ShipState` in `FrameId::Cosmological`; momentum flight
       bit-reproducible at fixed step; compression ceiling 10⁹ verified
       via `Occupancy`.
-- [ ] Marker via `world_to_pixels` in every camera mode; FirstPerson
+- [x] Marker via `world_to_pixels` in every camera mode; FirstPerson
       hides it; contract tests pinned.
-- [ ] 3-mode space camera with distance-derived near/far; no precision
+- [x] 3-mode space camera with distance-derived near/far; no precision
       jitter at Mpc offsets (camera-relative `recenter` path).
-- [ ] Fly-to: click-select + `E` engage/cancel; eased arrival at node
+- [x] Fly-to: click-select + `E` engage/cancel; eased arrival at node
       center; HUD target line with distance + ETA.
-- [ ] `game::hud` live in the demo (frame/time/target; SOI `—`);
+- [x] `game::hud` live in the demo (frame/time/target; SOI `—`);
       pill + console fed by real fly-to events; `preview()` seed data
       deleted.
-- [ ] Docs sweep done (`controls.md`, `journey.md` — L1 traversable in
+- [x] Docs sweep done (`controls.md`, `journey.md` — L1 traversable in
       the demo + Cosmic Web tab mounted, `universe.md` — stage 0,
       `architecture.md`, `rendering.md` — marker/camera contract,
       milestones v0.3.2, techstack version bump, ADR-023 extending

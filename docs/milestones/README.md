@@ -90,7 +90,7 @@ commit when it reaches `done` (workflow rule:
 
 | Feature | Status | Spec section |
 |---|---|---|
-| [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | planned | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
+| [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | done | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
 
 ## Post-v0.3 (unscheduled)
 
