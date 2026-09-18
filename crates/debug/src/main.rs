@@ -35,6 +35,7 @@ use game::transit::{SIM_DT_SECS, Transit, plan_cost};
 use game_debug::actions::{Action, ActionGroup, DROPDOWN_ORDER, digit_for_dimension_index};
 use game_debug::app::{App as DebugApp, ChromeState, Screen, ViewContent, WidgetTab};
 use game_debug::cosmic_camera::cosmic_tip_world;
+use game_debug::cosmic_player::CRUISE_SPEED_NOTCH;
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
@@ -615,6 +616,20 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.camera.render_origin(),
         debug_app.cosmic.player.position_mpc()
     );
+    // Cruise smoke (update 2026-09-18-2027): five seconds of W must move
+    // the ship Mpc-scale — the old thrust law could not move it at all.
+    let cruise_p0 = debug_app.cosmic.player.position_mpc();
+    debug_app.cosmic.held.fwd = true;
+    for _ in 0..300 {
+        debug_app.cosmic.tick(1.0 / 60.0);
+    }
+    debug_app.cosmic.held.clear();
+    let cruise_moved = (debug_app.cosmic.player.position_mpc() - cruise_p0).length();
+    assert!(
+        cruise_moved > 1.0,
+        "headless cruise must move Mpc-scale, moved {cruise_moved}"
+    );
+    println!("cruise_selftest=moved{cruise_moved:.2}Mpc ok");
     // Unified shell smoke: F2 opens Dimensions on the active
     // waypoint, digits pick dropdown entries, F-keys jump the
     // widget to a sub-tab.
@@ -1210,6 +1225,11 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
         body_label: None,
     });
     let mode_line = format!("cam:   {} · marker YOU", cosmic.camera.mode().label());
+    let speed_line = format!(
+        "speed: {:.3} Mpc/s · cruise {:.1}s",
+        cosmic.player.real_speed_mpc_s(),
+        cosmic.player.cruise.t_cross_s
+    );
     let mut rows = ui::PanelRows::new(area, 12.0);
     section_bar(items, rows.next(lh + 6.0, 4.0), "GAME DEMO");
     for (line, color) in [
@@ -1230,6 +1250,7 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
             C_DIM,
         ),
         (mode_line, C_TEXT),
+        (speed_line, C_TEXT),
     ] {
         text_row(items, lh, rows.next(lh, 6.0), line, color);
     }
@@ -1237,7 +1258,8 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
         items,
         lh,
         rows.next(lh, 6.0),
-        "mouse steer · WASD thrust · click target · E fly-to · P camera".to_owned(),
+        "mouse steer · WASD cruise · click target · E fly-to · Shift+wheel pace · P camera"
+            .to_owned(),
         C_DIM,
     );
 }
@@ -3761,6 +3783,9 @@ struct ViewerApp {
     /// Mouse-held walk direction from a Settings Controls row
     /// (hold-to-press parity for WASD): cleared on mouse release.
     mouse_walk: Option<WalkDir>,
+    /// Shift modifier state (tracked via `ModifiersChanged`): `Shift`+wheel
+    /// adjusts the cosmic cruise pace instead of zooming the camera.
+    shift_held: bool,
 }
 
 /// Hold-to-press walk direction (mouse parity for the WASD keys).
@@ -3955,11 +3980,12 @@ impl ViewerApp {
             last_fps_tick: None,
             main: None,
             mouse_walk: None,
+            shift_held: false,
         }
     }
 
-    /// Cosmic demo tick: integrate flight from held thrust intent,
-    /// track the camera, rebase the buffers past 50 Mpc of travel.
+    /// Cosmic demo tick: cruise from held input intent, track the
+    /// camera, rebase the buffers past 50 Mpc of travel.
     /// Parked tabs clear stale thrust (keys never stick across
     /// switches). The dt floor keeps the flight assert (`dt > 0`)
     /// green on the very first frame.
@@ -4379,6 +4405,9 @@ impl ViewerApp {
     fn main_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.shift_held = modifiers.state().shift_key();
+            }
             WindowEvent::Resized(_) => {
                 if let Some(ctx) = self.main.as_mut() {
                     ctx.recreate_swapchain = true;
@@ -4843,11 +4872,27 @@ impl ViewerApp {
                     };
                     let content = self.debug.screen_content();
                     if matches!(self.debug.screen, Screen::GameDemo) {
-                        // Cosmic zoom: wheel-up (positive scroll) moves
-                        // the player camera closer. Checked before player
-                        // mode for the same reason as drag-steer.
-                        let factor = (1.0 - 0.12 * scroll).max(0.05);
-                        self.debug.cosmic.camera.zoom(factor);
+                        if self.shift_held {
+                            // Cruise pace: wheel-up (positive scroll)
+                            // tightens the pace (faster), wheel-down
+                            // loosens it — one notch per wheel direction
+                            // (wheel alone still zooms the camera below).
+                            let factor = if scroll > 0.0 {
+                                1.0 / CRUISE_SPEED_NOTCH
+                            } else {
+                                CRUISE_SPEED_NOTCH
+                            };
+                            let t = self.debug.cosmic.cruise_speed_by(factor);
+                            self.debug
+                                .fx
+                                .notify(format!("Cruise pace {t:.1}s per scale length"));
+                        } else {
+                            // Cosmic zoom: wheel-up (positive scroll) moves
+                            // the player camera closer. Checked before player
+                            // mode for the same reason as drag-steer.
+                            let factor = (1.0 - 0.12 * scroll).max(0.05);
+                            self.debug.cosmic.camera.zoom(factor);
+                        }
                     } else if content == Some(ViewContent::GalaxyMap) {
                         // Log zoom on the map: wheel-up (positive scroll)
                         // shrinks the camera distance.
@@ -4897,7 +4942,7 @@ impl ViewerApp {
                     let fields_free = !viewer.subdiv_field.focused
                         && !viewer.radius_field.focused
                         && !self.debug.galaxy.seed_field.focused;
-                    // Cosmic demo: WASD/arrows are thrust intent (the tab
+                    // Cosmic demo: WASD/arrows are cruise intent (the tab
                     // has no text fields; releases always clear).
                     if matches!(self.debug.screen, Screen::GameDemo) {
                         if fields_free || state == ElementState::Released {
@@ -5375,6 +5420,16 @@ impl ViewerApp {
             Action::TravelOffer => self.travel_offer_toggle(),
             Action::TravelBegin => self.travel_begin(),
             Action::FlyToToggle => self.toggle_fly_to(),
+            Action::CruiseSpeed => {
+                // Controls-row parity for the `Shift`+wheel pace action:
+                // a click steps one notch faster on the demo tab.
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    let t = self.debug.cosmic.cruise_speed_by(1.0 / CRUISE_SPEED_NOTCH);
+                    self.debug
+                        .fx
+                        .notify(format!("Cruise pace {t:.1}s per scale length"));
+                }
+            }
             Action::AscendLayer => self.ascend_layer(),
             Action::FocusToggle => self.focus_toggle(),
             Action::ConfirmField => self.confirm_focused_field(),
@@ -5383,7 +5438,7 @@ impl ViewerApp {
 
     /// Arm a mouse-held walk direction (player must be active; the
     /// release path clears it). On the demo tab the same parity rows
-    /// drive cosmic thrust instead.
+    /// drive cosmic cruise instead.
     fn hold_walk(&mut self, dir: WalkDir) {
         if matches!(self.debug.screen, Screen::GameDemo) {
             self.mouse_walk = Some(dir);

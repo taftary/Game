@@ -2,47 +2,89 @@
 //!
 //! This is the WS2 foundation the demo (WS4), inspector (WS5), and fly-to
 //! (WS6) build on. The player spawns inside a filament near the home node
-//! (CSP-008), integrates physical free flight through the shipped
-//! [`step_free_flight`] (CSP-006/007), and slews time compression up to
-//! the Cosmological ceiling of 10⁹.
+//! (CSP-008), flies a scale-relative cruise law (update 2026-09-18-2027),
+//! and slews time compression up to the Cosmological ceiling of 10⁹.
 //!
-//! Time-unit convention (read carefully — the `step_free_flight` doc
-//! string says "real seconds", which holds only for SI-time frames):
-//! `thrust_accel_frame` converts with `time_s² / length_m`, so the step
-//! `dt` must be expressed in the active frame's time unit — **Gyr here**,
-//! i.e. `dt_gyr = ratio × dt_real_s / FrameUnits::of(Cosmological).time_s`.
-//! The CSP-007 analytic test pins this: full throttle for a known sim
-//! span must match 30 m/s² exactly. (Noted for ADR-023 as a
-//! spec-clarification; the function itself is untouched.)
+//! Why cruise, not thrust: the spec §10 physical 30 m/s² envelope is
+//! unusable at Mpc — positions are f64 Mpc at ~30 Mpc magnitude (ulp ≈
+//! 7×10⁻¹⁵ Mpc ≈ 200,000 km), so per-frame ½·a·dt² ≈ 10⁻²² Mpc sits
+//! thousands of times below the ulp and `pos + δ == pos` bit-exactly. A
+//! ship under raw thrust could never move near a node, and the demo HUD
+//! never even showed speed. Cruise replaces it with real-time
+//! screen-speed authority: full input crosses the local scale length in
+//! `t_cross_s` seconds, eased over `tau_s` (momentum feel, coast on
+//! release — translation damping stays OFF per spec §10).
 //!
-//! Single-step exactness: with zero live gravity (spec §5) and
-//! piecewise-constant thrust input, velocity-Verlet under constant
-//! acceleration is exact for any step size, so one
-//! [`step_free_flight`] call per frame with the full sim dt is both
-//! exact and cheap — no 16M-substep blowup at 10⁹ compression. Pinned by
-//! `single_step_matches_fine_substeps`. Substepping activates only with
-//! live gravity (future frames), never here.
+//! Velocity-unit convention (pinned — a latent hand-back mismatch lived
+//! here): [`ShipState::vel`] at Cosmological is **frame units per sim
+//! second** (Mpc/sim-s), the same unit [`FlyToExec`] samples when it
+//! drives or hands back. A cancelled fly-to therefore continues seamlessly
+//! under cruise; integration `pos += v · sim_dt` is exact for the
+//! piecewise-constant eased step and Mpc-scale per frame at any depth.
 //!
 //! Sim-time authority stays the [`CompressionClock`]: every frame pushes
 //! wall time through `advance` on a throwaway integrator (one discarded
-//! Verlet — the physics comes from the flight step or the easing), so
+//! Verlet — the physics comes from the cruise step or the easing), so
 //! `sim_time_s` advances by exactly `ratio × dt_real` in both modes.
 //!
 //! Window- and GPU-free: pure state + tests. Rendering (WS3/WS4) reads
 //! this state through accessors.
 
 use super::cosmic_camera::facing_quat_for;
-use game_engine::flight::{
-    CraftParams, FlyToExec, ShipMode, ShipState, ThrustInput, mode_of, step_free_flight,
-};
+use game_engine::flight::{FlyToExec, ShipMode, ShipState, mode_of};
 use game_engine::frames::{FrameChain, FrameId};
-use game_engine::physics::{FrameUnits, IntegratorState};
+use game_engine::physics::IntegratorState;
 use game_engine::time::{CompressionClock, Occupancy, target_ratio};
 use game_engine::universe::WebDescriptor;
 use glam::{DQuat, DVec3};
 
 /// Nominal spawn offset along the departure link, Mpc.
 pub const SPAWN_OFFSET_MPC: f64 = 30.0;
+
+/// Cruise tuning: full input crosses the local scale length in this many
+/// real seconds (player-adjustable — see `CosmicDemoState::cruise_speed_by`
+/// in the sibling demo module).
+pub const CRUISE_T_CROSS_S: f64 = 20.0;
+
+/// Cruise tuning: velocity-easing time constant in real seconds (the
+/// momentum feel — release coasts, opposite input brakes).
+pub const CRUISE_TAU_S: f64 = 0.75;
+
+/// Cruise tuning: the scale length never drops below this multiple of the
+/// nearest virial radius — precision speeds at a node, never frozen.
+pub const CRUISE_SCALE_FLOOR_RVIR: f64 = 1.0;
+
+/// Cruise-speed adjust: `Shift`+wheel notch factor on `t_cross_s`
+/// (factor > 1 slows the crossing pace down, < 1 speeds it up).
+pub const CRUISE_SPEED_NOTCH: f64 = 1.5;
+
+/// Cruise-speed range for `t_cross_s`, real seconds.
+pub const CRUISE_T_CROSS_MIN_S: f64 = 2.0;
+/// Cruise-speed range for `t_cross_s`, real seconds.
+pub const CRUISE_T_CROSS_MAX_S: f64 = 600.0;
+
+/// Reference dry mass in kg (spec §10 envelope value): carried on the
+/// ship for persistence parity. Thrust itself is not integrated at this
+/// frame (see the module docs), so no craft envelope is stored.
+pub const SHIP_DRY_MASS_KG: f64 = 5_000.0;
+
+/// Cruise tuning (runtime params, not constants).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CruiseParams {
+    /// Real seconds to cross the local scale length at full input.
+    pub t_cross_s: f64,
+    /// Velocity-easing time constant, real seconds.
+    pub tau_s: f64,
+}
+
+impl Default for CruiseParams {
+    fn default() -> Self {
+        Self {
+            t_cross_s: CRUISE_T_CROSS_S,
+            tau_s: CRUISE_TAU_S,
+        }
+    }
+}
 
 /// Player-facing flight events (WS6 feeds the transition pill + console
 /// from [`CosmicPlayerState::drain_events`]).
@@ -79,8 +121,9 @@ fn zero_gravity(_position: DVec3) -> DVec3 {
 }
 
 /// Live cosmic player: ship + compression clock + fly-to executor slot +
-/// event queue. Field-visible for the WS4/WS6 shell wiring (debug crate
-/// is developer-only; independence of fields keeps tick code legible).
+/// cruise tuning + event queue. Field-visible for the WS4/WS6 shell wiring
+/// (debug crate is developer-only; independence of fields keeps tick code
+/// legible).
 pub struct CosmicPlayerState {
     /// Ship in `FrameId::Cosmological` (f64 Mpc frame-chain + momentum).
     pub ship: ShipState,
@@ -90,8 +133,9 @@ pub struct CosmicPlayerState {
     pub exec: Option<FlyToExec>,
     /// Node index the executor is flying to, if any.
     pub target_node: Option<u32>,
-    /// Craft envelope (spec §10 PO values via [`CraftParams::default`]).
-    pub params: CraftParams,
+    /// Cruise tuning (update 2026-09-18-2027: `t_cross_s` is
+    /// player-adjustable; the demo shell mutates it directly).
+    pub cruise: CruiseParams,
     /// Pending flight events for the pill/console feed.
     pub events: Vec<CosmicEvent>,
 }
@@ -126,28 +170,42 @@ impl CosmicPlayerState {
                 // parent links.
                 chain: FrameChain::new(FrameId::Cosmological, pos, orientation, Vec::new()),
                 vel: DVec3::ZERO,
-                mass_kg: params_mass(),
+                mass_kg: SHIP_DRY_MASS_KG,
                 fuel: f64::INFINITY,
             },
             clock: CompressionClock::new(),
             exec: None,
             target_node: None,
-            params: CraftParams::default(),
+            cruise: CruiseParams::default(),
             events: Vec::new(),
         }
     }
 
     /// Advance one real frame: slew compression toward the occupancy
-    /// target, push wall time through the clock, then integrate. A
-    /// committed executor drives position from the easing (and disarms
-    /// at arrival with a completion event); otherwise one exact
-    /// free-flight step runs.
+    /// target, push wall time through the clock, then move. A committed
+    /// executor drives position from the easing (and disarms at arrival
+    /// with a completion event); otherwise the cruise law runs: full
+    /// input crosses `scale_mpc` in `t_cross_s` real seconds, velocity
+    /// eased over `tau_s` (momentum feel), zero input coasts at the
+    /// current velocity. `ship.vel` is Mpc per **sim-second** everywhere
+    /// (the [`FlyToExec`] unit), so integration is `pos += v · sim_dt`.
     ///
-    /// `depth_fraction` is distance-to-nearest-significant-body over its
-    /// significance radius (callers that cannot compute it pass 1.0 =
-    /// real-time; deep-space cruise passes large values).
-    pub fn step_free(&mut self, input: &ThrustInput, dt_real_s: f64, depth_fraction: f64) {
+    /// `body_dir` is the cruise direction in ship body axes (zero =
+    /// coast); `scale_mpc` is the local scale length from the demo's
+    /// nearest-node scan; `depth_fraction` is distance-to-nearest-
+    /// significant-body over its significance radius (callers that cannot
+    /// compute it pass 1.0 = real-time; deep-space cruise passes large
+    /// values).
+    pub fn step_cruise(
+        &mut self,
+        body_dir: DVec3,
+        scale_mpc: f64,
+        dt_real_s: f64,
+        depth_fraction: f64,
+    ) {
         debug_assert!(dt_real_s >= 0.0 && dt_real_s.is_finite());
+        debug_assert!(body_dir.is_finite());
+        debug_assert!(scale_mpc >= 0.0 && scale_mpc.is_finite());
         let target = target_ratio(Occupancy {
             frame: FrameId::Cosmological,
             in_blend_band: false,
@@ -193,20 +251,30 @@ impl CosmicPlayerState {
             }
             return;
         }
-        // Free flight only when no committed executor drove this frame.
+        // Free cruise only when no committed executor drove this frame.
         let driving = self
             .exec
             .as_ref()
             .is_some_and(|e| mode_of(Some(e)) == ShipMode::FlyTo);
         if !driving {
-            let frame_time_s = FrameUnits::of(FrameId::Cosmological).time_s;
-            step_free_flight(
-                &mut self.ship,
-                &self.params,
-                input,
-                sim_dt_si / frame_time_s,
-                &zero_gravity,
-            );
+            let ratio = self.clock.ratio().max(1.0);
+            // Full input crosses the scale length in t_cross_s real
+            // seconds; the eased velocity is sim-anchored (per sim-second,
+            // the FlyToExec unit) so executor hand-back continues cleanly.
+            let full_sim = (scale_mpc / self.cruise.t_cross_s.max(f64::MIN_POSITIVE)) / ratio;
+            let target_vel = if body_dir.length_squared() > 1e-24 {
+                let world_dir = (self.ship.chain.orientation() * body_dir.normalize()).normalize();
+                world_dir * full_sim.max(0.0)
+            } else {
+                // Release coasts: the target is the current velocity, so
+                // the easing holds it bit-exact (damping stays OFF).
+                self.ship.vel
+            };
+            let k = (1.0 - (-dt_real_s / self.cruise.tau_s.max(f64::MIN_POSITIVE)).exp())
+                .clamp(0.0, 1.0);
+            self.ship.vel += (target_vel - self.ship.vel) * k;
+            let pos = self.ship.chain.position() + self.ship.vel * sim_dt_si;
+            self.ship.chain.set_position(pos);
         }
     }
 
@@ -251,12 +319,12 @@ impl CosmicPlayerState {
     pub fn facing(&self) -> DVec3 {
         self.ship.chain.orientation() * DVec3::X
     }
-}
 
-/// Reference dry mass: the spec §10 envelope value (single-sourced here
-/// so spawn and CraftParams cannot drift apart).
-fn params_mass() -> f64 {
-    CraftParams::default().dry_mass_kg
+    /// Current cruise speed in Mpc per **real** second (HUD display:
+    /// sim-anchored velocity through the live clock ratio).
+    pub fn real_speed_mpc_s(&self) -> f64 {
+        self.ship.vel.length() * self.clock.ratio()
+    }
 }
 
 #[cfg(test)]
@@ -318,54 +386,77 @@ mod tests {
     }
 
     #[test]
-    fn coast_keeps_momentum_bit_exact_in_cosmological() {
-        // The flight precedent, lifted to the cosmic frame (DoD 5):
-        // unthrusted coast changes nothing about velocity, and identical
-        // runs replay identically.
+    fn coast_preserves_velocity_and_replays_bit_exact() {
+        // Damping stays OFF (spec §10): zero input holds the velocity
+        // bit-exact (the easing target is the current velocity itself),
+        // and identical runs replay identically.
         let web = nominal_web();
         let mut player = CosmicPlayerState::spawn(&web);
-        player.ship.vel = DVec3::new(1.0e-6, 0.0, 0.0);
+        player.ship.vel = DVec3::new(0.5, -0.25, 0.1);
         let v0 = player.ship.vel;
+        let p0 = player.position_mpc();
         for _ in 0..100 {
-            player.step_free(&ThrustInput::none(), 1.0 / 60.0, 10.0);
+            player.step_cruise(DVec3::ZERO, 20.0, 1.0 / 60.0, 1.0);
         }
         assert_eq!(player.ship.vel, v0, "cosmic coast must not pace");
+        // Coast still travels — Mpc-scale in seconds (the visible-motion
+        // contract the old thrust law could never meet).
+        let moved = (player.position_mpc() - p0).length();
+        assert!(moved > 0.5, "coast must travel, moved {moved} Mpc");
         let mut replay = CosmicPlayerState::spawn(&web);
         replay.ship.vel = v0;
         for _ in 0..100 {
-            replay.step_free(&ThrustInput::none(), 1.0 / 60.0, 10.0);
+            replay.step_cruise(DVec3::ZERO, 20.0, 1.0 / 60.0, 1.0);
         }
         assert_eq!(player.ship, replay.ship, "fixed-step replay diverges");
     }
 
     #[test]
-    fn thrust_matches_the_frame_unit_convention() {
-        // Full throttle along body +X with identity orientation for a
-        // known sim span must match 30 m/s² through the frame conversion
-        // a_frame = a_si × T²/L with dt in frame time units (Gyr here).
-        // This pins the WS2 time-unit reading of step_free_flight.
+    fn cruise_from_spawn_moves_mpc_scale_in_seconds() {
+        // The headline regression (update 2026-09-18-2027): at depth 1
+        // the clock sits at ratio 1, so full input asks scale/t_cross =
+        // 20/20 = 1 Mpc per real second, eased over 0.75 s. Five seconds
+        // must move Mpc-scale along the input direction and converge on
+        // the target speed — the old 30 m/s² law moved ~10⁻¹⁵ Mpc in the
+        // same span (below the f64 ulp: the ship could never move).
         let web = nominal_web();
         let mut player = CosmicPlayerState::spawn(&web);
         player.ship.chain.set_orientation(DQuat::IDENTITY);
-        player.clock.slew(1_000.0, 1_000.0);
-        assert_eq!(player.clock.ratio(), 1_000.0);
-        let input = ThrustInput {
-            throttle: 1.0,
-            body_axis: DVec3::X,
-            attitude: None,
-            attitude_rate: DVec3::ZERO,
-        };
-        // Depth fraction 10 ⇒ target ratio exactly 1,000 (10³), so the
-        // pre-slewed ratio holds through the step.
-        player.step_free(&input, 60.0, 10.0);
-        let units = FrameUnits::of(FrameId::Cosmological);
-        let a_frame = 30.0 * units.time_s.powi(2) / units.length_m;
-        let dt_frame = 1_000.0 * 60.0 / units.time_s;
-        let expected = DVec3::X * a_frame * dt_frame;
-        let got = player.ship.vel;
+        let p0 = player.position_mpc();
+        for _ in 0..300 {
+            player.step_cruise(DVec3::X, 20.0, 1.0 / 60.0, 1.0);
+        }
+        let leg = player.position_mpc() - p0;
         assert!(
-            (got - expected).length() / expected.length() < 1e-9,
-            "dv mismatch: got {got} want {expected}"
+            leg.x > 1.0,
+            "5 s of cruise must move Mpc-scale, moved {leg}"
+        );
+        let speed = player.ship.vel.length();
+        assert!(
+            (speed - 1.0).abs() < 0.01,
+            "cruise must converge on 1 Mpc/s, got {speed}"
+        );
+        assert!(
+            player.facing().x > 0.999,
+            "cruise must keep flying the input direction"
+        );
+    }
+
+    #[test]
+    fn cruise_target_speed_scales_with_scale_length() {
+        // Depth-scaling contract: same input, double the scale length ⇒
+        // double the converged speed (both at ratio 1).
+        let web = nominal_web();
+        let mut near = CosmicPlayerState::spawn(&web);
+        let mut far = CosmicPlayerState::spawn(&web);
+        for _ in 0..300 {
+            near.step_cruise(DVec3::X, 20.0, 1.0 / 60.0, 1.0);
+            far.step_cruise(DVec3::X, 40.0, 1.0 / 60.0, 1.0);
+        }
+        let ratio = far.ship.vel.length() / near.ship.vel.length();
+        assert!(
+            (ratio - 2.0).abs() < 0.01,
+            "speed must double with scale, ratio {ratio}"
         );
     }
 
@@ -387,41 +478,10 @@ mod tests {
     }
 
     #[test]
-    fn single_step_matches_fine_substeps() {
-        // Justification for one step_free_flight per frame at any
-        // compression: constant acceleration + zero gravity integrates
-        // exactly at any step size (relative tolerance, since summation
-        // order differs).
-        let web = nominal_web();
-        let input = ThrustInput {
-            throttle: 0.7,
-            body_axis: DVec3::new(0.0, 1.0, 0.0),
-            attitude: None,
-            attitude_rate: DVec3::ZERO,
-        };
-        let mut single = CosmicPlayerState::spawn(&web);
-        single.clock.slew(1.0e6, 1_000.0);
-        // Depth fraction 100 ⇒ target ratio exactly 10⁶, so the ratio
-        // holds across single and substepped runs alike.
-        single.step_free(&input, 1.0, 100.0);
-        let mut fine = CosmicPlayerState::spawn(&web);
-        fine.clock.slew(1.0e6, 1_000.0);
-        for _ in 0..100 {
-            fine.step_free(&input, 0.01, 100.0);
-        }
-        let dp = (single.position_mpc() - fine.position_mpc()).length();
-        let scale = single.position_mpc().length().max(1.0);
-        assert!(dp / scale < 1e-9, "single vs substep drift {dp}");
-        let dv = (single.ship.vel - fine.ship.vel).length();
-        let vscale = single.ship.vel.length().max(1.0e-30);
-        assert!(dv / vscale < 1e-9, "velocity drift {dv}");
-    }
-
-    #[test]
     fn committed_executor_drives_to_rest_at_target() {
         // The WS6 branch contract, exercised directly: a committed
-        // executor overrides free flight, samples the easing at sim
-        // time, and disarms at arrival with a completion event.
+        // executor overrides cruise, samples the easing at sim time, and
+        // disarms at arrival with a completion event.
         let web = nominal_web();
         let mut player = CosmicPlayerState::spawn(&web);
         let home = DVec3::from(web.home().position_mpc);
@@ -433,7 +493,7 @@ mod tests {
         player.exec = Some(exec);
         player.target_node = Some(web.home_node);
         // One real second at full compression covers the ~210 s leg.
-        player.step_free(&ThrustInput::none(), 1.0, 1.0e6);
+        player.step_cruise(DVec3::ZERO, 1.0, 1.0, 1.0e6);
         assert!(player.exec.is_none(), "executor must disarm at arrival");
         assert!(player.target_node.is_none());
         // Arrival is the plan end (same easing path ⇒ bit-identical)
@@ -480,6 +540,43 @@ mod tests {
         assert!(player.exec.is_none());
         assert!(player.target_node.is_none());
         assert_eq!(player.position_mpc(), plan.position_at(0.0));
+        assert_eq!(
+            player.drain_events(),
+            vec![CosmicEvent::FlyToCancelled {
+                node: web.home_node
+            }]
+        );
+    }
+
+    #[test]
+    fn cancel_mid_leg_hands_back_the_eased_state_unit_consistent() {
+        // The velocity-unit pin: FlyToExec samples Mpc/sim-s and cruise
+        // integrates Mpc/sim-s, so a mid-leg cancel must hand back exactly
+        // the eased state (the old Gyr reading broke this by ×3.156e16).
+        let web = nominal_web();
+        let mut player = CosmicPlayerState::spawn(&web);
+        let home = DVec3::from(web.home().position_mpc);
+        let target = Target::new(FrameId::Cosmological, home).expect("finite");
+        let plan = plan_fly_to(FrameId::Cosmological, player.position_mpc(), &target, 0.0)
+            .expect("leg plannable");
+        let mut exec = FlyToExec::new(plan);
+        exec.commit().expect("commits once");
+        player.exec = Some(exec);
+        player.target_node = Some(web.home_node);
+        // 0.1 sim-s into the leg (ratio 1, far from arrival).
+        player.step_cruise(DVec3::ZERO, 1.0, 0.1, 1.0);
+        assert!(player.cancel_fly_to());
+        let t = player.clock.sim_time_s();
+        assert_eq!(
+            player.ship.vel,
+            plan.velocity_at(t),
+            "hand-back velocity must be the eased state"
+        );
+        assert_eq!(
+            player.position_mpc(),
+            plan.position_at(t),
+            "hand-back position must be the eased state"
+        );
         assert_eq!(
             player.drain_events(),
             vec![CosmicEvent::FlyToCancelled {

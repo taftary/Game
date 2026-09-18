@@ -2,18 +2,21 @@
 //! camera, the shipping HUD, and the frame's input intent.
 //!
 //! Window- and GPU-free: the binary turns keys/cursor into
-//! [`CosmicDemoState::set_held`]/[`steer`] calls, ticks
-//! [`tick`](CosmicDemoState::tick), and uploads buffers on
+//! [`CosmicDemoState::cruise_input`]/[`steer`](CosmicDemoState::steer)
+//! intent, ticks [`tick`](CosmicDemoState::tick), and uploads buffers on
 //! [`needs_rebase`](CosmicDemoState::needs_rebase). Everything here is
 //! unit-testable.
 
 use super::cosmic_camera::CosmicCamera;
-use super::cosmic_player::{CosmicEvent, CosmicPlayerState};
+use super::cosmic_player::{
+    CRUISE_SCALE_FLOOR_RVIR, CRUISE_T_CROSS_MAX_S, CRUISE_T_CROSS_MIN_S, CosmicEvent,
+    CosmicPlayerState,
+};
 use super::cosmic_web::COSMIC_PICK_RADIUS_PX;
 use super::picking::project_to_screen;
 use super::ui::Rect;
 use game::hud::Hud;
-use game_engine::flight::{FlyToExec, Target, ThrustInput, plan_fly_to};
+use game_engine::flight::{FlyToExec, Target, plan_fly_to};
 use game_engine::frames::FrameId;
 use game_engine::universe::{CosmicWebParams, WebDescriptor, generate_cosmic_web};
 use glam::{DQuat, DVec3};
@@ -133,54 +136,88 @@ impl CosmicDemoState {
         self.player.ship.chain.set_orientation(orientation);
     }
 
-    /// Thrust intent for the next tick: held keys on body axes, full
-    /// throttle while any key is down, orientation hold on the steered
-    /// attitude (rotation stabilization is ON per the craft envelope).
-    pub fn thrust_input(&self) -> ThrustInput {
-        let axis = DVec3::X * (f64::from(self.held.fwd as u8) - f64::from(self.held.back as u8))
+    /// Cruise intent for the next tick: held keys on body axes (zero =
+    /// coast). The player turns this into a depth-scaled target velocity
+    /// (orientation hold on the steered attitude — rotation stabilization
+    /// is ON per the craft envelope).
+    pub fn cruise_input(&self) -> (DVec3, bool) {
+        let dir = DVec3::X * (f64::from(self.held.fwd as u8) - f64::from(self.held.back as u8))
             + DVec3::Z * (f64::from(self.held.right as u8) - f64::from(self.held.left as u8));
-        ThrustInput {
-            throttle: if self.held.any() { 1.0 } else { 0.0 },
-            body_axis: axis,
-            attitude: Some(self.player.ship.chain.orientation()),
-            attitude_rate: DVec3::ZERO,
-        }
+        (dir, self.held.any())
     }
 
-    /// Depth fraction for the compression occupancy: distance to the
-    /// nearest node over ten of its virial radii (≤ 1 near a node ⇒
-    /// real-time maneuvering; thousands deep in the void ⇒ full
-    /// compression). O(nodes) per tick — ~6k distance checks, µs-scale.
-    pub fn depth_fraction(&self) -> f64 {
+    /// Nearest-node scan shared by the compression occupancy and the
+    /// cruise scale: minimum depth fraction, closest distance, and that
+    /// node's virial radius. O(nodes) per call — ~6k distance checks,
+    /// µs-scale.
+    fn scan_nodes(&self) -> Option<(f64, f64, f64)> {
         let pos = self.player.position_mpc();
-        let mut best = f64::INFINITY;
+        // (min depth fraction, nearest distance Mpc, its virial radius).
+        let mut acc: Option<(f64, f64, f64)> = None;
         for node in &self.web.nodes {
             let dx = node.position_mpc[0] - pos.x;
             let dy = node.position_mpc[1] - pos.y;
             let dz = node.position_mpc[2] - pos.z;
             let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-            let frac = dist / (10.0 * node.virial_radius_mpc.max(1e-6));
-            if frac < best {
-                best = frac;
-            }
+            let r_vir = node.virial_radius_mpc.max(1e-6);
+            let frac = dist / (10.0 * r_vir);
+            acc = Some(match acc {
+                Some((best_frac, best_dist, best_rvir)) => (
+                    frac.min(best_frac),
+                    // Lowest node index wins exact ties (the map-tab rule).
+                    if dist < best_dist { dist } else { best_dist },
+                    if dist < best_dist { r_vir } else { best_rvir },
+                ),
+                None => (frac, dist, r_vir),
+            });
         }
-        if best.is_finite() { best } else { 1.0 }
+        acc
     }
 
-    /// One real frame: integrate flight, then track the camera on the
-    /// ship. Returns true when the ship outran the upload origin and
-    /// the shell must rebuild the buffers (rebase path). Any held
-    /// thrust cancels a committed fly-to first (continuous hand-back —
-    /// the freed step flies free the same tick).
+    /// Depth fraction for the compression occupancy: distance to the
+    /// nearest node over ten of its virial radii (≤ 1 near a node ⇒
+    /// real-time maneuvering; thousands deep in the void ⇒ full
+    /// compression).
+    pub fn depth_fraction(&self) -> f64 {
+        self.scan_nodes().map(|(frac, _, _)| frac).unwrap_or(1.0)
+    }
+
+    /// Cruise scale length in Mpc: nearest-node distance with an
+    /// r_vir-scaled floor (precision speeds at a node, never frozen).
+    pub fn scale_length_mpc(&self) -> f64 {
+        match self.scan_nodes() {
+            Some((_, dist, r_vir)) => dist.max(CRUISE_SCALE_FLOOR_RVIR * r_vir),
+            None => 1.0,
+        }
+    }
+
+    /// Adjust the cruise pace: `Shift`+wheel scales `t_cross_s` by
+    /// `factor` (a wheel notch passes ×/÷ the cruise-speed notch),
+    /// clamped to the cruise-speed range. Returns the new crossing time
+    /// for the HUD.
+    pub fn cruise_speed_by(&mut self, factor: f64) -> f64 {
+        debug_assert!(factor > 0.0 && factor.is_finite());
+        let t = (self.player.cruise.t_cross_s * factor)
+            .clamp(CRUISE_T_CROSS_MIN_S, CRUISE_T_CROSS_MAX_S);
+        self.player.cruise.t_cross_s = t;
+        t
+    }
+
+    /// One real frame: cruise from held input, then track the camera on
+    /// the ship. Returns true when the ship outran the upload origin and
+    /// the shell must rebuild the buffers (rebase path). Any held cruise
+    /// input cancels a committed fly-to first (continuous hand-back —
+    /// the freed step cruises the same tick).
     pub fn tick(&mut self, dt_real_s: f64) -> bool {
-        let input = self.thrust_input();
-        if input.throttle > 0.0 {
+        let (dir, any) = self.cruise_input();
+        if any {
             self.player.cancel_fly_to();
         }
+        let scale = self.scale_length_mpc();
         let depth = self
             .depth_fraction_override
             .unwrap_or_else(|| self.depth_fraction());
-        self.player.step_free(&input, dt_real_s, depth);
+        self.player.step_cruise(dir, scale, dt_real_s, depth);
         self.camera
             .track(self.player.position_mpc(), self.player.facing());
         self.needs_rebase()
@@ -335,19 +372,45 @@ mod tests {
     }
 
     #[test]
-    fn thrust_intent_maps_held_keys_to_body_axes() {
+    fn cruise_intent_maps_held_keys_to_body_axes() {
         let mut demo = demo();
-        let idle = demo.thrust_input();
-        assert_eq!(idle.throttle, 0.0);
-        assert_eq!(idle.body_axis, DVec3::ZERO);
+        let (idle_dir, idle_any) = demo.cruise_input();
+        assert!(!idle_any);
+        assert_eq!(idle_dir, DVec3::ZERO);
         demo.held.fwd = true;
         demo.held.right = true;
-        let input = demo.thrust_input();
-        assert_eq!(input.throttle, 1.0);
-        assert_eq!(input.body_axis, DVec3::new(1.0, 0.0, 1.0));
-        assert!(input.attitude.is_some());
+        let (dir, any) = demo.cruise_input();
+        assert!(any);
+        assert_eq!(dir, DVec3::new(1.0, 0.0, 1.0));
         demo.held.clear();
         assert!(!demo.held.any());
+    }
+
+    #[test]
+    fn scale_length_is_floored_near_nodes() {
+        use crate::cosmic_player::{CRUISE_SPEED_NOTCH, CRUISE_T_CROSS_S};
+
+        let mut demo = demo();
+        let spawn_scale = demo.scale_length_mpc();
+        assert!(
+            spawn_scale.is_finite() && spawn_scale > 0.0,
+            "spawn scale {spawn_scale}"
+        );
+        // Parked on node 0, the scale is exactly the r_vir floor, never
+        // zero (cruise stays alive at a fly-to arrival point).
+        let node = &demo.web.nodes[0];
+        demo.player
+            .ship
+            .chain
+            .set_position(DVec3::from(node.position_mpc));
+        let floor = CRUISE_SCALE_FLOOR_RVIR * node.virial_radius_mpc.max(1e-6);
+        assert_eq!(demo.scale_length_mpc(), floor);
+        // Speed adjust starts at the nominal pace, notches both ways,
+        // and clamps at the range ends.
+        assert_eq!(demo.player.cruise.t_cross_s, CRUISE_T_CROSS_S);
+        assert!(demo.cruise_speed_by(1.0 / CRUISE_SPEED_NOTCH) < CRUISE_T_CROSS_S);
+        assert_eq!(demo.cruise_speed_by(1e-9), CRUISE_T_CROSS_MIN_S);
+        assert_eq!(demo.cruise_speed_by(1e9), CRUISE_T_CROSS_MAX_S);
     }
 
     #[test]
@@ -360,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn select_engage_cancel_and_thrust_cancel_flow() {
+    fn select_engage_cancel_and_cruise_cancel_flow() {
         use super::CosmicEvent;
 
         let mut demo = demo();
@@ -403,12 +466,12 @@ mod tests {
             None
         );
         assert_eq!(demo.player.target_node, None);
-        // Re-select and engage, then thrust-cancel mid-leg.
+        // Re-select and engage, then cruise-cancel mid-leg.
         assert_eq!(demo.select_node_at(cursor, vp), Some(idx));
         assert_eq!(demo.engage_fly_to(), EngageOutcome::Engaged);
         demo.held.fwd = true;
         demo.tick(1.0 / 60.0);
-        assert!(demo.player.exec.is_none(), "held thrust must cancel fly-to");
+        assert!(demo.player.exec.is_none(), "held cruise must cancel fly-to");
         let events = demo.player.drain_events();
         let kinds: Vec<&str> = events
             .iter()
@@ -448,29 +511,24 @@ mod tests {
     }
 
     #[test]
-    fn tick_advances_flight_and_tracks_camera() {
-        // Mpc units cannot resolve real-time thrust inside a
-        // test-length run (sub-f64 at 30 Mpc magnitude — correct
-        // behavior near a node), so the override pins the compressed
-        // regime: a minute of full thrust at 10⁹ compression moves
-        // Mpc-scale, and the camera stays glued throughout.
+    fn tick_cruises_visibly_and_tracks_camera() {
+        // The playtest regression (update 2026-09-18-2027): five seconds
+        // of W at spawn must move Mpc-scale with no test override — the
+        // old thrust law needed `depth_fraction_override` to move at all
+        // and still moved sub-ulp. The camera stays glued throughout.
         let mut demo = demo();
         demo.held.fwd = true;
-        demo.depth_fraction_override = Some(1.0e6);
         let p0 = demo.player.position_mpc();
-        let v0 = demo.player.ship.vel;
         let mut rebased = false;
-        for _ in 0..3600 {
+        for _ in 0..300 {
             rebased |= demo.tick(1.0 / 60.0);
         }
-        assert!(!rebased, "a minute must not outrun the origin");
+        let moved = (demo.player.position_mpc() - p0).length();
         assert!(
-            demo.player.clock.ratio() >= 1.0e8,
-            "compression must engage: {}",
-            demo.player.clock.ratio()
+            moved > 1.0,
+            "5 s of W must move Mpc-scale, moved {moved} Mpc"
         );
-        assert_ne!(demo.player.ship.vel, v0, "thrust must act");
-        assert_ne!(demo.player.position_mpc(), p0);
+        assert!(!rebased, "five seconds must not outrun the origin");
         // Camera still glued to the ship: the live anchor (in the
         // origin-relative frame, mirroring the marker path) projects
         // to center.

@@ -118,6 +118,9 @@ pub enum Action {
     TravelOffer,
     TravelBegin,
     FlyToToggle,
+    // Cosmic-demo cruise pace (`Shift`+wheel; the Controls row steps one
+    // notch faster — update 2026-09-18-2027).
+    CruiseSpeed,
     AscendLayer,
     FocusToggle,
     ConfirmField,
@@ -155,6 +158,7 @@ impl Action {
             Action::TravelOffer => "T",
             Action::TravelBegin => "E",
             Action::FlyToToggle => "E",
+            Action::CruiseSpeed => "Shift+wheel",
             Action::AscendLayer => "Q",
             Action::FocusToggle => "F",
             Action::ConfirmField => "Enter",
@@ -191,6 +195,7 @@ impl Action {
             Action::TravelOffer => "Arm/withdraw travel",
             Action::TravelBegin => "Begin travel",
             Action::FlyToToggle => "Engage/cancel fly-to",
+            Action::CruiseSpeed => "Adjust cruise pace",
             Action::AscendLayer => "Ascend journey layer",
             Action::FocusToggle => "Toggle planet focus",
             Action::ConfirmField => "Confirm field",
@@ -227,6 +232,7 @@ impl Action {
             Action::TravelOffer
             | Action::TravelBegin
             | Action::FlyToToggle
+            | Action::CruiseSpeed
             | Action::AscendLayer
             | Action::FocusToggle
             | Action::ConfirmField => ActionGroup::Travel,
@@ -256,7 +262,7 @@ impl Action {
 
     /// Every static (non-parameterized) action, for the Controls list
     /// and the parity test.
-    pub const ALL_STATIC: [Action; 29] = [
+    pub const ALL_STATIC: [Action; 30] = [
         Action::ToggleLeftDock,
         Action::ToggleRightDock,
         Action::ToggleDevWidget,
@@ -283,6 +289,7 @@ impl Action {
         Action::TravelOffer,
         Action::TravelBegin,
         Action::FlyToToggle,
+        Action::CruiseSpeed,
         Action::AscendLayer,
         Action::FocusToggle,
         Action::ConfirmField,
@@ -337,7 +344,7 @@ mod tests {
 
     #[test]
     fn registry_size_is_pinned() {
-        // 29 static + 10 dimensions + 6 shader modes.
-        assert_eq!(all_actions().len(), 45);
+        // 30 static + 10 dimensions + 6 shader modes.
+        assert_eq!(all_actions().len(), 46);
     }
 }

@@ -40,20 +40,23 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   snap); other dimension tabs are placeholders with `INACTIVE`
   badges.
 - Game Demo tab (v0.3.2 `cosmic-scale-player` — the main game
-  notion: a player in space navigating the Cosmic Scale): the player
-  is a marker (`YOU` dot + heading arrow) with its own camera in the
-  generated cosmic web, spawned inside a filament near the home
-  galaxy. Mouse drag steers the nose; `W`/`S` = main thrust,
-  `A`/`D` = lateral thrust (arrows mirror WASD); `P` cycles Chase
-  (default) → Orbit (drag orbits, wheel zooms) → FirstPerson (marker
-  hidden); wheel zooms the Chase/Orbit camera; click a node to
-  target it, `E` engages/cancels the eased fly-to (any thrust also
-  cancels); `R` re-seeds the web. The shipping HUD shows frame
-  (cosmological/Mpc), time (real-time or compressed ratio), and the
-  fly-to target with distance + ETA; SOI stays `—` (no handoffs at
-  this scale). `E` is context-dependent by design: fly-to in the
-  demo, travel-begin on the galaxy/system tabs (the `T`
-  dual-binding precedent: travel offer / top preset).
+  notion: a player in space navigating the Cosmic Scale, amended by
+  update-2026-09-18-2027): the player is a marker (`YOU` dot + heading
+  arrow) with its own camera in the generated cosmic web, spawned
+  inside a filament near the home galaxy. Mouse drag steers the nose;
+  `W`/`S` = cruise forward/backward, `A`/`D` = lateral cruise (arrows
+  mirror WASD) — full input crosses the local scale length (nearest-node
+  distance, r_vir-scaled floor) in ~20 s with eased momentum, release
+  coasts; `Shift`+wheel adjusts the pace (2–600 s crossing time);
+  `P` cycles Chase (default) → Orbit (drag orbits, wheel zooms) →
+  FirstPerson (marker hidden); wheel zooms the Chase/Orbit camera;
+  click a node to target it, `E` engages/cancels the eased fly-to (any
+  cruise input also cancels); `R` re-seeds the web. The shipping HUD
+  shows frame (cosmological/Mpc), time (real-time or compressed ratio),
+  live cruise speed (Mpc/s), and the fly-to target with distance + ETA;
+  SOI stays `—` (no handoffs at this scale). `E` is context-dependent
+  by design: fly-to in the demo, travel-begin on the galaxy/system tabs
+  (the `T` dual-binding precedent: travel offer / top preset).
 - Dev widget (`` ` `` toggle; `F6`/`F7`/`F8` = FPS/Console/Inspector
   sub-tabs): floats over every tab. Console carries the transition-
   event log; a transition pill floats bottom-center while a waypoint

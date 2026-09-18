@@ -1,10 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.33.0 (2026-09-18, cosmic-scale player per ADR-023:
-  stage-0 generated cosmic web, Game Demo rebuilt around the player
-  (marker + Chase/Orbit/FirstPerson camera + fly-to), Cosmic Web
-  inspector as the fourth absorbed view, real pill/console feed;
-  shell, registry (+1 action), and invariants preserved)
+- **Version:** 0.33.1 (2026-09-18, cosmic-scale player cruise update per
+  ADR-023 amendment: scale-relative cruise replaces raw thrust at
+  Cosmological (velocity-unit pin, live speed HUD row, `Shift`+wheel
+  pace), registry (+1 action), fly-to/clock/camera/marker unchanged)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

@@ -104,7 +104,8 @@ v0.3.2) then stages 1–2 with quantized cross-platform hashes;
 `game_debug` mounts the generated web twice from one descriptor — the
 Game Demo tab (`F1`, default) renders the player flying inside it
 (`ShipState` in `FrameId::Cosmological`, marker + Chase/Orbit/
-FirstPerson camera, physical thrust + click/`E` fly-to, shipping HUD)
+FirstPerson camera, scale-relative cruise + click/`E` fly-to, shipping
+HUD with live speed)
 while the Cosmic Web dimension tab (`F2` dropdown, digit `1`) inspects
 it (orbit/pan/log-zoom, click-node readout, live player point,
 `Home` top-down snap) — plus the System Map on the Solar System tab
