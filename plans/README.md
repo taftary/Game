@@ -36,6 +36,7 @@ Current version folders (contents + per-version scope:
 - `v0.2.0/` — Scale rendering & visuals (spec §4, §9)
 - `v0.3.0/` — Player-facing layer (spec §10 + debug screens)
 - `v0.3.1/` — Debug shell unification (ADR-022: `unified-debug-view`)
+- `v0.3.2/` — Cosmic-scale player (main game notion: `cosmic-scale-player`)
 
 ## Role gates
 

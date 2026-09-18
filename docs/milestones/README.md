@@ -82,6 +82,16 @@ commit when it reaches `done` (workflow rule:
 |---|---|---|
 | [`unified-debug-view`](../../plans/v0.3.1/unified-debug-view/) | done | dev tooling (ADR-022) |
 
+## v0.3.2 — Cosmic-scale player (main game notion)
+
+Work happens on branch `v0.3.2`; the feature lands as exactly one
+commit when it reaches `done` (workflow rule:
+[`plans/README.md`](../../plans/README.md) § *7. Version branch*).
+
+| Feature | Status | Spec section |
+|---|---|---|
+| [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | planned | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
+
 ## Post-v0.3 (unscheduled)
 
 - **Colony milestones (historical labels):** M2 descent slice, M3 surface
