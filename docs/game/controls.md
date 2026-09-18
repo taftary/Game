@@ -50,7 +50,8 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   coasts; `Shift`+wheel adjusts the pace (2–600 s crossing time);
   `P` cycles Chase (default) → Orbit (drag orbits, wheel zooms) →
   FirstPerson (marker hidden); wheel zooms the Chase/Orbit camera;
-  click a node to target it, `E` engages/cancels the eased fly-to (any
+  click a node to target it (amber ring marker, also on the Cosmic Web
+  tab's clicked node), `E` engages/cancels the eased fly-to (any
   cruise input also cancels); `R` re-seeds the web. The shipping HUD
   shows frame (cosmological/Mpc), time (real-time or compressed ratio),
   live cruise speed (Mpc/s), and the fly-to target with distance + ETA;

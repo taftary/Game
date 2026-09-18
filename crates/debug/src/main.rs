@@ -999,6 +999,44 @@ fn draw_player_marker(items: &mut UiItems, origin: (f32, f32), tip: Option<(f32,
     items.text("YOU".to_owned(), mx + PLAYER_DOT, my - 6.0, C_PLAYER);
 }
 
+/// Target highlight ring radius, pixels.
+const TARGET_RING_R: f32 = 9.0;
+
+/// Target/selection ring: square outline around a projected viewport
+/// point as four thin UI-pass rects (the galaxy/system map
+/// selection-ring geometry). Pure geometry — unit-tested below.
+fn draw_target_ring(items: &mut UiItems, center: (f32, f32), r: f32, color: Color) {
+    let (x0, y0) = center;
+    for rect in [
+        Rect {
+            x: x0 - r,
+            y: y0 - r,
+            w: 2.0 * r,
+            h: 1.5,
+        },
+        Rect {
+            x: x0 - r,
+            y: y0 + r,
+            w: 2.0 * r,
+            h: 1.5,
+        },
+        Rect {
+            x: x0 - r,
+            y: y0 - r,
+            w: 1.5,
+            h: 2.0 * r,
+        },
+        Rect {
+            x: x0 + r,
+            y: y0 - r,
+            w: 1.5,
+            h: 2.0 * r,
+        },
+    ] {
+        items.solid(rect, color);
+    }
+}
+
 /// Checkbox square inside a label row.
 fn check_box(row: Rect, lh: f32) -> Rect {
     Rect {
@@ -1405,6 +1443,30 @@ fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -
                     C_DIM,
                 );
             }
+        }
+    }
+    // Target highlight: amber ring around the inspected node,
+    // projected through the inspector camera at the fixed web-center
+    // origin the tab buffers share (the galaxy-tab ring precedent —
+    // clamped into the viewport, hidden behind the camera).
+    if let Some(node) = inspector
+        .selected
+        .and_then(|i| cosmic.web.nodes.get(i as usize))
+    {
+        let vp = layout.viewport;
+        let view_proj = inspector.view_proj(vp.w / vp.h);
+        let world = Vec3::new(
+            node.position_mpc[0] as f32,
+            node.position_mpc[1] as f32,
+            node.position_mpc[2] as f32,
+        );
+        if let Some((sx, sy)) = project_to_screen(world, view_proj, vp) {
+            draw_target_ring(
+                &mut items,
+                (sx.clamp(vp.x, vp.x + vp.w), sy.clamp(vp.y, vp.y + vp.h)),
+                TARGET_RING_R,
+                C_WARN,
+            );
         }
     }
     items
@@ -2687,6 +2749,23 @@ fn compose_overlay_ui(
             let facing_f32 = Vec3::new(facing.x as f32, facing.y as f32, facing.z as f32);
             let tip = world_to_pixels(main_vp, cosmic_tip_world(ship, facing_f32, eye_dist), vp);
             draw_player_marker(items, dot, tip);
+        }
+        // Target highlight (UX-3 affordance): amber ring around the
+        // selected fly-to node, projected through the player camera in
+        // the upload-origin frame the buffers share. Hidden when the
+        // node is behind the camera or off-screen — same rule as the
+        // ship marker. The ring tracks `target_node`, so it rides the
+        // destination through `E` fly-to until arrival / cancel /
+        // re-click clears it.
+        if let Some(node) = cosmic.player.target_node
+            && let Some(descriptor) = cosmic.web.nodes.get(node as usize)
+            && let Some(center) = world_to_pixels(
+                main_vp,
+                recenter(DVec3::from(descriptor.position_mpc), cosmic.upload_origin),
+                vp,
+            )
+        {
+            draw_target_ring(items, center, TARGET_RING_R, C_WARN);
         }
     }
     // Transition fade + notice banner (UMAP-017): a fullscreen black
@@ -6718,6 +6797,171 @@ mod tests {
         draw_player_marker(&mut bare, (100.0, 100.0), None);
         assert_eq!(bare.solids.len(), 1);
         assert!(bare.tris.is_empty());
+    }
+
+    #[test]
+    fn draw_target_ring_emits_four_rects() {
+        let mut items = UiItems::default();
+        draw_target_ring(&mut items, (100.0, 100.0), TARGET_RING_R, C_WARN);
+        assert_eq!(items.solids.len(), 4, "top/bottom/left/right bars");
+        assert!(items.tris.is_empty());
+        assert!(items.texts.is_empty());
+        assert!(
+            items.solids.iter().all(|(_, color)| *color == C_WARN),
+            "ring rides one color"
+        );
+        let r = TARGET_RING_R;
+        for want in [
+            Rect {
+                x: 100.0 - r,
+                y: 100.0 - r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: 100.0 - r,
+                y: 100.0 + r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: 100.0 - r,
+                y: 100.0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+            Rect {
+                x: 100.0 + r,
+                y: 100.0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+        ] {
+            assert!(
+                items.solids.iter().any(|(rect, _)| *rect == want),
+                "ring missing bar {want:?}"
+            );
+        }
+    }
+
+    /// Count amber (target-ring) solids in a composed frame.
+    fn warn_solids(items: &UiItems) -> usize {
+        items
+            .solids
+            .iter()
+            .filter(|(_, color)| *color == C_WARN)
+            .count()
+    }
+
+    #[test]
+    fn demo_target_ring_overlays_selected_node() {
+        // `DebugApp::new` boots on the Game Demo tab with a fixed seed,
+        // so the projection below is deterministic.
+        let mut atlas = GlyphAtlas::new(UI_PX);
+        let mut app = DebugApp::new();
+        assert_eq!(app.screen, Screen::GameDemo);
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let compose = |app: &DebugApp, atlas: &mut GlyphAtlas| {
+            let mut items = UiItems::default();
+            let mut drop = UiItems::default();
+            compose_overlay_ui(
+                &mut items,
+                &mut drop,
+                atlas,
+                app,
+                layout,
+                (1280.0, 720.0),
+                None,
+            );
+            items
+        };
+        let baseline = warn_solids(&compose(&app, &mut atlas));
+        // Pick a node the default demo camera actually shows, through
+        // the same recenter + projection the overlay uses.
+        let vp = layout.viewport;
+        let main_vp = app.cosmic.camera.view_proj(vp.w / vp.h);
+        let (index, center) = app
+            .cosmic
+            .web
+            .nodes
+            .iter()
+            .find_map(|node| {
+                let world = recenter(DVec3::from(node.position_mpc), app.cosmic.upload_origin);
+                world_to_pixels(main_vp, world, vp).map(|at| (node.node_index, at))
+            })
+            .expect("default demo view must show at least one node");
+        app.cosmic.player.target_node = Some(index);
+        let items = compose(&app, &mut atlas);
+        assert_eq!(
+            warn_solids(&items),
+            baseline + 4,
+            "selected node gets one 4-rect ring"
+        );
+        let (cx, cy) = center;
+        assert!(
+            items.solids.iter().any(|(rect, color)| *color == C_WARN
+                && *rect
+                    == Rect {
+                        x: cx - TARGET_RING_R,
+                        y: cy - TARGET_RING_R,
+                        w: 2.0 * TARGET_RING_R,
+                        h: 1.5,
+                    }),
+            "ring top bar centers on the projected node"
+        );
+        // Clearing the target clears the ring.
+        app.cosmic.player.target_node = None;
+        assert_eq!(warn_solids(&compose(&app, &mut atlas)), baseline);
+    }
+
+    #[test]
+    fn inspector_selected_ring_overlays_node() {
+        let mut atlas = GlyphAtlas::new(UI_PX);
+        let mut app = DebugApp::new();
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let build =
+            |app: &DebugApp, atlas: &mut GlyphAtlas| build_cosmic_web_ui(atlas, app, layout);
+        let baseline = warn_solids(&build(&app, &mut atlas));
+        // Pick a node strictly inside the default inspector viewport
+        // (the ring clamps, so the test pins the unclamped center).
+        let vp = layout.viewport;
+        let view_proj = app.cosmic_inspector.view_proj(vp.w / vp.h);
+        let (index, center) = app
+            .cosmic
+            .web
+            .nodes
+            .iter()
+            .find_map(|node| {
+                let world = Vec3::new(
+                    node.position_mpc[0] as f32,
+                    node.position_mpc[1] as f32,
+                    node.position_mpc[2] as f32,
+                );
+                project_to_screen(world, view_proj, vp).and_then(|(sx, sy)| {
+                    (sx >= vp.x && sx <= vp.x + vp.w && sy >= vp.y && sy <= vp.y + vp.h)
+                        .then_some((node.node_index, (sx, sy)))
+                })
+            })
+            .expect("default inspector view must show at least one node");
+        app.cosmic_inspector.selected = Some(index);
+        let items = build(&app, &mut atlas);
+        assert_eq!(
+            warn_solids(&items),
+            baseline + 4,
+            "inspected node gets one 4-rect ring"
+        );
+        let (cx, cy) = center;
+        assert!(
+            items.solids.iter().any(|(rect, color)| *color == C_WARN
+                && *rect
+                    == Rect {
+                        x: cx - TARGET_RING_R,
+                        y: cy - TARGET_RING_R,
+                        w: 2.0 * TARGET_RING_R,
+                        h: 1.5,
+                    }),
+            "ring top bar centers on the projected node"
+        );
     }
 
     #[test]
