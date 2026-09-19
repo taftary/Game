@@ -7,15 +7,22 @@
 //! (pinned by `selection_is_read_only` in `app.rs`).
 //!
 //! This module also owns the CPU-side vertex layout both 3D surfaces
-//! share ([`node_point_cloud`], [`link_segments`], [`glow_point_cloud`]):
-//! one source of truth for positions (origin-relative Mpc f32), colors,
-//! and sprite sizes. The binary maps the tuples onto its GPU vertex
-//! types at upload.
+//! share ([`node_point_cloud`], [`link_segments`], [`glow_point_cloud`]
+//! plus the cinematic enrichment layer [`braid_segments`],
+//! [`grain_cloud`], [`node_impostors`]): one source of truth for
+//! positions (origin-relative Mpc f32), colors, and sprite sizes. The
+//! binary maps the tuples onto its GPU vertex types at upload.
+//!
+//! The enrichment layer is render-only: every value derives
+//! deterministically from the descriptor + seed (never fed back into
+//! selection, flight, or saves), so the stage-0 descriptor, its hash,
+//! and `UNIVERSE_VERSION` are untouched.
 
 use super::map_camera::{DEFAULT_PITCH, DEFAULT_YAW, MapOrbitCamera};
 use super::picking::project_to_screen;
 use super::ui::Rect;
-use game_engine::universe::WebDescriptor;
+use game_engine::core::SeededRng;
+use game_engine::universe::{WebDescriptor, WebLink};
 use glam::{DVec3, Mat4, Vec3};
 
 /// Click-selection radius in px (the map-tab precedent).
@@ -169,13 +176,366 @@ pub fn link_segments(web: &WebDescriptor, origin: DVec3) -> Vec<[f32; 3]> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Cinematic enrichment layer (update-2026-09-18-2328): braided filaments,
+// particulate grain, emissive node impostors. Render-only derivations of
+// the descriptor — deterministic per (seed, web, origin), never hashed.
+// ---------------------------------------------------------------------------
+
+/// Subdivisions per link per braid strand (segments = subdivisions).
+pub const BRAID_SUBDIVISIONS: usize = 10;
+/// Braid lateral amplitude in Mpc (strand + wander combined stay under
+/// ~1.6× this; tests pin the bound).
+pub const BRAID_AMPLITUDE_MPC: f64 = 1.5;
+/// Strands for a zero-density link; a full-density link gets three
+/// (`1 + floor(2·density)`).
+pub const BRAID_MIN_STRANDS: u64 = 1;
+/// Strands for a full-density link.
+pub const BRAID_MAX_STRANDS: u64 = 3;
+/// Visual grain points emitted per Mpc of link (pre-budget, density
+/// weighted — the same two-pass budget pattern as descriptor glow).
+pub const GRAIN_PER_MPC: f64 = 8.0;
+/// Hard cap on emitted grain points (boot + rebase cost control).
+pub const MAX_GRAIN_POINTS: u32 = 800_000;
+/// Transverse jitter sigma of grain around its strand, Mpc.
+pub const GRAIN_TRANSVERSE_SIGMA_MPC: f64 = 0.8;
+/// Domain-separated stream for braid phases (order-independent from
+/// the grain stream: both consume in canonical link order).
+pub const BRAID_STREAM: &str = "cosmic_web/braid";
+/// Domain-separated stream for grain emission.
+pub const GRAIN_STREAM: &str = "cosmic_web/grain";
+/// Exaggerated Hubble redshift strength per Mpc of view depth for the
+/// cosmic glow shaders (spec §9.1 depth cue, artistically boosted: at
+/// 250 Mpc the exaggerated depth is 1.0 — distant filaments redden
+/// and dim to roughly half blue). Single tuning knob, shared by both
+/// cosmic surfaces.
+pub const COSMIC_REDSHIFT_PER_MPC: f32 = 0.004;
+
+/// Orthonormal-adjacent lateral basis for a link direction (the glow
+/// precedent: `u = normalize(cross(d, reference))`, `v = cross(d, u)`).
+fn lateral_basis(d: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let mut reference = [0.0, 1.0, 0.0];
+    if (d[0] * reference[0] + d[1] * reference[1] + d[2] * reference[2]).abs() > 0.9 {
+        reference = [1.0, 0.0, 0.0];
+    }
+    let mut u = [
+        d[1] * reference[2] - d[2] * reference[1],
+        d[2] * reference[0] - d[0] * reference[2],
+        d[0] * reference[1] - d[1] * reference[0],
+    ];
+    let ulen = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2])
+        .sqrt()
+        .max(f64::MIN_POSITIVE);
+    u = [u[0] / ulen, u[1] / ulen, u[2] / ulen];
+    let v = [
+        d[1] * u[2] - d[2] * u[1],
+        d[2] * u[0] - d[0] * u[2],
+        d[0] * u[1] - d[1] * u[0],
+    ];
+    (u, v)
+}
+
+/// One braid strand's deterministic shape parameters (drawn from the
+/// braid stream in canonical link order — replay-safe because the draw
+/// count is a pure function of link density).
+struct BraidStrand {
+    phase: f64,
+    windings: f64,
+    mix_u: f64,
+    mix_v: f64,
+}
+
+/// Shared low-frequency trunk wander per link (all strands of the link
+/// braid around the same wandering center).
+struct BraidWander {
+    phase: f64,
+    amplitude: f64,
+}
+
+/// Point on a strand at parameter `t ∈ [0, 1]`: trunk center + shared
+/// wander + the strand's own twist, all tapered to zero at the nodes
+/// so strands melt into the cluster hubs.
+fn braid_point(
+    a: [f64; 3],
+    d: [f64; 3],
+    u: [f64; 3],
+    v: [f64; 3],
+    wander: &BraidWander,
+    strand: &BraidStrand,
+    t: f64,
+) -> [f64; 3] {
+    const TAU: f64 = std::f64::consts::TAU;
+    let taper = (std::f64::consts::PI * t).sin();
+    let wobble_u = (TAU * t + wander.phase).sin() * wander.amplitude * taper;
+    let wobble_v = (TAU * t * 0.7 + wander.phase).cos() * wander.amplitude * taper;
+    let angle = TAU * strand.windings * t + strand.phase;
+    let off_u = (wobble_u + angle.sin() * strand.mix_u * BRAID_AMPLITUDE_MPC) * taper;
+    let off_v = (wobble_v + angle.cos() * strand.mix_v * BRAID_AMPLITUDE_MPC) * taper;
+    [
+        a[0] + d[0] * t + u[0] * off_u + v[0] * off_v,
+        a[1] + d[1] * t + u[1] * off_u + v[1] * off_v,
+        a[2] + d[2] * t + u[2] * off_u + v[2] * off_v,
+    ]
+}
+
+/// One link's full braid shape: lateral basis, shared trunk wander,
+/// and the strand parameters. Derived from a per-link sub-stream keyed
+/// by the canonical endpoint pair (`seed ^ (a << 32 | b)`), so the line
+/// pass ([`braid_segments`]) and the grain pass ([`grain_cloud`])
+/// derive identical strands independently — no shared stream state,
+/// no cross-link coupling, replay-identical per (seed, link).
+struct BraidShape {
+    u: [f64; 3],
+    v: [f64; 3],
+    wander: BraidWander,
+    strands: Vec<BraidStrand>,
+}
+
+fn braid_shape(seed: u64, link: &WebLink, pa: [f64; 3], pb: [f64; 3]) -> BraidShape {
+    const TAU: f64 = std::f64::consts::TAU;
+    let mut rng = SeededRng::stream(
+        seed ^ ((u64::from(link.a) << 32) | u64::from(link.b)),
+        BRAID_STREAM,
+    );
+    let raw = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+    let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2])
+        .sqrt()
+        .max(f64::MIN_POSITIVE);
+    let dir = [raw[0] / len, raw[1] / len, raw[2] / len];
+    let (u, v) = lateral_basis(dir);
+    let strands =
+        (BRAID_MIN_STRANDS + (f64::from(link.density) * 2.0).floor() as u64).min(BRAID_MAX_STRANDS);
+    let wander = BraidWander {
+        phase: rng.unit_f64() * TAU,
+        amplitude: (0.3 + 0.7 * rng.unit_f64()) * BRAID_AMPLITUDE_MPC * 0.6,
+    };
+    let mut strand_params = Vec::with_capacity(strands as usize);
+    for _ in 0..strands {
+        strand_params.push(BraidStrand {
+            phase: rng.unit_f64() * TAU,
+            windings: 1.0 + rng.unit_f64(),
+            mix_u: 0.6 + 0.4 * rng.unit_f64(),
+            mix_v: 0.6 + 0.4 * rng.unit_f64(),
+        });
+    }
+    BraidShape {
+        u,
+        v,
+        wander,
+        strands: strand_params,
+    }
+}
+
+/// Braided filament strands as flattened `(position, rgba)` endpoint
+/// pairs (origin-relative Mpc f32) for an additive colored-`LineList`
+/// pipeline. Strand count follows link density (1–3); color grades
+/// from dim indigo (faint) to bright cyan-violet (dense) with alpha
+/// melting into the endpoint nodes.
+pub fn braid_segments(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<([f32; 3], [f32; 4])> {
+    let mut out = Vec::new();
+    for link in &web.links {
+        let pa = web.nodes[link.a as usize].position_mpc;
+        let pb = web.nodes[link.b as usize].position_mpc;
+        let raw = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let shape = braid_shape(seed, link, pa, pb);
+        let density = f64::from(link.density);
+        // Filament palette: dim indigo → bright cyan-violet by density.
+        let rgb = [
+            0.40 + 0.32 * density,
+            0.42 + 0.36 * density,
+            0.85 + 0.20 * density,
+        ];
+        let alpha = 0.30 + 0.60 * density;
+        for strand in &shape.strands {
+            for s in 0..BRAID_SUBDIVISIONS {
+                for end in [s, s + 1] {
+                    let t = end as f64 / BRAID_SUBDIVISIONS as f64;
+                    let p = braid_point(pa, raw, shape.u, shape.v, &shape.wander, strand, t);
+                    let melt = (std::f64::consts::PI * t).sin().sqrt().max(0.0);
+                    out.push((
+                        [
+                            (p[0] - origin.x) as f32,
+                            (p[1] - origin.y) as f32,
+                            (p[2] - origin.z) as f32,
+                        ],
+                        [
+                            rgb[0] as f32,
+                            rgb[1] as f32,
+                            rgb[2] as f32,
+                            (alpha * melt) as f32,
+                        ],
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Irwin–Hall-3 jitter, σ = 0.5 (the descriptor-glow precedent: pure
+/// arithmetic shaping, no transcendentals in the sampling).
+fn ihalf3(rng: &mut SeededRng) -> f64 {
+    rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 1.5
+}
+
+/// Particulate grain along the braid strands as `(position, color,
+/// misc)` tuples — the same shape as [`node_point_cloud`] (`misc =
+/// (pixel size, alpha, kind 0)`), colors up to slightly emissive on
+/// dense links. Deterministic per (seed, web, origin) under the
+/// [`GRAIN_STREAM`] domain; two-pass budget capped at
+/// [`MAX_GRAIN_POINTS`] (the descriptor-glow pattern).
+pub fn grain_cloud(
+    web: &WebDescriptor,
+    seed: u64,
+    origin: DVec3,
+) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
+    // Pass 1: raw counts in canonical link order (pure function of
+    // link data — no RNG involved).
+    let mut raw: Vec<f64> = Vec::with_capacity(web.links.len());
+    let mut total_raw = 0.0;
+    for link in &web.links {
+        let pa = web.nodes[link.a as usize].position_mpc;
+        let pb = web.nodes[link.b as usize].position_mpc;
+        let len =
+            ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2) + (pb[2] - pa[2]).powi(2)).sqrt();
+        let count = GRAIN_PER_MPC * len * f64::from(link.density);
+        raw.push(count);
+        total_raw += count;
+    }
+    let scale = if total_raw > 0.0 {
+        (f64::from(MAX_GRAIN_POINTS) / total_raw).min(1.0)
+    } else {
+        0.0
+    };
+    // Pass 2: budgeted emission. Each grain point lands on a strand of
+    // the SAME braid shape the line pass draws (shared `braid_shape`
+    // derivation), plus transverse jitter — the grain textures the
+    // drawn strands instead of floating beside them.
+    let mut rng = SeededRng::stream(seed, GRAIN_STREAM);
+    let mut out: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+    for (link, count) in web.links.iter().zip(raw.iter()) {
+        let scaled = count * scale;
+        let mut emit = scaled.floor() as u64;
+        let frac = scaled - scaled.floor();
+        if rng.below(1000) < (frac * 1000.0) as u64 {
+            emit += 1;
+        }
+        if emit == 0 {
+            continue;
+        }
+        let pa = web.nodes[link.a as usize].position_mpc;
+        let pb = web.nodes[link.b as usize].position_mpc;
+        let raw_d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let shape = braid_shape(seed, link, pa, pb);
+        let strands = shape.strands.len().max(1);
+        let sigma = GRAIN_TRANSVERSE_SIGMA_MPC;
+        for _ in 0..emit {
+            let t = rng.unit_f64();
+            let strand = &shape.strands[rng.below(strands as u64) as usize];
+            let c = braid_point(pa, raw_d, shape.u, shape.v, &shape.wander, strand, t);
+            let j1 = ihalf3(&mut rng) * 2.0 * sigma;
+            let j2 = ihalf3(&mut rng) * 2.0 * sigma;
+            let bright = 0.5 + 0.7 * rng.unit_f64();
+            let size = 1.5 + rng.unit_f64();
+            out.push((
+                [
+                    (c[0] + shape.u[0] * j1 + shape.v[0] * j2 - origin.x) as f32,
+                    (c[1] + shape.u[1] * j1 + shape.v[1] * j2 - origin.y) as f32,
+                    (c[2] + shape.u[2] * j1 + shape.v[2] * j2 - origin.z) as f32,
+                ],
+                [
+                    (0.68 * bright) as f32,
+                    (0.62 * bright) as f32,
+                    (1.0 * bright) as f32,
+                ],
+                [size as f32, 0.5, 0.0],
+            ));
+        }
+    }
+    out.truncate(MAX_GRAIN_POINTS as usize);
+    out
+}
+
+/// Node impostors as `(position, color, misc)` tuples: two sprites per
+/// node — an emissive hot core (channels > 1.0, mass-graded, the bloom
+/// threshold's target) plus a soft pale-cyan halo. Pure function of
+/// node mass/position (no RNG): same node → same impostors, everywhere.
+pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
+    let mut out = Vec::with_capacity(web.nodes.len() * 2);
+    for node in &web.nodes {
+        let l = ((node.mass_msun.log10() - 12.7) / (15.4 - 12.7)).clamp(0.0, 1.0) as f32;
+        let pos = [
+            (node.position_mpc[0] - origin.x) as f32,
+            (node.position_mpc[1] - origin.y) as f32,
+            (node.position_mpc[2] - origin.z) as f32,
+        ];
+        let base = node_color(node.mass_msun);
+        let emissive = 1.5 + 2.5 * l;
+        // Hot core: small, near-white, emissive.
+        out.push((
+            pos,
+            [base[0] * emissive, base[1] * emissive, base[2] * emissive],
+            [2.5 + 3.5 * l, 1.0, 0.0],
+        ));
+        // Halo: large, pale cyan, faint.
+        out.push((
+            pos,
+            [
+                0.55 * (0.5 + 0.5 * l),
+                0.72 * (0.5 + 0.5 * l),
+                1.0 * (0.5 + 0.5 * l),
+            ],
+            [10.0 + 18.0 * l, 0.4, 0.0],
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_engine::universe::{CosmicWebParams, generate_cosmic_web};
+    use game_engine::universe::{CosmicWebParams, WebLink, WebNode, generate_cosmic_web};
 
     fn web() -> WebDescriptor {
         generate_cosmic_web(1234, &CosmicWebParams::nominal())
+    }
+
+    /// Two-link toy web: a dense 30 Mpc link (3 strands) and a faint
+    /// 40 Mpc link (1 strand), with light / heavy / mid nodes.
+    fn toy_web() -> WebDescriptor {
+        let nodes = vec![
+            WebNode {
+                node_index: 0,
+                position_mpc: [0.0, 0.0, 0.0],
+                mass_msun: 1.0e15,
+                virial_radius_mpc: 2.0,
+            },
+            WebNode {
+                node_index: 1,
+                position_mpc: [30.0, 0.0, 0.0],
+                mass_msun: 5.0e12,
+                virial_radius_mpc: 0.3,
+            },
+            WebNode {
+                node_index: 2,
+                position_mpc: [0.0, 40.0, 0.0],
+                mass_msun: 3.0e14,
+                virial_radius_mpc: 1.2,
+            },
+        ];
+        let links = vec![
+            WebLink {
+                a: 0,
+                b: 1,
+                density: 1.0,
+            },
+            WebLink {
+                a: 0,
+                b: 2,
+                density: 0.1,
+            },
+        ];
+        WebDescriptor::new(7, nodes, links, Vec::new(), 0, 0.75)
     }
 
     fn vp() -> Rect {
@@ -242,6 +602,198 @@ mod tests {
         assert!(
             node_size_px(by_mass[by_mass.len() - 1].mass_msun) > node_size_px(by_mass[0].mass_msun)
         );
+    }
+
+    #[test]
+    fn braid_strand_counts_follow_density() {
+        // Dense link → 3 strands, faint link → 1 strand; each strand
+        // emits 2 verts per subdivision.
+        let braided = braid_segments(&toy_web(), 7, DVec3::ZERO);
+        assert_eq!(braided.len(), (3 + 1) * 2 * BRAID_SUBDIVISIONS);
+        // The dense link's strands actually leave the trunk: some
+        // midpoint vert sits laterally off the segment.
+        let dense: Vec<[f32; 3]> = braided
+            .iter()
+            .take(3 * 2 * BRAID_SUBDIVISIONS)
+            .map(|v| v.0)
+            .collect();
+        let lateral = dense
+            .iter()
+            .map(|p| (p[1] * p[1] + p[2] * p[2]).sqrt())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            lateral > 1e-6 && lateral <= 2.0 * BRAID_AMPLITUDE_MPC as f32,
+            "braid must leave the trunk within its amplitude bound: {lateral}"
+        );
+    }
+
+    #[test]
+    fn braid_replays_identically_and_tapers_at_endpoints() {
+        let web = toy_web();
+        let a = braid_segments(&web, 7, DVec3::ZERO);
+        let b = braid_segments(&web, 7, DVec3::ZERO);
+        assert_eq!(a, b);
+        // Endpoints melt into the nodes: the first vert of each strand
+        // sits on node `a` (taper = 0 at t = 0).
+        assert!((a[0].0[0]).abs() < 1e-3 && (a[0].0[1]).abs() < 1e-3 && (a[0].0[2]).abs() < 1e-3);
+        // Every vert stays within the amplitude bound of its segment.
+        let segs = [
+            ([0.0, 0.0, 0.0], [30.0, 0.0, 0.0]),
+            ([0.0, 0.0, 0.0], [0.0, 40.0, 0.0]),
+        ];
+        for (pos, _) in &a {
+            let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+            let near = segs.iter().any(|(s, e)| {
+                let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
+                let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                let t = ((p[0] - s[0]) * d[0] + (p[1] - s[1]) * d[1] + (p[2] - s[2]) * d[2]) / l2;
+                let t = t.clamp(0.0, 1.0);
+                let q = [s[0] + d[0] * t, s[1] + d[1] * t, s[2] + d[2] * t];
+                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+                    <= 2.0 * BRAID_AMPLITUDE_MPC + 1e-3
+            });
+            assert!(near, "braid vert drifted off every segment: {p:?}");
+        }
+    }
+
+    #[test]
+    fn braid_colors_grade_with_density() {
+        // Mean endpoint color of the dense link must beat the faint
+        // link on every channel (same melt schedule both sides).
+        let braided = braid_segments(&toy_web(), 7, DVec3::ZERO);
+        let mean = |verts: &[([f32; 3], [f32; 4])]| {
+            let mut acc = [0.0_f64; 4];
+            for v in verts {
+                for (channel, sum) in acc.iter_mut().enumerate() {
+                    *sum += f64::from(v.1[channel]);
+                }
+            }
+            let n = verts.len() as f64;
+            [acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n]
+        };
+        let dense = mean(&braided[..3 * 2 * BRAID_SUBDIVISIONS]);
+        let faint = mean(&braided[3 * 2 * BRAID_SUBDIVISIONS..]);
+        for c in 0..4 {
+            assert!(
+                dense[c] > faint[c],
+                "dense link must outshine faint on channel {c}: {dense:?} vs {faint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grain_replays_identically_and_respects_budget() {
+        let toy = toy_web();
+        assert_eq!(
+            grain_cloud(&toy, 7, DVec3::ZERO),
+            grain_cloud(&toy, 7, DVec3::ZERO)
+        );
+        let nominal = grain_cloud(&web(), 1234, DVec3::ZERO);
+        assert!(!nominal.is_empty(), "nominal web must emit grain");
+        assert!(
+            nominal.len() <= MAX_GRAIN_POINTS as usize,
+            "grain over budget: {}",
+            nominal.len()
+        );
+    }
+
+    #[test]
+    fn grain_stays_near_its_strand() {
+        // Every toy grain point sits within the strand bundle (braid
+        // amplitude + jitter headroom) of some link segment.
+        let grain = grain_cloud(&toy_web(), 7, DVec3::ZERO);
+        assert!(!grain.is_empty());
+        let segs = [
+            ([0.0, 0.0, 0.0], [30.0, 0.0, 0.0]),
+            ([0.0, 0.0, 0.0], [0.0, 40.0, 0.0]),
+        ];
+        for (pos, _, _) in &grain {
+            let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+            let near = segs.iter().any(|(s, e)| {
+                let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
+                let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+                let t = ((p[0] - s[0]) * d[0] + (p[1] - s[1]) * d[1] + (p[2] - s[2]) * d[2]) / l2;
+                let t = t.clamp(0.0, 1.0);
+                let q = [s[0] + d[0] * t, s[1] + d[1] * t, s[2] + d[2] * t];
+                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
+                    <= 8.0
+            });
+            assert!(near, "grain drifted off every strand: {p:?}");
+        }
+    }
+
+    #[test]
+    fn impostors_emit_core_and_halo_per_node() {
+        let web = toy_web();
+        let impostors = node_impostors(&web, DVec3::ZERO);
+        assert_eq!(impostors.len(), web.nodes.len() * 2);
+        for i in 0..web.nodes.len() {
+            let (core, halo) = (&impostors[2 * i], &impostors[2 * i + 1]);
+            // Same position (the hub).
+            assert_eq!(core.0, halo.0);
+            // Core is emissive (bloom target), small, fully opaque;
+            // halo is large and faint.
+            assert!(
+                core.1.iter().any(|c| *c > 1.0),
+                "core must be emissive: {:?}",
+                core.1
+            );
+            assert!(core.2[0] < halo.2[0], "halo must dwarf the core");
+            assert!(halo.2[1] < core.2[1], "halo must be fainter");
+        }
+        // Mass grading: the 1e15 node outshines the 5e12 node.
+        let heavy = impostors[0].1;
+        let light = impostors[2].1;
+        for c in 0..3 {
+            assert!(heavy[c] > light[c], "heavy core must outshine light");
+        }
+    }
+
+    #[test]
+    fn enrichment_layouts_are_origin_relative() {
+        // Rebase invariant for the new layouts: shifting the origin
+        // shifts every point by exactly the delta (demo rebase-safe).
+        let web = toy_web();
+        let a = DVec3::ZERO;
+        let b = DVec3::new(10.0, -4.0, 2.0);
+        let pa = braid_segments(&web, 7, a);
+        let pb = braid_segments(&web, 7, b);
+        assert_eq!(pa.len(), pb.len());
+        for (p, q) in pa.iter().zip(pb.iter()).take(50) {
+            for axis in 0..3 {
+                let delta = f64::from(p.0[axis]) - f64::from(q.0[axis]);
+                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
+                assert!(
+                    (delta - want).abs() < 1e-3,
+                    "axis {axis}: {delta} vs {want}"
+                );
+            }
+        }
+        let ga = grain_cloud(&web, 7, a);
+        let gb = grain_cloud(&web, 7, b);
+        assert_eq!(ga.len(), gb.len());
+        for ((p, _, _), (q, _, _)) in ga.iter().zip(gb.iter()).take(50) {
+            for axis in 0..3 {
+                let delta = f64::from(p[axis]) - f64::from(q[axis]);
+                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
+                assert!(
+                    (delta - want).abs() < 1e-3,
+                    "axis {axis}: {delta} vs {want}"
+                );
+            }
+        }
+        let ia = node_impostors(&web, a);
+        let ib = node_impostors(&web, b);
+        for (p, q) in ia.iter().zip(ib.iter()) {
+            for axis in 0..3 {
+                let delta = f64::from(p.0[axis]) - f64::from(q.0[axis]);
+                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
+                assert!(
+                    (delta - want).abs() < 1e-3,
+                    "axis {axis}: {delta} vs {want}"
+                );
+            }
+        }
     }
 
     #[test]

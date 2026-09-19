@@ -263,13 +263,18 @@ System Map and Planet View (current `HexSphere` as dual-cell fans
 with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
-stats); the Cosmic Web tab (v0.3.2, ADR-023) mounts the absorbed
-cosmic-web inspector (stage-0 nodes + dwarf glow through the map
-`PointList` pipeline, filament links through the line pipeline, own
-orbit/pan/zoom camera, live player point). The Game Demo tab renders
-the same web as the player-immersive scene (one point draw + one line
-draw per surface, buffers relative to an upload origin, camera
-recentered on the same origin with a 50 Mpc rebase). The dev widget
+stats); the Cosmic Web tab (v0.3.2, ADR-023; cinematic refresh in
+update-2026-09-18-2328) mounts the absorbed cosmic-web inspector
+(seeded braid strands through the additive webline `LineList`
+pipeline, grain + dwarf glow + emissive node impostors through the
+additive glow `PointList` pipeline, own orbit/pan/zoom camera, live
+player point). The Game Demo tab renders the same web as the
+player-immersive scene (one glow draw + one braid draw per surface,
+buffers relative to an upload origin, camera recentered on the same
+origin with a 50 Mpc rebase). Both cosmic views render through an
+HDR scene target with a real bloom chain (bright extract + 2-scale
+separable blur + ACES resolve composite) on capable devices, LDR
+bypass otherwise. The dev widget
 (`` ` `` toggle, `F6`–`F8` sub-tabs) hosts FPS
 (live frame-health), the Console (fly-to event feed) and the
 Inspector (journey summary); a fly-to pill floats bottom-center
@@ -287,6 +292,25 @@ the sphere marker (FirstPerson hides it by construction — eye-plane
 `w ≤ 0`); the inspector player point is map content (one-vertex
 point draw), never the UI marker. Points/lines carry no faces, so no
 front-face/cull state is involved on either cosmic surface.
+
+Cinematic refresh (update-2026-09-18-2328): the cosmic draws use two
+new additive (`One`, `One`, premultiplied in-shader) pipelines —
+glow points (soft Gaussian sprite mask, per-sprite alpha, emissive
+colors above 1.0 on cluster cores) and braid lines (per-vertex
+rgba) — both carrying an exaggerated Hubble redshift tint from view
+depth (`clip.w`, spec §9.1). The shared alpha `map`/`line`
+pipelines and every other surface are untouched. In HDR mode the
+same draws record into an offscreen HDR scene pass (indigo clear),
+then a half-res bright extract, two H/V separable Gaussian blur
+passes ping-ponging with a widening step (tight flare + wide haze),
+then the bloom-composite ACES resolve into the swapchain image; the
+inspector marker and all UI draw after the resolve. Fullscreen
+passes reuse `RESOLVE_VERT` empty-vertex-input triangles with
+the `post.rs` NDC-top-row UV contract (`v_uv = vec2(pos.x, 1.0 -
+pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,
+`resolve_frag_bloom`) and `BloomParams` live in
+`engine::render::post`, the GPU half follows the `game_tools`
+`ResolvePass` precedent, and transients rebuild with the swapchain.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,

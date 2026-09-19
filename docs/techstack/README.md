@@ -1,9 +1,10 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.33.3 (2026-09-18, seed editing moves to Settings as the
-  single editable field + staged universe loader with a modal
-  determinate progress bar per v0.3.2 `settings-seed-loader`; Milky Way
-  dock keeps a read-only seed row, generation/simulation unchanged)
+- **Version:** 0.33.4 (2026-09-18, cinematic cosmic-web view per v0.3.2
+  `cosmic-scale-player` update-2026-09-18-2328: seeded braid strands +
+  grain + emissive node impostors, additive glow pipelines, in-shader
+  Hubble redshift tint, HDR bloom post chain on the cosmic views;
+  descriptor, gameplay, and all other surfaces unchanged)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

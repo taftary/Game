@@ -70,8 +70,9 @@ pub use exposure::{
 };
 pub use planet::{IndexedMesh, PlanetVertex, SeededPlanet};
 pub use post::{
-    ACES_FIT_GLSL, HDR_FORMAT_PREFERENCE, HdrSelection, RESOLVE_FRAG_FIXED, RESOLVE_VERT,
-    ResolvePush, resolve_frag_aces, select_hdr_format,
+    ACES_FIT_GLSL, BLOOM_BLUR_FRAG, BLOOM_BRIGHT_FRAG, BloomBlurPush, BloomBrightPush, BloomParams,
+    BloomResolvePush, HDR_FORMAT_PREFERENCE, HdrSelection, RESOLVE_FRAG_FIXED, RESOLVE_VERT,
+    ResolvePush, gaussian9_weights, resolve_frag_aces, resolve_frag_bloom, select_hdr_format,
 };
 pub use shaders::{
     PLANET_FRAG, PLANET_VERT, ShaderCompileError, ShaderKind, compile_glsl_to_spirv,

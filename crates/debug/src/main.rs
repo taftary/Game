@@ -51,9 +51,11 @@ use game_engine::catalog::scheduler::SkyView;
 use game_engine::flight::{ShipMode, mode_of};
 use game_engine::frames::recenter;
 use game_engine::render::{
-    ExposureParams, FOV_Y, MAX_PITCH, OrbitCamera, ShaderKind, WORLD_TO_EQUATORIAL,
-    compile_glsl_to_spirv, create_instance, device_score, log_physical_device,
-    required_device_extensions, star_visibility, visible_hemisphere,
+    BLOOM_BLUR_FRAG, BLOOM_BRIGHT_FRAG, BloomBlurPush, BloomBrightPush, BloomParams,
+    BloomResolvePush, ExposureParams, FOV_Y, HdrSelection, MAX_PITCH, OrbitCamera, RESOLVE_VERT,
+    ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv, create_instance, device_score,
+    log_physical_device, required_device_extensions, resolve_frag_bloom, select_hdr_format,
+    star_visibility, visible_hemisphere,
 };
 use game_engine::universe::WebDescriptor;
 use game_engine::waypoints::WaypointId;
@@ -67,21 +69,21 @@ use vulkano::command_buffer::{
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags};
-use vulkano::format::{ClearValue, Format};
-use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
+use vulkano::format::{ClearValue, Format, FormatFeatures};
+use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
+    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
 };
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition, VertexInputState};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
@@ -366,6 +368,73 @@ void main() {
     f_color = vec4(v_color, v_alpha);
 }";
 
+// Cosmic glow point sprites (update-2026-09-18-2328): soft Gaussian
+// mask (no hard edge — halo impostors fade out), premultiplied
+// additive output for the `One, One` blend, and an exaggerated
+// Hubble redshift tint from view depth (`clip.w`, spec §9.1: distant
+// filaments redden and dim). Cosmic views only — the shared map
+// shaders above stay byte-identical for galaxy/system/planet/sky.
+const GLOW_VERT: &str = r"#version 450
+layout(location = 0) in vec3 map_pos;
+layout(location = 1) in vec3 color;
+layout(location = 2) in vec3 misc;
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    float px_scale;
+    float exposure;
+    float redshift;
+} pc;
+layout(location = 0) out vec3 v_color;
+layout(location = 1) out float v_alpha;
+void main() {
+    vec4 clip = pc.mvp * vec4(map_pos, 1.0);
+    gl_Position = clip;
+    gl_PointSize = clamp(misc.x, 1.0, 256.0);
+    float z = pc.redshift * clip.w;
+    vec3 tint = vec3(1.0 + 0.9 * z, 1.0, 1.0 / (1.0 + 1.2 * z));
+    float dim = 1.0 / (1.0 + 0.8 * z);
+    v_color = color * tint * dim;
+    v_alpha = misc.y * pc.exposure;
+}";
+
+const GLOW_FRAG: &str = r"#version 450
+layout(location = 0) in vec3 v_color;
+layout(location = 1) in float v_alpha;
+layout(location = 0) out vec4 f_color;
+void main() {
+    vec2 d = gl_PointCoord - vec2(0.5);
+    float fall = exp(-12.0 * dot(d, d));
+    f_color = vec4(v_color * v_alpha * fall, 1.0);
+}";
+
+// Cosmic braid lines (update-2026-09-18-2328): per-vertex rgba from
+// the `cosmic_web` braid layout, same redshift treatment as the glow
+// sprites, premultiplied additive output. 1-px `LineList` segments —
+// the braid density comes from strand count, not line width.
+const WEBLINE_VERT: &str = r"#version 450
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec4 rgba;
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    float redshift;
+} pc;
+layout(location = 0) out vec4 v_rgba;
+void main() {
+    vec4 clip = pc.mvp * vec4(position, 1.0);
+    gl_Position = clip;
+    float z = pc.redshift * clip.w;
+    vec3 tint = vec3(1.0 + 0.9 * z, 1.0, 1.0 / (1.0 + 1.2 * z));
+    float dim = 1.0 / (1.0 + 0.8 * z);
+    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a);
+}";
+
+const WEBLINE_FRAG: &str = r"#version 450
+layout(location = 0) in vec4 v_rgba;
+layout(location = 0) out vec4 f_color;
+void main() {
+    f_color = vec4(v_rgba.rgb * v_rgba.a, 1.0);
+}";
+
 // ---------------------------------------------------------------------------
 // GPU types (bin-local, mirroring the `game_tools` `MvpData` pattern).
 // ---------------------------------------------------------------------------
@@ -472,6 +541,68 @@ struct MapPush {
     px_scale: f32,
     exposure: f32,
 }
+
+/// Cosmic glow push constants: MVP + pixel size scale + exposure +
+/// exaggerated Hubble redshift strength per Mpc of view depth
+/// (update-2026-09-18-2328; 76 B < 128 B Vulkan 1.1 floor).
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct GlowPush {
+    mvp: [[f32; 4]; 4],
+    px_scale: f32,
+    exposure: f32,
+    redshift: f32,
+}
+
+/// Cosmic braid-line push constants: MVP + redshift strength
+/// (68 B < 128 B Vulkan 1.1 floor).
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct WebLinePush {
+    mvp: [[f32; 4]; 4],
+    redshift: f32,
+}
+
+/// Cosmic braid line vertex: origin-relative Mpc position + linear
+/// rgba (update-2026-09-18-2328; the alpha melts strands into nodes).
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+struct GlowLineVertex {
+    #[format(R32G32B32_SFLOAT)]
+    position: [f32; 3],
+    #[format(R32G32B32A32_SFLOAT)]
+    rgba: [f32; 4],
+}
+
+/// Precomputed per-frame cosmic draw state (update-2026-09-18-2328) —
+/// see `ViewerApp::cosmic_frame`.
+struct CosmicFrame {
+    mvp: [[f32; 4]; 4],
+    px_scale: f32,
+    is_demo: bool,
+    braid: Subbuffer<[GlowLineVertex]>,
+    glow: Subbuffer<[MapVertex]>,
+    viewport: Viewport,
+}
+
+/// Additive blend for the cosmic glow paths: source added at full
+/// strength (premultiplied in-shader), so overlapping strands and
+/// halos accumulate light. The shared alpha-blend pipelines are
+/// untouched.
+fn additive_blend() -> AttachmentBlend {
+    AttachmentBlend {
+        color_blend_op: BlendOp::Add,
+        src_color_blend_factor: BlendFactor::One,
+        dst_color_blend_factor: BlendFactor::One,
+        alpha_blend_op: BlendOp::Add,
+        src_alpha_blend_factor: BlendFactor::One,
+        dst_alpha_blend_factor: BlendFactor::One,
+    }
+}
+
+/// Deep-indigo clear color for the cosmic views (near-black violet —
+/// voids read as negative space against additive filaments).
+const COSMIC_BACKDROP: [f32; 4] = [0.012, 0.008, 0.030, 1.0];
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -616,6 +747,29 @@ fn run_headless(seed: Option<u64>) -> i32 {
     assert_eq!(
         debug_app.cosmic.camera.render_origin(),
         debug_app.cosmic.player.position_mpc()
+    );
+    // Cinematic layout smoke (update 2026-09-18-2328): the enrichment
+    // layer derives non-empty braid/grain/impostor clouds from the
+    // boot web. GPU-free — upload happens only in the windowed shell.
+    let layout_seed = debug_app.cosmic.seed;
+    let layout_origin = debug_app.cosmic.upload_origin;
+    let braid =
+        game_debug::cosmic_web::braid_segments(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let grain =
+        game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
+    assert!(!braid.is_empty(), "braid must emit segments");
+    assert!(!grain.is_empty(), "grain must emit points");
+    assert_eq!(
+        impostors.len(),
+        debug_app.cosmic.web.nodes.len() * 2,
+        "two impostors per node"
+    );
+    println!(
+        "cosmic_layout=braid{} grain{} impostors{} ok",
+        braid.len(),
+        grain.len(),
+        impostors.len()
     );
     // Cruise smoke (update 2026-09-18-2027): five seconds of W must move
     // the ship Mpc-scale — the old thrust law could not move it at all.
@@ -3211,6 +3365,14 @@ struct ShaderSet {
     ui_frag: Arc<ShaderModule>,
     map_vert: Arc<ShaderModule>,
     map_frag: Arc<ShaderModule>,
+    glow_vert: Arc<ShaderModule>,
+    glow_frag: Arc<ShaderModule>,
+    webline_vert: Arc<ShaderModule>,
+    webline_frag: Arc<ShaderModule>,
+    post_vert: Arc<ShaderModule>,
+    bright_frag: Arc<ShaderModule>,
+    blur_frag: Arc<ShaderModule>,
+    resolve_frag: Arc<ShaderModule>,
 }
 
 impl ShaderSet {
@@ -3224,6 +3386,39 @@ impl ShaderSet {
             ui_frag: compile_shader(device, ShaderKind::Fragment, UI_FRAG, "ui fragment"),
             map_vert: compile_shader(device, ShaderKind::Vertex, MAP_VERT, "map vertex"),
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
+            glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
+            glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
+            webline_vert: compile_shader(
+                device,
+                ShaderKind::Vertex,
+                WEBLINE_VERT,
+                "webline vertex",
+            ),
+            webline_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                WEBLINE_FRAG,
+                "webline fragment",
+            ),
+            post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
+            bright_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                BLOOM_BRIGHT_FRAG,
+                "bloom bright fragment",
+            ),
+            blur_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                BLOOM_BLUR_FRAG,
+                "bloom blur fragment",
+            ),
+            resolve_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                &resolve_frag_bloom(),
+                "bloom resolve fragment",
+            ),
         }
     }
 }
@@ -3455,6 +3650,310 @@ fn build_map_pipeline(
     .expect("map graphics pipeline must create")
 }
 
+/// Cosmic glow point pipeline (update-2026-09-18-2328): `PointList`,
+/// premultiplied-additive blend, no depth write (overlaps accumulate;
+/// draw order decides nothing). Same vertex type as the map pipeline
+/// — only the shaders, blend, and push block differ.
+fn build_glow_pipeline(
+    device: &Arc<Device>,
+    shaders: &ShaderSet,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs = shaders
+        .glow_vert
+        .entry_point("main")
+        .expect("vertex entry point");
+    let fs = shaders
+        .glow_frag
+        .entry_point("main")
+        .expect("fragment entry point");
+    let vertex_input_state = MapVertex::per_vertex()
+        .definition(&vs)
+        .expect("glow vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::PointList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(additive_blend()),
+                    ..Default::default()
+                },
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("glow graphics pipeline must create")
+}
+
+/// Cosmic braid-line pipeline (update-2026-09-18-2328): `LineList`
+/// over [`GlowLineVertex`] (per-vertex rgba), premultiplied-additive,
+/// no depth write (strands accumulate like the glow sprites).
+fn build_webline_pipeline(
+    device: &Arc<Device>,
+    shaders: &ShaderSet,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs = shaders
+        .webline_vert
+        .entry_point("main")
+        .expect("vertex entry point");
+    let fs = shaders
+        .webline_frag
+        .entry_point("main")
+        .expect("fragment entry point");
+    let vertex_input_state = GlowLineVertex::per_vertex()
+        .definition(&vs)
+        .expect("webline vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::LineList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(additive_blend()),
+                    ..Default::default()
+                },
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("webline graphics pipeline must create")
+}
+
+// ---------------------------------------------------------------------------
+// HDR bloom post chain (update-2026-09-18-2328, cosmic views only).
+// ---------------------------------------------------------------------------
+
+/// HDR support probe: a candidate format must serve both as the scene
+/// color attachment and as the downstream sampler source (the
+/// `post::HDR_FORMAT_PREFERENCE` contract — mirrors
+/// `game_tools::hdr_support`).
+fn hdr_support(
+    physical_device: &vulkano::device::physical::PhysicalDevice,
+    format: Format,
+) -> bool {
+    physical_device
+        .format_properties(format)
+        .map(|props| {
+            props
+                .optimal_tiling_features
+                .contains(FormatFeatures::COLOR_ATTACHMENT | FormatFeatures::SAMPLED_IMAGE)
+        })
+        .unwrap_or(false)
+}
+
+/// HDR scene pass: HDR color + depth, both cleared (the `game_tools`
+/// scene-pass shape; the cosmic scene draws here in HDR mode).
+fn build_scene_pass(device: &Arc<Device>, hdr_format: Format) -> Arc<RenderPass> {
+    vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: hdr_format,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+            depth: {
+                format: DEPTH_FORMAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: DontCare,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {depth},
+        },
+    )
+    .expect("HDR scene render pass must create")
+}
+
+/// Post pass: one HDR color attachment, cleared (shared by the bright
+/// extract and every blur step — all are fullscreen overwrites).
+fn build_post_pass(device: &Arc<Device>, hdr_format: Format) -> Arc<RenderPass> {
+    vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: hdr_format,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        },
+    )
+    .expect("post render pass must create")
+}
+
+/// Fullscreen-triangle pipeline constructor (bright / blur / resolve):
+/// empty vertex input (everything derives from `gl_VertexIndex`), no
+/// depth test, no culling, no blending (every pass overwrites fully).
+/// The `game_tools` `build_resolve_pipeline` shape, generalized over
+/// the fragment module. `depth_state` must mirror the subpass:
+/// `Some(default)` where the subpass owns a depth attachment (main
+/// pass — VUID-06043), `None` where it does not (post pass).
+fn build_post_pipeline(
+    device: &Arc<Device>,
+    frag: &Arc<ShaderModule>,
+    vert: &Arc<ShaderModule>,
+    render_pass: &Arc<RenderPass>,
+    depth_state: Option<DepthStencilState>,
+    what: &str,
+) -> Arc<GraphicsPipeline> {
+    let vs = vert.entry_point("main").expect("vertex entry point");
+    let fs = frag.entry_point("main").expect("fragment entry point");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            // No vertex buffers (see the `game_tools` note: explicit
+            // empty state, not `None`).
+            vertex_input_state: Some(VertexInputState::default()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            depth_stencil_state: depth_state,
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap_or_else(|error| panic!("{what} graphics pipeline must create: {error:?}"))
+}
+
+/// Transient HDR image view (scene + bloom targets): single-sampled,
+/// no mipmaps, `COLOR_ATTACHMENT | SAMPLED` (the `game_tools`
+/// `create_hdr_view` shape).
+fn create_post_view(
+    allocator: &Arc<StandardMemoryAllocator>,
+    extent: [u32; 2],
+    format: Format,
+    what: &str,
+) -> Arc<ImageView> {
+    let image = Image::new(
+        allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [extent[0], extent[1], 1],
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("{what} image must create: {error}"));
+    ImageView::new_default(image).unwrap_or_else(|error| panic!("{what} view must create: {error}"))
+}
+
+/// One sampled-image descriptor set (image + sampler at bindings 0–1 —
+/// the `game_tools` `build_resolve_set` shape). The bloom-resolve set
+/// (two images) is built by binding its second pair explicitly.
+fn post_image_set(
+    allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline: &Arc<GraphicsPipeline>,
+    view: &Arc<ImageView>,
+    sampler: &Arc<Sampler>,
+    what: &str,
+) -> Arc<DescriptorSet> {
+    let layout = pipeline.layout().set_layouts()[0].clone();
+    DescriptorSet::new(
+        allocator.clone(),
+        layout,
+        [
+            WriteDescriptorSet::image_view(0, view.clone()),
+            WriteDescriptorSet::sampler(1, sampler.clone()),
+        ],
+        [],
+    )
+    .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error}"))
+}
+
+/// Per-window HDR bloom resources (cosmic views only): scene target +
+/// depth, half-res bloom ping-pong pair, and the sampling sets. One
+/// frame executes at a time behind `previous_frame_end`, so one set
+/// of transients is enough. Rebuilt on swapchain recreate.
+struct HdrChain {
+    format: Format,
+    // Views live on through the framebuffers + descriptor sets below;
+    // only the framebuffers, sets, and extents are read per frame.
+    scene_fb: Arc<Framebuffer>,
+    half_a_fb: Arc<Framebuffer>,
+    half_b_fb: Arc<Framebuffer>,
+    half_extent: [u32; 2],
+    bright_set: Arc<DescriptorSet>,
+    blur_a_set: Arc<DescriptorSet>,
+    blur_b_set: Arc<DescriptorSet>,
+    resolve_set: Arc<DescriptorSet>,
+}
+
 fn upload_fill(
     allocator: &Arc<StandardMemoryAllocator>,
     viewer: &PlanetViewerState,
@@ -3585,20 +4084,23 @@ fn upload_map(
     .expect("galaxy map vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic-web point buffer (v0.3.2 `cosmic-scale-player`):
-/// halo nodes then dwarf glow, laid out by the shared [`cosmic_web`]
-/// helpers (one palette for both 3D surfaces). Positions are
-/// origin-relative Mpc; camera motion rides the MVP push, never this
-/// buffer. Rebuilt on reseed and on rebase (WS4 tick moves the upload
-/// origin back under the ship past 50 Mpc).
-fn upload_cosmic_points(
+/// Upload the cosmic glow point buffer (update-2026-09-18-2328):
+/// particulate grain, then descriptor dwarf glow, then node impostors
+/// (core + halo), laid out by the shared [`cosmic_web`] helpers (one
+/// palette for both 3D surfaces). Positions are origin-relative Mpc;
+/// camera motion rides the MVP push, never this buffer. Rebuilt on
+/// reseed and on rebase (the tick moves the upload origin back under
+/// the ship past the rebase distance).
+fn upload_cosmic_glow(
     allocator: &Arc<StandardMemoryAllocator>,
     web: &WebDescriptor,
+    seed: u64,
     origin: glam::DVec3,
 ) -> Subbuffer<[MapVertex]> {
-    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::node_point_cloud(web, origin)
+    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::grain_cloud(web, seed, origin)
         .iter()
         .chain(game_debug::cosmic_web::glow_point_cloud(web, origin).iter())
+        .chain(game_debug::cosmic_web::node_impostors(web, origin).iter())
         .map(|(pos, color, misc)| MapVertex {
             map_pos: *pos,
             color: *color,
@@ -3627,28 +4129,34 @@ fn upload_cosmic_points(
         },
         verts,
     )
-    .expect("cosmic web vertex buffer upload must succeed")
+    .expect("cosmic glow vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic filament links as line segments (same origin frame
-/// as [`upload_cosmic_points`], layout from [`cosmic_web`]). A
-/// degenerate empty set uploads one zero-length segment (rasterizes
-/// nothing).
-fn upload_cosmic_lines(
+/// Upload the cosmic braid lines as colored segments (same origin
+/// frame as [`upload_cosmic_glow`], layout from [`cosmic_web`]). A
+/// degenerate empty set uploads one zero-length, zero-alpha segment
+/// (rasterizes nothing).
+fn upload_cosmic_braid(
     allocator: &Arc<StandardMemoryAllocator>,
     web: &WebDescriptor,
+    seed: u64,
     origin: glam::DVec3,
-) -> Subbuffer<[LineVertex]> {
-    let mut verts: Vec<LineVertex> = game_debug::cosmic_web::link_segments(web, origin)
+) -> Subbuffer<[GlowLineVertex]> {
+    let mut verts: Vec<GlowLineVertex> = game_debug::cosmic_web::braid_segments(web, seed, origin)
         .iter()
-        .map(|pos| LineVertex { position: *pos })
+        .map(|(pos, rgba)| GlowLineVertex {
+            position: *pos,
+            rgba: *rgba,
+        })
         .collect();
     if verts.is_empty() {
-        verts.push(LineVertex {
+        verts.push(GlowLineVertex {
             position: [0.0, 0.0, 0.0],
+            rgba: [0.0, 0.0, 0.0, 0.0],
         });
-        verts.push(LineVertex {
+        verts.push(GlowLineVertex {
             position: [0.0, 0.0, 0.0],
+            rgba: [0.0, 0.0, 0.0, 0.0],
         });
     }
     Buffer::from_iter(
@@ -3664,7 +4172,7 @@ fn upload_cosmic_lines(
         },
         verts,
     )
-    .expect("cosmic web wireframe buffer upload must succeed")
+    .expect("cosmic braid wireframe buffer upload must succeed")
 }
 
 /// Upload the inspector player point: one origin-relative vertex (near-
@@ -3904,6 +4412,7 @@ struct ViewerApp {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     sampler: Arc<Sampler>,
+    post_sampler: Arc<Sampler>,
     shaders: ShaderSet,
     fill_vertices: Subbuffer<[FillVertex]>,
     fill_indices: Subbuffer<[u32]>,
@@ -3911,16 +4420,17 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
-    /// Cosmic-web point buffer (nodes + dwarf glow, v0.3.2): uploaded
-    /// relative to the demo upload origin, rebuilt on reseed + rebase.
-    cosmic_points: Subbuffer<[MapVertex]>,
-    /// Cosmic filament links (LineList, same origin frame as points).
-    cosmic_lines: Subbuffer<[LineVertex]>,
-    /// Inspector point buffer (fixed web-center origin, rebuilt on
+    /// Cosmic glow point buffer (grain + dwarf glow + node impostors,
+    /// update-2026-09-18-2328): uploaded relative to the demo upload
+    /// origin, rebuilt on reseed + rebase.
+    cosmic_glow: Subbuffer<[MapVertex]>,
+    /// Cosmic braid lines (colored LineList, same origin frame).
+    cosmic_braid: Subbuffer<[GlowLineVertex]>,
+    /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
-    cosmic_tab_points: Subbuffer<[MapVertex]>,
-    /// Inspector filament links (fixed web-center origin).
-    cosmic_tab_lines: Subbuffer<[LineVertex]>,
+    cosmic_tab_glow: Subbuffer<[MapVertex]>,
+    /// Inspector braid lines (fixed web-center origin).
+    cosmic_tab_braid: Subbuffer<[GlowLineVertex]>,
     /// Inspector player point (one vertex, rebuilt per frame while the
     /// tab shows — the ship moves continuously).
     cosmic_tab_player: Subbuffer<[MapVertex]>,
@@ -3990,6 +4500,14 @@ struct WindowContext {
     last_cursor: Option<(f32, f32)>,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
+    /// Selected HDR scene format (`None` = LDR bypass).
+    hdr_format: Option<Format>,
+    /// HDR scene pass (HDR color + depth, cosmic views only).
+    scene_pass: Arc<RenderPass>,
+    /// Shared post pass (bright extract + blur steps).
+    post_pass: Arc<RenderPass>,
+    /// Transient HDR bloom resources (`None` in LDR bypass).
+    hdr: Option<HdrChain>,
 }
 
 impl WindowContext {
@@ -4060,6 +4578,18 @@ impl ViewerApp {
             },
         )
         .expect("atlas sampler must create");
+        // Post-chain sampler (update-2026-09-18-2328): linear for the
+        // bright downsample, clamp-to-edge so blur taps never wrap.
+        let post_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                ..Default::default()
+            },
+        )
+        .expect("post sampler must create");
 
         // The windowed viewer opens at N=4: at the N=6 headless default
         // cells are subpixel (faces and pentagon sites unreadable), which
@@ -4093,14 +4623,32 @@ impl ViewerApp {
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
         // Cosmic web for the demo tab (same master seed as the maps).
         let cosmic_origin = debug.cosmic.upload_origin;
-        let cosmic_points =
-            upload_cosmic_points(&memory_allocator, &debug.cosmic.web, cosmic_origin);
-        let cosmic_lines = upload_cosmic_lines(&memory_allocator, &debug.cosmic.web, cosmic_origin);
+        let cosmic_seed = debug.cosmic.seed;
+        let cosmic_glow = upload_cosmic_glow(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            cosmic_origin,
+        );
+        let cosmic_braid = upload_cosmic_braid(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            cosmic_origin,
+        );
         // Inspector buffers at the fixed web-center origin (WS5).
-        let cosmic_tab_points =
-            upload_cosmic_points(&memory_allocator, &debug.cosmic.web, glam::DVec3::ZERO);
-        let cosmic_tab_lines =
-            upload_cosmic_lines(&memory_allocator, &debug.cosmic.web, glam::DVec3::ZERO);
+        let cosmic_tab_glow = upload_cosmic_glow(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            glam::DVec3::ZERO,
+        );
+        let cosmic_tab_braid = upload_cosmic_braid(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            glam::DVec3::ZERO,
+        );
         let cosmic_tab_player = upload_cosmic_player_point(&memory_allocator, [0.0, 0.0, 0.0]);
         // Catalog sky over the cooker layout (`assets/catalog`); missing
         // manifest ⇒ procedural fallback sky (model-only, logged). The
@@ -4125,6 +4673,7 @@ impl ViewerApp {
             command_buffer_allocator,
             descriptor_set_allocator,
             sampler,
+            post_sampler,
             shaders,
             fill_vertices,
             fill_indices,
@@ -4132,10 +4681,10 @@ impl ViewerApp {
             map_vertices,
             system_points,
             system_lines,
-            cosmic_points,
-            cosmic_lines,
-            cosmic_tab_points,
-            cosmic_tab_lines,
+            cosmic_glow,
+            cosmic_braid,
+            cosmic_tab_glow,
+            cosmic_tab_braid,
             cosmic_tab_player,
             sky,
             sky_vertices,
@@ -4219,18 +4768,21 @@ impl ViewerApp {
     /// (fixed web-center origin) rebuild on reseed only.
     fn refresh_cosmic(&mut self) {
         let origin = self.debug.cosmic.upload_origin;
-        self.cosmic_points =
-            upload_cosmic_points(&self.memory_allocator, &self.debug.cosmic.web, origin);
-        self.cosmic_lines =
-            upload_cosmic_lines(&self.memory_allocator, &self.debug.cosmic.web, origin);
-        self.cosmic_tab_points = upload_cosmic_points(
+        let seed = self.debug.cosmic.seed;
+        self.cosmic_glow =
+            upload_cosmic_glow(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        self.cosmic_braid =
+            upload_cosmic_braid(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        self.cosmic_tab_glow = upload_cosmic_glow(
             &self.memory_allocator,
             &self.debug.cosmic.web,
+            seed,
             glam::DVec3::ZERO,
         );
-        self.cosmic_tab_lines = upload_cosmic_lines(
+        self.cosmic_tab_braid = upload_cosmic_braid(
             &self.memory_allocator,
             &self.debug.cosmic.web,
+            seed,
             glam::DVec3::ZERO,
         );
         tracing::info!(
@@ -4239,6 +4791,53 @@ impl ViewerApp {
             links = self.debug.cosmic.web.links.len(),
             "cosmic web buffers rebuilt",
         );
+    }
+
+    /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328):
+    /// MVP + sprite scale + per-surface buffers + viewport, shared by
+    /// the LDR direct path and the HDR scene/resolve path so both
+    /// record identical draws. Also rebuilds the inspector player
+    /// point (the ship moves continuously).
+    fn cosmic_frame(&mut self, vp: Rect) -> CosmicFrame {
+        let (mvp, px_scale, is_demo) = if self.debug.screen == Screen::GameDemo {
+            let camera = &self.debug.cosmic.camera;
+            (
+                camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                camera.px_scale(vp.h),
+                true,
+            )
+        } else {
+            let inspector = &self.debug.cosmic_inspector;
+            (
+                inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                inspector.camera.px_scale(vp.h),
+                false,
+            )
+        };
+        let (braid, glow) = if is_demo {
+            (self.cosmic_braid.clone(), self.cosmic_glow.clone())
+        } else {
+            (self.cosmic_tab_braid.clone(), self.cosmic_tab_glow.clone())
+        };
+        if !is_demo {
+            let ship = self.debug.cosmic.player.position_mpc();
+            self.cosmic_tab_player = upload_cosmic_player_point(
+                &self.memory_allocator,
+                [ship.x as f32, ship.y as f32, ship.z as f32],
+            );
+        }
+        CosmicFrame {
+            mvp,
+            px_scale,
+            is_demo,
+            braid,
+            glow,
+            viewport: Viewport {
+                offset: [vp.x, vp.y],
+                extent: [vp.w, vp.h],
+                depth_range: 0.0..=1.0,
+            },
+        }
     }
 
     /// Reseed the cosmic demo (web + player + camera + HUD) and rebuild
@@ -4434,7 +5033,20 @@ impl ViewerApp {
         }
     }
 
-    fn build_pipelines(&self, swapchain: &Arc<Swapchain>) -> (Arc<RenderPass>, Pipelines) {
+    /// Window pipelines + the HDR scene/post passes. The HDR format
+    /// selection is a physical-device query (no window needed — the
+    /// `game_tools` boot pattern); `None` means LDR bypass (cosmic
+    /// views draw the same layouts direct-to-swapchain, minus bloom).
+    fn build_pipelines(
+        &self,
+        swapchain: &Arc<Swapchain>,
+    ) -> (
+        Arc<RenderPass>,
+        Pipelines,
+        Option<Format>,
+        Arc<RenderPass>,
+        Arc<RenderPass>,
+    ) {
         let render_pass = vulkano::single_pass_renderpass!(
             self.device.clone(),
             attachments: {
@@ -4457,13 +5069,147 @@ impl ViewerApp {
             },
         )
         .expect("render pass must create");
+        let hdr_format =
+            match select_hdr_format(|format| hdr_support(self.device.physical_device(), format)) {
+                HdrSelection::Hdr(format) => Some(format),
+                HdrSelection::LdrBypass => None,
+            };
+        // Scene + post passes exist regardless (cheap objects); the
+        // transient images driving them exist only in HDR mode.
+        let scene_format = hdr_format.unwrap_or(swapchain.image_format());
+        let scene_pass = build_scene_pass(&self.device, scene_format);
+        let post_pass = build_post_pass(&self.device, scene_format);
         let pipelines = Pipelines {
             fill: build_fill_pipeline(&self.device, &self.shaders, &render_pass),
             line: build_line_pipeline(&self.device, &self.shaders, &render_pass),
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
+            map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
+            web_line: build_webline_pipeline(&self.device, &self.shaders, &render_pass),
+            glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
+            webline_scene: build_webline_pipeline(&self.device, &self.shaders, &scene_pass),
+            bright: build_post_pipeline(
+                &self.device,
+                &self.shaders.bright_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "bloom bright",
+            ),
+            blur: build_post_pipeline(
+                &self.device,
+                &self.shaders.blur_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "bloom blur",
+            ),
+            resolve: build_post_pipeline(
+                &self.device,
+                &self.shaders.resolve_frag,
+                &self.shaders.post_vert,
+                &render_pass,
+                // State present, test off (the UI-pipeline
+                // precedent): the main subpass owns a depth
+                // attachment (VUID-06043).
+                Some(DepthStencilState::default()),
+                "bloom resolve",
+            ),
         };
-        (render_pass, pipelines)
+        (render_pass, pipelines, hdr_format, scene_pass, post_pass)
+    }
+
+    /// Build (or rebuild, on swapchain recreate) the transient HDR
+    /// bloom resources for the window: scene target + depth, half-res
+    /// bloom ping-pong pair, and the four sampling sets. `None` in LDR
+    /// bypass (no transients — the cosmic draws go direct). Associated
+    /// function (not a method) so the recreate path can pass disjoint
+    /// `self` fields alongside the `&mut` window context.
+    fn build_hdr_chain(
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+        post_sampler: &Arc<Sampler>,
+        ctx: &WindowContext,
+    ) -> Option<HdrChain> {
+        let format = ctx.hdr_format?;
+        let extent = ctx.swapchain.image_extent();
+        let half = [extent[0].max(2) / 2, extent[1].max(2) / 2];
+        let scene_view = create_post_view(memory_allocator, extent, format, "HDR scene");
+        let scene_depth = create_depth_view(memory_allocator, extent);
+        let scene_fb = Framebuffer::new(
+            ctx.scene_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![scene_view.clone(), scene_depth.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("HDR scene framebuffer must create");
+        let half_a_view = create_post_view(memory_allocator, half, format, "bloom half A");
+        let half_a_fb = Framebuffer::new(
+            ctx.post_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![half_a_view.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("bloom half-A framebuffer must create");
+        let half_b_view = create_post_view(memory_allocator, half, format, "bloom half B");
+        let half_b_fb = Framebuffer::new(
+            ctx.post_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![half_b_view.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("bloom half-B framebuffer must create");
+        let pipes = &ctx.pipelines;
+        let bright_set = post_image_set(
+            descriptor_set_allocator,
+            &pipes.bright,
+            &scene_view,
+            post_sampler,
+            "bloom bright",
+        );
+        let blur_a_set = post_image_set(
+            descriptor_set_allocator,
+            &pipes.blur,
+            &half_a_view,
+            post_sampler,
+            "bloom blur A",
+        );
+        let blur_b_set = post_image_set(
+            descriptor_set_allocator,
+            &pipes.blur,
+            &half_b_view,
+            post_sampler,
+            "bloom blur B",
+        );
+        // Resolve samples two images (scene + final bloom): the second
+        // pair is written against the same layout explicitly.
+        let resolve_layout = pipes.resolve.layout().set_layouts()[0].clone();
+        let resolve_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            resolve_layout,
+            [
+                WriteDescriptorSet::image_view(0, scene_view.clone()),
+                WriteDescriptorSet::sampler(1, post_sampler.clone()),
+                WriteDescriptorSet::image_view(2, half_a_view.clone()),
+                WriteDescriptorSet::sampler(3, post_sampler.clone()),
+            ],
+            [],
+        )
+        .expect("bloom resolve descriptor set must create");
+        Some(HdrChain {
+            format,
+            scene_fb,
+            half_a_fb,
+            half_b_fb,
+            half_extent: half,
+            bright_set,
+            blur_a_set,
+            blur_b_set,
+            resolve_set,
+        })
     }
 }
 
@@ -4472,6 +5218,19 @@ struct Pipelines {
     line: Arc<GraphicsPipeline>,
     ui: Arc<GraphicsPipeline>,
     map: Arc<GraphicsPipeline>,
+    /// Cosmic glow sprites (additive, update-2026-09-18-2328).
+    map_glow: Arc<GraphicsPipeline>,
+    /// Cosmic braid lines (additive RGBA, update-2026-09-18-2328).
+    web_line: Arc<GraphicsPipeline>,
+    /// Scene-pass variants of the cosmic pipelines (HDR mode).
+    glow_scene: Arc<GraphicsPipeline>,
+    webline_scene: Arc<GraphicsPipeline>,
+    /// Bloom bright extract (post pass).
+    bright: Arc<GraphicsPipeline>,
+    /// Separable blur step (post pass, axis via push).
+    blur: Arc<GraphicsPipeline>,
+    /// Bloom-composite ACES resolve (main pass).
+    resolve: Arc<GraphicsPipeline>,
 }
 
 fn window_size_dependent_setup(
@@ -4534,10 +5293,11 @@ impl ViewerApp {
             )
             .expect("swapchain must create")
         };
-        let (render_pass, pipelines) = self.build_pipelines(&swapchain);
+        let (render_pass, pipelines, hdr_format, scene_pass, post_pass) =
+            self.build_pipelines(&swapchain);
         let depth_view = create_depth_view(&self.memory_allocator, swapchain.image_extent());
         let framebuffers = window_size_dependent_setup(&images, &render_pass, &depth_view);
-        WindowContext {
+        let mut ctx = WindowContext {
             window,
             swapchain,
             render_pass,
@@ -4549,7 +5309,23 @@ impl ViewerApp {
             last_cursor: None,
             recreate_swapchain: false,
             previous_frame_end: Some(sync::now(self.device.clone()).boxed()),
+            hdr_format,
+            scene_pass,
+            post_pass,
+            hdr: None,
+        };
+        ctx.hdr = Self::build_hdr_chain(
+            &self.memory_allocator,
+            &self.descriptor_set_allocator,
+            &self.post_sampler,
+            &ctx,
+        );
+        if let Some(chain) = ctx.hdr.as_ref() {
+            tracing::info!(format = ?chain.format, "HDR cosmic post chain active");
+        } else {
+            tracing::info!("LDR bypass: cosmic views draw direct-to-swapchain");
         }
+        ctx
     }
 
     /// Whether an event belongs to the window (`false` for stale ids
@@ -5932,6 +6708,14 @@ impl ViewerApp {
                     create_depth_view(&self.memory_allocator, ctx.swapchain.image_extent());
                 ctx.framebuffers =
                     window_size_dependent_setup(&new_images, &ctx.render_pass, &ctx.depth_view);
+                // HDR transients track the swapchain extent (the passes
+                // and pipelines persist — only images/sets rebuild).
+                ctx.hdr = Self::build_hdr_chain(
+                    &self.memory_allocator,
+                    &self.descriptor_set_allocator,
+                    &self.post_sampler,
+                    ctx,
+                );
                 ctx.recreate_swapchain = false;
             }
         }
@@ -5939,6 +6723,12 @@ impl ViewerApp {
         let layout = app_layout(self.debug.chrome, win_w, win_h);
         let player_active = self.debug.viewer.player.active;
         let content = self.debug.screen_content();
+        // Cosmic draw state, precomputed once per frame (player point
+        // rebuild included): the LDR direct path and the HDR
+        // scene/resolve path below share it, so both record identical
+        // draws. `None` on non-cosmic tabs.
+        let cosmic_frame =
+            (content == Some(ViewContent::CosmicWeb)).then(|| self.cosmic_frame(layout.viewport));
 
         // Build frame UI (atlas insertions happen here) and sync the GPU
         // atlas before recording. The top bar + docks render inside the
@@ -6074,17 +6864,179 @@ impl ViewerApp {
         .expect("command buffer builder must create");
         // Orbit backdrop (UMAP-020): the arrival target's atmosphere
         // color, scaled to a near-black space read; the default tint
-        // otherwise. Descriptor palette straight to the frame.
-        let backdrop: [f32; 4] = self
-            .debug
-            .viewer
-            .arrival
-            .as_ref()
-            .map(|arrival| {
-                let c = arrival.atmosphere.color;
-                [c[0] * 0.07, c[1] * 0.07, c[2] * 0.07 + 0.02, 1.0]
-            })
-            .unwrap_or([0.02, 0.03, 0.08, 1.0]);
+        // otherwise. Cosmic views clear to deep indigo instead
+        // (update-2026-09-18-2328) so voids read as negative space
+        // against the additive filaments. Descriptor palette straight
+        // to the frame.
+        let backdrop: [f32; 4] = if content == Some(ViewContent::CosmicWeb) {
+            COSMIC_BACKDROP
+        } else {
+            self.debug
+                .viewer
+                .arrival
+                .as_ref()
+                .map(|arrival| {
+                    let c = arrival.atmosphere.color;
+                    [c[0] * 0.07, c[1] * 0.07, c[2] * 0.07 + 0.02, 1.0]
+                })
+                .unwrap_or([0.02, 0.03, 0.08, 1.0])
+        };
+        // HDR cosmic pre-pass (update-2026-09-18-2328): the scene and
+        // bloom chain run offscreen before the main pass begins; the
+        // views loop below only resolves into the swapchain image. LDR
+        // bypass skips this block and draws direct-to-swapchain in the
+        // loop instead.
+        if let Some(frame) = cosmic_frame.as_ref()
+            && let Some(hdr) = ctx.hdr.as_ref()
+        {
+            let pipes = &ctx.pipelines;
+            let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+            let bloom = BloomParams::spec_defaults();
+            // Scene: indigo clear, braid then glow.
+            builder
+                .begin_render_pass(
+                    RenderPassBeginInfo {
+                        clear_values: vec![
+                            Some(COSMIC_BACKDROP.into()),
+                            Some(ClearValue::Depth(1.0)),
+                        ],
+                        ..RenderPassBeginInfo::framebuffer(hdr.scene_fb.clone())
+                    },
+                    SubpassBeginInfo {
+                        contents: SubpassContents::Inline,
+                        ..Default::default()
+                    },
+                )
+                .expect("HDR scene pass must begin")
+                .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
+                .expect("viewport must set")
+                .bind_pipeline_graphics(pipes.webline_scene.clone())
+                .expect("pipeline must bind")
+                .bind_vertex_buffers(0, frame.braid.clone())
+                .expect("vertex buffer must bind")
+                .push_constants(
+                    pipes.webline_scene.layout().clone(),
+                    0,
+                    WebLinePush {
+                        mvp: frame.mvp,
+                        redshift,
+                    },
+                )
+                .expect("webline push constants must upload");
+            // SAFETY: buffer holds exactly the uploaded braid
+            // segments, no index buffer bound.
+            unsafe { builder.draw(frame.braid.len() as u32, 1, 0, 0) }
+                .expect("HDR scene braid draw must record");
+            builder
+                .bind_pipeline_graphics(pipes.glow_scene.clone())
+                .expect("pipeline must bind")
+                .bind_vertex_buffers(0, frame.glow.clone())
+                .expect("vertex buffer must bind")
+                .push_constants(
+                    pipes.glow_scene.layout().clone(),
+                    0,
+                    GlowPush {
+                        mvp: frame.mvp,
+                        px_scale: frame.px_scale,
+                        exposure: 1.0,
+                        redshift,
+                    },
+                )
+                .expect("glow push constants must upload");
+            // SAFETY: same PointList contract as the galaxy map.
+            unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
+                .expect("HDR scene glow draw must record");
+            builder
+                .end_render_pass(Default::default())
+                .expect("HDR scene pass must end");
+            // Bloom chain at half res: bright extract, then two H/V
+            // separable passes ping-ponging A/B with a widening
+            // step (tight flare plus wide haze). Final bloom lands
+            // back in A, which the resolve samples.
+            let half_vp = Viewport {
+                offset: [0.0, 0.0],
+                extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            };
+            let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
+            builder
+                .begin_render_pass(
+                    RenderPassBeginInfo {
+                        clear_values: vec![Some(black)],
+                        ..RenderPassBeginInfo::framebuffer(hdr.half_a_fb.clone())
+                    },
+                    SubpassBeginInfo {
+                        contents: SubpassContents::Inline,
+                        ..Default::default()
+                    },
+                )
+                .expect("bloom bright pass must begin")
+                .set_viewport(0, [half_vp.clone()].into_iter().collect())
+                .expect("viewport must set")
+                .bind_pipeline_graphics(pipes.bright.clone())
+                .expect("pipeline must bind")
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipes.bright.layout().clone(),
+                    0,
+                    hdr.bright_set.clone(),
+                )
+                .expect("bloom bright set must bind")
+                .push_constants(
+                    pipes.bright.layout().clone(),
+                    0,
+                    BloomBrightPush {
+                        threshold: bloom.threshold,
+                    },
+                )
+                .expect("bloom bright push must upload");
+            // SAFETY: fullscreen-triangle pipeline, no vertex input
+            // — 3 unbuffered vertices are the whole draw.
+            unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom bright draw must record");
+            builder
+                .end_render_pass(Default::default())
+                .expect("bloom bright pass must end");
+            let hw = hdr.half_extent[0] as f32;
+            let hh = hdr.half_extent[1] as f32;
+            for (dst, set, step) in [
+                (&hdr.half_b_fb, &hdr.blur_a_set, [1.0 / hw, 0.0]),
+                (&hdr.half_a_fb, &hdr.blur_b_set, [0.0, 1.0 / hh]),
+                (&hdr.half_b_fb, &hdr.blur_a_set, [2.0 / hw, 0.0]),
+                (&hdr.half_a_fb, &hdr.blur_b_set, [0.0, 2.0 / hh]),
+            ] {
+                builder
+                    .begin_render_pass(
+                        RenderPassBeginInfo {
+                            clear_values: vec![Some(black)],
+                            ..RenderPassBeginInfo::framebuffer(dst.clone())
+                        },
+                        SubpassBeginInfo {
+                            contents: SubpassContents::Inline,
+                            ..Default::default()
+                        },
+                    )
+                    .expect("bloom blur pass must begin")
+                    .set_viewport(0, [half_vp.clone()].into_iter().collect())
+                    .expect("viewport must set")
+                    .bind_pipeline_graphics(pipes.blur.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.blur.layout().clone(),
+                        0,
+                        set.clone(),
+                    )
+                    .expect("bloom blur set must bind")
+                    .push_constants(pipes.blur.layout().clone(), 0, BloomBlurPush { step })
+                    .expect("bloom blur push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex
+                // input — 3 unbuffered vertices are the whole draw.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom blur draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom blur pass must end");
+            }
+        }
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -6166,92 +7118,113 @@ impl ViewerApp {
                     unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
                         .expect("map draw must record");
                 } else if view == ViewContent::CosmicWeb {
-                    // Cosmic player scene (v0.3.2): web points (nodes +
-                    // dwarf glow) through the map pipeline, filament
-                    // links through the line pipeline — links first. The
-                    // demo tab renders the player-immersive view (demo
-                    // buffers + player camera); the Cosmic Web tab
-                    // renders the same web through the inspector camera
-                    // (fixed-center buffers + live player point).
-                    let (mvp, px_scale, is_demo) = if self.debug.screen == Screen::GameDemo {
-                        let camera = &self.debug.cosmic.camera;
-                        (
-                            camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
-                            camera.px_scale(vp.h),
-                            true,
-                        )
-                    } else {
-                        let inspector = &self.debug.cosmic_inspector;
-                        (
-                            inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
-                            inspector.camera.px_scale(vp.h),
-                            false,
-                        )
-                    };
-                    // Per-surface buffers: demo (ship-relative origin)
-                    // vs inspector (fixed web-center origin).
-                    let (lines, points) = if is_demo {
-                        (self.cosmic_lines.clone(), self.cosmic_points.clone())
-                    } else {
-                        (
-                            self.cosmic_tab_lines.clone(),
-                            self.cosmic_tab_points.clone(),
-                        )
-                    };
-                    let (lines_len, points_len) = (lines.len(), points.len());
-                    builder
-                        .set_viewport(0, [viewport].into_iter().collect())
-                        .expect("viewport must set")
-                        .bind_pipeline_graphics(ctx.pipelines.line.clone())
-                        .expect("pipeline must bind")
-                        .bind_vertex_buffers(0, lines)
-                        .expect("vertex buffer must bind")
-                        .push_constants(
-                            ctx.pipelines.line.layout().clone(),
-                            0,
-                            LinePush { mvp, inflate: 0.0 },
-                        )
-                        .expect("line push constants must upload");
-                    // SAFETY: buffer holds exactly the uploaded link
-                    // segments, no index buffer bound.
-                    unsafe { builder.draw(lines_len as u32, 1, 0, 0) }
-                        .expect("cosmic links draw must record");
-                    builder
-                        .bind_pipeline_graphics(ctx.pipelines.map.clone())
-                        .expect("pipeline must bind")
-                        .bind_vertex_buffers(0, points)
-                        .expect("vertex buffer must bind")
-                        .push_constants(
-                            ctx.pipelines.map.layout().clone(),
-                            0,
-                            MapPush {
-                                mvp,
-                                px_scale,
-                                exposure: 1.0,
-                            },
-                        )
-                        .expect("map push constants must upload");
-                    // SAFETY: same PointList contract as the galaxy map.
-                    unsafe { builder.draw(points_len as u32, 1, 0, 0) }
-                        .expect("cosmic points draw must record");
-                    if !is_demo {
-                        // Inspector player point: one vertex at the live
-                        // ship position (center-relative), rebuilt per
-                        // frame while the tab shows.
-                        let ship = self.debug.cosmic.player.position_mpc();
-                        self.cosmic_tab_player = upload_cosmic_player_point(
-                            &self.memory_allocator,
-                            [ship.x as f32, ship.y as f32, ship.z as f32],
-                        );
+                    // Cosmic player scene (update-2026-09-18-2328): HDR
+                    // mode resolves the pre-recorded scene + bloom over
+                    // the full window; LDR bypass draws braid + glow
+                    // direct-to-swapchain. Both arms share the
+                    // precomputed frame, so the draws are identical.
+                    // The demo tab renders the player-immersive view;
+                    // the Cosmic Web tab renders through the inspector
+                    // camera (fixed-center buffers + live player point).
+                    let frame = cosmic_frame
+                        .as_ref()
+                        .expect("cosmic view must precompute its frame");
+                    let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+                    if let Some(hdr) = ctx.hdr.as_ref() {
+                        let bloom = BloomParams::spec_defaults();
+                        let full_vp = Viewport {
+                            offset: [0.0, 0.0],
+                            extent: [win_w, win_h],
+                            depth_range: 0.0..=1.0,
+                        };
                         builder
+                            .set_viewport(0, [full_vp].into_iter().collect())
+                            .expect("viewport must set")
+                            .bind_pipeline_graphics(ctx.pipelines.resolve.clone())
+                            .expect("pipeline must bind")
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                ctx.pipelines.resolve.layout().clone(),
+                                0,
+                                hdr.resolve_set.clone(),
+                            )
+                            .expect("bloom resolve set must bind")
+                            .push_constants(
+                                ctx.pipelines.resolve.layout().clone(),
+                                0,
+                                BloomResolvePush {
+                                    exposure: 1.0,
+                                    intensity: bloom.intensity,
+                                },
+                            )
+                            .expect("bloom resolve push must upload");
+                        // SAFETY: fullscreen-triangle pipeline, no vertex
+                        // input — 3 unbuffered vertices are the whole
+                        // draw.
+                        unsafe { builder.draw(3, 1, 0, 0) }
+                            .expect("bloom resolve draw must record");
+                    } else {
+                        let (braid_len, glow_len) = (frame.braid.len(), frame.glow.len());
+                        builder
+                            .set_viewport(0, [viewport].into_iter().collect())
+                            .expect("viewport must set")
+                            .bind_pipeline_graphics(ctx.pipelines.web_line.clone())
+                            .expect("pipeline must bind")
+                            .bind_vertex_buffers(0, frame.braid.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                ctx.pipelines.web_line.layout().clone(),
+                                0,
+                                WebLinePush {
+                                    mvp: frame.mvp,
+                                    redshift,
+                                },
+                            )
+                            .expect("webline push constants must upload");
+                        // SAFETY: buffer holds exactly the uploaded braid
+                        // segments, no index buffer bound.
+                        unsafe { builder.draw(braid_len as u32, 1, 0, 0) }
+                            .expect("cosmic braid draw must record");
+                        builder
+                            .bind_pipeline_graphics(ctx.pipelines.map_glow.clone())
+                            .expect("pipeline must bind")
+                            .bind_vertex_buffers(0, frame.glow.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                ctx.pipelines.map_glow.layout().clone(),
+                                0,
+                                GlowPush {
+                                    mvp: frame.mvp,
+                                    px_scale: frame.px_scale,
+                                    exposure: 1.0,
+                                    redshift,
+                                },
+                            )
+                            .expect("glow push constants must upload");
+                        // SAFETY: same PointList contract as the galaxy map.
+                        unsafe { builder.draw(glow_len as u32, 1, 0, 0) }
+                            .expect("cosmic glow draw must record");
+                    }
+                    if !frame.is_demo {
+                        // Inspector player point (precomputed in the
+                        // frame): drawn last through the alpha map
+                        // pipeline — after the resolve in HDR mode, so
+                        // the marker stays legible over the glow. The
+                        // pipeline bind is explicit: the previously
+                        // bound pipeline here is `resolve` (HDR) or
+                        // `map_glow` (LDR), whose push layouts are
+                        // incompatible with `MapPush` (VUID-06425).
+                        builder
+                            .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                            .expect("pipeline must bind")
                             .bind_vertex_buffers(0, self.cosmic_tab_player.clone())
                             .expect("vertex buffer must bind")
                             .push_constants(
                                 ctx.pipelines.map.layout().clone(),
                                 0,
                                 MapPush {
-                                    mvp,
-                                    px_scale,
+                                    mvp: frame.mvp,
+                                    px_scale: frame.px_scale,
                                     exposure: 1.0,
                                 },
                             )
@@ -6644,10 +7617,37 @@ mod tests {
             (ShaderKind::Fragment, UI_FRAG, "ui frag"),
             (ShaderKind::Vertex, MAP_VERT, "map vert"),
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
+            (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
+            (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
+            (ShaderKind::Vertex, WEBLINE_VERT, "webline vert"),
+            (ShaderKind::Fragment, WEBLINE_FRAG, "webline frag"),
         ] {
             if let Err(error) = compile_glsl_to_spirv(kind, source) {
                 panic!("{what} must compile: {error}");
             }
+        }
+    }
+
+    #[test]
+    fn cosmic_vertex_inputs_match_vertex_fields() {
+        // Regression pin for the windowed startup panic
+        // (update-2026-09-18-2328): vulkano maps shader inputs to
+        // vertex-struct fields BY NAME at pipeline creation — naga
+        // compilation cannot catch a mismatch, and there is no
+        // GPU-free way to run the real check, so the names are pinned
+        // here. `GlowLineVertex { position, rgba }`,
+        // `MapVertex { map_pos, color, misc }`.
+        for (source, name, what) in [
+            (WEBLINE_VERT, "in vec3 position;", "webline position"),
+            (WEBLINE_VERT, "in vec4 rgba;", "webline rgba"),
+            (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
+            (GLOW_VERT, "in vec3 color;", "glow color"),
+            (GLOW_VERT, "in vec3 misc;", "glow misc"),
+        ] {
+            assert!(
+                source.contains(name),
+                "{what} input missing from its vertex shader"
+            );
         }
     }
 
@@ -6671,6 +7671,22 @@ mod tests {
             bytes <= 128,
             "MapPush is {bytes} B, over the 128 B Vulkan 1.1 floor"
         );
+    }
+
+    #[test]
+    fn cosmic_push_constants_fit_vulkan_floor() {
+        // Update-2026-09-18-2328 blocks: glow (MVP + scale + exposure
+        // + redshift) and webline (MVP + redshift) must stay under the
+        // 128 B Vulkan 1.1 floor on every tier.
+        for (bytes, what) in [
+            (std::mem::size_of::<GlowPush>(), "GlowPush"),
+            (std::mem::size_of::<WebLinePush>(), "WebLinePush"),
+        ] {
+            assert!(
+                bytes <= 128,
+                "{what} is {bytes} B, over the 128 B Vulkan 1.1 floor"
+            );
+        }
     }
 
     #[test]

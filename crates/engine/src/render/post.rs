@@ -137,6 +137,199 @@ pub struct ResolvePush {
     pub exposure: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Bloom chain (update-2026-09-18-2328): threshold extract + separable
+// Gaussian blur + bloom-composite resolve. Same split as the rest of
+// this module — GLSL sources and params here, GPU resources in the
+// binaries (the `game_tools` `ResolvePass` precedent).
+// ---------------------------------------------------------------------------
+
+/// Tunable bloom-chain parameters.
+///
+/// ```
+/// use game_engine::render::post::BloomParams;
+///
+/// let p = BloomParams::spec_defaults();
+/// assert_eq!((p.threshold, p.intensity), (1.0, 0.85));
+/// assert!(BloomParams::new(1.0, 0.85, 1.6).is_some());
+/// assert!(BloomParams::new(-1.0, 0.85, 1.6).is_none());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BloomParams {
+    /// HDR threshold: linear luminance above this feeds the bloom
+    /// chain (emissive node cores sit at 1.5–4.0 by construction).
+    pub threshold: f32,
+    /// Bloom weight added back at resolve (0 = chain runs dry).
+    pub intensity: f32,
+    /// Blur sigma in target texels (the 9-tap kernel below is the
+    /// σ = 1.6 specialization; other values rescale the step push).
+    pub sigma_texels: f32,
+}
+
+impl BloomParams {
+    /// Shipped calibration: threshold at the emissive floor, gentle
+    /// bloom weight, σ = 1.6 kernel.
+    pub const fn spec_defaults() -> Self {
+        Self {
+            threshold: 1.0,
+            intensity: 0.85,
+            sigma_texels: 1.6,
+        }
+    }
+
+    /// Validated constructor: threshold in [0, 8], intensity in
+    /// [0, 2], sigma in (0, 8] — all finite.
+    pub fn new(threshold: f32, intensity: f32, sigma_texels: f32) -> Option<Self> {
+        if threshold.is_finite()
+            && (0.0..=8.0).contains(&threshold)
+            && intensity.is_finite()
+            && (0.0..=2.0).contains(&intensity)
+            && sigma_texels.is_finite()
+            && sigma_texels > 0.0
+            && sigma_texels <= 8.0
+        {
+            Some(Self {
+                threshold,
+                intensity,
+                sigma_texels,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Separable 9-tap Gaussian weights for σ (offsets 0–4, normalized —
+/// the single author of the kernel both sides pin against).
+/// Central weight first, then the symmetric pairs.
+pub fn gaussian9_weights(sigma: f64) -> [f64; 5] {
+    let g = |x: f64| (-x * x / (2.0 * sigma * sigma)).exp();
+    let (g0, g1, g2, g3, g4) = (g(0.0), g(1.0), g(2.0), g(3.0), g(4.0));
+    let total = g0 + 2.0 * (g1 + g2 + g3 + g4);
+    [g0 / total, g1 / total, g2 / total, g3 / total, g4 / total]
+}
+
+/// Bright-pass fragment shader: hard threshold extract of the HDR
+/// scene into the half-res bloom target (linear throughout — tone
+/// mapping happens only at resolve). Same sampler discipline as the
+/// resolve shaders (separate `texture2D` + `sampler` for naga).
+pub const BLOOM_BRIGHT_FRAG: &str = r"#version 450
+layout(set = 0, binding = 0) uniform texture2D hdr_tex;
+layout(set = 0, binding = 1) uniform sampler hdr_sampler;
+layout(push_constant) uniform PushConstants {
+    float threshold;
+} pc;
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 f_color;
+void main() {
+    vec3 hdr = texture(sampler2D(hdr_tex, hdr_sampler), v_uv).rgb;
+    vec3 bloom = max(hdr - vec3(pc.threshold), vec3(0.0));
+    f_color = vec4(bloom, 1.0);
+}";
+
+/// Blur fragment shader: one axis of the separable 9-tap Gaussian
+/// (σ = 1.6 texels — weights pinned by
+/// `bloom_weights_match_cpu_mirror`). The push `step` selects the
+/// axis (`(1/w, 0)` then `(0, 1/h)`) and rescales the kernel for the
+/// wide pass. Explicit texel fetches, so a nearest sampler suffices.
+pub const BLOOM_BLUR_FRAG: &str = r"#version 450
+layout(set = 0, binding = 0) uniform texture2D bloom_tex;
+layout(set = 0, binding = 1) uniform sampler bloom_sampler;
+layout(push_constant) uniform PushConstants {
+    vec2 step;
+} pc;
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 f_color;
+void main() {
+    vec3 acc = texture(sampler2D(bloom_tex, bloom_sampler), v_uv).rgb * 0.2504;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv + pc.step * 1.0).rgb * 0.2060;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv - pc.step * 1.0).rgb * 0.2060;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv + pc.step * 2.0).rgb * 0.1146;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv - pc.step * 2.0).rgb * 0.1146;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv + pc.step * 3.0).rgb * 0.0432;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv - pc.step * 3.0).rgb * 0.0432;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv + pc.step * 4.0).rgb * 0.0110;
+    acc += texture(sampler2D(bloom_tex, bloom_sampler), v_uv - pc.step * 4.0).rgb * 0.0110;
+    f_color = vec4(acc, 1.0);
+}";
+
+/// Resolve fragment shader, bloom-composite variant: exposure-scaled
+/// HDR plus the intensity-weighted bloom texture through
+/// [`ACES_FIT_GLSL`]. Composed from [`RESOLVE_FRAG_FIXED`] (same
+/// pattern as [`resolve_frag_aces`]): the bloom sampler rides
+/// bindings 2–3, the fixed source is never hand-duplicated.
+pub fn resolve_frag_bloom() -> String {
+    let with_fit = RESOLVE_FRAG_FIXED.replacen(
+        "void main() {",
+        &format!("{ACES_FIT_GLSL}\nvoid main() {{"),
+        1,
+    );
+    let with_bloom_tex = with_fit.replacen(
+        "layout(set = 0, binding = 1) uniform sampler hdr_sampler;",
+        "layout(set = 0, binding = 1) uniform sampler hdr_sampler;\nlayout(set = 0, binding = 2) uniform texture2D bloom_tex;\nlayout(set = 0, binding = 3) uniform sampler bloom_sampler;",
+        1,
+    );
+    let with_bloom_push = with_bloom_tex.replacen(
+        "float exposure;",
+        "float exposure;\n    float intensity;",
+        1,
+    );
+    with_bloom_push.replacen(
+        "f_color = vec4(hdr * pc.exposure, 1.0);",
+        "vec3 bloom = texture(sampler2D(bloom_tex, bloom_sampler), v_uv).rgb;\n    f_color = vec4(aces_fit(hdr * pc.exposure + bloom * pc.intensity), 1.0);",
+        1,
+    )
+}
+
+/// Bright-pass push-constant block: HDR threshold (4 B).
+///
+/// ```
+/// use game_engine::render::post::BloomBrightPush;
+/// use std::mem::size_of;
+///
+/// assert_eq!(size_of::<BloomBrightPush>(), 4);
+/// ```
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+pub struct BloomBrightPush {
+    /// Linear threshold subtracted before clamping at zero.
+    pub threshold: f32,
+}
+
+/// Blur push-constant block: per-tap texel step selecting the blur
+/// axis (8 B).
+///
+/// ```
+/// use game_engine::render::post::BloomBlurPush;
+/// use std::mem::size_of;
+///
+/// assert_eq!(size_of::<BloomBlurPush>(), 8);
+/// ```
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+pub struct BloomBlurPush {
+    /// Axis step in UV (`(1/w, 0)` horizontal, `(0, 1/h)` vertical,
+    /// scaled for the wide pass).
+    pub step: [f32; 2],
+}
+
+/// Bloom-resolve push-constant block: exposure + bloom weight (8 B).
+///
+/// ```
+/// use game_engine::render::post::BloomResolvePush;
+/// use std::mem::size_of;
+///
+/// assert_eq!(size_of::<BloomResolvePush>(), 8);
+/// ```
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+pub struct BloomResolvePush {
+    /// Linear exposure multiplier applied to the HDR scene sample.
+    pub exposure: f32,
+    /// Bloom weight added before tone mapping.
+    pub intensity: f32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::shaders::{ShaderKind, compile_glsl_to_spirv};
@@ -196,6 +389,76 @@ mod tests {
         );
         assert!(
             !aces.contains("hdr * pc.exposure, 1.0"),
+            "no unmapped linear output may survive"
+        );
+    }
+
+    #[test]
+    fn bloom_params_validate_and_default() {
+        let d = BloomParams::spec_defaults();
+        assert_eq!((d.threshold, d.intensity, d.sigma_texels), (1.0, 0.85, 1.6));
+        assert!(BloomParams::new(1.0, 0.85, 1.6).is_some());
+        assert!(BloomParams::new(8.0, 2.0, 8.0).is_some());
+        assert!(BloomParams::new(-0.1, 0.85, 1.6).is_none());
+        assert!(BloomParams::new(1.0, 2.1, 1.6).is_none());
+        assert!(BloomParams::new(1.0, 0.85, 0.0).is_none());
+        assert!(BloomParams::new(f32::NAN, 0.85, 1.6).is_none());
+        assert!(BloomParams::new(1.0, 0.85, f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn bloom_shaders_compile_under_naga() {
+        compile_glsl_to_spirv(ShaderKind::Fragment, BLOOM_BRIGHT_FRAG)
+            .expect("bloom bright fragment shader must compile");
+        compile_glsl_to_spirv(ShaderKind::Fragment, BLOOM_BLUR_FRAG)
+            .expect("bloom blur fragment shader must compile");
+        compile_glsl_to_spirv(ShaderKind::Fragment, &resolve_frag_bloom())
+            .expect("bloom resolve fragment shader must compile");
+    }
+
+    #[test]
+    fn bloom_weights_match_cpu_mirror() {
+        // The blur kernel embeds the σ = 1.6 specialization as
+        // literals; this pins them against the single-authored
+        // `gaussian9_weights` (the ACES constant-pin precedent).
+        let want = gaussian9_weights(1.6);
+        for (tap, w) in want.iter().enumerate() {
+            let literal = format!("{w:.4}");
+            assert!(
+                BLOOM_BLUR_FRAG.contains(&literal),
+                "blur kernel lost tap {tap} weight {literal}"
+            );
+        }
+        let total: f64 = want[0] + 2.0 * (want[1] + want[2] + want[3] + want[4]);
+        assert!((total - 1.0).abs() < 1e-12, "kernel must sum to 1: {total}");
+    }
+
+    #[test]
+    fn bloom_resolve_composition_shares_the_fixed_source() {
+        let bloom = resolve_frag_bloom();
+        // Sampling, bindings, and output survive composition.
+        for anchor in [
+            "uniform texture2D hdr_tex;",
+            "uniform sampler hdr_sampler;",
+            "uniform texture2D bloom_tex;",
+            "uniform sampler bloom_sampler;",
+            "float exposure;",
+            "float intensity;",
+            "f_color = vec4(",
+        ] {
+            assert!(bloom.contains(anchor), "composition dropped {anchor:?}");
+        }
+        // The fit wraps scene + weighted bloom exactly once, and no
+        // unmapped linear output survives.
+        assert_eq!(
+            bloom
+                .matches("aces_fit(hdr * pc.exposure + bloom * pc.intensity)")
+                .count(),
+            1,
+            "fit must wrap the composite once"
+        );
+        assert!(
+            !bloom.contains("hdr * pc.exposure, 1.0"),
             "no unmapped linear output may survive"
         );
     }
