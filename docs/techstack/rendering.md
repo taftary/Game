@@ -295,10 +295,13 @@ front-face/cull state is involved on either cosmic surface.
 
 Cinematic refresh (update-2026-09-18-2328): the cosmic draws use two
 new additive (`One`, `One`, premultiplied in-shader) pipelines —
-glow points (soft Gaussian sprite mask, per-sprite alpha, emissive
-colors above 1.0 on cluster cores) and braid lines (per-vertex
-rgba) — both carrying an exaggerated Hubble redshift tint from view
-depth (`clip.w`, spec §9.1). The shared alpha `map`/`line`
+glow points (rim-zero quadratic-falloff sprite mask, per-sprite
+alpha, emissive colors above 1.0 on cluster cores; halos are
+world-sized `kind`-1 sprites, cores/grain/glow fixed-pixel `kind` 0)
+and braid lines (per-vertex rgba) — both carrying a bounded
+exaggerated Hubble redshift tint from view depth (`clip.w` clamped
+non-negative and capped, spec §9.1; unbounded tint decorrelated
+channels into rainbow squares on screen). The shared alpha `map`/`line`
 pipelines and every other surface are untouched. In HDR mode the
 same draws record into an offscreen HDR scene pass (indigo clear),
 then a half-res bright extract, two H/V separable Gaussian blur

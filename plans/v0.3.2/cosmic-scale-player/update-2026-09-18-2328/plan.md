@@ -83,9 +83,10 @@ annotations in the delta breakdown above)_ · Todos approved by:
 TECHLEAD _(done 2026-09-18 — risk-first order below; todo IDs carry
 the HHMM (`UPD-20260918-2328-NNN`) because the plain YYYYMMDD
 namespace already belongs to `update-2026-09-18-2027` in this
-feature)_ · Implemented by DEV: _(done 2026-09-19 — gates green,
-evidence in DoD table)_ · Verified by ANALYST: _(pending)_ ·
-Security reviewed by SECURITY: _(pending)_
+feature)_ · Implemented by DEV: _(done 2026-09-19 — visual-issue fix round
+applied as todos 010–012 below, gates re-green, evidence in DoD
+table)_ · Verified by ANALYST: _(pending)_ · Security reviewed by
+SECURITY: _(pending)_
 
 ## Todo
 
@@ -100,6 +101,17 @@ Security reviewed by SECURITY: _(pending)_
 | UPD-20260918-2328-007 | done | UPD-E: rendering.md, quality.md, techstack README bump, parent cross-links | DoD 7 |
 | UPD-20260918-2328-008 | done | Quality gates green (fmt/clippy/build/test/doc/headless ×2); DoD evidence in table | DoD 6 |
 | UPD-20260918-2328-009 | pending | User visual sign-off on rebuilt viewer (both cosmic tabs) | DoD 8 |
+| UPD-20260918-2328-010 | done | Visual-issue fix F1+F2: rim-zero sprite falloff (`GLOW_FRAG`), bounded redshift depth (`GLOW_VERT` + `WEBLINE_VERT`) | DoD 8 |
+| UPD-20260918-2328-011 | done | Visual-issue fix F3+F4: world-sized halo impostors (`kind` 1, `node_impostors` + `GLOW_VERT` branch) + bright-pass 64.0 firewall (`post.rs`) | DoD 8 |
+| UPD-20260918-2328-012 | done | Visual-issue fix F5: `cosmic_shader_safety_pins` + `bloom_bright_clamps_runaway_hdr` + updated impostor test; full gates re-green; windowed smoke clean | DoD 6, 8 |
+| UPD-20260918-2328-013 | done | Visual-issue round 2, L1: light rebalance (grain 0.08/0.35–0.9, glow 0.12, halo 0.10, core 1.2+1.3·l, braid 0.18+0.40·d) | DoD 8 |
+| UPD-20260918-2328-014 | done | Visual-issue round 2, L2+L3: resolve scene clamp 65000.0 (`post.rs` + `bloom_resolve_clamps_scene_sample`) + `GAME_DEBUG_COSMIC_POST=0` LDR kill-switch | DoD 8 |
+| UPD-20260918-2328-015 | done | Visual-issue round 2, L4: full gates re-green (551/0 + doc), windowed smoke clean, evidence synced | DoD 6, 8 |
+| UPD-20260918-2328-016 | done | CPU-side finiteness proof: `enrichment_layouts_are_finite_and_bounded` scans all ~2.2M nominal verts (finite, in-band) — corruption is created on-GPU, not in buffers | DoD 8 |
+| UPD-20260918-2328-017 | done | CPU-side finiteness proof: `enrichment_layouts_are_finite_and_bounded` scans all ~2.2M nominal verts (finite, in-band) — corruption is created on-GPU, not in buffers | DoD 8 |
+| UPD-20260918-2328-018 | done | User bisect: `GAME_DEBUG_COSMIC_POST=0` renders clean — scene draws/layouts/shaders/buffers exonerated; fault isolated to the HDR post chain (scene image+fb+depth, bright, blur×4, resolve, sets, sampler) | DoD 8 |
+| UPD-20260918-2328-019 | done | GPU bisect round 2 with user: `GAME_DEBUG_COSMIC_BLOOM=0` renders clean — bright/resolve/scene-image exonerated; fault isolated to the blur ping-pong (A/B images rewritten across passes) | DoD 8 |
+| UPD-20260918-2328-020 | done | Blur fix: five dedicated targets A–E (bright→A, H:A→B, V:B→C, wide-H:C→D, wide-V:D→E), each written once then only read; separate `resolve_nobloom_set` (scene+A) keeps the `BLOOM=0` path valid; windowed smoke clean, no validation errors | DoD 8 |
 
 ## DoD verification
 
@@ -112,7 +124,7 @@ Security reviewed by SECURITY: _(pending)_
 | 5 | Gameplay unchanged (picking/fly-to/cruise/HUD/marker/ring tests green, unmodified) | done | `select_engage_cancel_and_cruise_cancel_flow`, `tick_cruises_visibly_and_tracks_camera`, `demo_target_ring_overlays_selected_node`, `inspector_selected_ring_overlays_node`, cruise/HUD tests all green, unmodified; workspace suite 547/0 (40 game + 180 debug-lib + 26 debug-bin + 293 engine + 3 integration + 5 tools) |
 | 6 | Quality gates green | done | `cargo fmt --check` clean; `clippy --workspace --all-targets --all-features -- -D warnings` clean; `build --workspace` ok; `test --workspace --all-targets` 547/0; `test --doc --workspace` 87/0 (6 game + 81 engine); `cargo run --bin game` traces ok; `game_debug --headless` ok; `game_tools --headless --tier low` ok; mobile guard `cargo check --workspace` × (android + ios) clean |
 | 7 | Docs sweep; parents untouched/cross-linked; one `feat:` commit on `v0.3.2` | partial | `rendering.md` cosmic refresh (tab description + new extension §), `quality.md` bloom-budget row, techstack `0.33.4`; parents untouched (update links up only); `git status` shows exactly the 7 touched files + new folder; commit pending ANALYST + SECURITY sign-off |
-| 8 | User visual sign-off (both cosmic tabs, default + reseeded) | pending | — |
+| 8 | User visual sign-off (both cosmic tabs, default + reseeded) | pending | First attempt rejected with screenshots (solid rainbow/black squares + white blow-out). Root causes: rim-nonzero Gaussian (full quads), unbounded redshift tint (far→pure-red; w<0→Inf/NaN/negative→ACES pole→primaries/black), fixed-pixel halos (overdraw mush), unclamped bright pass. Fixed by todos 010–012: rim-zero `(1−4d²)²` falloff, `z=min(redshift·max(w,0),0.5)`, world-sized halos (2–8 Mpc), bright ceiling 64.0. Awaiting re-check on the rebuilt viewer |
 
 ## Acceptance criteria
 

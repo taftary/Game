@@ -211,8 +211,11 @@ pub fn gaussian9_weights(sigma: f64) -> [f64; 5] {
 
 /// Bright-pass fragment shader: hard threshold extract of the HDR
 /// scene into the half-res bloom target (linear throughout — tone
-/// mapping happens only at resolve). Same sampler discipline as the
-/// resolve shaders (separate `texture2D` + `sampler` for naga).
+/// mapping happens only at resolve). The 64.0 ceiling is a runaway
+/// firewall: no legitimate emissive exceeds it, while an Inf/NaN
+/// leak upstream would otherwise smear across both blur scales into
+/// the resolve. Same sampler discipline as the resolve shaders
+/// (separate `texture2D` + `sampler` for naga).
 pub const BLOOM_BRIGHT_FRAG: &str = r"#version 450
 layout(set = 0, binding = 0) uniform texture2D hdr_tex;
 layout(set = 0, binding = 1) uniform sampler hdr_sampler;
@@ -223,7 +226,7 @@ layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 f_color;
 void main() {
     vec3 hdr = texture(sampler2D(hdr_tex, hdr_sampler), v_uv).rgb;
-    vec3 bloom = max(hdr - vec3(pc.threshold), vec3(0.0));
+    vec3 bloom = min(max(hdr - vec3(pc.threshold), vec3(0.0)), vec3(64.0));
     f_color = vec4(bloom, 1.0);
 }";
 
@@ -274,7 +277,16 @@ pub fn resolve_frag_bloom() -> String {
         "float exposure;\n    float intensity;",
         1,
     );
-    with_bloom_push.replacen(
+    // Scene-sample clamp (below f16 max): dense additive packing can
+    // push texels to +Inf per channel, and `aces_fit(Inf)` is NaN —
+    // which the swapchain readback renders as random primaries. The
+    // clamp keeps overflow out of the fit, whatever the accumulation.
+    let with_clamp = with_bloom_push.replacen(
+        "vec3 hdr = texture(sampler2D(hdr_tex, hdr_sampler), v_uv).rgb;",
+        "vec3 hdr = min(texture(sampler2D(hdr_tex, hdr_sampler), v_uv).rgb, vec3(65000.0));",
+        1,
+    );
+    with_clamp.replacen(
         "f_color = vec4(hdr * pc.exposure, 1.0);",
         "vec3 bloom = texture(sampler2D(bloom_tex, bloom_sampler), v_uv).rgb;\n    f_color = vec4(aces_fit(hdr * pc.exposure + bloom * pc.intensity), 1.0);",
         1,
@@ -431,6 +443,28 @@ mod tests {
         }
         let total: f64 = want[0] + 2.0 * (want[1] + want[2] + want[3] + want[4]);
         assert!((total - 1.0).abs() < 1e-12, "kernel must sum to 1: {total}");
+    }
+
+    #[test]
+    fn bloom_bright_clamps_runaway_hdr() {
+        // Runaway firewall pin (visual-issue fix): the bright extract
+        // must ceiling its output so an Inf/NaN leak upstream cannot
+        // smear across both blur scales into the resolve.
+        assert!(
+            BLOOM_BRIGHT_FRAG.contains("vec3(64.0)"),
+            "bright-pass ceiling missing"
+        );
+    }
+
+    #[test]
+    fn bloom_resolve_clamps_scene_sample() {
+        // Overflow guard pin (visual-issue fix round 2): the composed
+        // resolve must ceiling the scene sample below f16 max before
+        // the fit, so +Inf texels can never produce NaN primaries.
+        assert!(
+            resolve_frag_bloom().contains("vec3(65000.0)"),
+            "scene-sample clamp missing from the bloom resolve"
+        );
     }
 
     #[test]

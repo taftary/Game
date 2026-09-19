@@ -389,8 +389,16 @@ layout(location = 1) out float v_alpha;
 void main() {
     vec4 clip = pc.mvp * vec4(map_pos, 1.0);
     gl_Position = clip;
-    gl_PointSize = clamp(misc.x, 1.0, 256.0);
-    float z = pc.redshift * clip.w;
+    // `kind` 1 = world-unit size (halo impostors), scaled by
+    // `px_scale` over the perspective divide — the shared map-shader
+    // convention; `kind` 0 = fixed pixel size (cores, grain, glow).
+    float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
+    gl_PointSize = clamp(px, 1.0, 256.0);
+    // Bounded redshift depth: negative view depth clamps to 0 and the
+    // exaggerated term caps at 0.5, so both denominators stay >= 1.4
+    // — the tint can never divide by zero, flip a channel's sign, or
+    // feed Inf/NaN into the additive chain (the visual-issue fix).
+    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
     vec3 tint = vec3(1.0 + 0.9 * z, 1.0, 1.0 / (1.0 + 1.2 * z));
     float dim = 1.0 / (1.0 + 0.8 * z);
     v_color = color * tint * dim;
@@ -403,7 +411,10 @@ layout(location = 1) in float v_alpha;
 layout(location = 0) out vec4 f_color;
 void main() {
     vec2 d = gl_PointCoord - vec2(0.5);
-    float fall = exp(-12.0 * dot(d, d));
+    // Soft round sprite: exactly 0 at the rim (an exp() floor left
+    // faint square corners on screen — the visual-issue fix).
+    float t = max(0.0, 1.0 - 4.0 * dot(d, d));
+    float fall = t * t;
     f_color = vec4(v_color * v_alpha * fall, 1.0);
 }";
 
@@ -422,7 +433,9 @@ layout(location = 0) out vec4 v_rgba;
 void main() {
     vec4 clip = pc.mvp * vec4(position, 1.0);
     gl_Position = clip;
-    float z = pc.redshift * clip.w;
+    // Same bounded redshift depth as the glow sprites (never divides
+    // by zero, never flips a channel sign).
+    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
     vec3 tint = vec3(1.0 + 0.9 * z, 1.0, 1.0 / (1.0 + 1.2 * z));
     float dim = 1.0 / (1.0 + 0.8 * z);
     v_rgba = vec4(rgba.rgb * tint * dim, rgba.a);
@@ -3937,21 +3950,34 @@ fn post_image_set(
 }
 
 /// Per-window HDR bloom resources (cosmic views only): scene target +
-/// depth, half-res bloom ping-pong pair, and the sampling sets. One
-/// frame executes at a time behind `previous_frame_end`, so one set
-/// of transients is enough. Rebuilt on swapchain recreate.
+/// depth, half-res bloom chain targets, and the sampling sets. Each
+/// bloom target is written exactly once per frame and only read
+/// afterwards — never rewritten (an A/B ping-pong reuse pattern
+/// corrupted its images on Intel UHD 620, diagnosed via the
+/// `GAME_DEBUG_COSMIC_BLOOM=0` bisect). One frame executes at a time
+/// behind `previous_frame_end`, so one set of transients is enough.
+/// Rebuilt on swapchain recreate.
 struct HdrChain {
     format: Format,
     // Views live on through the framebuffers + descriptor sets below;
     // only the framebuffers, sets, and extents are read per frame.
     scene_fb: Arc<Framebuffer>,
-    half_a_fb: Arc<Framebuffer>,
-    half_b_fb: Arc<Framebuffer>,
+    bloom_a_fb: Arc<Framebuffer>,
+    bloom_b_fb: Arc<Framebuffer>,
+    bloom_c_fb: Arc<Framebuffer>,
+    bloom_d_fb: Arc<Framebuffer>,
+    bloom_e_fb: Arc<Framebuffer>,
     half_extent: [u32; 2],
     bright_set: Arc<DescriptorSet>,
     blur_a_set: Arc<DescriptorSet>,
     blur_b_set: Arc<DescriptorSet>,
+    blur_c_set: Arc<DescriptorSet>,
+    blur_d_set: Arc<DescriptorSet>,
+    /// Resolve set sampling scene + final bloom (E).
     resolve_set: Arc<DescriptorSet>,
+    /// Resolve set sampling scene + bright extract (A): the
+    /// `GAME_DEBUG_COSMIC_BLOOM=0` path, where E is never written.
+    resolve_nobloom_set: Arc<DescriptorSet>,
 }
 
 fn upload_fill(
@@ -4502,6 +4528,9 @@ struct WindowContext {
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     /// Selected HDR scene format (`None` = LDR bypass).
     hdr_format: Option<Format>,
+    /// False when `GAME_DEBUG_COSMIC_BLOOM=0` (bright extract only,
+    /// blur passes skipped).
+    bloom_enabled: bool,
     /// HDR scene pass (HDR color + depth, cosmic views only).
     scene_pass: Arc<RenderPass>,
     /// Shared post pass (bright extract + blur steps).
@@ -4661,6 +4690,14 @@ impl ViewerApp {
         // Shader modules compile once here; each window builds its own
         // pipelines from them (see `build_pipelines`).
         let shaders = ShaderSet::compile(&device);
+        // Build tag (update-2026-09-18-2328 round 2): proves which
+        // visual code is actually running — a stale `game_debug.exe`
+        // (e.g. relink blocked by a still-running viewer holding the
+        // exe lock) silently keeps the old look. If this line is
+        // missing from the log, the binary predates the fix.
+        tracing::info!(
+            "cosmic visual build r2: rim-zero falloff + bounded tint + world halos + light rebalance + resolve clamp"
+        );
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),
             debug,
@@ -5044,6 +5081,7 @@ impl ViewerApp {
         Arc<RenderPass>,
         Pipelines,
         Option<Format>,
+        bool,
         Arc<RenderPass>,
         Arc<RenderPass>,
     ) {
@@ -5069,11 +5107,23 @@ impl ViewerApp {
             },
         )
         .expect("render pass must create");
-        let hdr_format =
+        // `GAME_DEBUG_COSMIC_POST=0` forces the LDR direct path and
+        // `GAME_DEBUG_COSMIC_BLOOM=0` keeps HDR scene + resolve while
+        // skipping the bright/blur chain: diagnostic A/B switches for
+        // the post chain, and fallbacks for drivers that misbehave
+        // under HDR.
+        let post_disabled = std::env::var("GAME_DEBUG_COSMIC_POST").is_ok_and(|value| value == "0");
+        let bloom_enabled =
+            !std::env::var("GAME_DEBUG_COSMIC_BLOOM").is_ok_and(|value| value == "0");
+        let hdr_format = if post_disabled {
+            tracing::info!("GAME_DEBUG_COSMIC_POST=0: LDR bypass forced");
+            None
+        } else {
             match select_hdr_format(|format| hdr_support(self.device.physical_device(), format)) {
                 HdrSelection::Hdr(format) => Some(format),
                 HdrSelection::LdrBypass => None,
-            };
+            }
+        };
         // Scene + post passes exist regardless (cheap objects); the
         // transient images driving them exist only in HDR mode.
         let scene_format = hdr_format.unwrap_or(swapchain.image_format());
@@ -5116,7 +5166,14 @@ impl ViewerApp {
                 "bloom resolve",
             ),
         };
-        (render_pass, pipelines, hdr_format, scene_pass, post_pass)
+        (
+            render_pass,
+            pipelines,
+            hdr_format,
+            bloom_enabled,
+            scene_pass,
+            post_pass,
+        )
     }
 
     /// Build (or rebuild, on swapchain recreate) the transient HDR
@@ -5144,24 +5201,24 @@ impl ViewerApp {
             },
         )
         .expect("HDR scene framebuffer must create");
-        let half_a_view = create_post_view(memory_allocator, half, format, "bloom half A");
-        let half_a_fb = Framebuffer::new(
-            ctx.post_pass.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![half_a_view.clone()],
-                ..Default::default()
-            },
-        )
-        .expect("bloom half-A framebuffer must create");
-        let half_b_view = create_post_view(memory_allocator, half, format, "bloom half B");
-        let half_b_fb = Framebuffer::new(
-            ctx.post_pass.clone(),
-            FramebufferCreateInfo {
-                attachments: vec![half_b_view.clone()],
-                ..Default::default()
-            },
-        )
-        .expect("bloom half-B framebuffer must create");
+        // Five dedicated bloom targets (A–E): bright→A, blur-H A→B,
+        // blur-V B→C, wide-H C→D, wide-V D→E(final). No target is
+        // ever rewritten — see the `HdrChain` doc.
+        let mut bloom_views = Vec::with_capacity(5);
+        let mut bloom_fbs = Vec::with_capacity(5);
+        for what in ["A", "B", "C", "D", "E"] {
+            let view = create_post_view(memory_allocator, half, format, what);
+            let fb = Framebuffer::new(
+                ctx.post_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![view.clone()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("bloom {what} framebuffer must create: {error:?}"));
+            bloom_views.push(view);
+            bloom_fbs.push(fb);
+        }
         let pipes = &ctx.pipelines;
         let bright_set = post_image_set(
             descriptor_set_allocator,
@@ -5170,45 +5227,53 @@ impl ViewerApp {
             post_sampler,
             "bloom bright",
         );
-        let blur_a_set = post_image_set(
-            descriptor_set_allocator,
-            &pipes.blur,
-            &half_a_view,
-            post_sampler,
-            "bloom blur A",
-        );
-        let blur_b_set = post_image_set(
-            descriptor_set_allocator,
-            &pipes.blur,
-            &half_b_view,
-            post_sampler,
-            "bloom blur B",
-        );
+        let mut blur_sets = Vec::with_capacity(4);
+        for (view, tag) in bloom_views.iter().zip(["A", "B", "C", "D"]) {
+            blur_sets.push(post_image_set(
+                descriptor_set_allocator,
+                &pipes.blur,
+                view,
+                post_sampler,
+                &format!("bloom blur {tag}"),
+            ));
+        }
         // Resolve samples two images (scene + final bloom): the second
         // pair is written against the same layout explicitly.
         let resolve_layout = pipes.resolve.layout().set_layouts()[0].clone();
-        let resolve_set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            resolve_layout,
-            [
-                WriteDescriptorSet::image_view(0, scene_view.clone()),
-                WriteDescriptorSet::sampler(1, post_sampler.clone()),
-                WriteDescriptorSet::image_view(2, half_a_view.clone()),
-                WriteDescriptorSet::sampler(3, post_sampler.clone()),
-            ],
-            [],
-        )
-        .expect("bloom resolve descriptor set must create");
+        let resolve_pair = |bloom_view: &Arc<ImageView>, what: &str| {
+            DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                resolve_layout.clone(),
+                [
+                    WriteDescriptorSet::image_view(0, scene_view.clone()),
+                    WriteDescriptorSet::sampler(1, post_sampler.clone()),
+                    WriteDescriptorSet::image_view(2, bloom_view.clone()),
+                    WriteDescriptorSet::sampler(3, post_sampler.clone()),
+                ],
+                [],
+            )
+            .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error:?}"))
+        };
+        let resolve_set = resolve_pair(&bloom_views[4], "bloom resolve");
+        let resolve_nobloom_set = resolve_pair(&bloom_views[0], "bloom resolve nobloom");
+        let mut fbs = bloom_fbs.into_iter();
+        let mut sets = blur_sets.into_iter();
         Some(HdrChain {
             format,
             scene_fb,
-            half_a_fb,
-            half_b_fb,
+            bloom_a_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_b_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_c_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_d_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_e_fb: fbs.next().expect("five bloom framebuffers"),
             half_extent: half,
             bright_set,
-            blur_a_set,
-            blur_b_set,
+            blur_a_set: sets.next().expect("four bloom sets"),
+            blur_b_set: sets.next().expect("four bloom sets"),
+            blur_c_set: sets.next().expect("four bloom sets"),
+            blur_d_set: sets.next().expect("four bloom sets"),
             resolve_set,
+            resolve_nobloom_set,
         })
     }
 }
@@ -5293,7 +5358,7 @@ impl ViewerApp {
             )
             .expect("swapchain must create")
         };
-        let (render_pass, pipelines, hdr_format, scene_pass, post_pass) =
+        let (render_pass, pipelines, hdr_format, bloom_enabled, scene_pass, post_pass) =
             self.build_pipelines(&swapchain);
         let depth_view = create_depth_view(&self.memory_allocator, swapchain.image_extent());
         let framebuffers = window_size_dependent_setup(&images, &render_pass, &depth_view);
@@ -5310,6 +5375,7 @@ impl ViewerApp {
             recreate_swapchain: false,
             previous_frame_end: Some(sync::now(self.device.clone()).boxed()),
             hdr_format,
+            bloom_enabled,
             scene_pass,
             post_pass,
             hdr: None,
@@ -6963,7 +7029,7 @@ impl ViewerApp {
                 .begin_render_pass(
                     RenderPassBeginInfo {
                         clear_values: vec![Some(black)],
-                        ..RenderPassBeginInfo::framebuffer(hdr.half_a_fb.clone())
+                        ..RenderPassBeginInfo::framebuffer(hdr.bloom_a_fb.clone())
                     },
                     SubpassBeginInfo {
                         contents: SubpassContents::Inline,
@@ -6998,12 +7064,37 @@ impl ViewerApp {
                 .expect("bloom bright pass must end");
             let hw = hdr.half_extent[0] as f32;
             let hh = hdr.half_extent[1] as f32;
-            for (dst, set, step) in [
-                (&hdr.half_b_fb, &hdr.blur_a_set, [1.0 / hw, 0.0]),
-                (&hdr.half_a_fb, &hdr.blur_b_set, [0.0, 1.0 / hh]),
-                (&hdr.half_b_fb, &hdr.blur_a_set, [2.0 / hw, 0.0]),
-                (&hdr.half_a_fb, &hdr.blur_b_set, [0.0, 2.0 / hh]),
-            ] {
+            // Dedicated targets per step (see `HdrChain`): bright→A,
+            // H:A→B, V:B→C, wide-H:C→D, wide-V:D→E(final). No target
+            // is ever rewritten. `GAME_DEBUG_COSMIC_BLOOM=0` skips the
+            // chain: the resolve then adds the sharp bright extract.
+            let blur_steps = if ctx.bloom_enabled {
+                vec![
+                    (
+                        hdr.bloom_b_fb.clone(),
+                        hdr.blur_a_set.clone(),
+                        [1.0 / hw, 0.0],
+                    ),
+                    (
+                        hdr.bloom_c_fb.clone(),
+                        hdr.blur_b_set.clone(),
+                        [0.0, 1.0 / hh],
+                    ),
+                    (
+                        hdr.bloom_d_fb.clone(),
+                        hdr.blur_c_set.clone(),
+                        [2.0 / hw, 0.0],
+                    ),
+                    (
+                        hdr.bloom_e_fb.clone(),
+                        hdr.blur_d_set.clone(),
+                        [0.0, 2.0 / hh],
+                    ),
+                ]
+            } else {
+                Vec::new()
+            };
+            for (dst, set, step) in &blur_steps {
                 builder
                     .begin_render_pass(
                         RenderPassBeginInfo {
@@ -7027,7 +7118,11 @@ impl ViewerApp {
                         set.clone(),
                     )
                     .expect("bloom blur set must bind")
-                    .push_constants(pipes.blur.layout().clone(), 0, BloomBlurPush { step })
+                    .push_constants(
+                        pipes.blur.layout().clone(),
+                        0,
+                        BloomBlurPush { step: *step },
+                    )
                     .expect("bloom blur push must upload");
                 // SAFETY: fullscreen-triangle pipeline, no vertex
                 // input — 3 unbuffered vertices are the whole draw.
@@ -7137,6 +7232,14 @@ impl ViewerApp {
                             extent: [win_w, win_h],
                             depth_range: 0.0..=1.0,
                         };
+                        // Full bloom chain: scene + final bloom (E).
+                        // `GAME_DEBUG_COSMIC_BLOOM=0`: scene + bright
+                        // extract (A) — E is never written there.
+                        let resolve_set = if ctx.bloom_enabled {
+                            hdr.resolve_set.clone()
+                        } else {
+                            hdr.resolve_nobloom_set.clone()
+                        };
                         builder
                             .set_viewport(0, [full_vp].into_iter().collect())
                             .expect("viewport must set")
@@ -7146,7 +7249,7 @@ impl ViewerApp {
                                 PipelineBindPoint::Graphics,
                                 ctx.pipelines.resolve.layout().clone(),
                                 0,
-                                hdr.resolve_set.clone(),
+                                resolve_set,
                             )
                             .expect("bloom resolve set must bind")
                             .push_constants(
@@ -7647,6 +7750,31 @@ mod tests {
             assert!(
                 source.contains(name),
                 "{what} input missing from its vertex shader"
+            );
+        }
+    }
+
+    #[test]
+    fn cosmic_shader_safety_pins() {
+        // Regression pins for the visual-issue fix
+        // (update-2026-09-18-2328): the sprite falloff must hit
+        // exactly zero at the rim (else full quads), and the redshift
+        // depth term must be clamped non-negative and capped (else
+        // Inf/NaN/negative channels decorrelate into rainbow squares).
+        // String pins, because neither naga nor any GPU-free test can
+        // evaluate the shaders.
+        for (source, literal, what) in [
+            (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
+            (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
+            (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
+            (WEBLINE_VERT, "max(clip.w, 0.0)", "webline depth clamp"),
+        ] {
+            assert!(source.contains(literal), "{what} missing from its shader");
+        }
+        for source in [GLOW_VERT, WEBLINE_VERT] {
+            assert!(
+                source.contains(", 0.5)"),
+                "redshift cap missing from a cosmic vertex shader"
             );
         }
     }

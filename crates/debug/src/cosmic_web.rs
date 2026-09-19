@@ -139,7 +139,9 @@ pub fn node_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f
         .collect()
 }
 
-/// Dwarf glow points as tuples (`misc = (1.5 px, 0.45 alpha, kind 0)`).
+/// Dwarf glow points as tuples (`misc = (1.5 px, 0.12 alpha, kind
+/// 0)` — dim filament body; the additive chain saturates fast, so
+/// alphas stay small by design).
 pub fn glow_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     web.glow_mpc
         .iter()
@@ -151,7 +153,7 @@ pub fn glow_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f
                     (f64::from(g[2]) - origin.z) as f32,
                 ],
                 [0.58, 0.55, 0.88],
-                [1.5, 0.45, 0.0],
+                [1.5, 0.12, 0.0],
             )
         })
         .collect()
@@ -345,7 +347,9 @@ pub fn braid_segments(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<([f3
             0.42 + 0.36 * density,
             0.85 + 0.20 * density,
         ];
-        let alpha = 0.30 + 0.60 * density;
+        // Kept modest: dozens of strands cross per pixel, and the
+        // additive chain saturates fast.
+        let alpha = 0.18 + 0.40 * density;
         for strand in &shape.strands {
             for s in 0..BRAID_SUBDIVISIONS {
                 for end in [s, s + 1] {
@@ -435,7 +439,7 @@ pub fn grain_cloud(
             let c = braid_point(pa, raw_d, shape.u, shape.v, &shape.wander, strand, t);
             let j1 = ihalf3(&mut rng) * 2.0 * sigma;
             let j2 = ihalf3(&mut rng) * 2.0 * sigma;
-            let bright = 0.5 + 0.7 * rng.unit_f64();
+            let bright = 0.35 + 0.55 * rng.unit_f64();
             let size = 1.5 + rng.unit_f64();
             out.push((
                 [
@@ -448,7 +452,8 @@ pub fn grain_cloud(
                     (0.62 * bright) as f32,
                     (1.0 * bright) as f32,
                 ],
-                [size as f32, 0.5, 0.0],
+                // Grain textures; it must not light the scene.
+                [size as f32, 0.08, 0.0],
             ));
         }
     }
@@ -458,8 +463,11 @@ pub fn grain_cloud(
 
 /// Node impostors as `(position, color, misc)` tuples: two sprites per
 /// node — an emissive hot core (channels > 1.0, mass-graded, the bloom
-/// threshold's target) plus a soft pale-cyan halo. Pure function of
-/// node mass/position (no RNG): same node → same impostors, everywhere.
+/// threshold's target; `kind` 0 = fixed pixel size) plus a soft
+/// pale-cyan halo (`kind` 1 = world-unit diameter in Mpc, so it
+/// shrinks with distance instead of plastering fixed-size quads over
+/// the whole web — the visual-issue fix). Pure function of node
+/// mass/position (no RNG): same node → same impostors, everywhere.
 pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     let mut out = Vec::with_capacity(web.nodes.len() * 2);
     for node in &web.nodes {
@@ -470,14 +478,16 @@ pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32
             (node.position_mpc[2] - origin.z) as f32,
         ];
         let base = node_color(node.mass_msun);
-        let emissive = 1.5 + 2.5 * l;
-        // Hot core: small, near-white, emissive.
+        // Emissive enough to cross the bloom threshold (1.0) without
+        // flooding the additive chain.
+        let emissive = 1.2 + 1.3 * l;
+        // Hot core: small, near-white, emissive, fixed pixel size.
         out.push((
             pos,
             [base[0] * emissive, base[1] * emissive, base[2] * emissive],
             [2.5 + 3.5 * l, 1.0, 0.0],
         ));
-        // Halo: large, pale cyan, faint.
+        // Halo: large, pale cyan, faint, world-sized (Mpc diameter).
         out.push((
             pos,
             [
@@ -485,7 +495,7 @@ pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32
                 0.72 * (0.5 + 0.5 * l),
                 1.0 * (0.5 + 0.5 * l),
             ],
-            [10.0 + 18.0 * l, 0.4, 0.0],
+            [2.0 + 6.0 * l, 0.10, 1.0],
         ));
     }
     out
@@ -731,14 +741,20 @@ mod tests {
             let (core, halo) = (&impostors[2 * i], &impostors[2 * i + 1]);
             // Same position (the hub).
             assert_eq!(core.0, halo.0);
-            // Core is emissive (bloom target), small, fully opaque;
-            // halo is large and faint.
+            // Core is emissive (bloom target), fixed pixel size, fully
+            // opaque; halo is world-sized (kind 1, Mpc) and fainter.
             assert!(
                 core.1.iter().any(|c| *c > 1.0),
                 "core must be emissive: {:?}",
                 core.1
             );
-            assert!(core.2[0] < halo.2[0], "halo must dwarf the core");
+            assert_eq!(core.2[2], 0.0, "core must be pixel-sized");
+            assert_eq!(halo.2[2], 1.0, "halo must be world-sized");
+            assert!(
+                (2.0..=8.0).contains(&halo.2[0]),
+                "halo world diameter out of band: {}",
+                halo.2[0]
+            );
             assert!(halo.2[1] < core.2[1], "halo must be fainter");
         }
         // Mass grading: the 1e15 node outshines the 5e12 node.
@@ -793,6 +809,60 @@ mod tests {
                     "axis {axis}: {delta} vs {want}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn enrichment_layouts_are_finite_and_bounded() {
+        // GPU-debug aid (visual-issue round 2): scans every emitted
+        // vertex of the nominal web for non-finite or out-of-band
+        // values. The shaders assume finite inputs with sane
+        // magnitudes — Inf/NaN here would decorrelate color channels
+        // through the additive chain into rainbow squares on screen.
+        let web = web();
+        let origin = DVec3::ZERO;
+        let seed = 1234;
+        for (pos, rgba) in braid_segments(&web, seed, origin) {
+            for axis in 0..3 {
+                assert!(pos[axis].is_finite(), "braid pos not finite");
+                assert!(
+                    rgba[axis].is_finite() && (0.0..=2.0).contains(&rgba[axis]),
+                    "braid color out of band: {:?}",
+                    rgba
+                );
+            }
+            assert!(
+                rgba[3].is_finite() && (0.0..=1.0).contains(&rgba[3]),
+                "braid alpha out of band: {:?}",
+                rgba
+            );
+        }
+        let points = grain_cloud(&web, seed, origin)
+            .into_iter()
+            .chain(glow_point_cloud(&web, origin))
+            .chain(node_impostors(&web, origin))
+            .collect::<Vec<_>>();
+        assert!(!points.is_empty());
+        for (pos, color, misc) in &points {
+            for axis in 0..3 {
+                assert!(pos[axis].is_finite(), "point pos not finite");
+                assert!(
+                    color[axis].is_finite() && (0.0..=5.0).contains(&color[axis]),
+                    "point color out of band: {color:?}"
+                );
+            }
+            assert!(
+                misc[0].is_finite() && (0.0..=300.0).contains(&misc[0]),
+                "sprite size out of band: {misc:?}"
+            );
+            assert!(
+                misc[1].is_finite() && (0.0..=1.0).contains(&misc[1]),
+                "sprite alpha out of band: {misc:?}"
+            );
+            assert!(
+                misc[2] == 0.0 || misc[2] == 1.0,
+                "sprite kind must be 0 or 1: {misc:?}"
+            );
         }
     }
 
