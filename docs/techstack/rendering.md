@@ -304,10 +304,13 @@ non-negative and capped, spec §9.1; unbounded tint decorrelated
 channels into rainbow squares on screen). The shared alpha `map`/`line`
 pipelines and every other surface are untouched. In HDR mode the
 same draws record into an offscreen HDR scene pass (indigo clear),
-then a half-res bright extract, two H/V separable Gaussian blur
-passes ping-ponging with a widening step (tight flare + wide haze),
-then the bloom-composite ACES resolve into the swapchain image; the
-inspector marker and all UI draw after the resolve. Fullscreen
+then five dedicated bloom targets (A–E) at half-res: bright extract
+→ A, H blur A → B, V blur B → C, wide-H C → D, wide-V D → E (final).
+Every target is written exactly once, then only read — never ping-
+ponged (Intel UHD 620 corruption workaround, see
+`docs/reports/2026-09-19-intel-hdr-bloom-corruption.md`). The
+bloom-composite ACES resolve reads scene + E into the swapchain
+image; the inspector marker and all UI draw after the resolve. Fullscreen
 passes reuse `RESOLVE_VERT` empty-vertex-input triangles with
 the `post.rs` NDC-top-row UV contract (`v_uv = vec2(pos.x, 1.0 -
 pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,

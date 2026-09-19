@@ -186,7 +186,7 @@ pub fn assemble(
     let count = accepted.len();
     let mut positioned: Vec<([f64; 3], f64)> = Vec::with_capacity(count);
     for (rank, cell) in accepted.iter().enumerate() {
-        let u = (rank as f64 + 0.5) / count.max(1) as f64;
+        let u = 1.0 - (rank as f64 + 0.5) / count.max(1) as f64;
         let mass = params.mass_star_msun * table.quantile(u);
         positioned.push((to_mpc(*cell), mass));
     }

@@ -39,8 +39,9 @@ on every platform.
 - White Gaussian noise on a periodic 128^3 integer Lagrangian lattice
   (4 Mpc/cell = 512 Mpc box).
 - Irwin-Hall shaping (sum of 12 uniform randoms = N(0,1), no transcendentals).
-- Weighted dyadic box smoothings at 3 scales (cells 1, 2, 4; weights
-  0.35, 0.7, 1.0) approximating a Lambda-CDM power spectrum rollover.
+- Weighted dyadic box smoothings at 3 scales (sigmas 1, 2, 4 cells;
+  radii 2, 3, 7 cells via `round(σ·√3)`; weights 0.35, 0.7, 1.0)
+  approximating a Lambda-CDM power spectrum rollover.
 - Output: standardized zero-mean, unit-variance potential field Psi.
 
 ### Stage B — Zel'dovich displacement (`web/displace.rs`)
@@ -58,9 +59,11 @@ on every platform.
 - Tidal tensor H_ij from second central differences of the potential.
 - Jacobi eigenvalue solver (fixed 8 sweeps, sqrt-only rotations —
   no sin/cos/convergence branches, ensuring bit-identical replay).
-- Classification per cell by number of eigenvalues below threshold:
+- Classification per cell by number of eigenvalues below
+  −λ_th (strongly negative, collapsed axis):
   3 = **NODE**, 2 = **FILAMENT**, 1 = **SHEET**, 0 = **VOID**
-  (Forero-Romero T-web).
+  (Forero-Romero T-web). Threshold `web_threshold = 0.06`; the
+  test is `eig < −web_threshold` (`classify.rs:174`).
 - Deep voids (density < 10% of mean) skip the eigensolver.
 - Peak extraction: local density maxima in 3x3x3 neighborhoods,
   densest-first, min 6 Mpc separation, targeting ~6000 nodes.
@@ -70,7 +73,8 @@ on every platform.
 
 ### Stage D — Descriptor assembly (`web/descriptor.rs`)
 
-- **Nodes**: ~5000-8000 halo nodes with f64 Mpc positions (parabolic
+- **Nodes**: ~3000-8000 halo nodes (test band; nominal exactly 6,000 at
+  seed 1234) with f64 Mpc positions (parabolic
   sub-cell refinement), Press-Schechter masses (5e12 to >3e14 Msun),
   virial radii from M = 200*rho_c*4/3*pi*r^3.
 - **Filament links**: spatial grid linking, max 60 Mpc separation, 8
@@ -88,7 +92,7 @@ on every platform.
 |-----------|---------|------|
 | `lattice_cells` | 128 | Grid resolution per axis |
 | `cell_size_mpc` | 4.0 | Mpc per cell |
-| `descriptor_radius_mpc` | 250.0 | Renderable sphere radius |
+| `descriptor_radius_mpc` | 250.0 | Camera extent + validation (not a generation cut) |
 | `growth_factor` | 3.0 | Zel'dovich displacement strength |
 | `web_threshold` | 0.06 | T-web eigenvalue collapse cutoff |
 | `void_density_ratio` | 0.1 | Void definition (< 10% mean density) |
@@ -125,7 +129,7 @@ link trunk:
 - **Lateral amplitude**: ~1.5 Mpc (`BRAID_AMPLITUDE_MPC`).
 - **Colors**: dim indigo `[0.40, 0.42, 0.85]` at low density grading
   to bright cyan-violet `[0.72, 0.78, 1.05]` at full density.
-- **Alpha**: 0.18-0.58, multiplied by taper.
+- **Alpha**: 0.18-0.58, multiplied by √taper (not taper directly).
 
 ### 3b. Particulate grain (`grain_cloud`)
 
@@ -148,7 +152,9 @@ Two sprites per node:
   cross the bloom threshold. Fixed pixel size (2.5-6 px). This is the
   bloom target — the bright cores produce the soft glow halos.
 - **Soft halo**: pale cyan, faint (alpha 0.10), world-sized in Mpc
-  (2-8 Mpc diameter based on virial radius). Shrinks with distance.
+  (2-8 Mpc diameter based on mass log-grade `l`, same as the core
+  color grade — `node_impostors` never reads `virial_radius_mpc`).
+  Shrinks with distance.
 
 ### 3d. Base descriptor glow (`glow_point_cloud`)
 
@@ -162,7 +168,9 @@ particulate haze.
 
 ### Pipelines (in `crates/debug/src/main.rs`)
 
-Three Vulkan graphics pipelines, all additive:
+Three pipeline types (five compiled objects — LDR + HDR scene variants
+for Glow and Webline, shared Map). Glow and Webline are additive;
+Map is standard alpha:
 
 | Pipeline | Topology | Blend | Role |
 |----------|----------|-------|------|
@@ -216,21 +224,27 @@ On capable devices (R16G16B16A16_SFLOAT or B10G11R11_UFLOAT_PACK32):
 
 ### Pass chain
 
+Five dedicated bloom targets (A–E), all at half-res:
+
 ```
 HDR scene pass (indigo clear + cosmic draws)
     ↓
-Bright extract (half-res, threshold at 1.0, ceiling at 64.0)
+Bright extract → target A (half-res, threshold 1.0, ceiling 64.0)
     ↓
-Blur H pass 1 (half-res, 9-tap Gaussian, sigma = 1.6 texels)
+Blur H pass 1: A → B (half-res, 9-tap Gaussian, σ = 1.6, step 1/texel)
     ↓
-Blur V pass 1 (half-res, same kernel)
+Blur V pass 1: B → C (half-res, same kernel, step 1/texel)
     ↓
-Blur H pass 2 (quarter-res, wider step)
+Blur H pass 2: C → D (half-res, same kernel, step 2/texels — wider reach)
     ↓
-Blur V pass 2 (quarter-res, same kernel)
+Blur V pass 2: D → E (half-res, same kernel, step 2/texels)
     ↓
-Bloom-composite resolve: aces_fit(hdr * exposure + bloom * intensity)
+Bloom-composite resolve: aces_fit(hdr * exposure + E * intensity)
 ```
+
+All five targets are allocated at the **same half extent**; pass 2 uses
+a wider **2× texel step** for a broader blur kernel, not a quarter-res
+downsample. Every target is written exactly once (see rule below).
 
 - **Exposure**: 1.0
 - **Bloom intensity**: 0.85
@@ -268,7 +282,7 @@ swapchain (no bloom, no tonemap).
 
 | Element | Count |
 |---------|-------|
-| Nodes (galaxy clusters/groups) | ~5,000-8,000 |
+| Nodes (galaxy clusters/groups) | ~3,000-8,000 (test band) |
 | Filament links | ~20,000 |
 | Dwarf glow points | up to 150,000 |
 | Grain points | up to 800,000 |
@@ -307,6 +321,31 @@ swapchain (no bloom, no tonemap).
 - **Galaxy maps**: a separate `BackdropSprite` field (400 dim sprites)
   provides a simpler cosmic web backdrop for the far-away galaxy map
   view.
+
+---
+
+## 8b. Known limitations
+
+- **Redshift saturation**: `COSMIC_REDSHIFT_PER_MPC = 0.004` hits the
+  z = 0.5 cap at 125 Mpc of view depth. Most of a 500 Mpc web viewed
+  from one edge renders at maximum redshift — the primary depth cue is
+  effectively binary beyond 125 Mpc.
+- **No depth occlusion**: depth test with writes off and nothing writing
+  depth; distant node cores shine through foreground filaments. Combined
+  with saturation, depth ordering beyond 125 Mpc collapses.
+- **gl_PointSize clamp at 256 px** (`main.rs:396`): near-camera
+  world-sized halos saturate silently.
+- **Zero culling / LOD**: ~2.18 M vertices and ~1 M additive sprites
+  are drawn every frame regardless of camera distance or frustum.
+- **Braid vertex duplication**: LineList emits 20 verts/strand vs 11
+  for a strip (+82% vertex traffic on 1.22 M braid verts).
+- **Env kill-switches**: `GAME_DEBUG_COSMIC_POST=0` forces LDR;
+  `GAME_DEBUG_COSMIC_BLOOM=0` keeps HDR scene but skips blur chain
+  (`main.rs:5115-5117`). Present in code, not previously documented.
+- **Dual buffer sets**: ~137 MB resident (demo + inspector), inspector
+  rebuilt redundantly on every demo rebase (`main.rs:4806-4831`).
+- **Player marker**: 1-vertex `Buffer::from_iter` allocated every frame
+  (`main.rs:4861-4864`).
 
 ---
 
@@ -360,8 +399,10 @@ swapchain (no bloom, no tonemap).
 > node impostors** (bloom-target cores + world-sized halos). Rendered
 > through **additive point/line pipelines** on a deep indigo clear,
 > with **HDR bloom** (bright extract + 2-scale separable Gaussian blur +
-> ACES resolve) and **Hubble redshift tinting** in the vertex shader.
-> Every visual layer derives deterministically from `(seed, version,
-> params)` — the enrichment is render-only and never affects gameplay.
-> Key files: `web/mod.rs` (generation), `cosmic_web.rs` (enrichment),
-> `main.rs` (GPU pipelines + HdrChain).
+> ACES resolve, five dedicated write-once targets) and **Hubble redshift
+> tinting** in the vertex shader. Generation replays identically per
+> `(seed, version, params)` on every platform (hash quantized to hide
+> 1-ulp libm drift). Enrichment is render-only, uses std sin/cos (same-
+> platform replay only, not cross-platform bit-identical), and never
+> affects gameplay. Key files: `web/mod.rs` (generation),
+> `cosmic_web.rs` (enrichment), `main.rs` (GPU pipelines + HdrChain).

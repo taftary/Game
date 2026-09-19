@@ -50,8 +50,11 @@ pub use web::{CosmicWebParams, WebDescriptor, WebLink, WebNode, generate_cosmic_
 /// change; stamped into every descriptor. Version bump = migration or
 /// new game, never silent drift (see `docs/game/universe.md` rules).
 ///
-/// v2 (v0.3.2 `cosmic-scale-player`): adds the stage-0 cosmic web. Stage
-/// 1–2 streams are domain-separated and untouched, so galaxies and
-/// systems replay identically — only their hashes re-roll via the stamp
-/// (the migration signal working as designed).
-pub const UNIVERSE_VERSION: u32 = 2;
+/// v3 (v0.3.2 `cosmic-web-mass-rank-fix`): fixes inverted mass-rank
+/// assignment in the stage-0 cosmic web — densest peak now correctly
+/// receives the rarest (most massive) halo.  Stage 1–2 streams are
+/// domain-separated and untouched, so galaxies and systems replay
+/// identically — only their hashes re-roll via the stamp.
+///
+/// v2 (v0.3.2 `cosmic-scale-player`): adds the stage-0 cosmic web.
+pub const UNIVERSE_VERSION: u32 = 3;

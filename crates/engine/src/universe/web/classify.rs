@@ -1,11 +1,12 @@
 //! Stage C — T-web classification, node peaks, halo masses.
 //!
 //! Physics: the tidal tensor T_ij = ∂²Φ/∂x_i∂x_j of the initial
-//! potential decides collapse dimensionality — 3 eigenvalues above
-//! threshold = node, 2 = filament, 1 = sheet, 0 = void (Forero-Romero
-//! T-web). Halo masses follow the Press–Schechter n=0 shape (power law
-//! with exponential cutoff above M\*), assigned by rank: the densest
-//! peak gets the rarest mass.
+//! potential decides collapse dimensionality — an axis is "collapsed"
+//! when its Hessian eigenvalue λ < −web_threshold (strongly negative).
+//! Classification by count of collapsed axes: 3 = node, 2 = filament,
+//! 1 = sheet, 0 = void (Forero-Romero T-web). Halo masses follow the
+//! Press–Schechter n=0 shape (power law with exponential cutoff above
+//! M\*), assigned by rank: the densest peak gets the rarest mass.
 //!
 //! Determinism design (read carefully — this is the delicate file):
 //! eigenvalues come from Jacobi rotations with a FIXED sweep count and

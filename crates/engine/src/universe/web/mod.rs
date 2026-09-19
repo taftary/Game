@@ -278,6 +278,26 @@ mod tests {
     }
 
     #[test]
+    fn masses_decrease_with_density_rank() {
+        // Regression: densest accepted peak must have the largest mass,
+        // least-dense the smallest.  (Pre-fix, the rank was inverted.)
+        let web = generate_cosmic_web(1234, &nominal());
+        assert!(
+            web.nodes.len() >= 2,
+            "need at least 2 nodes for the rank check"
+        );
+        for i in 0..web.nodes.len() - 1 {
+            assert!(
+                web.nodes[i].mass_msun >= web.nodes[i + 1].mass_msun,
+                "mass rank inversion at index {}: {} < {}",
+                i,
+                web.nodes[i].mass_msun,
+                web.nodes[i + 1].mass_msun,
+            );
+        }
+    }
+
+    #[test]
     fn ulp_perturbation_cannot_flip_web_hash() {
         // Drift model: 1 ulp relative (toward +inf) on the libm-derived
         // fields — masses via the exp-built PS table, radii via cbrt.
@@ -327,7 +347,7 @@ mod tests {
         // change updates these alongside a UNIVERSE_VERSION bump.
         assert_eq!(
             web_hash(&generate_cosmic_web(1234, &CosmicWebParams::nominal())),
-            14_062_203_475_186_774_008
+            17_301_221_795_867_311_725
         );
     }
 }

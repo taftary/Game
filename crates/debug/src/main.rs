@@ -5177,8 +5177,9 @@ impl ViewerApp {
     }
 
     /// Build (or rebuild, on swapchain recreate) the transient HDR
-    /// bloom resources for the window: scene target + depth, half-res
-    /// bloom ping-pong pair, and the four sampling sets. `None` in LDR
+    /// bloom resources for the window: scene target + depth, five
+    /// dedicated bloom targets A-E (write-once, never ping-ponged),
+    /// and their sampling sets. `None` in LDR
     /// bypass (no transients — the cosmic draws go direct). Associated
     /// function (not a method) so the recreate path can pass disjoint
     /// `self` fields alongside the `&mut` window context.
@@ -7015,10 +7016,10 @@ impl ViewerApp {
             builder
                 .end_render_pass(Default::default())
                 .expect("HDR scene pass must end");
-            // Bloom chain at half res: bright extract, then two H/V
-            // separable passes ping-ponging A/B with a widening
-            // step (tight flare plus wide haze). Final bloom lands
-            // back in A, which the resolve samples.
+            // Bloom chain at half res: bright extract, then four H/V
+            // separable blur passes through dedicated targets A-E
+            // (write-once, never ping-ponged). Final bloom lands in
+            // E, which the resolve samples.
             let half_vp = Viewport {
                 offset: [0.0, 0.0],
                 extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],

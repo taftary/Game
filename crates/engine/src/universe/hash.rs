@@ -272,7 +272,7 @@ mod tests {
         // change updates these alongside a UNIVERSE_VERSION bump.
         assert_eq!(
             galaxy_hash(&generate_galaxy(1234, 100)),
-            11_228_504_424_767_388_277
+            4_159_227_938_759_867_464
         );
         let galaxy = generate_galaxy(1234, 100);
         assert_eq!(

@@ -92,6 +92,7 @@ commit when it reaches `done` (workflow rule:
 |---|---|---|
 | [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | done | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
 | [`settings-seed-loader`](../../plans/v0.3.2/settings-seed-loader/) | done | dev tooling (single Settings seed editor + staged load progress) |
+| [`cosmic-web-mass-rank-fix`](../../plans/v0.3.2/cosmic-web-mass-rank-fix/) | in-progress | bugfix: densest peak now gets rarest mass (UNIVERSE_VERSION 2→3) |
 
 ## Post-v0.3 (unscheduled)
 
@@ -108,6 +109,14 @@ commit when it reaches `done` (workflow rule:
   the player-traversable cosmic web as the demo's starting dimension;
   region streaming, sheet rendering, and frame handoff stay follow-ups
   per ADR-023.)
+- **Cosmic web roadmap** (decisions 2026-09-19): stability-first ordering.
+  Immediate: perf measurement + tier budgets → LOD/culling → cheap wins
+  (redshift rescale, braid strip, marker caching) → filament ribbons.
+  One batched descriptor change (UNIVERSE_VERSION bump): dominant long
+  filaments + sheet/density export + sheet sprite render. Volumetric
+  raymarching deferred to discrete-GPU tiers only. Compute-grain dropped
+  (build-time cost, not per-frame). SDSS overlay deferred (data-ingest
+  project). 2LPT deferred until nested grids exist.
 
 ## Open product items (spec §10 — must not be silently dropped)
 
