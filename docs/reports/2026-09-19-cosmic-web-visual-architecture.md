@@ -127,9 +127,13 @@ link trunk:
 - **Taper**: `sin(t * Pi)` so strands melt to zero at node endpoints,
   creating smooth transitions into cluster hubs.
 - **Lateral amplitude**: ~1.5 Mpc (`BRAID_AMPLITUDE_MPC`).
-- **Colors**: dim indigo `[0.40, 0.42, 0.85]` at low density grading
-  to bright cyan-violet `[0.72, 0.78, 1.05]` at full density.
-- **Alpha**: 0.18-0.58, multiplied by √taper (not taper directly).
+- **Colors** (update-2026-09-19-1933): dim indigo `[0.18, 0.22, 0.60]`
+  at low density grading to bright blue-violet `[0.48, 0.57, 1.95]` at
+  full density — the blue channel sits past the bloom threshold after
+  premultiplication so dense filaments glow.
+- **Alpha**: 0.05-1.00 by density (floor dropped from 0.18 in
+  update-2026-09-19-1933 so voids read dark), multiplied by √taper
+  (not taper directly).
 
 ### 3b. Particulate grain (`grain_cloud`)
 
@@ -147,19 +151,23 @@ Up to 800,000 sprite points along the braid strands:
 Two sprites per node:
 
 - **Hot core**: mass-graded emissive color (blue-white dwarfs to
-  yellow-white giants, RGB from `[0.62, 0.70, 1.00]` to
-  `[1.00, 0.93, 0.72]`), multiplied by emissive factor 1.2-2.5x to
-  cross the bloom threshold. Fixed pixel size (2.5-6 px). This is the
-  bloom target — the bright cores produce the soft glow halos.
-- **Soft halo**: pale cyan, faint (alpha 0.10), world-sized in Mpc
-  (2-8 Mpc diameter based on mass log-grade `l`, same as the core
-  color grade — `node_impostors` never reads `virial_radius_mpc`).
-  Shrinks with distance.
+  golden giants, RGB from `[0.60, 0.68, 1.00]` to `[1.00, 0.88, 0.62]`
+  via the shared `mass_level` ramp — re-centered 1e12–3e14 M☉ in
+  update-2026-09-19-1933 so ordinary cluster hubs read golden),
+  multiplied by emissive factor 1.5-5.0x to cross the bloom threshold.
+  Fixed pixel size (3-12 px — big enough that the blur chain keeps a
+  visible halo). This is the bloom target — the bright cores produce
+  the soft glow halos.
+- **Soft halo**: mass-warmed cyan→gold, faint (alpha 0.14-0.24 by
+  mass), world-sized in Mpc (3-8 Mpc diameter based on the same
+  `mass_level` grade — `node_impostors` never reads
+  `virial_radius_mpc`). Shrinks with distance.
 
 ### 3d. Base descriptor glow (`glow_point_cloud`)
 
-Dwarf glow points from the descriptor: lavender `[0.58, 0.55, 0.88]`,
-1.5 px, alpha 0.12. These fill the filament bodies with a dim
+Dwarf glow points from the descriptor: lavender `[0.55, 0.54, 0.90]`,
+1.5 px, alpha 0.09 (lowered from 0.12 in update-2026-09-19-1933 for
+void-darkness headroom). These fill the filament bodies with a dim
 particulate haze.
 
 ---
@@ -184,16 +192,22 @@ lines accumulate freely, creating brighter intersections at nodes.
 ### Vertex shaders
 
 Both cosmic vertex shaders apply a bounded Hubble redshift tint from
-view depth:
+view depth (coefficients softened in update-2026-09-19-1933 so golden
+hubs survive at depth; safety clamps unchanged):
 
 ```
 z = min(redshift * max(clip.w, 0), 0.5)
-tint = (1 + 0.9*z, 1, 1/(1 + 1.2*z))
-dimming = 1/(1 + 0.8*z)
+tint = (1 + 0.55*z, 1, 1/(1 + 0.7*z))
+dimming = 1/(1 + 0.45*z)
 ```
 
 This makes distant structures progressively redder and dimmer, providing
-depth cueing without a volumetric pass.
+depth cueing without a volumetric pass. Both shaders also take a
+per-surface **alpha exposure** multiplier (`WebLinePush.exposure` added
+in update-2026-09-19-1933; `GlowPush.exposure` pre-existing): the
+zoomed-out inspector stacks ~50 strands per pixel where the immersive
+demo stacks a few, so the two surfaces grade independently
+(`COSMIC_MAP_*` vs `COSMIC_DEMO_*` consts in `main.rs`).
 
 The glow vertex shader also computes point size by sprite kind:
 - kind 0: fixed pixel size (cores, grain, glow)
@@ -204,8 +218,9 @@ The glow fragment shader applies a **rim-zero quadratic falloff**
 
 ### Draw order
 
-1. Deep indigo clear: `[0.012, 0.008, 0.030, 1.0]` — near-black
-   violet. Voids read as negative space against additive filaments.
+1. Deep indigo clear: `[0.008, 0.005, 0.024, 1.0]` — near-black
+   violet (deepened in update-2026-09-19-1933). Voids read as
+   negative space against additive filaments.
 2. Additive braid lines (webline pipeline).
 3. Additive grain + glow + impostors (glow pipeline).
 4. Player marker (map pipeline, last, on top).
@@ -246,8 +261,12 @@ All five targets are allocated at the **same half extent**; pass 2 uses
 a wider **2× texel step** for a broader blur kernel, not a quarter-res
 downsample. Every target is written exactly once (see rule below).
 
-- **Exposure**: 1.0
-- **Bloom intensity**: 0.85
+- **Exposure**: per-surface (update-2026-09-19-1933) — 1.15 demo /
+  0.85 inspector
+- **Bloom intensity**: per-surface — 2.2 demo / 1.2 inspector (spec
+  default 0.85 lifted: the half-res 4-pass chain keeps only ~1/4 of a
+  1-px line's over-threshold energy and dilutes point sources
+  ~1/(2πσ²), so visible bloom needs the push)
 - **ACES fit**: HDR scene clamped to 65000.0 to prevent NaN
 
 ### Critical design rule
@@ -269,14 +288,16 @@ swapchain (no bloom, no tonemap).
 
 | Element | Color | Notes |
 |---------|-------|-------|
-| Background/clear | `[0.012, 0.008, 0.030]` | Near-black violet |
-| Filament strands (low density) | `[0.40, 0.42, 0.85]` | Dim indigo |
-| Filament strands (high density) | `[0.72, 0.78, 1.05]` | Bright cyan-violet |
+| Background/clear | `[0.008, 0.005, 0.024]` | Near-black violet |
+| Filament strands (low density) | `[0.18, 0.22, 0.60]`, alpha 0.05 | Dim indigo, recedes into voids |
+| Filament strands (high density) | `[0.48, 0.57, 1.95]`, alpha 1.0 | Blue-violet, blooms |
 | Grain particles | lavender-white, alpha 0.08 | Brightness 0.35-0.9 |
-| Dwarf glow points | `[0.58, 0.55, 0.88]` | Alpha 0.12 |
-| Node cores (dwarfs) | `[0.62, 0.70, 1.00]` | Blue-white, emissive x1.2 |
-| Node cores (giants) | `[1.00, 0.93, 0.72]` | Yellow-white, emissive x2.5 |
-| Node halos | pale cyan | Alpha 0.10, world-sized |
+| Dwarf glow points | `[0.55, 0.54, 0.90]` | Alpha 0.09 |
+| Node cores (dwarfs) | `[0.60, 0.68, 1.00]` | Blue-white, emissive x1.5 |
+| Node cores (giants) | `[1.00, 0.88, 0.62]` | Golden, emissive x5.0 |
+| Node halos | cyan→gold by mass | Alpha 0.14-0.24, world-sized |
+
+(Palette values current as of update-2026-09-19-1933.)
 
 ### Structure counts (nominal seed 1234)
 
@@ -326,13 +347,14 @@ swapchain (no bloom, no tonemap).
 
 ## 8b. Known limitations
 
-- **Redshift saturation**: `COSMIC_REDSHIFT_PER_MPC = 0.004` hits the
-  z = 0.5 cap at 125 Mpc of view depth. Most of a 500 Mpc web viewed
-  from one edge renders at maximum redshift — the primary depth cue is
-  effectively binary beyond 125 Mpc.
+- **Redshift saturation**: `COSMIC_REDSHIFT_PER_MPC = 0.002` hits the
+  z = 0.5 cap at 250 Mpc of view depth (was 0.004/125 Mpc before
+  update-2026-09-19-1933 — the softer ramp keeps the cue monotonic
+  across half the visible box and lets gold survive at depth).
+  Structures beyond 250 Mpc still render at maximum redshift.
 - **No depth occlusion**: depth test with writes off and nothing writing
   depth; distant node cores shine through foreground filaments. Combined
-  with saturation, depth ordering beyond 125 Mpc collapses.
+  with saturation, depth ordering beyond 250 Mpc collapses.
 - **gl_PointSize clamp at 256 px** (`main.rs:396`): near-camera
   world-sized halos saturate silently.
 - **Zero culling / LOD**: ~2.18 M vertices and ~1 M additive sprites
@@ -387,6 +409,7 @@ swapchain (no bloom, no tonemap).
 | `docs/techstack/rendering.md` | Rendering architecture (cosmic extension) |
 | `plans/v0.3.2/cosmic-scale-player/notion.md` | Feature specification |
 | `plans/v0.3.2/cosmic-scale-player/update-2026-09-18-2328/` | Cinematic refresh spec |
+| `plans/v0.3.2/cosmic-scale-player/update-2026-09-19-1933/` | Palette quick pass spec |
 
 ---
 

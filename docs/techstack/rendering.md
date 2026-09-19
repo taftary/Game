@@ -318,6 +318,30 @@ pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,
 `engine::render::post`, the GPU half follows the `game_tools`
 `ResolvePass` precedent, and transients rebuild with the swapchain.
 
+Palette quick pass (update-2026-09-19-1933): grading-only retune on
+the same geometry — no pipeline, topology, or image changes, bloom
+write-once rule trivially preserved. Filament braid ramps regraded to
+dim-indigo → blue-violet with the alpha floor at 0.05 (faint links
+sink to the deepened backdrop `[0.008, 0.005, 0.024]`, voids read
+dark) and dense strands premultiplying to ~1.95 in blue, past the
+bloom threshold (1.0): the half-res 4-pass blur chain keeps only ~1/4
+of a 1-px line's over-threshold energy and dilutes point sources
+~1/(2πσ²), so braid emissive and node-core size/brightness must sit
+well above threshold to bloom visibly. Node impostors mass-stratify
+harder (shared `mass_level` ramp re-centered 1e12–3e14 M☉ so ordinary
+cluster hubs read golden, cores 3–12 px at up to 5.0 emissive, halos
+warm-graded, 3–8 Mpc). The redshift depth cue softened
+(`COSMIC_REDSHIFT_PER_MPC` 0.004 → 0.002, saturation 125 → 250 Mpc;
+gentler tint/dim coefficients) so gold survives at depth, safety
+clamps unchanged. Grade knobs are per-surface bin-local consts in
+`main.rs` (`COSMIC_DEMO_*` / `COSMIC_MAP_*`): line/sprite alpha
+exposure (a new `WebLinePush.exposure` field scales braid alpha
+in-shader; `GlowPush.exposure` already existed) plus resolve
+exposure/bloom intensity — the zoomed-out inspector stacks ~50
+strands per pixel where the immersive demo stacks a few, so one
+grade cannot serve both. Engine `BloomParams::spec_defaults()`
+(threshold, blur σ) stays untouched.
+
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).

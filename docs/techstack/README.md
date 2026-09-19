@@ -1,10 +1,10 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.33.4 (2026-09-18, cinematic cosmic-web view per v0.3.2
-  `cosmic-scale-player` update-2026-09-18-2328: seeded braid strands +
-  grain + emissive node impostors, additive glow pipelines, in-shader
-  Hubble redshift tint, HDR bloom post chain on the cosmic views;
-  descriptor, gameplay, and all other surfaces unchanged)
+- **Version:** 0.33.5 (2026-09-19, cosmic-web palette quick pass per v0.3.2
+  `cosmic-scale-player` update-2026-09-19-1933: blue-violet filaments that
+  cross the bloom threshold, golden mass-stratified hubs, dark voids,
+  softened Hubble redshift, per-surface grade knobs — grading-only, no
+  pipeline/topology/image changes, descriptor hash unchanged)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

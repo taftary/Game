@@ -107,17 +107,27 @@ impl Default for CosmicWebInspector {
     }
 }
 
-/// Mass-graded node tint: blue-white dwarfs → yellow-white giants.
+/// Shared mass→[0,1] grading level for every node visual (color,
+/// size, emissive): 1e12 M☉ → 0, ~3e14 M☉ → 1. Re-centered in
+/// update-2026-09-19-1933 (was 1e12.7–1e15.4): the target reference
+/// reads golden at ordinary cluster hubs (~1e14), not only at the
+/// rarest giants, so the warm ramp must start earlier.
+fn mass_level(mass_msun: f64) -> f32 {
+    ((mass_msun.log10() - 12.0) / 2.5).clamp(0.0, 1.0) as f32
+}
+
+/// Mass-graded node tint: blue-white dwarfs → golden giants (the
+/// gold end deepened in update-2026-09-19-1933 so massive hubs read
+/// like the target reference, not pale yellow).
 /// Shared by the demo and inspector uploads (one palette, two surfaces).
 pub fn node_color(mass_msun: f64) -> [f32; 3] {
-    let l = ((mass_msun.log10() - 12.7) / (15.4 - 12.7)).clamp(0.0, 1.0) as f32;
-    [0.62 + 0.38 * l, 0.70 + 0.23 * l, 1.00 - 0.28 * l]
+    let l = mass_level(mass_msun);
+    [0.60 + 0.40 * l, 0.68 + 0.20 * l, 1.00 - 0.38 * l]
 }
 
 /// Node pixel size from mass (2–5 px sprite floor for legibility).
 pub fn node_size_px(mass_msun: f64) -> f32 {
-    let l = ((mass_msun.log10() - 12.7) / (15.4 - 12.7)).clamp(0.0, 1.0) as f32;
-    2.0 + 3.0 * l
+    2.0 + 3.0 * mass_level(mass_msun)
 }
 
 /// Halo nodes as `(position, color, misc)` tuples in origin-relative
@@ -139,9 +149,10 @@ pub fn node_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f
         .collect()
 }
 
-/// Dwarf glow points as tuples (`misc = (1.5 px, 0.12 alpha, kind
+/// Dwarf glow points as tuples (`misc = (1.5 px, 0.09 alpha, kind
 /// 0)` — dim filament body; the additive chain saturates fast, so
-/// alphas stay small by design).
+/// alphas stay small by design and were lowered further in
+/// update-2026-09-19-1933 so sparse regions let voids read dark).
 pub fn glow_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     web.glow_mpc
         .iter()
@@ -152,8 +163,8 @@ pub fn glow_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f
                     (f64::from(g[1]) - origin.y) as f32,
                     (f64::from(g[2]) - origin.z) as f32,
                 ],
-                [0.58, 0.55, 0.88],
-                [1.5, 0.12, 0.0],
+                [0.55, 0.54, 0.90],
+                [1.5, 0.09, 0.0],
             )
         })
         .collect()
@@ -208,10 +219,12 @@ pub const BRAID_STREAM: &str = "cosmic_web/braid";
 pub const GRAIN_STREAM: &str = "cosmic_web/grain";
 /// Exaggerated Hubble redshift strength per Mpc of view depth for the
 /// cosmic glow shaders (spec §9.1 depth cue, artistically boosted: at
-/// 250 Mpc the exaggerated depth is 1.0 — distant filaments redden
-/// and dim to roughly half blue). Single tuning knob, shared by both
-/// cosmic surfaces.
-pub const COSMIC_REDSHIFT_PER_MPC: f32 = 0.004;
+/// 250 Mpc the exaggerated depth is 0.5 — distant filaments redden
+/// gently). Halved in update-2026-09-19-1933 (was 0.004, saturating
+/// at 125 Mpc): the softer ramp keeps the depth cue readable while
+/// letting golden hubs survive at depth. Single tuning knob, shared
+/// by both cosmic surfaces.
+pub const COSMIC_REDSHIFT_PER_MPC: f32 = 0.002;
 
 /// Orthonormal-adjacent lateral basis for a link direction (the glow
 /// precedent: `u = normalize(cross(d, reference))`, `v = cross(d, u)`).
@@ -341,15 +354,25 @@ pub fn braid_segments(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<([f3
         let raw = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
         let shape = braid_shape(seed, link, pa, pb);
         let density = f64::from(link.density);
-        // Filament palette: dim indigo → bright cyan-violet by density.
+        // Filament palette (update-2026-09-19-1933): dim indigo →
+        // bright blue-violet by density. Dense strands premultiply to
+        // ~1.7 in blue — well past the bloom threshold (1.0), because
+        // the blur chain keeps only ~1/4 of a 1-px line's over-
+        // threshold energy: crossings and dense links bloom hard,
+        // mid-density stays crisp, faint links sink to backdrop level
+        // so voids read dark. Bands pinned by the enrichment tests:
+        // rgb ≤ 2.0, monotonic in density.
         let rgb = [
-            0.40 + 0.32 * density,
-            0.42 + 0.36 * density,
-            0.85 + 0.20 * density,
+            0.18 + 0.30 * density,
+            0.22 + 0.35 * density,
+            0.60 + 1.35 * density,
         ];
-        // Kept modest: dozens of strands cross per pixel, and the
-        // additive chain saturates fast.
-        let alpha = 0.18 + 0.40 * density;
+        // Alpha floor near zero: dozens of strands cross per pixel and
+        // the additive chain saturates fast, so low-density links must
+        // start almost invisible or voids never darken. The high
+        // ceiling is what pushes dense strands past the bloom
+        // threshold (premult = rgb × alpha = 1.95 in blue at d = 1).
+        let alpha = 0.05 + 0.95 * density;
         for strand in &shape.strands {
             for s in 0..BRAID_SUBDIVISIONS {
                 for end in [s, s + 1] {
@@ -471,7 +494,7 @@ pub fn grain_cloud(
 pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     let mut out = Vec::with_capacity(web.nodes.len() * 2);
     for node in &web.nodes {
-        let l = ((node.mass_msun.log10() - 12.7) / (15.4 - 12.7)).clamp(0.0, 1.0) as f32;
+        let l = mass_level(node.mass_msun);
         let pos = [
             (node.position_mpc[0] - origin.x) as f32,
             (node.position_mpc[1] - origin.y) as f32,
@@ -479,23 +502,32 @@ pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32
         ];
         let base = node_color(node.mass_msun);
         // Emissive enough to cross the bloom threshold (1.0) without
-        // flooding the additive chain.
-        let emissive = 1.2 + 1.3 * l;
-        // Hot core: small, near-white, emissive, fixed pixel size.
+        // flooding the additive chain. Mass-stratified and pushed hard
+        // (update-2026-09-19-1933): giants reach the 5.0 test band max
+        // with big fixed-px cores, because the half-res blur chain
+        // dilutes point sources ~1/(2πσ²) — only large, very bright
+        // cores survive the chain as visible golden blooms (max
+        // channel 1.0 × 5.0 = 5.0 band).
+        let emissive = 1.5 + 3.5 * l;
+        // Hot core: near-white, emissive, fixed pixel size (3–12 px —
+        // big enough for the bloom chain to keep a visible halo).
         out.push((
             pos,
             [base[0] * emissive, base[1] * emissive, base[2] * emissive],
-            [2.5 + 3.5 * l, 1.0, 0.0],
+            [3.0 + 9.0 * l, 1.0, 0.0],
         ));
-        // Halo: large, pale cyan, faint, world-sized (Mpc diameter).
+        // Halo: large, faint, world-sized (Mpc diameter). Cool cyan
+        // for dwarfs warming toward gold for giants
+        // (update-2026-09-19-1933); alpha lifts with mass so cluster
+        // hubs glow wider. Diameter stays in the pinned 2–8 Mpc band.
         out.push((
             pos,
             [
-                0.55 * (0.5 + 0.5 * l),
-                0.72 * (0.5 + 0.5 * l),
-                1.0 * (0.5 + 0.5 * l),
+                (0.55 + 0.30 * l) * (0.5 + 0.5 * l),
+                (0.72 + 0.10 * l) * (0.5 + 0.5 * l),
+                (1.00 - 0.25 * l) * (0.5 + 0.5 * l),
             ],
-            [2.0 + 6.0 * l, 0.10, 1.0],
+            [3.0 + 5.0 * l, 0.14 + 0.10 * l, 1.0],
         ));
     }
     out

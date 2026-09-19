@@ -395,12 +395,14 @@ void main() {
     float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
     gl_PointSize = clamp(px, 1.0, 256.0);
     // Bounded redshift depth: negative view depth clamps to 0 and the
-    // exaggerated term caps at 0.5, so both denominators stay >= 1.4
+    // exaggerated term caps at 0.5, so both denominators stay >= 1.35
     // — the tint can never divide by zero, flip a channel's sign, or
     // feed Inf/NaN into the additive chain (the visual-issue fix).
+    // Coefficients softened in update-2026-09-19-1933: gentle redden,
+    // mild dim, so golden hubs survive at depth.
     float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
-    vec3 tint = vec3(1.0 + 0.9 * z, 1.0, 1.0 / (1.0 + 1.2 * z));
-    float dim = 1.0 / (1.0 + 0.8 * z);
+    vec3 tint = vec3(1.0 + 0.55 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    float dim = 1.0 / (1.0 + 0.45 * z);
     v_color = color * tint * dim;
     v_alpha = misc.y * pc.exposure;
 }";
@@ -428,17 +430,23 @@ layout(location = 1) in vec4 rgba;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     float redshift;
+    float exposure;
 } pc;
 layout(location = 0) out vec4 v_rgba;
 void main() {
     vec4 clip = pc.mvp * vec4(position, 1.0);
     gl_Position = clip;
     // Same bounded redshift depth as the glow sprites (never divides
-    // by zero, never flips a channel sign).
+    // by zero, never flips a channel sign); coefficients softened in
+    // update-2026-09-19-1933 so dense blue filaments keep their hue
+    // and golden hubs survive at depth.
     float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
-    vec3 tint = vec3(1.0 + 0.9 * z, 1.0, 1.0 / (1.0 + 1.2 * z));
-    float dim = 1.0 / (1.0 + 0.8 * z);
-    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a);
+    vec3 tint = vec3(1.0 + 0.55 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    float dim = 1.0 / (1.0 + 0.45 * z);
+    // Alpha-side per-surface exposure: premultiplied output is
+    // rgb × a, so alpha scales the result linearly without touching
+    // the hue.
+    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure);
 }";
 
 const WEBLINE_FRAG: &str = r"#version 450
@@ -567,13 +575,18 @@ struct GlowPush {
     redshift: f32,
 }
 
-/// Cosmic braid-line push constants: MVP + redshift strength
-/// (68 B < 128 B Vulkan 1.1 floor).
+/// Cosmic braid-line push constants: MVP + redshift strength +
+/// per-surface alpha exposure (72 B < 128 B Vulkan 1.1 floor).
+/// `exposure` scales alpha only (update-2026-09-19-1933): the
+/// zoomed-out inspector stacks ~50 strands per pixel where the
+/// immersive demo stacks a few, so the two surfaces grade
+/// independently or one of them is always wrong.
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct WebLinePush {
     mvp: [[f32; 4]; 4],
     redshift: f32,
+    exposure: f32,
 }
 
 /// Cosmic braid line vertex: origin-relative Mpc position + linear
@@ -614,8 +627,29 @@ fn additive_blend() -> AttachmentBlend {
 }
 
 /// Deep-indigo clear color for the cosmic views (near-black violet —
-/// voids read as negative space against additive filaments).
-const COSMIC_BACKDROP: [f32; 4] = [0.012, 0.008, 0.030, 1.0];
+/// voids read as negative space against additive filaments). Deepened
+/// in update-2026-09-19-1933 so faint links can sink below it.
+const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
+
+/// Cosmic grade knobs (update-2026-09-19-1933), split per surface:
+/// the immersive Game Demo stacks a few strands per pixel while the
+/// zoomed-out inspector stacks ~50, so one grade cannot serve both.
+/// Engine `BloomParams::spec_defaults()` (threshold 1.0, blur σ)
+/// stays the shared spec; only these bin-local values tune the look.
+/// Line alpha exposure (multiplies braid alpha in the vertex shader).
+const COSMIC_DEMO_LINE_EXPOSURE: f32 = 1.0;
+const COSMIC_MAP_LINE_EXPOSURE: f32 = 0.14;
+/// Sprite alpha exposure (grain, dwarf glow, node cores + halos).
+const COSMIC_DEMO_GLOW_EXPOSURE: f32 = 1.0;
+const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
+/// Scene exposure at the ACES resolve.
+const COSMIC_DEMO_EXPOSURE: f32 = 1.15;
+const COSMIC_MAP_EXPOSURE: f32 = 0.85;
+/// Bloom intensity at the resolve (spec default 0.85 lifted: the
+/// half-res 4-pass chain attenuates 1-px lines and small sprites
+/// hard, so the composite needs the push to reach the target glow).
+const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 2.2;
+const COSMIC_MAP_BLOOM_INTENSITY: f32 = 1.2;
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -6959,6 +6993,15 @@ impl ViewerApp {
             let pipes = &ctx.pipelines;
             let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
             let bloom = BloomParams::spec_defaults();
+            // Per-surface grade (update-2026-09-19-1933): the
+            // inspector's zoomed-out view stacks ~50 strands/px where
+            // the immersive demo stacks a few — one exposure can't
+            // serve both.
+            let (line_exposure, glow_exposure) = if frame.is_demo {
+                (COSMIC_DEMO_LINE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+            } else {
+                (COSMIC_MAP_LINE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+            };
             // Scene: indigo clear, braid then glow.
             builder
                 .begin_render_pass(
@@ -6987,6 +7030,7 @@ impl ViewerApp {
                     WebLinePush {
                         mvp: frame.mvp,
                         redshift,
+                        exposure: line_exposure,
                     },
                 )
                 .expect("webline push constants must upload");
@@ -7005,7 +7049,7 @@ impl ViewerApp {
                     GlowPush {
                         mvp: frame.mvp,
                         px_scale: frame.px_scale,
-                        exposure: 1.0,
+                        exposure: glow_exposure,
                         redshift,
                     },
                 )
@@ -7226,8 +7270,17 @@ impl ViewerApp {
                         .as_ref()
                         .expect("cosmic view must precompute its frame");
                     let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+                    let (line_exposure, glow_exposure) = if frame.is_demo {
+                        (COSMIC_DEMO_LINE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+                    } else {
+                        (COSMIC_MAP_LINE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+                    };
+                    let (resolve_exposure, bloom_intensity) = if frame.is_demo {
+                        (COSMIC_DEMO_EXPOSURE, COSMIC_DEMO_BLOOM_INTENSITY)
+                    } else {
+                        (COSMIC_MAP_EXPOSURE, COSMIC_MAP_BLOOM_INTENSITY)
+                    };
                     if let Some(hdr) = ctx.hdr.as_ref() {
-                        let bloom = BloomParams::spec_defaults();
                         let full_vp = Viewport {
                             offset: [0.0, 0.0],
                             extent: [win_w, win_h],
@@ -7242,7 +7295,7 @@ impl ViewerApp {
                             hdr.resolve_nobloom_set.clone()
                         };
                         builder
-                            .set_viewport(0, [full_vp].into_iter().collect())
+                            .set_viewport(0, [full_vp.clone()].into_iter().collect())
                             .expect("viewport must set")
                             .bind_pipeline_graphics(ctx.pipelines.resolve.clone())
                             .expect("pipeline must bind")
@@ -7257,8 +7310,8 @@ impl ViewerApp {
                                 ctx.pipelines.resolve.layout().clone(),
                                 0,
                                 BloomResolvePush {
-                                    exposure: 1.0,
-                                    intensity: bloom.intensity,
+                                    exposure: resolve_exposure,
+                                    intensity: bloom_intensity,
                                 },
                             )
                             .expect("bloom resolve push must upload");
@@ -7282,6 +7335,7 @@ impl ViewerApp {
                                 WebLinePush {
                                     mvp: frame.mvp,
                                     redshift,
+                                    exposure: line_exposure,
                                 },
                             )
                             .expect("webline push constants must upload");
@@ -7300,7 +7354,7 @@ impl ViewerApp {
                                 GlowPush {
                                     mvp: frame.mvp,
                                     px_scale: frame.px_scale,
-                                    exposure: 1.0,
+                                    exposure: glow_exposure,
                                     redshift,
                                 },
                             )
