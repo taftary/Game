@@ -412,6 +412,100 @@ pub fn strand_records(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<Stra
     out
 }
 
+/// Smoke puffs replacing the retired ribbon tubes (perf-first gaseous
+/// filaments): one soft camera-facing billboard per puff, hugging the
+/// same [`braid_shape`] centerlines the grain pass uses. Counts scale
+/// with `length × density` so dense hubs read thick and voids stay
+/// empty; sizes are world Mpc diameters; alpha stays tiny (additive
+/// chain saturates fast on mobile tile GPUs).
+pub const SMOKE_PER_MPC: f64 = 0.08;
+/// At least one puff per link (no filament ever vanishes).
+pub const SMOKE_MIN_PER_LINK: u64 = 1;
+/// Cap per link (overdraw control for the zoomed-out inspector, which
+/// stacks ~50 strands/px).
+pub const SMOKE_MAX_PER_LINK: u64 = 6;
+/// Hard cap on emitted smoke puffs (buffer + fill-rate control).
+pub const MAX_SMOKE_PUFFS: u32 = 65_000;
+/// Domain-separated stream for smoke emission.
+pub const SMOKE_STREAM: &str = "cosmic_web/smoke";
+
+/// One smoke puff's CPU layout: origin-relative center Mpc f32,
+/// world diameter Mpc, premultiplied link-level color + alpha, and a
+/// deterministic noise seed (fragment dust variation). ~32 B/puff —
+/// ~40k nominal puffs ≈ 1.3 MB/surface (vs ~3.8 MB strand records).
+pub struct SmokePuff {
+    /// Puff center, origin-relative Mpc f32.
+    pub pos: [f32; 3],
+    /// World diameter, Mpc (2.0–6.5 nominal).
+    pub size_mpc: f32,
+    /// Link-level color (density ramp, hub-warmed) + puff alpha.
+    pub rgba: [f32; 4],
+    /// Deterministic noise seed (radians).
+    pub seed: f32,
+}
+
+/// Filament smoke as compact per-puff records for the instanced smoke
+/// pipeline. Deterministic per (seed, web, origin); translation-
+/// invariant except for `pos`.
+pub fn smoke_puffs(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<SmokePuff> {
+    let mut rng = SeededRng::stream(seed, SMOKE_STREAM);
+    let mut out: Vec<SmokePuff> = Vec::new();
+    for link in &web.links {
+        let pa = web.nodes[link.a as usize].position_mpc;
+        let pb = web.nodes[link.b as usize].position_mpc;
+        let raw_d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        let len = ((raw_d[0]).powi(2) + (raw_d[1]).powi(2) + (raw_d[2]).powi(2)).sqrt();
+        if !(len.is_finite() && len > 1e-6) {
+            continue;
+        }
+        let density = f64::from(link.density);
+        let want = len * SMOKE_PER_MPC * (0.4 + 0.6 * density);
+        let mut emit = (want.floor() as u64).clamp(SMOKE_MIN_PER_LINK, SMOKE_MAX_PER_LINK);
+        let frac = (want - want.floor()).clamp(0.0, 1.0);
+        if rng.below(1000) < (frac * 1000.0) as u64 && emit < SMOKE_MAX_PER_LINK {
+            emit += 1;
+        }
+        if out.len() as u64 + emit > u64::from(MAX_SMOKE_PUFFS) {
+            break;
+        }
+        let shape = braid_shape(seed, link, pa, pb);
+        let strands = shape.strands.len().max(1);
+        let base_rgb = [
+            0.18 + 0.30 * density,
+            0.22 + 0.35 * density,
+            0.60 + 1.35 * density,
+        ];
+        let alpha = 0.035 + 0.055 * density;
+        for _ in 0..emit {
+            let t = rng.unit_f64().clamp(0.02, 0.98);
+            let strand = &shape.strands[rng.below(strands as u64) as usize];
+            let c = braid_point(pa, raw_d, shape.u, shape.v, &shape.wander, strand, t);
+            let j1 = ihalf3(&mut rng) * 2.0 * 1.0;
+            let j2 = ihalf3(&mut rng) * 2.0 * 1.0;
+            let melt = (std::f64::consts::PI * t).sin().max(0.0).sqrt();
+            let warm = (1.0 - melt) * 0.55;
+            let rgb = [
+                base_rgb[0] + (1.05 - base_rgb[0]) * warm,
+                base_rgb[1] + (0.72 - base_rgb[1]) * warm,
+                base_rgb[2] + (0.42 - base_rgb[2]) * warm,
+            ];
+            let size = 2.0 + 3.0 * density + rng.unit_f64() * 1.5;
+            let pseed = rng.unit_f64() * std::f64::consts::TAU;
+            out.push(SmokePuff {
+                pos: [
+                    (c[0] + shape.u[0] * j1 + shape.v[0] * j2 - origin.x) as f32,
+                    (c[1] + shape.u[1] * j1 + shape.v[1] * j2 - origin.y) as f32,
+                    (c[2] + shape.u[2] * j1 + shape.v[2] * j2 - origin.z) as f32,
+                ],
+                size_mpc: size as f32,
+                rgba: [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, alpha as f32],
+                seed: pseed as f32,
+            });
+        }
+    }
+    out
+}
+
 /// Irwin–Hall-3 jitter, σ = 0.5 (the descriptor-glow precedent: pure
 /// arithmetic shaping, no transcendentals in the sampling).
 fn ihalf3(rng: &mut SeededRng) -> f64 {
@@ -938,6 +1032,53 @@ mod tests {
                     "axis {axis}: {delta} vs {want}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn smoke_replays_and_stays_in_budget() {
+        let toy = toy_web();
+        assert_eq!(
+            smoke_puffs(&toy, 7, DVec3::ZERO).len(),
+            smoke_puffs(&toy, 7, DVec3::ZERO).len()
+        );
+        let nominal = smoke_puffs(&web(), 1234, DVec3::ZERO);
+        assert!(!nominal.is_empty(), "nominal web must emit smoke");
+        assert!(
+            nominal.len() <= MAX_SMOKE_PUFFS as usize,
+            "smoke over budget: {}",
+            nominal.len()
+        );
+        // Dense 30 Mpc link must emit at least as many puffs as the
+        // faint 40 Mpc link emits per Mpc (density weighting).
+        assert!(nominal.len() < 65_000);
+    }
+
+    #[test]
+    fn smoke_puffs_are_finite_bounded_and_rebase_safe() {
+        let web = toy_web();
+        let a = DVec3::ZERO;
+        let b = DVec3::new(10.0, -4.0, 2.0);
+        let pa = smoke_puffs(&web, 7, a);
+        let pb = smoke_puffs(&web, 7, b);
+        assert_eq!(pa.len(), pb.len());
+        assert!(!pa.is_empty());
+        for (p, q) in pa.iter().zip(pb.iter()) {
+            for axis in 0..3 {
+                assert!(p.pos[axis].is_finite());
+                let delta = f64::from(p.pos[axis]) - f64::from(q.pos[axis]);
+                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
+                assert!(
+                    (delta - want).abs() < 1e-3,
+                    "axis {axis}: {delta} vs {want}"
+                );
+            }
+            for c in 0..3 {
+                assert!(p.rgba[c].is_finite() && (0.0..=2.0).contains(&p.rgba[c]));
+            }
+            assert!(p.rgba[3].is_finite() && (0.0..=0.2).contains(&p.rgba[3]));
+            assert!(p.size_mpc.is_finite() && (1.0..=10.0).contains(&p.size_mpc));
+            assert!(p.seed.is_finite());
         }
     }
 }

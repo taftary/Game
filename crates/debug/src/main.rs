@@ -422,100 +422,83 @@ void main() {
     f_color = vec4(v_color * v_alpha * fall, 1.0);
 }";
 
-// Cosmic ribbon filaments (update-2026-09-19-1245 P1): instanced
-// strand records expanded in-shader into camera-facing ribbon quads
-// (TriangleList, 6 verts per segment — no CPU-baked lines). Same
-// redshift treatment as the glow sprites, premultiplied additive
-// output, rim-zero Gaussian lateral falloff in the fragment shader.
-// The vertex math mirrors `cosmic_web::braid_point` (trunk + shared
-// wander + per-strand twist, all tapered at the nodes).
-const RIBBON_VERT: &str = r"#version 450
-layout(location = 0) in vec4 rec_a;    // strand root xyz, wander phase
-layout(location = 1) in vec4 rec_raw;  // trunk vec xyz, wander amplitude
-layout(location = 2) in vec4 rec_u;    // lateral basis u xyz, twist phase
-layout(location = 3) in vec4 rec_v;    // lateral basis v xyz, twist windings
-layout(location = 4) in vec4 rec_mix;  // mix_u, mix_v, link density, -
-layout(location = 5) in vec4 rec_rgba; // link rgb, mid-strand alpha
+// Cosmic smoke filaments (smoke display, replaces update-2026-09-19-1245
+// P1 ribbons): instanced puff records expanded in-shader into
+// camera-facing billboard quads (TriangleList, 6 verts per puff — two
+// triangles, no index buffer). No trig in the vertex shader (one
+// cross + normalize for the billboard frame); dust variation is a
+// cheap 4x4 hash in the fragment shader. Same bounded redshift
+// treatment as the glow sprites, premultiplied additive output.
+const SMOKE_VERT: &str = r"#version 450
+layout(location = 0) in vec4 pos_size; // puff center xyz, diameter Mpc
+layout(location = 1) in vec4 rgba;     // link rgb (hub-warmed), alpha
+layout(location = 2) in vec4 misc;     // noise seed, 0, 0, 0
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 eye;
     float px_scale;
     float exposure;
     float redshift;
-    float width_mpc;
-    float subdiv;
 } pc;
 layout(location = 0) out vec4 v_rgba;
-layout(location = 1) out float v_lat;
-const float PI = 3.141592653589793;
-const float TAU = 6.283185307179586;
-const float AMP = 1.5; // braid amplitude — mirrors BRAID_AMPLITUDE_MPC
-vec3 braid_point(float t) {
-    float taper = sin(PI * t);
-    float wu = sin(TAU * t + rec_a.w) * rec_raw.w * taper;
-    float wv = cos(TAU * t * 0.7 + rec_a.w) * rec_raw.w * taper;
-    float ang = TAU * rec_v.w * t + rec_u.w;
-    float ou = (wu + sin(ang) * rec_mix.x * AMP) * taper;
-    float ov = (wv + cos(ang) * rec_mix.y * AMP) * taper;
-    return rec_a.xyz + rec_raw.xyz * t + rec_u.xyz * ou + rec_v.xyz * ov;
-}
+layout(location = 1) out vec2 v_uv;
+layout(location = 2) out float v_seed;
 void main() {
     int vi = int(gl_VertexIndex);
-    int seg = vi / 6;
-    int corner = vi - seg * 6;
-    float t0 = float(seg) / pc.subdiv;
-    float t1 = float(seg + 1) / pc.subdiv;
-    vec3 p0 = braid_point(t0);
-    vec3 p1 = braid_point(t1);
-    // Two triangles per segment quad: (p0-, p0+, p1-), (p0+, p1-, p1+).
-    float tt = (corner == 0 || corner == 1 || corner == 3) ? t0 : t1;
-    vec3 base = (corner == 0 || corner == 1 || corner == 3) ? p0 : p1;
-    float lat = (corner == 0 || corner == 2 || corner == 4) ? -1.0 : 1.0;
-    // Camera-facing side: ribbon normal is the view axis, so the quad
-    // spans the segment direction x the view direction.
-    vec3 mid = (p0 + p1) * 0.5;
-    vec3 seg_dir = p1 - p0;
-    vec3 side = cross(seg_dir, pc.eye.xyz - mid);
-    float sl = length(side);
-    side = (sl > 1e-10) ? side / sl : normalize(cross(seg_dir, vec3(0.0, 1.0, 0.0)) + vec3(1e-6, 0.0, 0.0));
-    // Width profile melts into the hubs (same sqrt-sin as the alpha
-    // melt); the min-pixel clamp keeps distant filaments visible.
-    float melt = sqrt(max(sin(PI * tt), 0.0));
-    vec4 clipc = pc.mvp * vec4(base, 1.0);
-    float wmin = 1.5 * max(clipc.w, 1e-6) / pc.px_scale;
-    float w = max(pc.width_mpc * melt, wmin);
-    vec3 world = base + side * (lat * 0.5 * w);
+    // Two triangles: (-,-),(+,-),(+,-)/(-,-),(+,-),(-,+) pattern over
+    // 6 verts without an index buffer.
+    vec2 corner = vec2((vi == 1 || vi == 2 || vi == 4) ? 1.0 : -1.0,
+                       (vi == 2 || vi == 4 || vi == 5) ? 1.0 : -1.0);
+    vec3 center = pos_size.xyz;
+    vec4 clipc0 = pc.mvp * vec4(center, 1.0);
+    // Minimum-pixel clamp (the retired ribbon's 1.5-px rule): without
+    // it, distant puffs in the zoomed-out inspector shrink subpixel
+    // and vanish while near puffs stay huge.
+    float min_world = 2.0 * max(clipc0.w, 1e-6) / max(pc.px_scale, 1e-6);
+    float size = max(max(pos_size.w, 1e-6), min_world);
+    vec3 view_dir = center - pc.eye.xyz;
+    float vd = length(view_dir);
+    view_dir = (vd > 1e-6) ? view_dir / vd : vec3(0.0, 0.0, 1.0);
+    vec3 up_ref = (abs(view_dir.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 right = cross(view_dir, up_ref);
+    float rl = length(right);
+    right = (rl > 1e-10) ? right / rl : vec3(1.0, 0.0, 0.0);
+    vec3 upv = cross(right, view_dir);
+    vec3 world = center + (right * corner.x + upv * corner.y) * (0.5 * size);
+    vec4 clipc = clipc0;
     gl_Position = pc.mvp * vec4(world, 1.0);
-    v_lat = lat;
-    // Endpoint warming: strands melt into warm amber near the hubs,
-    // staying blue-violet mid-strand (convex mix, like the old CPU
-    // palette pass).
-    float warm = (1.0 - melt) * 0.55;
-    vec3 rgb = mix(rec_rgba.rgb, vec3(1.05, 0.72, 0.42), warm);
+    v_uv = corner;
+    v_seed = misc.x;
     // Same bounded redshift depth as the glow sprites (never divides
     // by zero, never flips a channel sign).
     float z = min(pc.redshift * max(clipc.w, 0.0), 0.5);
     vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
-    // Near-eye fade: the player spawns inside a filament, so ribbons
+    // Near-eye fade: the player spawns inside a filament, so puffs
     // within a few Mpc of the eye would fill the screen as white
-    // slabs (same reason the halo clamp smudges). Fade them out
-    // instead.
-    float ed = length(pc.eye.xyz - mid);
-    float efade = smoothstep(1.0, 6.0, ed);
-    v_rgba = vec4(rgb * tint * dim, rec_rgba.a * melt * pc.exposure * efade);
+    // slabs. Fade them out instead.
+    float efade = smoothstep(1.0, 6.0, vd);
+    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure * efade);
 }";
 
-const RIBBON_FRAG: &str = r"#version 450
+const SMOKE_FRAG: &str = r"#version 450
 layout(location = 0) in vec4 v_rgba;
-layout(location = 1) in float v_lat;
+layout(location = 1) in vec2 v_uv;
+layout(location = 2) in float v_seed;
 layout(location = 0) out vec4 f_color;
 void main() {
-    // Rim-zero lateral falloff: soft tube, no hard edge (the sprite
-    // convention, squared parabola).
-    float fall = 1.0 - v_lat * v_lat;
+    float r2 = dot(v_uv, v_uv);
+    if (r2 > 1.0) { discard; }
+    // Rim-zero radial falloff: soft puff, no hard edge (squared).
+    float fall = 1.0 - r2;
     fall = fall * fall;
-    f_color = vec4(v_rgba.rgb * v_rgba.a * fall, 1.0);
+    // Cheap dust variation: 4x4 hash blocks over the puff, softened
+    // by the falloff (no sin/exp per pixel — fill-rate friendly on
+    // mobile tile GPUs).
+    vec2 cell = floor((v_uv * 0.5 + 0.5) * 4.0);
+    float h = fract(v_seed * 0.173 + dot(cell, vec2(12.9898, 78.233)));
+    float n = 0.72 + 0.28 * h;
+    f_color = vec4(v_rgba.rgb * v_rgba.a * fall * n, 1.0);
 }";
 
 // ---------------------------------------------------------------------------
@@ -637,55 +620,44 @@ struct GlowPush {
     redshift: f32,
 }
 
-/// Cosmic ribbon push constants: MVP, camera eye (buffer frame),
-/// sprite scale, per-surface alpha exposure, redshift strength,
-/// ribbon half-width (Mpc) and segments per strand. 100 B total,
-/// under the 128 B Vulkan 1.1 floor.
+/// Cosmic smoke push constants: MVP, camera eye (buffer frame),
+/// sprite scale (reserved), per-surface alpha exposure, redshift
+/// strength. 92 B total, under the 128 B Vulkan 1.1 floor.
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct RibbonPush {
+struct SmokePush {
     mvp: [[f32; 4]; 4],
     eye: [f32; 4],
     px_scale: f32,
     exposure: f32,
     redshift: f32,
-    width_mpc: f32,
-    subdiv: f32,
 }
 
-/// Cosmic ribbon strand record: per-instance vertex layout for the
-/// ribbon pipeline (update-2026-09-19-1245 P1) — six `vec4`
-/// attributes at instance rate, 96 B, mirroring
-/// [`game_debug::cosmic_web::StrandRecord`] (f64 trunk/basis fields
-/// demoted to f32: Mpc coords need ~1e-4 precision, f32 has ~1e-7
-/// relative).
+/// Cosmic smoke puff: per-instance vertex layout for the smoke
+/// pipeline — three `vec4` attributes at instance rate, 48 B,
+/// mirroring [`game_debug::cosmic_web::SmokePuff`] (~1.9 MB for the
+/// nominal 40k-puff web per surface).
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
-struct StrandVertex {
+struct SmokeVertex {
     #[format(R32G32B32A32_SFLOAT)]
-    rec_a: [f32; 4],
+    pos_size: [f32; 4],
     #[format(R32G32B32A32_SFLOAT)]
-    rec_raw: [f32; 4],
+    rgba: [f32; 4],
     #[format(R32G32B32A32_SFLOAT)]
-    rec_u: [f32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    rec_v: [f32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    rec_mix: [f32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    rec_rgba: [f32; 4],
+    misc: [f32; 4],
 }
 
 /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328) —
 /// see `ViewerApp::cosmic_frame`. `eye` is the camera position in the
-/// surface's buffer frame (update-2026-09-19-1245 P1: the ribbon
-/// shader builds camera-facing quads from it).
+/// surface's buffer frame (the smoke shader builds camera-facing
+/// billboards from it).
 struct CosmicFrame {
     mvp: [[f32; 4]; 4],
     px_scale: f32,
     is_demo: bool,
     eye: [f32; 3],
-    braid: Subbuffer<[StrandVertex]>,
+    smoke: Subbuffer<[SmokeVertex]>,
     glow: Subbuffer<[MapVertex]>,
     viewport: Viewport,
 }
@@ -711,18 +683,18 @@ fn additive_blend() -> AttachmentBlend {
 const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
 
 /// Cosmic grade knobs (update-2026-09-19-1933), split per surface:
-/// the immersive Game Demo stacks a few strands per pixel while the
-/// zoomed-out inspector stacks ~50, so one grade cannot serve both.
+/// the immersive Game Demo stacks a few puffs per pixel while the
+/// zoomed-out inspector stacks dozens, so one grade cannot serve both.
 /// Engine `BloomParams::spec_defaults()` (threshold 1.0, blur σ)
 /// stays the shared spec; only these bin-local values tune the look.
-/// Ribbon half-width in Mpc (update-2026-09-19-1245 P1): world-space
-/// thickness (PO decision 2026-09-19) with a 1.5-px in-shader minimum
-/// so distant filaments stay visible.
-/// Line alpha exposure (multiplies braid alpha in the vertex shader;
-/// ribbons cover far more pixels than 1-px lines did, so the demo grade
-/// drops below 1.0).
-const COSMIC_DEMO_LINE_EXPOSURE: f32 = 0.55;
-const COSMIC_MAP_LINE_EXPOSURE: f32 = 0.12;
+/// Smoke alpha exposure (multiplies puff alpha in the vertex shader).
+/// A billboard puff spreads its energy over ~6–50 px where the retired
+/// 1-px lines/1.5-Mpc tubes concentrated it, so the zoomed-out
+/// inspector needs ~6x the old ribbon MAP grade to read at all; the
+/// immersive demo stacks a few puffs/px and keeps the lower grade to
+/// protect mobile fill-rate.
+const COSMIC_DEMO_SMOKE_EXPOSURE: f32 = 0.5;
+const COSMIC_MAP_SMOKE_EXPOSURE: f32 = 0.7;
 /// Sprite alpha exposure (grain, dwarf glow, node cores + halos).
 const COSMIC_DEMO_GLOW_EXPOSURE: f32 = 1.0;
 const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
@@ -734,11 +706,6 @@ const COSMIC_MAP_EXPOSURE: f32 = 0.85;
 /// hard, so the composite needs the push to reach the target glow).
 const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 2.2;
 const COSMIC_MAP_BLOOM_INTENSITY: f32 = 1.2;
-
-/// Ribbon half-width in Mpc (update-2026-09-19-1245 P1): full tube
-/// ~1.5 Mpc at mid-strand, melting into the hubs; the vertex shader
-/// enforces a 1.5-px minimum so distant filaments never vanish.
-const RIBBON_HALF_WIDTH_MPC: f32 = 0.75;
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -884,18 +851,18 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.camera.render_origin(),
         debug_app.cosmic.player.position_mpc()
     );
-    // Cinematic layout smoke (update 2026-09-18-2328, ribbons in
-    // update-2026-09-19-1245): the enrichment layer derives non-empty
-    // strand-record/grain/impostor clouds from the boot web. GPU-free
-    // — upload happens only in the windowed shell.
+    // Cinematic layout smoke (update 2026-09-18-2328, smoke
+    // billboards replace ribbons): the enrichment layer derives
+    // non-empty smoke/grain/impostor clouds from the boot web.
+    // GPU-free — upload happens only in the windowed shell.
     let layout_seed = debug_app.cosmic.seed;
     let layout_origin = debug_app.cosmic.upload_origin;
-    let strands =
-        game_debug::cosmic_web::strand_records(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let smoke =
+        game_debug::cosmic_web::smoke_puffs(&debug_app.cosmic.web, layout_seed, layout_origin);
     let grain =
         game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
     let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
-    assert!(!strands.is_empty(), "ribbons must emit strand records");
+    assert!(!smoke.is_empty(), "smoke must emit puffs");
     assert!(!grain.is_empty(), "grain must emit points");
     assert_eq!(
         impostors.len(),
@@ -903,8 +870,8 @@ fn run_headless(seed: Option<u64>) -> i32 {
         "three impostors per node"
     );
     println!(
-        "cosmic_layout=strands{} grain{} impostors{} ok",
-        strands.len(),
+        "cosmic_layout=smoke{} grain{} impostors{} ok",
+        smoke.len(),
         grain.len(),
         impostors.len()
     );
@@ -3504,8 +3471,8 @@ struct ShaderSet {
     map_frag: Arc<ShaderModule>,
     glow_vert: Arc<ShaderModule>,
     glow_frag: Arc<ShaderModule>,
-    ribbon_vert: Arc<ShaderModule>,
-    ribbon_frag: Arc<ShaderModule>,
+    smoke_vert: Arc<ShaderModule>,
+    smoke_frag: Arc<ShaderModule>,
     post_vert: Arc<ShaderModule>,
     bright_frag: Arc<ShaderModule>,
     blur_frag: Arc<ShaderModule>,
@@ -3525,13 +3492,8 @@ impl ShaderSet {
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
             glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
             glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
-            ribbon_vert: compile_shader(device, ShaderKind::Vertex, RIBBON_VERT, "ribbon vertex"),
-            ribbon_frag: compile_shader(
-                device,
-                ShaderKind::Fragment,
-                RIBBON_FRAG,
-                "ribbon fragment",
-            ),
+            smoke_vert: compile_shader(device, ShaderKind::Vertex, SMOKE_VERT, "smoke vertex"),
+            smoke_frag: compile_shader(device, ShaderKind::Fragment, SMOKE_FRAG, "smoke fragment"),
             post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
             bright_frag: compile_shader(
                 device,
@@ -3842,27 +3804,27 @@ fn build_glow_pipeline(
     .expect("glow graphics pipeline must create")
 }
 
-/// Cosmic ribbon-filament pipeline (update-2026-09-19-1245 P1):
-/// `TriangleList` over per-instance [`StrandVertex`] records (the
-/// vertex shader expands `gl_VertexIndex` into camera-facing ribbon
-/// quads), premultiplied-additive, no depth write (tubes accumulate
-/// like the glow sprites).
-fn build_ribbon_pipeline(
+/// Cosmic smoke-filament pipeline (smoke display): `TriangleList`
+/// over per-instance [`SmokeVertex`] records (the vertex shader
+/// expands `gl_VertexIndex` into camera-facing billboard quads),
+/// premultiplied-additive, no depth write (puffs accumulate like the
+/// glow sprites).
+fn build_smoke_pipeline(
     device: &Arc<Device>,
     shaders: &ShaderSet,
     render_pass: &Arc<RenderPass>,
 ) -> Arc<GraphicsPipeline> {
     let vs = shaders
-        .ribbon_vert
+        .smoke_vert
         .entry_point("main")
         .expect("vertex entry point");
     let fs = shaders
-        .ribbon_frag
+        .smoke_frag
         .entry_point("main")
         .expect("fragment entry point");
-    let vertex_input_state = StrandVertex::per_instance()
+    let vertex_input_state = SmokeVertex::per_instance()
         .definition(&vs)
-        .expect("ribbon vertex layout must match shader");
+        .expect("smoke vertex layout must match shader");
     let (layout, stages) = pipeline_layout_for(device, vs, fs);
     let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
     GraphicsPipeline::new(
@@ -3900,7 +3862,7 @@ fn build_ribbon_pipeline(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .expect("ribbon graphics pipeline must create")
+    .expect("smoke graphics pipeline must create")
 }
 
 // ---------------------------------------------------------------------------
@@ -4279,50 +4241,29 @@ fn upload_cosmic_glow(
     .expect("cosmic glow vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic ribbon strand records as per-instance vertices
-/// (same origin frame as [`upload_cosmic_glow`], layout from
+/// Upload the cosmic smoke puffs as per-instance vertices (same
+/// origin frame as [`upload_cosmic_glow`], layout from
 /// [`cosmic_web`]). A degenerate empty set uploads one zero-alpha
-/// record (rasterizes nothing — the melt profile zeroes it anyway).
-fn upload_cosmic_braid(
+/// puff (rasterizes nothing — the radial falloff discards it).
+fn upload_cosmic_smoke(
     allocator: &Arc<StandardMemoryAllocator>,
     web: &WebDescriptor,
     seed: u64,
     origin: glam::DVec3,
-) -> Subbuffer<[StrandVertex]> {
-    let mut verts: Vec<StrandVertex> = game_debug::cosmic_web::strand_records(web, seed, origin)
+) -> Subbuffer<[SmokeVertex]> {
+    let mut verts: Vec<SmokeVertex> = game_debug::cosmic_web::smoke_puffs(web, seed, origin)
         .iter()
-        .map(|r| StrandVertex {
-            rec_a: [r.a[0], r.a[1], r.a[2], r.wander[0] as f32],
-            rec_raw: [
-                r.raw[0] as f32,
-                r.raw[1] as f32,
-                r.raw[2] as f32,
-                r.wander[1] as f32,
-            ],
-            rec_u: [
-                r.u[0] as f32,
-                r.u[1] as f32,
-                r.u[2] as f32,
-                r.twist[0] as f32,
-            ],
-            rec_v: [
-                r.v[0] as f32,
-                r.v[1] as f32,
-                r.v[2] as f32,
-                r.twist[1] as f32,
-            ],
-            rec_mix: [r.twist[2] as f32, r.twist[3] as f32, 0.0, 0.0],
-            rec_rgba: r.rgba,
+        .map(|p| SmokeVertex {
+            pos_size: [p.pos[0], p.pos[1], p.pos[2], p.size_mpc],
+            rgba: p.rgba,
+            misc: [p.seed, 0.0, 0.0, 0.0],
         })
         .collect();
     if verts.is_empty() {
-        verts.push(StrandVertex {
-            rec_a: [0.0, 0.0, 0.0, 0.0],
-            rec_raw: [0.0, 0.0, 0.0, 0.0],
-            rec_u: [0.0, 0.0, 0.0, 0.0],
-            rec_v: [0.0, 0.0, 0.0, 0.0],
-            rec_mix: [0.0, 0.0, 0.0, 0.0],
-            rec_rgba: [0.0, 0.0, 0.0, 0.0],
+        verts.push(SmokeVertex {
+            pos_size: [0.0, 0.0, 0.0, 1.0],
+            rgba: [0.0, 0.0, 0.0, 0.0],
+            misc: [0.0, 0.0, 0.0, 0.0],
         });
     }
     Buffer::from_iter(
@@ -4338,7 +4279,7 @@ fn upload_cosmic_braid(
         },
         verts,
     )
-    .expect("cosmic braid wireframe buffer upload must succeed")
+    .expect("cosmic smoke vertex buffer upload must succeed")
 }
 
 /// Upload the inspector player point: one origin-relative vertex (near-
@@ -4590,13 +4531,13 @@ struct ViewerApp {
     /// update-2026-09-18-2328): uploaded relative to the demo upload
     /// origin, rebuilt on reseed + rebase.
     cosmic_glow: Subbuffer<[MapVertex]>,
-    /// Cosmic braid lines (colored LineList, same origin frame).
-    cosmic_braid: Subbuffer<[StrandVertex]>,
+    /// Cosmic smoke puffs (instanced billboards, same origin frame).
+    cosmic_smoke: Subbuffer<[SmokeVertex]>,
     /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
     cosmic_tab_glow: Subbuffer<[MapVertex]>,
-    /// Inspector braid lines (fixed web-center origin).
-    cosmic_tab_braid: Subbuffer<[StrandVertex]>,
+    /// Inspector smoke puffs (fixed web-center origin).
+    cosmic_tab_smoke: Subbuffer<[SmokeVertex]>,
     /// Inspector player point (one vertex, rebuilt per frame while the
     /// tab shows — the ship moves continuously).
     cosmic_tab_player: Subbuffer<[MapVertex]>,
@@ -4799,7 +4740,7 @@ impl ViewerApp {
             cosmic_seed,
             cosmic_origin,
         );
-        let cosmic_braid = upload_cosmic_braid(
+        let cosmic_smoke = upload_cosmic_smoke(
             &memory_allocator,
             &debug.cosmic.web,
             cosmic_seed,
@@ -4812,7 +4753,7 @@ impl ViewerApp {
             cosmic_seed,
             glam::DVec3::ZERO,
         );
-        let cosmic_tab_braid = upload_cosmic_braid(
+        let cosmic_tab_smoke = upload_cosmic_smoke(
             &memory_allocator,
             &debug.cosmic.web,
             cosmic_seed,
@@ -4836,7 +4777,7 @@ impl ViewerApp {
         // exe lock) silently keeps the old look. If this line is
         // missing from the log, the binary predates the fix.
         tracing::info!(
-            "cosmic visual build r2: rim-zero falloff + bounded tint + world halos + light rebalance + resolve clamp"
+            "cosmic visual build r3: smoke billboards replace ribbons + rim-zero falloff + bounded tint + world halos + resolve clamp"
         );
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),
@@ -4859,9 +4800,9 @@ impl ViewerApp {
             system_points,
             system_lines,
             cosmic_glow,
-            cosmic_braid,
+            cosmic_smoke,
             cosmic_tab_glow,
-            cosmic_tab_braid,
+            cosmic_tab_smoke,
             cosmic_tab_player,
             sky,
             sky_vertices,
@@ -4948,15 +4889,15 @@ impl ViewerApp {
         let seed = self.debug.cosmic.seed;
         self.cosmic_glow =
             upload_cosmic_glow(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
-        self.cosmic_braid =
-            upload_cosmic_braid(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        self.cosmic_smoke =
+            upload_cosmic_smoke(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
         self.cosmic_tab_glow = upload_cosmic_glow(
             &self.memory_allocator,
             &self.debug.cosmic.web,
             seed,
             glam::DVec3::ZERO,
         );
-        self.cosmic_tab_braid = upload_cosmic_braid(
+        self.cosmic_tab_smoke = upload_cosmic_smoke(
             &self.memory_allocator,
             &self.debug.cosmic.web,
             seed,
@@ -5004,10 +4945,10 @@ impl ViewerApp {
                 [e.x, e.y, e.z],
             )
         };
-        let (braid, glow) = if is_demo {
-            (self.cosmic_braid.clone(), self.cosmic_glow.clone())
+        let (smoke, glow) = if is_demo {
+            (self.cosmic_smoke.clone(), self.cosmic_glow.clone())
         } else {
-            (self.cosmic_tab_braid.clone(), self.cosmic_tab_glow.clone())
+            (self.cosmic_tab_smoke.clone(), self.cosmic_tab_glow.clone())
         };
         if !is_demo {
             let ship = self.debug.cosmic.player.position_mpc();
@@ -5021,7 +4962,7 @@ impl ViewerApp {
             px_scale,
             is_demo,
             eye,
-            braid,
+            smoke,
             glow,
             viewport: Viewport {
                 offset: [vp.x, vp.y],
@@ -5289,9 +5230,9 @@ impl ViewerApp {
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
             map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
-            ribbon: build_ribbon_pipeline(&self.device, &self.shaders, &render_pass),
+            smoke: build_smoke_pipeline(&self.device, &self.shaders, &render_pass),
             glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
-            ribbon_scene: build_ribbon_pipeline(&self.device, &self.shaders, &scene_pass),
+            smoke_scene: build_smoke_pipeline(&self.device, &self.shaders, &scene_pass),
             bright: build_post_pipeline(
                 &self.device,
                 &self.shaders.bright_frag,
@@ -5440,11 +5381,11 @@ struct Pipelines {
     map: Arc<GraphicsPipeline>,
     /// Cosmic glow sprites (additive, update-2026-09-18-2328).
     map_glow: Arc<GraphicsPipeline>,
-    /// Cosmic ribbon filaments (additive instanced, update-2026-09-19-1245).
-    ribbon: Arc<GraphicsPipeline>,
+    /// Cosmic smoke filaments (additive instanced billboards).
+    smoke: Arc<GraphicsPipeline>,
     /// Scene-pass variants of the cosmic pipelines (HDR mode).
     glow_scene: Arc<GraphicsPipeline>,
-    ribbon_scene: Arc<GraphicsPipeline>,
+    smoke_scene: Arc<GraphicsPipeline>,
     /// Bloom bright extract (post pass).
     bright: Arc<GraphicsPipeline>,
     /// Separable blur step (post pass, axis via push).
@@ -7114,15 +7055,15 @@ impl ViewerApp {
             let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
             let bloom = BloomParams::spec_defaults();
             // Per-surface grade (update-2026-09-19-1933): the
-            // inspector's zoomed-out view stacks ~50 strands/px where
-            // the immersive demo stacks a few — one exposure can't
-            // serve both.
-            let (line_exposure, glow_exposure) = if frame.is_demo {
-                (COSMIC_DEMO_LINE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+            // inspector's zoomed-out view stacks dozens of puffs/px
+            // where the immersive demo stacks a few — one exposure
+            // can't serve both.
+            let (smoke_exposure, glow_exposure) = if frame.is_demo {
+                (COSMIC_DEMO_SMOKE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
             } else {
-                (COSMIC_MAP_LINE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+                (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
             };
-            // Scene: indigo clear, braid then glow.
+            // Scene: indigo clear, smoke then glow.
             builder
                 .begin_render_pass(
                     RenderPassBeginInfo {
@@ -7140,36 +7081,27 @@ impl ViewerApp {
                 .expect("HDR scene pass must begin")
                 .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
                 .expect("viewport must set")
-                .bind_pipeline_graphics(pipes.ribbon_scene.clone())
+                .bind_pipeline_graphics(pipes.smoke_scene.clone())
                 .expect("pipeline must bind")
-                .bind_vertex_buffers(0, frame.braid.clone())
+                .bind_vertex_buffers(0, frame.smoke.clone())
                 .expect("vertex buffer must bind")
                 .push_constants(
-                    pipes.ribbon_scene.layout().clone(),
+                    pipes.smoke_scene.layout().clone(),
                     0,
-                    RibbonPush {
+                    SmokePush {
                         mvp: frame.mvp,
                         eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
                         px_scale: frame.px_scale,
-                        exposure: line_exposure,
+                        exposure: smoke_exposure,
                         redshift,
-                        width_mpc: RIBBON_HALF_WIDTH_MPC,
-                        subdiv: game_debug::cosmic_web::BRAID_SUBDIVISIONS as f32,
                     },
                 )
-                .expect("ribbon push constants must upload");
-            // SAFETY: per-instance strand records, 6 verts per segment
-            // (two triangles) × subdivisions per strand; instance
-            // count is the record count, no index buffer bound.
-            unsafe {
-                builder.draw(
-                    game_debug::cosmic_web::BRAID_SUBDIVISIONS as u32 * 6,
-                    frame.braid.len() as u32,
-                    0,
-                    0,
-                )
-            }
-            .expect("HDR scene ribbon draw must record");
+                .expect("smoke push constants must upload");
+            // SAFETY: per-instance puff records, 6 verts per billboard
+            // (two triangles); instance count is the puff count, no
+            // index buffer bound.
+            unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
+                .expect("HDR scene smoke draw must record");
             builder
                 .bind_pipeline_graphics(pipes.glow_scene.clone())
                 .expect("pipeline must bind")
@@ -7392,7 +7324,7 @@ impl ViewerApp {
                 } else if view == ViewContent::CosmicWeb {
                     // Cosmic player scene (update-2026-09-18-2328): HDR
                     // mode resolves the pre-recorded scene + bloom over
-                    // the full window; LDR bypass draws braid + glow
+                    // the full window; LDR bypass draws smoke + glow
                     // direct-to-swapchain. Both arms share the
                     // precomputed frame, so the draws are identical.
                     // The demo tab renders the player-immersive view;
@@ -7402,10 +7334,10 @@ impl ViewerApp {
                         .as_ref()
                         .expect("cosmic view must precompute its frame");
                     let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
-                    let (line_exposure, glow_exposure) = if frame.is_demo {
-                        (COSMIC_DEMO_LINE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+                    let (smoke_exposure, glow_exposure) = if frame.is_demo {
+                        (COSMIC_DEMO_SMOKE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
                     } else {
-                        (COSMIC_MAP_LINE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+                        (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
                     };
                     let (resolve_exposure, bloom_intensity) = if frame.is_demo {
                         (COSMIC_DEMO_EXPOSURE, COSMIC_DEMO_BLOOM_INTENSITY)
@@ -7457,36 +7389,26 @@ impl ViewerApp {
                         builder
                             .set_viewport(0, [viewport].into_iter().collect())
                             .expect("viewport must set")
-                            .bind_pipeline_graphics(ctx.pipelines.ribbon.clone())
+                            .bind_pipeline_graphics(ctx.pipelines.smoke.clone())
                             .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, frame.braid.clone())
+                            .bind_vertex_buffers(0, frame.smoke.clone())
                             .expect("vertex buffer must bind")
                             .push_constants(
-                                ctx.pipelines.ribbon.layout().clone(),
+                                ctx.pipelines.smoke.layout().clone(),
                                 0,
-                                RibbonPush {
+                                SmokePush {
                                     mvp: frame.mvp,
                                     eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
                                     px_scale: frame.px_scale,
-                                    exposure: line_exposure,
+                                    exposure: smoke_exposure,
                                     redshift,
-                                    width_mpc: RIBBON_HALF_WIDTH_MPC,
-                                    subdiv: game_debug::cosmic_web::BRAID_SUBDIVISIONS as f32,
                                 },
                             )
-                            .expect("ribbon push constants must upload");
-                        // SAFETY: per-instance strand records, 6 verts
-                        // per segment × subdivisions per strand; no
-                        // index buffer bound.
-                        unsafe {
-                            builder.draw(
-                                game_debug::cosmic_web::BRAID_SUBDIVISIONS as u32 * 6,
-                                frame.braid.len() as u32,
-                                0,
-                                0,
-                            )
-                        }
-                        .expect("cosmic ribbon draw must record");
+                            .expect("smoke push constants must upload");
+                        // SAFETY: per-instance puff records, 6 verts
+                        // per billboard; no index buffer bound.
+                        unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
+                            .expect("cosmic smoke draw must record");
                         builder
                             .bind_pipeline_graphics(ctx.pipelines.map_glow.clone())
                             .expect("pipeline must bind")
@@ -7921,8 +7843,8 @@ mod tests {
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
             (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
             (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
-            (ShaderKind::Vertex, RIBBON_VERT, "ribbon vert"),
-            (ShaderKind::Fragment, RIBBON_FRAG, "ribbon frag"),
+            (ShaderKind::Vertex, SMOKE_VERT, "smoke vert"),
+            (ShaderKind::Fragment, SMOKE_FRAG, "smoke frag"),
         ] {
             if let Err(error) = compile_glsl_to_spirv(kind, source) {
                 panic!("{what} must compile: {error}");
@@ -7937,16 +7859,12 @@ mod tests {
         // vertex-struct fields BY NAME at pipeline creation — naga
         // compilation cannot catch a mismatch, and there is no
         // GPU-free way to run the real check, so the names are pinned
-        // here. `StrandVertex { rec_a, rec_raw, rec_u, rec_v,
-        // rec_mix, rec_rgba }` (per-instance), `MapVertex { map_pos,
-        // color, misc }`.
+        // here. `SmokeVertex { pos_size, rgba, misc }`
+        // (per-instance), `MapVertex { map_pos, color, misc }`.
         for (source, name, what) in [
-            (RIBBON_VERT, "in vec4 rec_a;", "ribbon rec_a"),
-            (RIBBON_VERT, "in vec4 rec_raw;", "ribbon rec_raw"),
-            (RIBBON_VERT, "in vec4 rec_u;", "ribbon rec_u"),
-            (RIBBON_VERT, "in vec4 rec_v;", "ribbon rec_v"),
-            (RIBBON_VERT, "in vec4 rec_mix;", "ribbon rec_mix"),
-            (RIBBON_VERT, "in vec4 rec_rgba;", "ribbon rec_rgba"),
+            (SMOKE_VERT, "in vec4 pos_size;", "smoke pos_size"),
+            (SMOKE_VERT, "in vec4 rgba;", "smoke rgba"),
+            (SMOKE_VERT, "in vec4 misc;", "smoke misc"),
             (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
             (GLOW_VERT, "in vec3 color;", "glow color"),
             (GLOW_VERT, "in vec3 misc;", "glow misc"),
@@ -7965,26 +7883,23 @@ mod tests {
         // exactly zero at the rim (else full quads), and the redshift
         // depth term must be clamped non-negative and capped (else
         // Inf/NaN/negative channels decorrelate into rainbow squares).
-        // The ribbon shader must pin the same redshift clamp, must
-        // guard the camera-facing side normalization, and must hit
-        // zero lateral falloff at the ribbon rims (else full quads).
-        // String pins, because neither naga nor any GPU-free test can
-        // evaluate the shaders.
+        // The smoke shader must pin the same redshift clamp, must
+        // guard the billboard normalization, and must hit zero radial
+        // falloff at the puff rims (else full quads). String pins,
+        // because neither naga nor any GPU-free test can evaluate the
+        // shaders.
         for (source, literal, what) in [
             (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
             (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
             (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
-            (RIBBON_VERT, "max(clipc.w, 0.0)", "ribbon depth clamp"),
-            (RIBBON_VERT, "sl > 1e-10", "ribbon side guard"),
-            (
-                RIBBON_FRAG,
-                "1.0 - v_lat * v_lat",
-                "ribbon rim-zero falloff",
-            ),
+            (SMOKE_VERT, "max(clipc.w, 0.0)", "smoke depth clamp"),
+            (SMOKE_VERT, "rl > 1e-10", "smoke side guard"),
+            (SMOKE_VERT, "min_world", "smoke min-pixel clamp"),
+            (SMOKE_FRAG, "1.0 - r2", "smoke rim-zero falloff"),
         ] {
             assert!(source.contains(literal), "{what} missing from its shader");
         }
-        for source in [GLOW_VERT, RIBBON_VERT] {
+        for source in [GLOW_VERT, SMOKE_VERT] {
             assert!(
                 source.contains(", 0.5)"),
                 "redshift cap missing from a cosmic vertex shader"
@@ -8017,12 +7932,11 @@ mod tests {
     #[test]
     fn cosmic_push_constants_fit_vulkan_floor() {
         // Cosmic blocks: glow (MVP + scale + exposure + redshift) and
-        // ribbon (MVP + eye + scale + exposure + redshift + width +
-        // subdiv, 100 B) must stay under the 128 B Vulkan 1.1 floor on
-        // every tier.
+        // smoke (MVP + eye + scale + exposure + redshift, 92 B) must
+        // stay under the 128 B Vulkan 1.1 floor on every tier.
         for (bytes, what) in [
             (std::mem::size_of::<GlowPush>(), "GlowPush"),
-            (std::mem::size_of::<RibbonPush>(), "RibbonPush"),
+            (std::mem::size_of::<SmokePush>(), "SmokePush"),
         ] {
             assert!(
                 bytes <= 128,

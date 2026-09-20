@@ -264,12 +264,13 @@ with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
 stats); the Cosmic Web tab (v0.3.2, ADR-023; cinematic refresh in
-update-2026-09-18-2328, ribbons in update-2026-09-19-1245) mounts the
-absorbed cosmic-web inspector (instanced ribbon filaments through
-the additive ribbon `TriangleList` pipeline, grain + gas veil +
+update-2026-09-18-2328, smoke in update-2026-09-20-0645 replacing the
+update-2026-09-19-1245 ribbons) mounts the
+absorbed cosmic-web inspector (instanced smoke-billboard filaments
+through the additive smoke `TriangleList` pipeline, grain + gas veil +
 3-layer node impostors through the additive glow `PointList`
 pipeline, own orbit/pan/zoom camera, live player point). The Game Demo tab renders the same web as the
-player-immersive scene (one glow draw + one ribbon draw per surface,
+player-immersive scene (one glow draw + one smoke draw per surface,
 buffers relative to an upload origin, camera recentered on the same
 origin with a 50 Mpc rebase). Both cosmic views render through an
 HDR scene target with a real bloom chain (bright extract + 2-scale
@@ -318,23 +319,29 @@ pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,
 `engine::render::post`, the GPU half follows the `game_tools`
 `ResolvePass` precedent, and transients rebuild with the swapchain.
 
-Ribbon filaments (update-2026-09-19-1245 P1): `cosmic_web.rs` emits
-one compact `StrandRecord` per braid strand (root, trunk, lateral
-basis, wander, twist, link rgba — 96 B, ~3.8 MB nominal vs ~34 MB of
-baked `LineList` verts). `main.rs` uploads them as per-instance
-vertices; `RIBBON_VERT` expands `gl_VertexIndex` into camera-facing
-ribbon quads (the same `braid_point` math the grain pass reuses, so
-grain still textures the tubes), world-space half-width 0.75 Mpc
-with a 1.5-px minimum, melt profile + endpoint amber warming +
-bounded redshift tint, and a 1→6 Mpc near-eye fade (the player
-spawns inside a filament — unfaded ribbons fill the screen as white
-slabs). `RIBBON_FRAG` applies rim-zero lateral falloff; push block
-`RibbonPush` (MVP, eye, px_scale, exposure, redshift, width, subdiv —
-100 B) carries the per-surface grade. ~1.2M tris, inside the 3M
-desktop budget. Known costs/risks: vertex braid math (~24M trig
-evaluations/frame) measured fine on UHD 620 (60/59.5 fps debug at
-1296×759); if a tier struggles, cut ribbon subdivisions or draw
-indexed (22 unique verts/strand vs 60 expanded).
+Smoke filaments (update-2026-09-20-0645, replaces update-2026-09-19-1245
+P1 ribbons): `cosmic_web.rs` emits one compact `SmokePuff` per puff
+(pos, world diameter, rgba, noise seed — 48 B GPU, ~2.5 MB nominal
+for ~52k puffs vs ~1.2M ribbon tris). `main.rs` uploads them as
+per-instance vertices; `SMOKE_VERT` expands `gl_VertexIndex` into
+camera-facing billboard quads (billboard frame = 1 cross +
+normalize, no trig in the vertex shader; centers reuse the same
+`braid_point` derivation the grain pass uses, so grain still
+textures the smoke), world diameters 2–6.5 Mpc, hub warming baked on
+CPU, bounded redshift tint, and a 1→6 Mpc near-eye fade (the player
+spawns inside a filament — unfaded puffs fill the screen as white
+slabs). `SMOKE_FRAG` applies rim-zero radial falloff × a cheap 4x4
+hash dust term (no sin/exp per pixel — mobile fill-rate friendly);
+push block `SmokePush` (MVP, eye, px_scale, exposure, redshift —
+92 B) carries the per-surface grade. A 2-px minimum-world-size clamp
+keeps distant puffs visible in the zoomed-out inspector (without it
+they shrink subpixel and vanish). ~104k tris, inside the 500k Low
+budget with margin. Known costs/risks: inspector zoom-out stacks
+dozens of puffs/px — mitigated by tiny alpha (0.035–0.09) with the
+MAP smoke exposure at 0.7 (~6x the retired ribbon MAP grade, paying
+for the billboard area spread) vs 0.5 demo; follow-ups:
+distance/frustum cull, Low grain-budget cut (grain still 800k
+points).
 
 Palette quick pass (update-2026-09-19-1933): grading-only retune on
 the same geometry — no pipeline, topology, or image changes, bloom
@@ -354,17 +361,18 @@ mass-stratify harder (shared `mass_level` ramp re-centered 1e12–3e14
 M☉ so ordinary cluster hubs read golden, cores 3–12 px at up to 5.0
 emissive on a deep-gold ramp, halos cyan→amber, 2.5–6 Mpc — narrowed
 so near-camera halos hit the 256 px point-size clamp as a smaller,
-dimmer smudge; the real fix is the ribbon update's quad impostors).
+dimmer smudge; the real fix is quad impostors (still open after the
+smoke update).
 The redshift depth cue softened (`COSMIC_REDSHIFT_PER_MPC` 0.004 →
 0.002, saturation 125 → 250 Mpc; red boost 0.75z over blue kill
 0.7z, dim 0.45z) so gold survives and distant structures warm like
 the target's pink-tinged far filaments; safety clamps unchanged.
 Grade knobs are per-surface bin-local consts in
-`main.rs` (`COSMIC_DEMO_*` / `COSMIC_MAP_*`): line/sprite alpha
-exposure (a new `WebLinePush.exposure` field scales braid alpha
-in-shader; `GlowPush.exposure` already existed) plus resolve
-exposure/bloom intensity — the zoomed-out inspector stacks ~50
-strands per pixel where the immersive demo stacks a few, so one
+`main.rs` (`COSMIC_DEMO_*` / `COSMIC_MAP_*`): smoke/sprite alpha
+exposure (`SmokePush.exposure` scales puff alpha in-shader;
+`GlowPush.exposure` already existed) plus resolve
+exposure/bloom intensity — the zoomed-out inspector stacks dozens
+of puffs per pixel where the immersive demo stacks a few, so one
 grade cannot serve both. Engine `BloomParams::spec_defaults()`
 (threshold, blur σ) stays untouched.
 
