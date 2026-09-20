@@ -53,7 +53,7 @@ cargo check --workspace --target aarch64-apple-ios
 ```
 
 Local visual gate (v0.3.3 `cosmic-capture-harness`, GPU required — never
-in CI; planned, active once that feature is `done`): every cosmic
+in CI; active since that feature is `done`): every cosmic
 feature's DoD carries before/after PNGs from the fixed presets, and two
 captures with identical arguments must be byte-identical on at least
 one reference GPU:
@@ -61,6 +61,14 @@ one reference GPU:
 ```text
 cargo run -p game_debug -- --capture shots/<preset>-after.png --seed 1337 --view inspector|slab|demo|vista
 ```
+
+Reference result (Intel UHD 620, 2026-09-20): three consecutive
+`inspector` captures at `1408x768` share SHA256
+`CDC86FE0…` (gate script in
+`plans/v0.3.3/cosmic-capture-harness/plan.md` CAP-008). Windowed
+`F12` writes the same PNG of the current cosmic surface to
+`captures/` (exploration only — DoD evidence always comes from
+presets).
 
 Test policy:
 

@@ -63,17 +63,19 @@ use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, RenderPassBeginInfo,
-    SubpassBeginInfo, SubpassContents,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageToBufferInfo,
+    PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags};
+use vulkano::device::{
+    Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+};
 use vulkano::format::{ClearValue, Format, FormatFeatures};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::instance::Instance;
+use vulkano::instance::{Instance, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -836,20 +838,41 @@ const STREAM_SYNC_MS: u64 = 100;
 // ---------------------------------------------------------------------------
 
 fn usage() -> &'static str {
-    "usage: game_debug [--headless] [--seed N]"
+    "usage: game_debug [--headless] [--seed N] [--capture OUT.png --view inspector|slab|demo|vista --size WxH]"
+}
+
+/// Offscreen capture request (`--capture`, `cosmic-capture-harness`):
+/// renders one frame of a cosmic surface without a window and writes
+/// an 8-bit sRGB PNG. GPU-gated (never in CI).
+#[derive(Debug)]
+struct CaptureRequest {
+    /// Output PNG path.
+    path: String,
+    /// Camera preset (surface + pose).
+    view: game_debug::cosmic_capture::CaptureView,
+    /// Output size, px.
+    width: u32,
+    /// Output size, px.
+    height: u32,
 }
 
 /// Parsed CLI: `--headless` runs the GPU-free checks; `--seed N`
-/// opens the viewer (and seeds the headless map checks) on universe N.
+/// opens the viewer (and seeds the headless map checks) on universe N;
+/// `--capture` renders one offscreen frame (GPU required).
 #[derive(Debug)]
 struct CliArgs {
     headless: bool,
     seed: Option<u64>,
+    capture: Option<CaptureRequest>,
 }
 
 fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
+    use game_debug::cosmic_capture::{CAPTURE_DEFAULT_SIZE, parse_size, parse_view};
     let mut headless = false;
     let mut seed = None;
+    let mut capture_path: Option<String> = None;
+    let mut capture_view = None;
+    let mut capture_size = CAPTURE_DEFAULT_SIZE;
     let mut rest = argv.iter().skip(1);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -869,6 +892,37 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
                     return Err(format!("--seed needs a value\n{usage}", usage = usage()));
                 }
             },
+            "--capture" => match rest.next() {
+                Some(value) => capture_path = Some(value.clone()),
+                None => {
+                    return Err(format!("--capture needs a path\n{usage}", usage = usage()));
+                }
+            },
+            "--view" => match rest.next() {
+                Some(value) => match parse_view(value) {
+                    Ok(view) => capture_view = Some(view),
+                    Err(error) => {
+                        return Err(format!("{error}\n{usage}", usage = usage()));
+                    }
+                },
+                None => {
+                    return Err(format!("--view needs a preset\n{usage}", usage = usage()));
+                }
+            },
+            "--size" => match rest.next() {
+                Some(value) => match parse_size(value) {
+                    Ok(size) => capture_size = size,
+                    Err(error) => {
+                        return Err(format!("{error}\n{usage}", usage = usage()));
+                    }
+                },
+                None => {
+                    return Err(format!(
+                        "--size needs a WxH value\n{usage}",
+                        usage = usage()
+                    ));
+                }
+            },
             other => {
                 return Err(format!(
                     "unknown argument {other:?}\n{usage}",
@@ -877,7 +931,23 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
             }
         }
     }
-    Ok(CliArgs { headless, seed })
+    let capture = capture_path.map(|path| CaptureRequest {
+        path,
+        view: capture_view.unwrap_or(game_debug::cosmic_capture::CaptureView::Inspector),
+        width: capture_size.0,
+        height: capture_size.1,
+    });
+    if capture.is_some() && headless {
+        return Err(format!(
+            "--capture needs a GPU; --headless is GPU-free\n{usage}",
+            usage = usage()
+        ));
+    }
+    Ok(CliArgs {
+        headless,
+        seed,
+        capture,
+    })
 }
 
 /// GPU-free viewer check: build the default mesh through the lib, print
@@ -1159,9 +1229,469 @@ fn run_headless(seed: Option<u64>) -> i32 {
     0
 }
 
+/// Offscreen capture format (R-1): no surface exists, so the windowed
+/// swapchain format is unavailable — `B8G8R8A8_SRGB` is the near-
+/// universal swapchain pick, and the capture builds its own render
+/// passes + pipelines against it (never reusing windowed pipelines
+/// against a foreign format).
+const CAPTURE_FORMAT: Format = Format::B8G8R8A8_SRGB;
+
+/// Default capture seed (the DoD gate examples use `--seed 1337`).
+const CAPTURE_DEFAULT_SEED: u64 = 1337;
+
+/// Offscreen cosmic capture (`cosmic-capture-harness` FR1): headless
+/// Vulkan boot (no surface, no swapchain, no window), same HDR chain /
+/// pipelines / buffers as the windowed viewer, one frame recorded
+/// through the shared CAP-001 seam (`record_cosmic_hdr_prepass` +
+/// `record_cosmic_view_arm` — the only recording path), read back to
+/// host, BGRA→RGBA swizzled, PNG-encoded top-row-first, written to
+/// `request.path`. Deterministic per (build, seed, preset, size) on a
+/// given GPU: fixed sim time `t = 0` (no ticks), no animation, all
+/// randomness from the seed. Exit codes (FR5): 2 = no Vulkan device,
+/// 3 = output unwritable.
+///
+/// This function intentionally duplicates the small CPU-side frame
+/// assembly (`cosmic_frame` stays windowed-only): the GPU command
+/// recording is shared, the CPU pose math is not.
+fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
+    use game_debug::cosmic_capture::{CaptureView, encode_png_rgba8, preset_for};
+    let seed = seed.unwrap_or(CAPTURE_DEFAULT_SEED);
+    let preset = preset_for(request.view);
+    let (w, h) = (request.width, request.height);
+    // FR5: unwritable path → exit 3 before touching Vulkan.
+    if let Some(parent) = std::path::Path::new(&request.path).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "capture: cannot create output dir {}: {error}",
+            parent.display()
+        );
+        return 3;
+    }
+    // Headless Vulkan boot: instance without surface extensions, a
+    // graphics queue without presentation support, no swapchain
+    // extension on the device.
+    let library = match VulkanLibrary::new() {
+        Ok(library) => library,
+        Err(error) => {
+            eprintln!("capture: no Vulkan loader: {error}");
+            return 2;
+        }
+    };
+    let instance = match create_instance(library, InstanceExtensions::empty(), false) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("capture: instance failed: {error:?}");
+            return 2;
+        }
+    };
+    let (physical_device, queue_family_index) = match instance
+        .enumerate_physical_devices()
+        .map_err(|error| format!("{error:?}"))
+        .and_then(|devices| {
+            devices
+                .filter_map(|p| {
+                    p.queue_family_properties()
+                        .iter()
+                        .enumerate()
+                        .position(|(_, q)| q.queue_flags.intersects(QueueFlags::GRAPHICS))
+                        .map(|i| (p, i as u32))
+                })
+                .min_by_key(|(p, _)| device_score(p.properties().device_type))
+                .ok_or_else(|| "no graphics queue found".to_owned())
+        }) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("capture: no suitable Vulkan device: {error}");
+            return 2;
+        }
+    };
+    log_physical_device(&physical_device);
+    let (device, mut queues) = match Device::new(
+        physical_device.clone(),
+        DeviceCreateInfo {
+            enabled_extensions: DeviceExtensions::empty(),
+            queue_create_infos: vec![QueueCreateInfo {
+                queue_family_index,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    ) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("capture: logical device failed: {error:?}");
+            return 2;
+        }
+    };
+    let queue = queues.next().expect("one queue requested");
+    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+        device.clone(),
+        Default::default(),
+    ));
+    let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+        device.clone(),
+        Default::default(),
+    ));
+    let post_sampler = Sampler::new(
+        device.clone(),
+        SamplerCreateInfo {
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::ClampToEdge; 3],
+            ..Default::default()
+        },
+    )
+    .expect("capture post sampler must create");
+    let shaders = ShaderSet::compile(&device);
+    // Offscreen render passes: main (capture format + depth, the
+    // windowed main-pass shape) plus the shared scene/post builders.
+    let render_pass = vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: CAPTURE_FORMAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+            depth: {
+                format: DEPTH_FORMAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: DontCare,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {depth},
+        },
+    )
+    .expect("capture render pass must create");
+    // HDR select over the same support predicate as windowed (FR5:
+    // missing HDR → LDR bypass + log, still exit 0).
+    let hdr_format = match select_hdr_format(|format| hdr_support(&physical_device, format)) {
+        HdrSelection::Hdr(format) => Some(format),
+        HdrSelection::LdrBypass => None,
+    };
+    if hdr_format.is_none() {
+        eprintln!("capture: no HDR format — LDR bypass");
+    }
+    let scene_format = hdr_format.unwrap_or(CAPTURE_FORMAT);
+    let scene_pass = build_scene_pass(&device, scene_format);
+    let post_pass = build_post_pass(&device, scene_format);
+    // Cosmic-only pipeline subset (the capture records no other view).
+    let pipes = Pipelines {
+        fill: build_fill_pipeline(&device, &shaders, &render_pass),
+        line: build_line_pipeline(&device, &shaders, &render_pass),
+        ui: build_ui_pipeline(&device, &shaders, &render_pass),
+        map: build_map_pipeline(&device, &shaders, &render_pass),
+        map_glow: build_glow_pipeline(&device, &shaders, &render_pass),
+        smoke: build_smoke_pipeline(&device, &shaders, &render_pass),
+        glow_scene: build_glow_pipeline(&device, &shaders, &scene_pass),
+        smoke_scene: build_smoke_pipeline(&device, &shaders, &scene_pass),
+        bright: build_post_pipeline(
+            &device,
+            &shaders.bright_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "bloom bright",
+        ),
+        blur: build_post_pipeline(
+            &device,
+            &shaders.blur_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "bloom blur",
+        ),
+        resolve: build_post_pipeline(
+            &device,
+            &shaders.resolve_frag,
+            &shaders.post_vert,
+            &render_pass,
+            Some(DepthStencilState::default()),
+            "bloom resolve",
+        ),
+    };
+    // Deterministic app state at t = 0 (no ticks, no animation).
+    let mut debug = DebugApp::new();
+    if seed != DEFAULT_GALAXY_SEED {
+        debug.cosmic.reseed(seed);
+    }
+    let is_demo = preset.surface_is_demo;
+    let aspect = w as f32 / h as f32;
+    let (mvp, px_scale, eye, origin) = if is_demo {
+        let camera = &debug.cosmic.camera;
+        let eye_w = camera.eye_world();
+        let origin = debug.cosmic.upload_origin;
+        (
+            camera.view_proj(aspect).to_cols_array_2d(),
+            camera.px_scale(h as f32),
+            [
+                (eye_w.x - origin.x) as f32,
+                (eye_w.y - origin.y) as f32,
+                (eye_w.z - origin.z) as f32,
+            ],
+            origin,
+        )
+    } else {
+        let inspector = &debug.cosmic_inspector;
+        let e = inspector.camera.eye();
+        (
+            inspector.view_proj(aspect).to_cols_array_2d(),
+            inspector.camera.px_scale(h as f32),
+            [e.x, e.y, e.z],
+            DVec3::ZERO,
+        )
+    };
+    let extent = [w, h];
+    let smoke = upload_cosmic_smoke(&memory_allocator, &debug.cosmic.web, seed, origin);
+    let glow = upload_cosmic_glow(&memory_allocator, &debug.cosmic.web, seed, origin);
+    let ship = debug.cosmic.player.position_mpc();
+    let player_point = upload_cosmic_player_point(
+        &memory_allocator,
+        [ship.x as f32, ship.y as f32, ship.z as f32],
+    );
+    let frame = CosmicFrame {
+        mvp,
+        px_scale,
+        is_demo,
+        eye,
+        smoke,
+        glow,
+        viewport: Viewport {
+            offset: [0.0, 0.0],
+            extent: [w as f32, h as f32],
+            depth_range: 0.0..=1.0,
+        },
+    };
+    let extent_arr = [w, h];
+    let hdr = hdr_format.map(|format| {
+        ViewerApp::build_hdr_chain(
+            &memory_allocator,
+            &descriptor_set_allocator,
+            &post_sampler,
+            format,
+            extent_arr,
+            &scene_pass,
+            &post_pass,
+            &pipes,
+        )
+    });
+    // Offscreen target: capture-format color (+TRANSFER_SRC for the
+    // readback) with depth, under the offscreen main pass.
+    let target_image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: CAPTURE_FORMAT,
+            extent: [w, h, 1],
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("capture: target image failed: {error}");
+        std::process::exit(2);
+    });
+    let target_view = ImageView::new_default(target_image.clone()).unwrap_or_else(|error| {
+        eprintln!("capture: target view failed: {error}");
+        std::process::exit(2);
+    });
+    let target_depth = create_depth_view(&memory_allocator, extent);
+    let target_fb = Framebuffer::new(
+        render_pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![target_view, target_depth],
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("capture: target framebuffer failed: {error:?}");
+        std::process::exit(2);
+    });
+    let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+    let (smoke_exposure, glow_exposure, resolve_exposure, bloom_intensity) = if is_demo {
+        (
+            COSMIC_DEMO_SMOKE_EXPOSURE,
+            COSMIC_DEMO_GLOW_EXPOSURE,
+            COSMIC_DEMO_EXPOSURE,
+            COSMIC_DEMO_BLOOM_INTENSITY,
+        )
+    } else {
+        (
+            COSMIC_MAP_SMOKE_EXPOSURE,
+            COSMIC_MAP_GLOW_EXPOSURE,
+            COSMIC_MAP_EXPOSURE,
+            COSMIC_MAP_BLOOM_INTENSITY,
+        )
+    };
+    let bloom_enabled = !std::env::var("GAME_DEBUG_COSMIC_BLOOM").is_ok_and(|value| value == "0");
+    let readback = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                | MemoryTypeFilter::PREFER_HOST,
+            ..Default::default()
+        },
+        (0..w as usize * h as usize * 4).map(|_| 0u8),
+    )
+    .expect("capture readback buffer must create");
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator.clone(),
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .expect("capture command buffer builder must create");
+    if let Some(chain) = hdr.as_ref() {
+        record_cosmic_hdr_prepass(
+            &mut builder,
+            &pipes,
+            chain,
+            &frame,
+            smoke_exposure,
+            glow_exposure,
+            redshift,
+            BloomParams::spec_defaults().threshold,
+            bloom_enabled,
+        );
+    }
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(COSMIC_BACKDROP.into()), Some(ClearValue::Depth(1.0))],
+                ..RenderPassBeginInfo::framebuffer(target_fb)
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )
+        .expect("capture pass must begin");
+    record_cosmic_view_arm(
+        &mut builder,
+        &pipes,
+        hdr.as_ref(),
+        bloom_enabled,
+        &frame,
+        frame.viewport.clone(),
+        [w as f32, h as f32],
+        smoke_exposure,
+        glow_exposure,
+        resolve_exposure,
+        bloom_intensity,
+        redshift,
+        player_point,
+    );
+    builder
+        .end_render_pass(Default::default())
+        .expect("capture pass must end");
+    builder
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            target_image,
+            readback.clone(),
+        ))
+        .expect("capture readback copy must record");
+    let command_buffer = builder.build().expect("capture command buffer must build");
+    if let Err(error) = sync::now(device.clone())
+        .then_execute(queue.clone(), command_buffer)
+        .expect("capture submit must succeed")
+        .then_signal_fence_and_flush()
+        .expect("capture fence must flush")
+        .wait(None)
+    {
+        eprintln!("capture: GPU execution failed: {error}");
+        return 2;
+    }
+    // BGRA (swapchain order) → RGBA swizzle, row 0 = top (NDC +1 =
+    // top invariant, NFR5) straight into the PNG encoder.
+    let pixels = {
+        let guard = readback.read().expect("capture readback must map");
+        let mut rgba = guard.to_vec();
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        rgba
+    };
+    debug_assert_eq!(pixels.len(), w as usize * h as usize * 4);
+    let png = match encode_png_rgba8(w, h, &pixels) {
+        Ok(png) => png,
+        Err(error) => {
+            eprintln!("capture: PNG encode failed: {error}");
+            return 3;
+        }
+    };
+    if let Err(error) = std::fs::write(&request.path, &png) {
+        eprintln!("capture: cannot write {}: {error}", request.path);
+        return 3;
+    }
+    let view_name = match request.view {
+        CaptureView::Inspector => "inspector",
+        CaptureView::Slab => "slab",
+        CaptureView::Demo => "demo",
+        CaptureView::Vista => "vista",
+    };
+    println!(
+        "capture saved: {} (view {view_name}, seed {seed}, {w}x{h})",
+        request.path
+    );
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Pure UI builders (unit-tested below; the frame loop only converts).
 // ---------------------------------------------------------------------------
+
+/// Windowed-capture timestamp (`captures/<surface>-<seed>-<ts>.png`):
+/// UTC `yyyymmdd-hhmmss` from UNIX seconds, dependency-free (Hinnant's
+/// days-from-civil algorithm over u64). Exploration filenames only —
+/// DoD evidence always comes from `--capture` presets.
+fn capture_timestamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    // Days → civil date (Hinnant): all exact u64 math, valid for any
+    // non-negative day count.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    y += u64::from(m <= 2);
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        y,
+        m,
+        d,
+        tod / 3_600,
+        (tod % 3_600) / 60,
+        tod % 60
+    )
+}
+
+/// Current UTC timestamp for windowed captures; `unknown-time` when
+/// the clock is unavailable (never a panic on a dev tool path).
+fn capture_now_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| capture_timestamp(d.as_secs()))
+        .unwrap_or_else(|_| "unknown-time".to_owned())
+}
 
 /// Thousands separator for stats (`40962` → `"40,962"`).
 fn fmt_int(mut n: usize) -> String {
@@ -4397,6 +4927,334 @@ fn upload_cosmic_player_point(
     .expect("cosmic player point upload must succeed")
 }
 
+/// Shared cosmic HDR pre-pass recording (`cosmic-capture-harness`
+/// CAP-001 seam): indigo scene (smoke then glow) + bright extract +
+/// blur chain through the write-once targets. Called by the windowed
+/// frame loop AND the offscreen `--capture` path — one recording
+/// function, two targets (NFR1). Everything target-independent arrives
+/// as params; the transients ride `hdr`, the draws ride `frame`.
+#[allow(clippy::too_many_arguments)] // seam fn: explicit params are the no-drift guarantee
+fn record_cosmic_hdr_prepass(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: &HdrChain,
+    frame: &CosmicFrame,
+    smoke_exposure: f32,
+    glow_exposure: f32,
+    redshift: f32,
+    bloom_threshold: f32,
+    bloom_enabled: bool,
+) {
+    // Scene: indigo clear, smoke then glow.
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(COSMIC_BACKDROP.into()), Some(ClearValue::Depth(1.0))],
+                ..RenderPassBeginInfo::framebuffer(hdr.scene_fb.clone())
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )
+        .expect("HDR scene pass must begin")
+        .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
+        .expect("viewport must set")
+        .bind_pipeline_graphics(pipes.smoke_scene.clone())
+        .expect("pipeline must bind")
+        .bind_vertex_buffers(0, frame.smoke.clone())
+        .expect("vertex buffer must bind")
+        .push_constants(
+            pipes.smoke_scene.layout().clone(),
+            0,
+            SmokePush {
+                mvp: frame.mvp,
+                eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                px_scale: frame.px_scale,
+                exposure: smoke_exposure,
+                redshift,
+            },
+        )
+        .expect("smoke push constants must upload");
+    // SAFETY: per-instance puff records, 6 verts per billboard
+    // (two triangles); instance count is the puff count, no
+    // index buffer bound.
+    unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
+        .expect("HDR scene smoke draw must record");
+    builder
+        .bind_pipeline_graphics(pipes.glow_scene.clone())
+        .expect("pipeline must bind")
+        .bind_vertex_buffers(0, frame.glow.clone())
+        .expect("vertex buffer must bind")
+        .push_constants(
+            pipes.glow_scene.layout().clone(),
+            0,
+            GlowPush {
+                mvp: frame.mvp,
+                px_scale: frame.px_scale,
+                exposure: glow_exposure,
+                redshift,
+            },
+        )
+        .expect("glow push constants must upload");
+    // SAFETY: same PointList contract as the galaxy map.
+    unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
+        .expect("HDR scene glow draw must record");
+    builder
+        .end_render_pass(Default::default())
+        .expect("HDR scene pass must end");
+    // Bloom chain at half res: bright extract, then four H/V
+    // separable blur passes through dedicated targets A-E
+    // (write-once, never ping-ponged). Final bloom lands in
+    // E, which the resolve samples.
+    let half_vp = Viewport {
+        offset: [0.0, 0.0],
+        extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],
+        depth_range: 0.0..=1.0,
+    };
+    let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(black)],
+                ..RenderPassBeginInfo::framebuffer(hdr.bloom_a_fb.clone())
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )
+        .expect("bloom bright pass must begin")
+        .set_viewport(0, [half_vp.clone()].into_iter().collect())
+        .expect("viewport must set")
+        .bind_pipeline_graphics(pipes.bright.clone())
+        .expect("pipeline must bind")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            pipes.bright.layout().clone(),
+            0,
+            hdr.bright_set.clone(),
+        )
+        .expect("bloom bright set must bind")
+        .push_constants(
+            pipes.bright.layout().clone(),
+            0,
+            BloomBrightPush {
+                threshold: bloom_threshold,
+            },
+        )
+        .expect("bloom bright push must upload");
+    // SAFETY: fullscreen-triangle pipeline, no vertex input
+    // — 3 unbuffered vertices are the whole draw.
+    unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom bright draw must record");
+    builder
+        .end_render_pass(Default::default())
+        .expect("bloom bright pass must end");
+    let hw = hdr.half_extent[0] as f32;
+    let hh = hdr.half_extent[1] as f32;
+    // Dedicated targets per step (see `HdrChain`): bright→A,
+    // H:A→B, V:B→C, wide-H:C→D, wide-V:D→E(final). No target
+    // is ever rewritten. `GAME_DEBUG_COSMIC_BLOOM=0` skips the
+    // chain: the resolve then adds the sharp bright extract.
+    let blur_steps = if bloom_enabled {
+        vec![
+            (
+                hdr.bloom_b_fb.clone(),
+                hdr.blur_a_set.clone(),
+                [1.0 / hw, 0.0],
+            ),
+            (
+                hdr.bloom_c_fb.clone(),
+                hdr.blur_b_set.clone(),
+                [0.0, 1.0 / hh],
+            ),
+            (
+                hdr.bloom_d_fb.clone(),
+                hdr.blur_c_set.clone(),
+                [2.0 / hw, 0.0],
+            ),
+            (
+                hdr.bloom_e_fb.clone(),
+                hdr.blur_d_set.clone(),
+                [0.0, 2.0 / hh],
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    for (dst, set, step) in &blur_steps {
+        builder
+            .begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![Some(black)],
+                    ..RenderPassBeginInfo::framebuffer(dst.clone())
+                },
+                SubpassBeginInfo {
+                    contents: SubpassContents::Inline,
+                    ..Default::default()
+                },
+            )
+            .expect("bloom blur pass must begin")
+            .set_viewport(0, [half_vp.clone()].into_iter().collect())
+            .expect("viewport must set")
+            .bind_pipeline_graphics(pipes.blur.clone())
+            .expect("pipeline must bind")
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                pipes.blur.layout().clone(),
+                0,
+                set.clone(),
+            )
+            .expect("bloom blur set must bind")
+            .push_constants(
+                pipes.blur.layout().clone(),
+                0,
+                BloomBlurPush { step: *step },
+            )
+            .expect("bloom blur push must upload");
+        // SAFETY: fullscreen-triangle pipeline, no vertex
+        // input — 3 unbuffered vertices are the whole draw.
+        unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom blur draw must record");
+        builder
+            .end_render_pass(Default::default())
+            .expect("bloom blur pass must end");
+    }
+}
+
+/// Shared cosmic view-arm recording (CAP-001 seam, second half): the
+/// `ViewContent::CosmicWeb` arm of the main pass — HDR mode resolves
+/// the pre-recorded scene + bloom over the target, LDR bypass draws
+/// smoke + glow direct, then the inspector player point. Called by the
+/// windowed frame loop (inside the swapchain pass, among the other
+/// views + UI) AND the offscreen `--capture` path (alone in its own
+/// pass) — one recording function, two targets. `viewport` is the
+/// per-view rect; `full_extent` sizes the HDR resolve triangle.
+#[allow(clippy::too_many_arguments)]
+fn record_cosmic_view_arm(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: Option<&HdrChain>,
+    bloom_enabled: bool,
+    frame: &CosmicFrame,
+    viewport: Viewport,
+    full_extent: [f32; 2],
+    smoke_exposure: f32,
+    glow_exposure: f32,
+    resolve_exposure: f32,
+    bloom_intensity: f32,
+    redshift: f32,
+    player_point: Subbuffer<[MapVertex]>,
+) {
+    if let Some(hdr) = hdr {
+        let full_vp = Viewport {
+            offset: [0.0, 0.0],
+            extent: full_extent,
+            depth_range: 0.0..=1.0,
+        };
+        // Full bloom chain: scene + final bloom (E).
+        // `GAME_DEBUG_COSMIC_BLOOM=0`: scene + bright
+        // extract (A) — E is never written there.
+        let resolve_set = if bloom_enabled {
+            hdr.resolve_set.clone()
+        } else {
+            hdr.resolve_nobloom_set.clone()
+        };
+        builder
+            .set_viewport(0, [full_vp.clone()].into_iter().collect())
+            .expect("viewport must set")
+            .bind_pipeline_graphics(pipes.resolve.clone())
+            .expect("pipeline must bind")
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                pipes.resolve.layout().clone(),
+                0,
+                resolve_set,
+            )
+            .expect("bloom resolve set must bind")
+            .push_constants(
+                pipes.resolve.layout().clone(),
+                0,
+                BloomResolvePush {
+                    exposure: resolve_exposure,
+                    intensity: bloom_intensity,
+                },
+            )
+            .expect("bloom resolve push must upload");
+        // SAFETY: fullscreen-triangle pipeline, no vertex
+        // input — 3 unbuffered vertices are the whole draw.
+        unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom resolve draw must record");
+    } else {
+        let glow_len = frame.glow.len();
+        builder
+            .set_viewport(0, [viewport].into_iter().collect())
+            .expect("viewport must set")
+            .bind_pipeline_graphics(pipes.smoke.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, frame.smoke.clone())
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.smoke.layout().clone(),
+                0,
+                SmokePush {
+                    mvp: frame.mvp,
+                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                    px_scale: frame.px_scale,
+                    exposure: smoke_exposure,
+                    redshift,
+                },
+            )
+            .expect("smoke push constants must upload");
+        // SAFETY: per-instance puff records, 6 verts
+        // per billboard; no index buffer bound.
+        unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
+            .expect("cosmic smoke draw must record");
+        builder
+            .bind_pipeline_graphics(pipes.map_glow.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, frame.glow.clone())
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.map_glow.layout().clone(),
+                0,
+                GlowPush {
+                    mvp: frame.mvp,
+                    px_scale: frame.px_scale,
+                    exposure: glow_exposure,
+                    redshift,
+                },
+            )
+            .expect("glow push constants must upload");
+        // SAFETY: same PointList contract as the galaxy map.
+        unsafe { builder.draw(glow_len as u32, 1, 0, 0) }.expect("cosmic glow draw must record");
+    }
+    if !frame.is_demo {
+        // Inspector player point: drawn last through the alpha map
+        // pipeline — after the resolve in HDR mode, so
+        // the marker stays legible over the glow. The
+        // pipeline bind is explicit: the previously
+        // bound pipeline here is `resolve` (HDR) or
+        // `map_glow` (LDR), whose push layouts are
+        // incompatible with `MapPush` (VUID-06425).
+        builder
+            .bind_pipeline_graphics(pipes.map.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, player_point)
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.map.layout().clone(),
+                0,
+                MapPush {
+                    mvp: frame.mvp,
+                    px_scale: frame.px_scale,
+                    exposure: 1.0,
+                },
+            )
+            .expect("map push constants must upload");
+        // SAFETY: single-vertex PointList, no index buffer.
+        unsafe { builder.draw(1, 1, 0, 0) }.expect("cosmic player point draw must record");
+    }
+}
+
 /// Upload catalog-sky points as Backdrop sprites (`misc` = pixel size,
 /// alpha, kind 0). Re-uploaded only when the tile set changes —
 /// camera motion rides the MVP push, never this buffer. Empty sets
@@ -4637,6 +5495,11 @@ struct ViewerApp {
     /// Astronomical): keys the sky-luminance input of the star
     /// fade-in (exposure-tone-mapping DoD-2 captures).
     twilight_stage: u8,
+    /// Windowed screenshot request (`F12`, `cosmic-capture-harness`):
+    /// the next frame copies its swapchain image to a host buffer and
+    /// writes `captures/<surface>-<seed>-<ts>.png`. Exploration only —
+    /// DoD evidence always comes from `--capture` presets.
+    pending_capture: bool,
     /// Partial sim-step accumulator for the transit countdown
     /// (fixed-step consumption of the frame dt).
     transit_acc: f32,
@@ -4686,6 +5549,8 @@ enum WalkDir {
 struct WindowContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
+    /// Swapchain images (F12 readback indexes the acquired one).
+    swapchain_images: Vec<Arc<Image>>,
     render_pass: Arc<RenderPass>,
     pipelines: Pipelines,
     framebuffers: Vec<Arc<Framebuffer>>,
@@ -4895,6 +5760,7 @@ impl ViewerApp {
             sky,
             sky_vertices,
             twilight_stage: 0,
+            pending_capture: false,
             transit_acc: 0.0,
             atlas_image: None,
             dragging_orbit: false,
@@ -5366,19 +6232,22 @@ impl ViewerApp {
     /// bypass (no transients — the cosmic draws go direct). Associated
     /// function (not a method) so the recreate path can pass disjoint
     /// `self` fields alongside the `&mut` window context.
+    #[allow(clippy::too_many_arguments)] // builder fn: explicit resources, two call sites + capture
     fn build_hdr_chain(
         memory_allocator: &Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         post_sampler: &Arc<Sampler>,
-        ctx: &WindowContext,
-    ) -> Option<HdrChain> {
-        let format = ctx.hdr_format?;
-        let extent = ctx.swapchain.image_extent();
+        format: Format,
+        extent: [u32; 2],
+        scene_pass: &Arc<RenderPass>,
+        post_pass: &Arc<RenderPass>,
+        pipes: &Pipelines,
+    ) -> HdrChain {
         let half = [extent[0].max(2) / 2, extent[1].max(2) / 2];
         let scene_view = create_post_view(memory_allocator, extent, format, "HDR scene");
         let scene_depth = create_depth_view(memory_allocator, extent);
         let scene_fb = Framebuffer::new(
-            ctx.scene_pass.clone(),
+            scene_pass.clone(),
             FramebufferCreateInfo {
                 attachments: vec![scene_view.clone(), scene_depth.clone()],
                 ..Default::default()
@@ -5393,7 +6262,7 @@ impl ViewerApp {
         for what in ["A", "B", "C", "D", "E"] {
             let view = create_post_view(memory_allocator, half, format, what);
             let fb = Framebuffer::new(
-                ctx.post_pass.clone(),
+                post_pass.clone(),
                 FramebufferCreateInfo {
                     attachments: vec![view.clone()],
                     ..Default::default()
@@ -5403,7 +6272,6 @@ impl ViewerApp {
             bloom_views.push(view);
             bloom_fbs.push(fb);
         }
-        let pipes = &ctx.pipelines;
         let bright_set = post_image_set(
             descriptor_set_allocator,
             &pipes.bright,
@@ -5442,7 +6310,7 @@ impl ViewerApp {
         let resolve_nobloom_set = resolve_pair(&bloom_views[0], "bloom resolve nobloom");
         let mut fbs = bloom_fbs.into_iter();
         let mut sets = blur_sets.into_iter();
-        Some(HdrChain {
+        HdrChain {
             format,
             scene_fb,
             bloom_a_fb: fbs.next().expect("five bloom framebuffers"),
@@ -5458,7 +6326,7 @@ impl ViewerApp {
             blur_d_set: sets.next().expect("four bloom sets"),
             resolve_set,
             resolve_nobloom_set,
-        })
+        }
     }
 }
 
@@ -5531,7 +6399,7 @@ impl ViewerApp {
                     min_image_count: capabilities.min_image_count.max(2),
                     image_format,
                     image_extent: window_size.into(),
-                    image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
                     composite_alpha: capabilities
                         .supported_composite_alpha
                         .into_iter()
@@ -5549,6 +6417,7 @@ impl ViewerApp {
         let mut ctx = WindowContext {
             window,
             swapchain,
+            swapchain_images: images.clone(),
             render_pass,
             pipelines,
             framebuffers,
@@ -5564,12 +6433,18 @@ impl ViewerApp {
             post_pass,
             hdr: None,
         };
-        ctx.hdr = Self::build_hdr_chain(
-            &self.memory_allocator,
-            &self.descriptor_set_allocator,
-            &self.post_sampler,
-            &ctx,
-        );
+        ctx.hdr = ctx.hdr_format.map(|format| {
+            Self::build_hdr_chain(
+                &self.memory_allocator,
+                &self.descriptor_set_allocator,
+                &self.post_sampler,
+                format,
+                ctx.swapchain.image_extent(),
+                &ctx.scene_pass,
+                &ctx.post_pass,
+                &ctx.pipelines,
+            )
+        });
         if let Some(chain) = ctx.hdr.as_ref() {
             tracing::info!(format = ?chain.format, "HDR cosmic post chain active");
         } else {
@@ -6285,6 +7160,19 @@ impl ViewerApp {
                         let (_, name) = twilight_key(self.twilight_stage);
                         self.debug.fx.notify(format!("Twilight {name}"));
                     }
+                    PhysicalKey::Code(KeyCode::F12) => {
+                        // Windowed PNG capture
+                        // (`cosmic-capture-harness`, exploration only —
+                        // DoD evidence comes from `--capture` presets).
+                        if self.debug.screen_content() == Some(ViewContent::CosmicWeb) {
+                            self.pending_capture = true;
+                        } else {
+                            self.debug.fx.notify(
+                                "F12 captures a cosmic view — switch to Game Demo or Cosmic Web"
+                                    .to_owned(),
+                            );
+                        }
+                    }
                     PhysicalKey::Code(
                         KeyCode::Digit0
                         | KeyCode::Digit1
@@ -6586,6 +7474,16 @@ impl ViewerApp {
             Action::ShowWidgetInspector => self.debug.select_widget_tab(WidgetTab::Inspector),
             Action::UnwindUi => {
                 self.debug.esc_unwind();
+            }
+            Action::CaptureScreenshot => {
+                // Settings Controls parity for F12 (same gate as the key).
+                if self.debug.screen_content() == Some(ViewContent::CosmicWeb) {
+                    self.pending_capture = true;
+                } else {
+                    self.debug.fx.notify(
+                        "F12 captures a cosmic view — switch to Game Demo or Cosmic Web".to_owned(),
+                    );
+                }
             }
             Action::NavGameDemo => self.debug.select_screen(Screen::GameDemo),
             Action::NavDimensions => self.debug.toggle_dropdown(),
@@ -6954,18 +7852,25 @@ impl ViewerApp {
                     })
                     .expect("swapchain recreation must succeed");
                 ctx.swapchain = new_swapchain;
+                ctx.swapchain_images = new_images.clone();
                 ctx.depth_view =
                     create_depth_view(&self.memory_allocator, ctx.swapchain.image_extent());
                 ctx.framebuffers =
                     window_size_dependent_setup(&new_images, &ctx.render_pass, &ctx.depth_view);
                 // HDR transients track the swapchain extent (the passes
                 // and pipelines persist — only images/sets rebuild).
-                ctx.hdr = Self::build_hdr_chain(
-                    &self.memory_allocator,
-                    &self.descriptor_set_allocator,
-                    &self.post_sampler,
-                    ctx,
-                );
+                ctx.hdr = ctx.hdr_format.map(|format| {
+                    Self::build_hdr_chain(
+                        &self.memory_allocator,
+                        &self.descriptor_set_allocator,
+                        &self.post_sampler,
+                        format,
+                        ctx.swapchain.image_extent(),
+                        &ctx.scene_pass,
+                        &ctx.post_pass,
+                        &ctx.pipelines,
+                    )
+                });
                 ctx.recreate_swapchain = false;
             }
         }
@@ -7112,6 +8017,39 @@ impl ViewerApp {
             CommandBufferUsage::OneTimeSubmit,
         )
         .expect("command buffer builder must create");
+        // Windowed capture (F12), first half: copy the acquired
+        // swapchain image to a host buffer BEFORE the render pass
+        // overwrites it. Encode + write happen after the flush below
+        // (one-frame deferred — the loop never blocks more than one
+        // frame for a capture).
+        let capture_readback = if self.pending_capture {
+            let extent = ctx.swapchain.image_extent();
+            let buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                        | MemoryTypeFilter::PREFER_HOST,
+                    ..Default::default()
+                },
+                (0..extent[0] as usize * extent[1] as usize * 4).map(|_| 0u8),
+            )
+            .expect("capture readback buffer must create");
+            let image = ctx
+                .swapchain_images
+                .get(image_index as usize)
+                .expect("acquired swapchain image must exist")
+                .clone();
+            builder
+                .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, buffer.clone()))
+                .expect("capture readback copy must record");
+            Some((buffer, extent))
+        } else {
+            None
+        };
         // Orbit backdrop (UMAP-020): the arrival target's atmosphere
         // color, scaled to a near-black space read; the default tint
         // otherwise. Cosmic views clear to deep indigo instead
@@ -7135,13 +8073,12 @@ impl ViewerApp {
         // bloom chain run offscreen before the main pass begins; the
         // views loop below only resolves into the swapchain image. LDR
         // bypass skips this block and draws direct-to-swapchain in the
-        // loop instead.
+        // loop instead. Recording lives in `record_cosmic_hdr_prepass`
+        // (CAP-001 seam: the offscreen `--capture` path calls it too).
         if let Some(frame) = cosmic_frame.as_ref()
             && let Some(hdr) = ctx.hdr.as_ref()
         {
-            let pipes = &ctx.pipelines;
             let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
-            let bloom = BloomParams::spec_defaults();
             // Per-surface grade (update-2026-09-19-1933): the
             // inspector's zoomed-out view stacks dozens of puffs/px
             // where the immersive demo stacks a few — one exposure
@@ -7151,183 +8088,17 @@ impl ViewerApp {
             } else {
                 (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
             };
-            // Scene: indigo clear, smoke then glow.
-            builder
-                .begin_render_pass(
-                    RenderPassBeginInfo {
-                        clear_values: vec![
-                            Some(COSMIC_BACKDROP.into()),
-                            Some(ClearValue::Depth(1.0)),
-                        ],
-                        ..RenderPassBeginInfo::framebuffer(hdr.scene_fb.clone())
-                    },
-                    SubpassBeginInfo {
-                        contents: SubpassContents::Inline,
-                        ..Default::default()
-                    },
-                )
-                .expect("HDR scene pass must begin")
-                .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
-                .expect("viewport must set")
-                .bind_pipeline_graphics(pipes.smoke_scene.clone())
-                .expect("pipeline must bind")
-                .bind_vertex_buffers(0, frame.smoke.clone())
-                .expect("vertex buffer must bind")
-                .push_constants(
-                    pipes.smoke_scene.layout().clone(),
-                    0,
-                    SmokePush {
-                        mvp: frame.mvp,
-                        eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
-                        px_scale: frame.px_scale,
-                        exposure: smoke_exposure,
-                        redshift,
-                    },
-                )
-                .expect("smoke push constants must upload");
-            // SAFETY: per-instance puff records, 6 verts per billboard
-            // (two triangles); instance count is the puff count, no
-            // index buffer bound.
-            unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
-                .expect("HDR scene smoke draw must record");
-            builder
-                .bind_pipeline_graphics(pipes.glow_scene.clone())
-                .expect("pipeline must bind")
-                .bind_vertex_buffers(0, frame.glow.clone())
-                .expect("vertex buffer must bind")
-                .push_constants(
-                    pipes.glow_scene.layout().clone(),
-                    0,
-                    GlowPush {
-                        mvp: frame.mvp,
-                        px_scale: frame.px_scale,
-                        exposure: glow_exposure,
-                        redshift,
-                    },
-                )
-                .expect("glow push constants must upload");
-            // SAFETY: same PointList contract as the galaxy map.
-            unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
-                .expect("HDR scene glow draw must record");
-            builder
-                .end_render_pass(Default::default())
-                .expect("HDR scene pass must end");
-            // Bloom chain at half res: bright extract, then four H/V
-            // separable blur passes through dedicated targets A-E
-            // (write-once, never ping-ponged). Final bloom lands in
-            // E, which the resolve samples.
-            let half_vp = Viewport {
-                offset: [0.0, 0.0],
-                extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],
-                depth_range: 0.0..=1.0,
-            };
-            let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
-            builder
-                .begin_render_pass(
-                    RenderPassBeginInfo {
-                        clear_values: vec![Some(black)],
-                        ..RenderPassBeginInfo::framebuffer(hdr.bloom_a_fb.clone())
-                    },
-                    SubpassBeginInfo {
-                        contents: SubpassContents::Inline,
-                        ..Default::default()
-                    },
-                )
-                .expect("bloom bright pass must begin")
-                .set_viewport(0, [half_vp.clone()].into_iter().collect())
-                .expect("viewport must set")
-                .bind_pipeline_graphics(pipes.bright.clone())
-                .expect("pipeline must bind")
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipes.bright.layout().clone(),
-                    0,
-                    hdr.bright_set.clone(),
-                )
-                .expect("bloom bright set must bind")
-                .push_constants(
-                    pipes.bright.layout().clone(),
-                    0,
-                    BloomBrightPush {
-                        threshold: bloom.threshold,
-                    },
-                )
-                .expect("bloom bright push must upload");
-            // SAFETY: fullscreen-triangle pipeline, no vertex input
-            // — 3 unbuffered vertices are the whole draw.
-            unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom bright draw must record");
-            builder
-                .end_render_pass(Default::default())
-                .expect("bloom bright pass must end");
-            let hw = hdr.half_extent[0] as f32;
-            let hh = hdr.half_extent[1] as f32;
-            // Dedicated targets per step (see `HdrChain`): bright→A,
-            // H:A→B, V:B→C, wide-H:C→D, wide-V:D→E(final). No target
-            // is ever rewritten. `GAME_DEBUG_COSMIC_BLOOM=0` skips the
-            // chain: the resolve then adds the sharp bright extract.
-            let blur_steps = if ctx.bloom_enabled {
-                vec![
-                    (
-                        hdr.bloom_b_fb.clone(),
-                        hdr.blur_a_set.clone(),
-                        [1.0 / hw, 0.0],
-                    ),
-                    (
-                        hdr.bloom_c_fb.clone(),
-                        hdr.blur_b_set.clone(),
-                        [0.0, 1.0 / hh],
-                    ),
-                    (
-                        hdr.bloom_d_fb.clone(),
-                        hdr.blur_c_set.clone(),
-                        [2.0 / hw, 0.0],
-                    ),
-                    (
-                        hdr.bloom_e_fb.clone(),
-                        hdr.blur_d_set.clone(),
-                        [0.0, 2.0 / hh],
-                    ),
-                ]
-            } else {
-                Vec::new()
-            };
-            for (dst, set, step) in &blur_steps {
-                builder
-                    .begin_render_pass(
-                        RenderPassBeginInfo {
-                            clear_values: vec![Some(black)],
-                            ..RenderPassBeginInfo::framebuffer(dst.clone())
-                        },
-                        SubpassBeginInfo {
-                            contents: SubpassContents::Inline,
-                            ..Default::default()
-                        },
-                    )
-                    .expect("bloom blur pass must begin")
-                    .set_viewport(0, [half_vp.clone()].into_iter().collect())
-                    .expect("viewport must set")
-                    .bind_pipeline_graphics(pipes.blur.clone())
-                    .expect("pipeline must bind")
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipes.blur.layout().clone(),
-                        0,
-                        set.clone(),
-                    )
-                    .expect("bloom blur set must bind")
-                    .push_constants(
-                        pipes.blur.layout().clone(),
-                        0,
-                        BloomBlurPush { step: *step },
-                    )
-                    .expect("bloom blur push must upload");
-                // SAFETY: fullscreen-triangle pipeline, no vertex
-                // input — 3 unbuffered vertices are the whole draw.
-                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom blur draw must record");
-                builder
-                    .end_render_pass(Default::default())
-                    .expect("bloom blur pass must end");
-            }
+            record_cosmic_hdr_prepass(
+                &mut builder,
+                &ctx.pipelines,
+                hdr,
+                frame,
+                smoke_exposure,
+                glow_exposure,
+                redshift,
+                BloomParams::spec_defaults().threshold,
+                ctx.bloom_enabled,
+            );
         }
         builder
             .begin_render_pass(
@@ -7418,6 +8189,8 @@ impl ViewerApp {
                     // The demo tab renders the player-immersive view;
                     // the Cosmic Web tab renders through the inspector
                     // camera (fixed-center buffers + live player point).
+                    // Recording lives in `record_cosmic_view_arm`
+                    // (CAP-001 seam: the offscreen path calls it too).
                     let frame = cosmic_frame
                         .as_ref()
                         .expect("cosmic view must precompute its frame");
@@ -7432,119 +8205,21 @@ impl ViewerApp {
                     } else {
                         (COSMIC_MAP_EXPOSURE, COSMIC_MAP_BLOOM_INTENSITY)
                     };
-                    if let Some(hdr) = ctx.hdr.as_ref() {
-                        let full_vp = Viewport {
-                            offset: [0.0, 0.0],
-                            extent: [win_w, win_h],
-                            depth_range: 0.0..=1.0,
-                        };
-                        // Full bloom chain: scene + final bloom (E).
-                        // `GAME_DEBUG_COSMIC_BLOOM=0`: scene + bright
-                        // extract (A) — E is never written there.
-                        let resolve_set = if ctx.bloom_enabled {
-                            hdr.resolve_set.clone()
-                        } else {
-                            hdr.resolve_nobloom_set.clone()
-                        };
-                        builder
-                            .set_viewport(0, [full_vp.clone()].into_iter().collect())
-                            .expect("viewport must set")
-                            .bind_pipeline_graphics(ctx.pipelines.resolve.clone())
-                            .expect("pipeline must bind")
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Graphics,
-                                ctx.pipelines.resolve.layout().clone(),
-                                0,
-                                resolve_set,
-                            )
-                            .expect("bloom resolve set must bind")
-                            .push_constants(
-                                ctx.pipelines.resolve.layout().clone(),
-                                0,
-                                BloomResolvePush {
-                                    exposure: resolve_exposure,
-                                    intensity: bloom_intensity,
-                                },
-                            )
-                            .expect("bloom resolve push must upload");
-                        // SAFETY: fullscreen-triangle pipeline, no vertex
-                        // input — 3 unbuffered vertices are the whole
-                        // draw.
-                        unsafe { builder.draw(3, 1, 0, 0) }
-                            .expect("bloom resolve draw must record");
-                    } else {
-                        let glow_len = frame.glow.len();
-                        builder
-                            .set_viewport(0, [viewport].into_iter().collect())
-                            .expect("viewport must set")
-                            .bind_pipeline_graphics(ctx.pipelines.smoke.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, frame.smoke.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.smoke.layout().clone(),
-                                0,
-                                SmokePush {
-                                    mvp: frame.mvp,
-                                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
-                                    px_scale: frame.px_scale,
-                                    exposure: smoke_exposure,
-                                    redshift,
-                                },
-                            )
-                            .expect("smoke push constants must upload");
-                        // SAFETY: per-instance puff records, 6 verts
-                        // per billboard; no index buffer bound.
-                        unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
-                            .expect("cosmic smoke draw must record");
-                        builder
-                            .bind_pipeline_graphics(ctx.pipelines.map_glow.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, frame.glow.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.map_glow.layout().clone(),
-                                0,
-                                GlowPush {
-                                    mvp: frame.mvp,
-                                    px_scale: frame.px_scale,
-                                    exposure: glow_exposure,
-                                    redshift,
-                                },
-                            )
-                            .expect("glow push constants must upload");
-                        // SAFETY: same PointList contract as the galaxy map.
-                        unsafe { builder.draw(glow_len as u32, 1, 0, 0) }
-                            .expect("cosmic glow draw must record");
-                    }
-                    if !frame.is_demo {
-                        // Inspector player point (precomputed in the
-                        // frame): drawn last through the alpha map
-                        // pipeline — after the resolve in HDR mode, so
-                        // the marker stays legible over the glow. The
-                        // pipeline bind is explicit: the previously
-                        // bound pipeline here is `resolve` (HDR) or
-                        // `map_glow` (LDR), whose push layouts are
-                        // incompatible with `MapPush` (VUID-06425).
-                        builder
-                            .bind_pipeline_graphics(ctx.pipelines.map.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, self.cosmic_tab_player.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.map.layout().clone(),
-                                0,
-                                MapPush {
-                                    mvp: frame.mvp,
-                                    px_scale: frame.px_scale,
-                                    exposure: 1.0,
-                                },
-                            )
-                            .expect("map push constants must upload");
-                        // SAFETY: single-vertex PointList, no index buffer.
-                        unsafe { builder.draw(1, 1, 0, 0) }
-                            .expect("cosmic player point draw must record");
-                    }
+                    record_cosmic_view_arm(
+                        &mut builder,
+                        &ctx.pipelines,
+                        ctx.hdr.as_ref(),
+                        ctx.bloom_enabled,
+                        frame,
+                        viewport.clone(),
+                        [win_w, win_h],
+                        smoke_exposure,
+                        glow_exposure,
+                        resolve_exposure,
+                        bloom_intensity,
+                        redshift,
+                        self.cosmic_tab_player.clone(),
+                    );
                 } else if view == ViewContent::SystemMap {
                     // System map: orbit rings through the line pipeline,
                     // star + planets through the map point pipeline — both
@@ -7824,12 +8499,78 @@ impl ViewerApp {
             )
             .then_signal_fence_and_flush();
         match future.map_err(Validated::unwrap) {
-            Ok(future) => ctx.previous_frame_end = Some(future.boxed()),
+            Ok(future) => {
+                if let Some((buffer, extent)) = capture_readback {
+                    // Windowed capture (F12), second half: this frame's
+                    // GPU work is ≤1 frame by construction — wait for
+                    // it, then map + encode + write on the CPU.
+                    self.pending_capture = false;
+                    match future.wait(None) {
+                        Ok(()) => {
+                            ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                            self.write_windowed_capture(&buffer, extent);
+                        }
+                        Err(error) => {
+                            ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                            self.debug
+                                .fx
+                                .notify(format!("F12 capture failed on the GPU: {error:?}"));
+                        }
+                    }
+                } else {
+                    ctx.previous_frame_end = Some(future.boxed());
+                }
+            }
             Err(VulkanError::OutOfDate) => {
+                if capture_readback.is_some() {
+                    self.pending_capture = false;
+                    self.debug.fx.notify(
+                        "F12 capture lost (swapchain out of date) — press F12 again".to_owned(),
+                    );
+                }
                 ctx.recreate_swapchain = true;
                 ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
             Err(error) => panic!("frame flush failed: {error}"),
+        }
+    }
+
+    /// Windowed capture (F12), CPU half: BGRA→RGBA swizzle + PNG write
+    /// + Console/notice log. Failures notify, never panic.
+    fn write_windowed_capture(&mut self, buffer: &Subbuffer<[u8]>, extent: [u32; 2]) {
+        use game_debug::cosmic_capture::{encode_png_rgba8, windowed_capture_filename};
+        let surface = match self.debug.screen {
+            Screen::GameDemo => "demo",
+            Screen::Dimensions(_) => "inspector",
+            Screen::Settings => "settings",
+        };
+        let path =
+            windowed_capture_filename(surface, self.debug.cosmic.seed, &capture_now_timestamp());
+        let result = (|| -> Result<String, String> {
+            if let Some(parent) = std::path::Path::new(&path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+            }
+            let guard = buffer.read().map_err(|e| format!("{e:?}"))?;
+            let mut rgba = guard.to_vec();
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let png = encode_png_rgba8(extent[0], extent[1], &rgba).map_err(|e| e.to_string())?;
+            std::fs::write(&path, &png).map_err(|e| format!("{e}"))?;
+            Ok(path.clone())
+        })();
+        match result {
+            Ok(path) => {
+                let line = format!("capture saved: {path}");
+                tracing::info!("{line}");
+                self.debug.console.push(line.clone());
+                self.debug.fx.notify(line);
+            }
+            Err(error) => {
+                self.debug.fx.notify(format!("F12 capture failed: {error}"));
+            }
         }
     }
 }
@@ -7854,6 +8595,9 @@ fn run() -> i32 {
     };
     if args.headless {
         return run_headless(args.seed);
+    }
+    if let Some(request) = args.capture {
+        return run_capture(request, args.seed);
     }
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
@@ -7884,6 +8628,21 @@ mod tests {
     }
 
     #[test]
+    fn capture_timestamp_formats_utc() {
+        // 2026-09-20 20:00:00 UTC — month/day/hour boundaries pinned.
+        assert_eq!(capture_timestamp(1_789_934_400), "20260920-200000");
+        assert_eq!(capture_timestamp(0), "19700101-000000");
+        assert_eq!(capture_timestamp(86_399), "19700101-235959");
+        assert_eq!(capture_timestamp(86_400), "19700102-000000");
+        // Leap day 2024-02-29 12:00:00 UTC.
+        assert_eq!(capture_timestamp(1_709_208_000), "20240229-120000");
+        // Shape: 15 chars, dash at 8.
+        let ts = capture_now_timestamp();
+        assert_eq!(ts.len(), 15, "bad timestamp shape: {ts}");
+        assert_eq!(&ts[8..9], "-");
+    }
+
+    #[test]
     fn cli_seed_parsing() {
         let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // Bare + headless.
@@ -7903,6 +8662,50 @@ mod tests {
             vec!["game_debug", "--seed", "abc"],
             vec!["game_debug", "--seed", "-1"],
             vec!["game_debug", "--nope"],
+        ] {
+            let err = parse_args(&argv(&bad)).expect_err("must reject");
+            assert!(err.contains("usage:"), "error lacks usage: {err}");
+        }
+    }
+
+    #[test]
+    fn cli_capture_parsing() {
+        use game_debug::cosmic_capture::CaptureView;
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Full form.
+        let args = parse_args(&argv(&[
+            "game_debug",
+            "--capture",
+            "shots/a.png",
+            "--seed",
+            "1337",
+            "--view",
+            "slab",
+            "--size",
+            "800x600",
+        ]))
+        .expect("capture must parse");
+        let req = args.capture.expect("capture request must exist");
+        assert_eq!(req.path, "shots/a.png");
+        assert_eq!(req.view, CaptureView::Slab);
+        assert_eq!((req.width, req.height), (800, 600));
+        assert_eq!(args.seed, Some(1337));
+        // Defaults: inspector preset, target aspect.
+        let args = parse_args(&argv(&["game_debug", "--capture", "b.png"])).expect("defaults");
+        let req = args.capture.expect("capture request must exist");
+        assert_eq!(req.view, CaptureView::Inspector);
+        assert_eq!(
+            (req.width, req.height),
+            game_debug::cosmic_capture::CAPTURE_DEFAULT_SIZE
+        );
+        // Failures carry usage.
+        for bad in [
+            vec!["game_debug", "--capture"],
+            vec!["game_debug", "--capture", "a.png", "--view", "orbit"],
+            vec!["game_debug", "--capture", "a.png", "--size", "abc"],
+            vec!["game_debug", "--capture", "a.png", "--size", "0x10"],
+            vec!["game_debug", "--capture", "a.png", "--headless"],
+            vec!["game_debug", "--headless", "--capture", "a.png"],
         ] {
             let err = parse_args(&argv(&bad)).expect_err("must reject");
             assert!(err.contains("usage:"), "error lacks usage: {err}");

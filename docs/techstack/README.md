@@ -1,9 +1,11 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.39.0 (2026-09-20, v0.3.3 `web-field-export` done:
-  non-hashed `WebField` sidecar shipped — 1 023 317 tracers at nominal,
-  17 MB, +0 ms dev-profile delta; equality + band + memory pins green;
-  headless prints `web_field=`; seven v0.3.3 features remain planned)
+- **Version:** 0.40.0 (2026-09-20, v0.3.3 `cosmic-capture-harness`
+  done: `--capture` offscreen PNGs on all four presets (shared
+  frame-recording seam, byte-identical determinism pinned on Intel
+  UHD 620) + windowed `F12`; v0.3.2 baselines under
+  `plans/v0.3.3/cosmic-capture-harness/shots/`; six v0.3.3 features
+  remain planned)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

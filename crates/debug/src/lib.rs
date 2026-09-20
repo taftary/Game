@@ -13,6 +13,7 @@ pub mod actions;
 pub mod app;
 pub mod console;
 pub mod cosmic_camera;
+pub mod cosmic_capture;
 pub mod cosmic_demo;
 pub mod cosmic_player;
 pub mod cosmic_web;

@@ -461,6 +461,21 @@ evidence comes first: `game_debug --capture` with four presets
 paths integer + `sqrt`-only, per-pixel shaders arithmetic-only.
 Plans: `plans/v0.3.3/`.
 
+Reproducible evidence (`cosmic-capture-harness`, shipped 2026-09-20):
+`game_debug --capture <out.png> --seed N --view
+inspector|slab|demo|vista --size WxH` renders one frame of a cosmic
+surface offscreen (no window, no event loop) through the exact same
+frame-recording functions as the windowed viewer
+(`record_cosmic_hdr_prepass` + `record_cosmic_view_arm` — one
+recording, two targets) and writes an 8-bit sRGB PNG, top row first
+(NDC `+1` = top end to end: framebuffer row 0 → ordered readback →
+top-first PNG). Byte-identical per (build, seed, preset, size) on a
+given GPU (pinned: three consecutive `inspector` captures share one
+SHA256 on the Intel UHD 620). `slab`/`vista` presets are reserved
+framings until `cosmic-depth-window` / `cosmic-vista-intro` fill them.
+Windowed `F12` (Settings › Controls `Save PNG capture`) writes the
+current cosmic surface to `captures/` for exploration only.
+
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).

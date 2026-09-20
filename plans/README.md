@@ -108,6 +108,16 @@ Single vocabulary everywhere (feature `notion.md`, update `notion.md`, issue `sp
   3. `plan.md` (from `issue-plan.md`) — added after investigation, fix tasks with IDs `ISS-YYYYMMDD-001`, … Only then implement.
 - Never rewrites parent feature/update files — cross-links only. Issue `done` requires `report.md` + `plan.md` present and all fix todos checked.
 
+### 6b. Evidence shots (v0.3.3 `cosmic-capture-harness` convention)
+
+- A feature folder may hold `shots/` with PNG files only, each
+  ≤ 4 MB, named `<preset>-<before|after>[-<tag>].png` where `<preset>`
+  is one of `inspector|slab|demo|vista` (the capture-harness presets).
+  Shots are committed with the feature's single `done` commit and
+  captioned in the plan's DoD table. (PO decision 2026-09-20: full
+  `1408x768` PNGs, no downscale — measured ~2–3 MB each on the
+  reference GPU, so the pre-cut ≤ 1 MB budget was raised to 4 MB.)
+
 ### 7. Version branch
 
 Each version folder `vX.Y.Z` gets a same-named git branch, cut from

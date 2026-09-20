@@ -26,6 +26,7 @@ naga = { version = "30", default-features = false, features = ["glsl-in", "spv-o
 fontdue = { version = "0.9", default-features = true }
 glam = { version = "0.33", default-features = true }
 hecs = { version = "0.10", default-features = true }
+png = { version = "0.17", default-features = false }
 tracing = { version = "0.1", default-features = true }
 tracing-subscriber = { version = "0.3", default-features = true }
 

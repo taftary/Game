@@ -76,7 +76,11 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   select the debug-shader mode (planet content), `F5` cycles the
   twilight stage, `G`/`T`/`B` snap the global camera to
   Perspective/Top/Bottom (planet content only, same as the panel VIEW
-  buttons; `R` = Right preset there). Map content
+  buttons; `R` = Right preset there). `F12` saves a PNG of the
+  current cosmic surface (Game Demo or Cosmic Web tab) to
+  `captures/<surface>-<seed>-<ts>.png` and logs the path to the
+  Console — exploration only; reproducible evidence comes from
+  `game_debug --capture` presets (see `docs/techstack/rendering.md`). Map content
   (`plans/v0.0.1/universe-maps`,
   `plans/v0.0.1/universe-maps-3d`): 3D perspective views — wheel = log zoom,
   left-drag = orbit, right/middle-drag = pan, click = select

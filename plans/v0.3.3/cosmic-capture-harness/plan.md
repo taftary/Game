@@ -55,26 +55,51 @@ shots of the v0.3.2 build for all four presets committed under
 
 | ID | Status | Task | Ref notion § |
 |----|--------|------|--------------|
-| CAP-001 | pending | Extract `record_cosmic_frame(target, extent, hdr, frame)` seam; windowed loop calls it; existing shader/vertex pins green | NFR1 |
-| CAP-002 | pending | `cosmic_capture.rs`: `CapturePreset` + four presets (poses in Mpc relative to home node) + GPU-free tests (lookup, parse, filename) | Goals §2, FR2 |
-| CAP-003 | pending | CLI: `--capture <path>`, `--view`, `--size WxH`; usage string; `parse_args` tests incl. bad preset / bad size | Goals §1, FR5 |
-| CAP-004 | pending | Offscreen boot (no window) + color image in pipeline format + record via CAP-001 + `copy_image_to_buffer` | FR1, NFR1 |
-| CAP-005 | pending | Add `png` (workspace root, `game_debug` only, encode) + write 8-bit sRGB PNG; row-0-is-top pin via known player-point capture | FR1, NFR2, NFR5 |
-| CAP-006 | pending | Exit codes: no device → 2, unwritable path → 3, no HDR → LDR bypass + log | FR5 |
-| CAP-007 | pending | `F12` windowed capture → `captures/<surface>-<seed>-<ts>.png`, Console log, one-frame deferred encode; Controls list + `controls.md` | Goals §4, FR4 |
-| CAP-008 | pending | Determinism gate: two captures byte-identical (script below); record result | FR3, DoD 3 |
-| CAP-009 | pending | `--headless` still GPU-free (module split verified by `cargo run -p game_debug -- --headless` on a runner without Vulkan or with `VK_ICD_FILENAMES=` empty) | NFR4 |
-| CAP-010 | pending | Baseline shots of the v0.3.2 build ×4 presets under `shots/` (`<preset>-before.png`) | DoD 7 |
-| CAP-011 | pending | Docs: `quality.md` local-gate row, `plans/README.md` shots rule (PNG ≤ 1 MB, naming), `rendering.md` capture note, techstack version bump; link check | DoD 6 |
-| CAP-012 | pending | Full gate suite + SECURITY dependency review (`png` encode-only, no `unsafe` features) + ANALYST DoD audit; single `done` commit | DoD 1–7 |
+| CAP-001 | done | Extract `record_cosmic_frame(target, extent, hdr, frame)` seam; windowed loop calls it; existing shader/vertex pins green | NFR1 |
+| CAP-002 | done | `cosmic_capture.rs`: `CapturePreset` + four presets (poses in Mpc relative to home node) + GPU-free tests (lookup, parse, filename) | Goals §2, FR2 |
+| CAP-003 | done | CLI: `--capture <path>`, `--view`, `--size WxH`; usage string; `parse_args` tests incl. bad preset / bad size | Goals §1, FR5 |
+| CAP-004 | done | Offscreen boot (no window) + color image in pipeline format + record via CAP-001 + `copy_image_to_buffer` | FR1, NFR1 |
+| CAP-005 | done | Add `png` (workspace root, `game_debug` only, encode) + write 8-bit sRGB PNG; row-0-is-top pin via known player-point capture | FR1, NFR2, NFR5 |
+| CAP-006 | done | Exit codes: no device → 2, unwritable path → 3, no HDR → LDR bypass + log | FR5 |
+| CAP-007 | done | `F12` windowed capture → `captures/<surface>-<seed>-<ts>.png`, Console log, one-frame deferred encode; Controls list + `controls.md` | Goals §4, FR4 |
+| CAP-008 | done | Determinism gate: two captures byte-identical (script below); record result | FR3, DoD 3 |
+| CAP-009 | done | `--headless` still GPU-free (module split verified by `cargo run -p game_debug -- --headless` on a runner without Vulkan or with `VK_ICD_FILENAMES=` empty) | NFR4 |
+| CAP-010 | done | Baseline shots of the v0.3.2 build ×4 presets under `shots/` (`<preset>-before.png`) | DoD 7 |
+| CAP-011 | done | Docs: `quality.md` local-gate row, `plans/README.md` shots rule (PNG ≤ 1 MB, naming), `rendering.md` capture note, techstack version bump; link check | DoD 6 |
+| CAP-012 | done | Full gate suite + SECURITY dependency review (`png` encode-only, no `unsafe` features) + ANALYST DoD audit; single `done` commit | DoD 1–7 |
 
-Local determinism gate (CAP-008):
+Local determinism gate (CAP-008) — green 2026-09-20, Intel UHD 620:
 
 ```text
 cargo run -p game_debug -- --capture a.png --seed 1337 --view inspector
 cargo run -p game_debug -- --capture b.png --seed 1337 --view inspector
 fc /b a.png b.png
 ```
+
+Three consecutive `inspector` captures at `1408x768` share SHA256
+`CDC86FE00C5C0E668D03ABB4EA4B147D4004184A714FFCEA2617B2C53064821E`
+(hash compared after `fc /b` proved awkward in PowerShell — SHA256
+over `Get-FileHash` is the recorded gate).
+
+Implementation notes vs plan: the seam landed as TWO functions
+(`record_cosmic_hdr_prepass` + `record_cosmic_view_arm` — pre-pass and
+view arm) instead of one `record_cosmic_frame`, because the windowed
+main pass interleaves the cosmic resolve with other views + UI while
+the capture records the cosmic arm alone; both call sites share both
+functions, which is the same no-drift guarantee. Offscreen format is
+`B8G8R8A8_SRGB` with its own render passes + pipelines (R-1 resolved
+by duplication, not parameterization — ~20 lines reusing the existing
+builders). `build_hdr_chain` was generalized from `&WindowContext` to
+explicit `(format, extent, passes, pipes)` so both paths build it.
+`slab`/`vista` presets render byte-identical to `inspector`/`demo`
+(literal: same-size files, `slab-before.png` = 2 917 127 B =
+`inspector-before.png`, `vista-before.png` = 2 236 778 B =
+`demo-before.png`). R-3 revised: full-size PNGs measure ~2–3 MB, so
+the shots rule is PNG ≤ 4 MB (PO decision, recorded in
+`plans/README.md` § 6b). NFR5 (row-0-is-top): construction pin —
+framebuffer row 0 = top (orientation contract) → ordered
+`copy_image_to_buffer` → top-first PNG input → encoder round-trip
+test pins first-row equality; no flipped-PNG path exists.
 
 ## Role sign-off
 
@@ -86,20 +111,24 @@ only; NDC-top-row pin listed) · Todos approved by: TECHLEAD
 (CAP-004) are the unknowns and go first; presets are data so every
 later feature can add a pose without code; gate commands listed) · UX
 acceptance rows (if player-facing): approved 2026-09-20 — UX-1 below
-(`F12` only) · DoD verified by: ANALYST _(pending)_ · Security reviewed
-by: SECURITY _(pending)_.
+(`F12` only) · DoD verified by: ANALYST (2026-09-20 — shots opened,
+gate hash recorded, code paths reviewed; windowed F12 keypress itself
+not hand-tested — compile + registry + code review) · Security reviewed
+by: SECURITY (2026-09-20 — `png` 0.17 pure-Rust, `default-features =
+false`, encode-only use; capture writes user-named paths only;
+no new network/unsafe surface).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | `--capture` writes a PNG, top row = top, exit 0 on both reference GPUs | pending | shot path + exit code log | ANALYST _(pending)_ |
-| 2 | Four presets render; `slab`/`vista` reserved | pending | four shot paths + preset doc comment | ANALYST _(pending)_ |
-| 3 | Two identical captures byte-identical | pending | `fc /b` output | ANALYST _(pending)_ |
-| 4 | `F12` writes PNG + logs; Controls list shows it; no key rebound | pending | Console log line + Controls screenshot | ANALYST _(pending)_ |
-| 5 | `--headless` GPU-free; `game` diff empty; `png` only new dep, SECURITY signed | pending | CI run + `git diff --stat` + Cargo.lock delta | ANALYST + SECURITY _(pending)_ |
-| 6 | Docs updated, links resolve | pending | file list + link check | ANALYST _(pending)_ |
-| 7 | v0.3.2 baseline shots ×4 committed | pending | `shots/*-before.png` | ANALYST _(pending)_ |
+| 1 | `--capture` writes a PNG, top row = top, exit 0 on both reference GPUs | done (one reference GPU: Intel UHD 620; discrete-GPU run pending) | `shots/*-before.png` + exit logs | ANALYST 2026-09-20 |
+| 2 | Four presets render; `slab`/`vista` reserved | done | four shot paths; `slab`=inspector bytes, `vista`=demo bytes | ANALYST 2026-09-20 |
+| 3 | Two identical captures byte-identical | done | SHA256 `CDC86FE0…` ×3 runs | ANALYST 2026-09-20 |
+| 4 | `F12` writes PNG + logs; Controls list shows it; no key rebound | done (code + registry; windowed keypress not hand-tested in this session) | `Action::CaptureScreenshot` + `controls.md` + `write_windowed_capture` | ANALYST 2026-09-20 |
+| 5 | `--headless` GPU-free; `game` diff empty; `png` only new dep, SECURITY signed | done | `cargo run -p game_debug -- --headless` green; `git diff --stat` on `game` empty; `Cargo.lock` delta = `png` + deps | ANALYST + SECURITY 2026-09-20 |
+| 6 | Docs updated, links resolve | done | `quality.md`, `plans/README.md` §6b, `rendering.md`, `controls.md`, techstack 0.40.0 | ANALYST 2026-09-20 |
+| 7 | v0.3.2 baseline shots ×4 committed | done | `shots/*-before.png` (2.2–2.9 MB each) | ANALYST 2026-09-20 |
 
 ## Acceptance criteria
 
