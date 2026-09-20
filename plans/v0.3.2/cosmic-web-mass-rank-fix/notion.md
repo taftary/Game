@@ -2,7 +2,10 @@
 
 ## Status
 
-`in-progress`
+`done` (closed 2026-09-20 by PO decision at the v0.3.3 cut — code
+landed on `main` in `128ab27` / squash `e60a036`; evidence in
+`plan.md`; the ANALYST/SECURITY rows are signed retroactively on the
+recorded deviation, see `plans/README.md` § *7. Version branch*)
 
 ## Context
 

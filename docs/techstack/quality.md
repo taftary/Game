@@ -14,8 +14,14 @@
 | Post chain per frame (v0.2.0) | +1 fullscreen resolve pass, one transient HDR image (16F preferred, packed-float fallback, content-preserving LDR bypass) | same | same |
 | Cosmic bloom per frame, cosmic views only, debug shell (update-2026-09-18-2328) | +1 bright + 4 blur passes at ½ res on five dedicated targets (A–E), 5 transient HDR images + scene depth (6 total); LDR bypass draws the same layouts direct (no post) | same | same |
 | Cosmic-web cue raymarch (v0.2.0) | 64x64 source grid, ≤16 steps, analytic fallback available | 128x128, ≤32 steps | 256x256, ≤64 steps |
+| Cosmic field render (v0.3.3, ADR-025 — planned; each feature fills its row on `done`) | tracer splats ≤ 300k pts (≤ 5 MB/surface); veil = cell sprites ≤ 200k (no raymarch); bloom 3 levels (`scene + 2·3` HDR images); `WebField` sidecar ≤ 20 MB, boot +≤ 120 ms | splats ≤ 1.0M; veil = quarter-res raymarch 32 steps (one 2 MB R8 3D image + one quarter-res HDR target); bloom 4 levels | splats all tracers (+ optional `refine(2)`); raymarch 48 steps; bloom 5 levels |
 
 Budgets are enforced by the `tools` renderer smoke + device profiles, not by vibes. Any feature that blows Low tier is cut or tier-gated.
+
+Note (v0.3.3): the "Cosmic-web cue raymarch (v0.2.0)" row describes
+the CPU reference in `engine::render::cue`; the GPU veil row above
+supersedes it as the shipped budget once `cosmic-gas-veil-v2` lands
+(the v0.2.0 row is then removed by that feature's docs sweep).
 
 Thermal: sustained 15-min session must not throttle below Low-tier fps on reference phones (named in M6, see [`../milestones/`](../milestones/) and ADR-007 in [`../decisions/`](../decisions/)).
 
@@ -44,6 +50,16 @@ Mobile compile-guard (CI always; local only if targets installed —
 ```text
 cargo check --workspace --target aarch64-linux-android
 cargo check --workspace --target aarch64-apple-ios
+```
+
+Local visual gate (v0.3.3 `cosmic-capture-harness`, GPU required — never
+in CI; planned, active once that feature is `done`): every cosmic
+feature's DoD carries before/after PNGs from the fixed presets, and two
+captures with identical arguments must be byte-identical on at least
+one reference GPU:
+
+```text
+cargo run -p game_debug -- --capture shots/<preset>-after.png --seed 1337 --view inspector|slab|demo|vista
 ```
 
 Test policy:

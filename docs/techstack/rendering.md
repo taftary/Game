@@ -424,6 +424,40 @@ of puffs per pixel where the immersive demo stacks a few, so one
 grade cannot serve both. Engine `BloomParams::spec_defaults()`
 (threshold, blur σ) stays untouched.
 
+**v0.3.3 direction (ADR-025, planned 2026-09-20 — nothing below is
+implemented yet; each paragraph above is rewritten by the feature
+that retires it).** The v0.3.2 cosmic renderer decorates the link
+graph (straight `a↔b` segments → smoke quads, grain, beads, 3-per-node
+impostors) and cannot produce the reference's curved/branching gas
+bodies, walls, dark voids, or hub hierarchy
+(`docs/reports/2026-09-19-cosmic-web-visual-architecture.md` § 11).
+v0.3.3 renders the **field** instead: `engine::universe::web` exports
+a non-hashed `WebField` sidecar (≈ 1M Zel'dovich tracers with a
+smoothed overdensity + the 128³ T-web class/density grid;
+`web-field-export`); the debug cosmic surfaces draw adaptive-kernel
+additive tracer splats coloured by one density ramp
+(`cosmic-tracer-splat`, retires grain + beads); a shared window term
+— visibility fog `1/(1+(d/L)²)` on every cosmic draw + an inspector
+slab mode with a 20° near-orthographic FOV (`cosmic-depth-window`;
+the camera contract gains a per-instance `fov_y` on `MapOrbitCamera`
+/ `CosmicCamera`, picking and drawing sharing one matrix); mass-rank
+hub tiers A/B/C with in-sprite radial core ramps and a member-galaxy
+scatter (`cosmic-hub-hierarchy`, retires the 3-per-node impostors); a
+write-once mip bloom pyramid whose pass list is asserted by a test —
+every image written once, never read by its writer
+(`bloom-mip-chain`, retires the 5-target blur); grid-driven gas bodies
+and walls as cell sprites on Low and a quarter-res emission-only
+raymarch of a 128³ 3D texture on Medium/High (`cosmic-gas-veil-v2`,
+retires smoke + the descriptor-glow veil + braid/spine/strand
+helpers); and a vista intro that boots the demo on the reference
+composition and dives to Chase (`cosmic-vista-intro`). Reproducible
+evidence comes first: `game_debug --capture` with four presets
+(`cosmic-capture-harness`). Invariants carried unchanged: un-flipped
+`directx::perspective`, `ndc = (2u−1, 1−2v)` node-only picking,
+`world_to_pixels` marker, bloom/raymarch write-once, hashed engine
+paths integer + `sqrt`-only, per-pixel shaders arithmetic-only.
+Plans: `plans/v0.3.3/`.
+
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).

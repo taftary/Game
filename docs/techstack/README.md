@@ -1,12 +1,12 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.37.0 (2026-09-20, smoke contrast + close-up fixes
-  per v0.3.2 `cosmic-web-illustris-look`: faint floor below old grade
-  (alpha 0.02+0.13d, dimmed rgb), density-gated white, peak-1.0 soft
-  dissolving falloff, smooth dust noise, size-relative near fade,
-  DEMO/MAP smoke exposure 0.65/0.85 — dark voids, bright dense
-  threads; render-only, budgets hold:
-  `smoke51953 grain800000 beads59958 impostors18000` headless)
+- **Version:** 0.38.0 (2026-09-20, v0.3.3 cut — docs only: ADR-025
+  field-based cosmic render accepted; eight planned features under
+  `plans/v0.3.3/` (capture harness → `WebField` export → tracer splats
+  → depth window → hub hierarchy → mip bloom → grid gas veil → vista
+  intro); v0.3.2 `cosmic-web-mass-rank-fix` + `cosmic-web-illustris-look`
+  closed `done`; code unchanged from 0.37.0 — headless still
+  `smoke51953 grain800000 beads59958 impostors18000`)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

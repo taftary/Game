@@ -2,9 +2,12 @@
 
 ## Status
 
-`in-review` (DEV implementation + full gate suite green 2026-09-20,
-evidence in `plan.md` DoD table; ANALYST audit + SECURITY review
-pending human go-ahead; single `done` commit pending)
+`done` (closed 2026-09-20 by PO decision at the v0.3.3 cut — code
+landed on `main` in squash `e60a036`; DEV evidence + full gate suite
+in `plan.md`; ANALYST/SECURITY rows signed retroactively on the
+recorded deviation, see `plans/README.md` § *7. Version branch*.
+Outcome: the render-only ceiling was reached — remaining gap is
+structural and is the subject of v0.3.3 / ADR-025)
 
 ## Context
 
