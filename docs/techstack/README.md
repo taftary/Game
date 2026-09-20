@@ -1,11 +1,10 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.33.7 (2026-09-20, cosmic-web smoke display per v0.3.2
-  `cosmic-scale-player` update-2026-09-20-0645: instanced
-  camera-facing smoke-billboard puffs replace the ribbon tubes, radial
-  falloff + hash dust, no vertex trig, ~104k tris (Low budget); hub
-  warming, redshift, near-eye fade, 3-layer node light carry over;
-  descriptor hash unchanged)
+- **Version:** 0.34.0 (2026-09-20, Illustris-look enrichment per v0.3.2
+  `cosmic-web-illustris-look`: frayed strands 3–7/link, tangent-aligned
+  smoke sheaths, gold beads over the bifurcation/spine skeleton;
+  render-only — descriptor hash unchanged, budgets hold:
+  `smoke51953 grain800000 beads59958 impostors18000` headless)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

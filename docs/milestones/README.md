@@ -93,6 +93,7 @@ commit when it reaches `done` (workflow rule:
 | [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | done | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
 | [`settings-seed-loader`](../../plans/v0.3.2/settings-seed-loader/) | done | dev tooling (single Settings seed editor + staged load progress) |
 | [`cosmic-web-mass-rank-fix`](../../plans/v0.3.2/cosmic-web-mass-rank-fix/) | in-progress | bugfix: densest peak now gets rarest mass (UNIVERSE_VERSION 2→3) |
+| [`cosmic-web-illustris-look`](../../plans/v0.3.2/cosmic-web-illustris-look/) | in-review | render-only enrichment: branching hair threads + smoke-v2 sheath + gold beads toward the Illustris target (no descriptor/hash change) |
 
 ## Post-v0.3 (unscheduled)
 

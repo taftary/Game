@@ -460,3 +460,18 @@ swapchain (no bloom, no tonemap).
 > platform replay only, not cross-platform bit-identical), and never
 > affects gameplay. Key files: `web/mod.rs` (generation),
 > `cosmic_web.rs` (enrichment), `main.rs` (GPU pipelines + HdrChain).
+
+---
+
+## 10. Follow-up: Illustris-look pass (2026-09-20, `cosmic-web-illustris-look`)
+
+Render-only, toward `target.jpeg`: strands fray `3–7` per link over
+one or two seeded arms (long links split); smoke reshaped from round
+blobs to tangent-aligned stretched sheaths (core + halo tiers,
+bifurcation warming, aniso falloff); gold beads (`≤60k`) glitter along
+spine sub-segments; faint-thread alpha floor lowered so voids stay
+dark. Nominal headless: `smoke51953 grain800000 beads59958
+impostors18000`. Descriptor, hashes, pipelines, and budgets unchanged;
+Low fallback order armed (beads → halo → strands) but not triggered.
+Remaining gap: true volumetric bodies and quad node impostors (still
+open), distance/frustum culling (still open).

@@ -422,17 +422,19 @@ void main() {
     f_color = vec4(v_color * v_alpha * fall, 1.0);
 }";
 
-// Cosmic smoke filaments (smoke display, replaces update-2026-09-19-1245
-// P1 ribbons): instanced puff records expanded in-shader into
-// camera-facing billboard quads (TriangleList, 6 verts per puff — two
-// triangles, no index buffer). No trig in the vertex shader (one
-// cross + normalize for the billboard frame); dust variation is a
-// cheap 4x4 hash in the fragment shader. Same bounded redshift
-// treatment as the glow sprites, premultiplied additive output.
+// Cosmic smoke filaments (smoke v2 display, Illustris-look WS3):
+// tangent-aligned stretched impostor records expanded in-shader into
+// filament-hugging quads (TriangleList, 6 verts per puff — two
+// triangles, no index buffer). The quad stretches 4× along the link
+// tangent (`misc.yzw`) and stays thin across, so sheaths read as
+// threads. No trig in the vertex shader (crosses + normalizes for the
+// frame); dust variation is a cheap 8x8 hash in the fragment shader.
+// Same bounded redshift treatment as the glow sprites, premultiplied
+// additive output.
 const SMOKE_VERT: &str = r"#version 450
-layout(location = 0) in vec4 pos_size; // puff center xyz, diameter Mpc
+layout(location = 0) in vec4 pos_size; // puff center xyz, across-width Mpc
 layout(location = 1) in vec4 rgba;     // link rgb (hub-warmed), alpha
-layout(location = 2) in vec4 misc;     // noise seed, 0, 0, 0
+layout(location = 2) in vec4 misc;     // noise seed, tangent xyz
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 eye;
@@ -446,25 +448,38 @@ layout(location = 2) out float v_seed;
 void main() {
     int vi = int(gl_VertexIndex);
     // Two triangles: (-,-),(+,-),(+,-)/(-,-),(+,-),(-,+) pattern over
-    // 6 verts without an index buffer.
+    // 6 verts without an index buffer. x runs ALONG the filament,
+    // y runs ACROSS it.
     vec2 corner = vec2((vi == 1 || vi == 2 || vi == 4) ? 1.0 : -1.0,
                        (vi == 2 || vi == 4 || vi == 5) ? 1.0 : -1.0);
     vec3 center = pos_size.xyz;
     vec4 clipc0 = pc.mvp * vec4(center, 1.0);
-    // Minimum-pixel clamp (the retired ribbon's 1.5-px rule): without
-    // it, distant puffs in the zoomed-out inspector shrink subpixel
-    // and vanish while near puffs stay huge.
+    // Minimum-pixel clamp on the ACROSS width (the retired ribbon's
+    // 1.5-px rule): without it, distant sheaths in the zoomed-out
+    // inspector shrink subpixel and vanish while near ones stay huge.
+    // The halo tier is allowed to vanish (overdraw relief); the core
+    // tier always passes a clamped width from the CPU.
     float min_world = 2.0 * max(clipc0.w, 1e-6) / max(pc.px_scale, 1e-6);
-    float size = max(max(pos_size.w, 1e-6), min_world);
+    float width = max(max(pos_size.w, 1e-6), min_world);
+    float len = width * 4.0;
     vec3 view_dir = center - pc.eye.xyz;
     float vd = length(view_dir);
     view_dir = (vd > 1e-6) ? view_dir / vd : vec3(0.0, 0.0, 1.0);
-    vec3 up_ref = (abs(view_dir.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
-    vec3 right = cross(view_dir, up_ref);
-    float rl = length(right);
-    right = (rl > 1e-10) ? right / rl : vec3(1.0, 0.0, 0.0);
-    vec3 upv = cross(right, view_dir);
-    vec3 world = center + (right * corner.x + upv * corner.y) * (0.5 * size);
+    vec3 axis = misc.yzw;
+    if (dot(axis, axis) < 1e-6) {
+        // Degenerate tangent (empty-set guard puff): fall back to a
+        // camera-facing square; its zero alpha rasterizes nothing.
+        vec3 up_ref = (abs(view_dir.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+        vec3 right0 = cross(view_dir, up_ref);
+        right0 = (length(right0) > 1e-10) ? normalize(right0) : vec3(1.0, 0.0, 0.0);
+        axis = normalize(cross(right0, view_dir));
+    } else {
+        axis = normalize(axis);
+    }
+    vec3 side = cross(view_dir, axis);
+    float rl = length(side);
+    side = (rl > 1e-10) ? side / rl : vec3(1.0, 0.0, 0.0);
+    vec3 world = center + axis * (corner.x * 0.5 * len) + side * (corner.y * 0.5 * width);
     vec4 clipc = clipc0;
     gl_Position = pc.mvp * vec4(world, 1.0);
     v_uv = corner;
@@ -487,15 +502,18 @@ layout(location = 1) in vec2 v_uv;
 layout(location = 2) in float v_seed;
 layout(location = 0) out vec4 f_color;
 void main() {
+    // Anisotropic sheath falloff: v_uv.x runs ALONG the filament
+    // (gentle taper), v_uv.y runs ACROSS it. Rim-zero via 1.0 - r2
+    // (corners discard, edges hit exactly zero — else full quads).
     float r2 = dot(v_uv, v_uv);
     if (r2 > 1.0) { discard; }
-    // Rim-zero radial falloff: soft puff, no hard edge (squared).
-    float fall = 1.0 - r2;
-    fall = fall * fall;
-    // Cheap dust variation: 4x4 hash blocks over the puff, softened
+    float ax = max(0.0, 1.0 - v_uv.x * v_uv.x * 0.35);
+    float fall = ax * max(0.0, 1.0 - r2);
+    if (fall <= 0.0) { discard; }
+    // Cheap dust variation: 8x8 hash blocks over the sheath, softened
     // by the falloff (no sin/exp per pixel — fill-rate friendly on
     // mobile tile GPUs).
-    vec2 cell = floor((v_uv * 0.5 + 0.5) * 4.0);
+    vec2 cell = floor((v_uv * 0.5 + 0.5) * 8.0);
     float h = fract(v_seed * 0.173 + dot(cell, vec2(12.9898, 78.233)));
     float n = 0.72 + 0.28 * h;
     f_color = vec4(v_rgba.rgb * v_rgba.a * fall * n, 1.0);
@@ -635,7 +653,8 @@ struct SmokePush {
 
 /// Cosmic smoke puff: per-instance vertex layout for the smoke
 /// pipeline — three `vec4` attributes at instance rate, 48 B,
-/// mirroring [`game_debug::cosmic_web::SmokePuff`] (~1.9 MB for the
+/// mirroring [`game_debug::cosmic_web::SmokePuff`]: center + across
+/// width, color + alpha, noise seed + tangent xyz (~1.9 MB for the
 /// nominal 40k-puff web per surface).
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
@@ -852,8 +871,10 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.player.position_mpc()
     );
     // Cinematic layout smoke (update 2026-09-18-2328, smoke
-    // billboards replace ribbons): the enrichment layer derives
-    // non-empty smoke/grain/impostor clouds from the boot web.
+    // billboards replace ribbons; Illustris-look WS1–WS4: stretched
+    // sheath quads, frayed strands, gold beads over the bifurcation /
+    // spine skeleton): the enrichment layer derives non-empty
+    // smoke/grain/bead/impostor clouds from the boot web.
     // GPU-free — upload happens only in the windowed shell.
     let layout_seed = debug_app.cosmic.seed;
     let layout_origin = debug_app.cosmic.upload_origin;
@@ -861,18 +882,22 @@ fn run_headless(seed: Option<u64>) -> i32 {
         game_debug::cosmic_web::smoke_puffs(&debug_app.cosmic.web, layout_seed, layout_origin);
     let grain =
         game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let beads =
+        game_debug::cosmic_web::bead_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
     let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
     assert!(!smoke.is_empty(), "smoke must emit puffs");
     assert!(!grain.is_empty(), "grain must emit points");
+    assert!(!beads.is_empty(), "beads must emit points");
     assert_eq!(
         impostors.len(),
         debug_app.cosmic.web.nodes.len() * 3,
         "three impostors per node"
     );
     println!(
-        "cosmic_layout=smoke{} grain{} impostors{} ok",
+        "cosmic_layout=smoke{} grain{} beads{} impostors{} ok",
         smoke.len(),
         grain.len(),
+        beads.len(),
         impostors.len()
     );
     // Cruise smoke (update 2026-09-18-2027): five seconds of W must move
@@ -4209,6 +4234,7 @@ fn upload_cosmic_glow(
     let mut verts: Vec<MapVertex> = game_debug::cosmic_web::grain_cloud(web, seed, origin)
         .iter()
         .chain(game_debug::cosmic_web::glow_point_cloud(web, origin).iter())
+        .chain(game_debug::cosmic_web::bead_cloud(web, seed, origin).iter())
         .chain(game_debug::cosmic_web::node_impostors(web, origin).iter())
         .map(|(pos, color, misc)| MapVertex {
             map_pos: *pos,
@@ -4256,7 +4282,7 @@ fn upload_cosmic_smoke(
         .map(|p| SmokeVertex {
             pos_size: [p.pos[0], p.pos[1], p.pos[2], p.size_mpc],
             rgba: p.rgba,
-            misc: [p.seed, 0.0, 0.0, 0.0],
+            misc: [p.seed, p.tangent[0], p.tangent[1], p.tangent[2]],
         })
         .collect();
     if verts.is_empty() {
@@ -4777,7 +4803,7 @@ impl ViewerApp {
         // exe lock) silently keeps the old look. If this line is
         // missing from the log, the binary predates the fix.
         tracing::info!(
-            "cosmic visual build r3: smoke billboards replace ribbons + rim-zero falloff + bounded tint + world halos + resolve clamp"
+            "cosmic visual build r4: illustris-look (stretched sheath quads + frayed strands + gold beads over bifurcation/spine skeleton) + rim-zero aniso falloff + bounded tint + world halos + resolve clamp"
         );
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),

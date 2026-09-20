@@ -338,10 +338,27 @@ keeps distant puffs visible in the zoomed-out inspector (without it
 they shrink subpixel and vanish). ~104k tris, inside the 500k Low
 budget with margin. Known costs/risks: inspector zoom-out stacks
 dozens of puffs/px — mitigated by tiny alpha (0.035–0.09) with the
-MAP smoke exposure at 0.7 (~6x the retired ribbon MAP grade, paying
-for the billboard area spread) vs 0.5 demo; follow-ups:
-distance/frustum cull, Low grain-budget cut (grain still 800k
-points).
+ MAP smoke exposure at 0.7 (~6x the retired ribbon MAP grade, paying
+ for the billboard area spread) vs 0.5 demo; follow-ups:
+ distance/frustum cull, Low grain-budget cut (grain still 800k
+ points).
+
+Illustris-look pass (`cosmic-web-illustris-look`, v0.3.2): render-only
+enrichment toward the Illustris projection target — no descriptor,
+hash, pipeline, or budget change. Strands fray `3–7` per link across
+one or two seeded arms (long links `>20 Mpc` split arms, so
+sub-threads diverge); smoke puffs become tangent-aligned stretched
+sheaths (`3–8 Mpc` long × `0.3–1.0 Mpc` thin, `4×` stretch in-shader,
+tighter `0.35 Mpc` jitter, core + faint-halo tiers, junction warming
+at degree-`≥3` bifurcations, anisotropic falloff + `8×8` hash dust);
+gold beads (`≤60k`, `cosmic_web/bead` stream, spine sub-segments,
+mass-graded emissive) string dwarf glitter along threads and ride the
+glow `PointList` (pick-ignored); faint-thread alpha floor `0.05 →
+0.03` so weak threads sink into the backdrop. Nominal headless:
+`smoke51953 grain800000 beads59958 impostors18000`. Bloom write-once,
+redshift/near-eye/picking/marker pins all preserved (pinned by
+`cosmic_shader_safety_pins`, which keeps the `rl > 1e-10` side
+guard and the `1.0 - r2` rim-zero literal).
 
 Palette quick pass (update-2026-09-19-1933): grading-only retune on
 the same geometry — no pipeline, topology, or image changes, bloom
