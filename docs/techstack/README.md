@@ -1,9 +1,11 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.34.0 (2026-09-20, Illustris-look enrichment per v0.3.2
-  `cosmic-web-illustris-look`: frayed strands 3–7/link, tangent-aligned
-  smoke sheaths, gold beads over the bifurcation/spine skeleton;
-  render-only — descriptor hash unchanged, budgets hold:
+- **Version:** 0.37.0 (2026-09-20, smoke contrast + close-up fixes
+  per v0.3.2 `cosmic-web-illustris-look`: faint floor below old grade
+  (alpha 0.02+0.13d, dimmed rgb), density-gated white, peak-1.0 soft
+  dissolving falloff, smooth dust noise, size-relative near fade,
+  DEMO/MAP smoke exposure 0.65/0.85 — dark voids, bright dense
+  threads; render-only, budgets hold:
   `smoke51953 grain800000 beads59958 impostors18000` headless)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)

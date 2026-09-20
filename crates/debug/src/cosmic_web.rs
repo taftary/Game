@@ -628,12 +628,18 @@ pub fn smoke_puffs(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<SmokePu
         // Bifurcation junctions warm like hubs: the target's golden
         // infusions sit at thread crossings, not only at massive nodes.
         let junction = bifurcated.contains(&link.a) || bifurcated.contains(&link.b);
+        // Steep density contrast (target: brightness ~= mass density,
+        // voids stay dark): the faint floor sits below the old grade so
+        // weak filaments sink into the backdrop, while the dense ceiling
+        // holds — dense threads carry ~2x the old far-field light, faint
+        // mist less than before. Dense rgb ceiling unchanged (band
+        // <= 2.0); faint floor dimmed on every channel.
         let base_rgb = [
-            0.18 + 0.30 * density,
-            0.22 + 0.35 * density,
-            0.60 + 1.35 * density,
+            0.10 + 0.38 * density,
+            0.12 + 0.45 * density,
+            0.35 + 1.60 * density,
         ];
-        let base_alpha = 0.035 + 0.055 * density;
+        let base_alpha = 0.02 + 0.13 * density;
         for i in 0..emit {
             let t = rng.unit_f64().clamp(0.02, 0.98);
             let (wander, strand) = shape.pick(&mut rng);
@@ -645,7 +651,7 @@ pub fn smoke_puffs(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<SmokePu
             if junction {
                 warm = warm.max(0.4);
             }
-            let rgb = [
+            let mut rgb = [
                 base_rgb[0] + (1.05 - base_rgb[0]) * warm,
                 base_rgb[1] + (0.72 - base_rgb[1]) * warm,
                 base_rgb[2] + (0.42 - base_rgb[2]) * warm,
@@ -653,6 +659,20 @@ pub fn smoke_puffs(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<SmokePu
             // Two tiers: even puffs are the sheath core, odd puffs the
             // wide faint halo (may vanish subpixel — overdraw relief).
             let halo = i % 2 == 1;
+            // White core subset, density-gated: only genuinely dense
+            // filaments go white-hot (the target's white-gold threads);
+            // faint-link smoke stays blue-dark so voids survive.
+            // Deterministic loop-index pick: replay/rebase-safe, no new
+            // RNG stream. Mix keeps rgb inside the 2.0 band (white target
+            // channels are all <= 1.0).
+            if !halo && i % 3 == 0 {
+                let mix = 0.15 + 0.55 * density;
+                rgb = [
+                    rgb[0] + (1.0 - rgb[0]) * mix,
+                    rgb[1] + (0.97 - rgb[1]) * mix,
+                    rgb[2] + (0.92 - rgb[2]) * mix,
+                ];
+            }
             let mut size = 0.6 + 1.2 * density + rng.unit_f64() * 0.6;
             let mut alpha = base_alpha;
             if halo {
@@ -1510,6 +1530,91 @@ mod tests {
                     "axis {axis}: {delta} vs {want}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn smoke_white_core_subset_exists_and_stays_brighter() {
+        // Density-contrast pass (target: brightness ~= mass density):
+        // a deterministic subset of dense-link core puffs must read
+        // near-white (all channels high, low saturation) while faint
+        // smoke stays dim; dense-link alpha must clearly exceed
+        // faint-link alpha so voids survive the far-field stack.
+        let nominal = smoke_puffs(&web(), 1234, DVec3::ZERO);
+        assert!(!nominal.is_empty());
+        let white = nominal
+            .iter()
+            .filter(|p| {
+                p.rgba[0] > 0.7 && p.rgba[1] > 0.65 && p.rgba[2] > 0.6 && {
+                    let mx = p.rgba[0].max(p.rgba[1]).max(p.rgba[2]);
+                    let mn = p.rgba[0].min(p.rgba[1]).min(p.rgba[2]);
+                    mx - mn < 0.35
+                }
+            })
+            .count();
+        let frac = white as f64 / nominal.len() as f64;
+        assert!(
+            frac > 0.10,
+            "white core subset too small: {white}/{}",
+            nominal.len()
+        );
+        // Contrast on the toy web (dense x-axis link d=1.0 vs faint
+        // y-axis link d=0.1): assign each puff to its nearest trunk and
+        // compare mean alpha. Design ratio is ~4.5x (0.15 vs 0.033,
+        // halo tier halves both equally); pin 2.5x with margin for
+        // junction bleed near the shared node. Faint mean is also
+        // capped: it is the far-field void floor.
+        let segs = [
+            ([0.0, 0.0, 0.0], [30.0, 0.0, 0.0]),
+            ([0.0, 0.0, 0.0], [0.0, 40.0, 0.0]),
+        ];
+        let dist_to = |p: &[f32; 3], s: &[f64; 3], e: &[f64; 3]| {
+            let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
+            let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            let t = ((f64::from(p[0]) - s[0]) * d[0]
+                + (f64::from(p[1]) - s[1]) * d[1]
+                + (f64::from(p[2]) - s[2]) * d[2])
+                / l2;
+            let t = t.clamp(0.0, 1.0);
+            let q = [s[0] + d[0] * t, s[1] + d[1] * t, s[2] + d[2] * t];
+            ((f64::from(p[0]) - q[0]).powi(2)
+                + (f64::from(p[1]) - q[1]).powi(2)
+                + (f64::from(p[2]) - q[2]).powi(2))
+            .sqrt()
+        };
+        let toy = smoke_puffs(&toy_web(), 7, DVec3::ZERO);
+        let mut dense_a = 0.0;
+        let mut dense_n = 0_u32;
+        let mut faint_a = 0.0;
+        let mut faint_n = 0_u32;
+        for p in &toy {
+            let dd = dist_to(&p.pos, &segs[0].0, &segs[0].1);
+            let df = dist_to(&p.pos, &segs[1].0, &segs[1].1);
+            if dd < df {
+                dense_a += f64::from(p.rgba[3]);
+                dense_n += 1;
+            } else {
+                faint_a += f64::from(p.rgba[3]);
+                faint_n += 1;
+            }
+        }
+        assert!(dense_n > 0 && faint_n > 0, "toy links must both emit");
+        let dense_mean = dense_a / f64::from(dense_n);
+        let faint_mean = faint_a / f64::from(faint_n);
+        assert!(
+            dense_mean > 2.5 * faint_mean,
+            "smoke contrast too flat: dense {dense_mean} vs faint {faint_mean}"
+        );
+        assert!(
+            faint_mean < 0.05,
+            "faint smoke would fill far-field voids: {faint_mean}"
+        );
+        // Replay-identical: the white subset is a pure function of the
+        // loop index, so a second derivation matches exactly.
+        let again = smoke_puffs(&web(), 1234, DVec3::ZERO);
+        assert_eq!(nominal.len(), again.len());
+        for (a, b) in nominal.iter().zip(again.iter()) {
+            assert_eq!(a.rgba, b.rgba);
         }
     }
 

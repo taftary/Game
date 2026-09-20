@@ -130,6 +130,35 @@ _(pending)_.
   relief by design, per NFR3).
 - D-4 (WS4 budget): nominal beads land at 59958/60000 (two-pass scale
   active, in budget); beads ride the existing glow `PointList`.
+- D-5 (white-smoke pass, 2026-09-20, same version): brighter sheaths +
+  white cores, still render-only (counts/pipelines/budgets unchanged).
+  CPU `smoke_puffs` base alpha `0.035+0.055d → 0.06+0.09d` + every
+  third core-tier puff lerps toward `[1.0, 0.97, 0.92]` (halo stays
+  blue; loop-index pick, replay/rebase-safe); `SMOKE_FRAG` adds a
+  `(1-r2)³ × 0.65` luminance hot-center (arithmetic-only); exposures
+  `DEMO 0.5→0.8 / MAP 0.7→1.0`. New test
+  `smoke_white_core_subset_exists_and_stays_brighter` + `vec3(luma)`
+  shader pin; 20/20 `cosmic_web` lib tests green.
+- D-6 (close-up fix, 2026-09-20, same version): stretched quads read
+  as hard blades when magnified. Shader-only: `SMOKE_FRAG` falloff
+  fully dissolves on both axes (`ax²` tips, `radial²` core),
+  renormalized `×1.8` (per-puff energy preserved, far-field grade
+  unchanged), `8×8` dust is smoothed value noise (fract-only);
+  `SMOKE_VERT` near fade is size-relative (`0.35×len → 1.25×len`).
+  `viewer_shaders_compile` + `cosmic_shader_safety_pins` (new tip
+  dissolve pin) green; headless counts unchanged.
+- D-7 (density-contrast fix, 2026-09-20, same version): the white
+  pass + an interim falloff x1.8 renormalization stacked ~4-5x light
+  onto distant puffs (far pixels sample only the falloff peak, so
+  peak renormalization brightens the whole far field — reverted).
+  Anchored back on the target (brightness ~= mass density, dark
+  voids): CPU faint floor now *below* the original grade (alpha
+  `0.02+0.13d`, dimmed rgb floor, dense ceiling unchanged), white
+  subset density-gated (`mix 0.15+0.55d`), frag peak back at 1.0 with
+  hot-center `0.65 -> 0.45`, exposures `DEMO 0.65 / MAP 0.85`.
+  Faint mist lands darker than the original look, dense threads ~2x
+  brighter. Test pins the contrast on the toy web (dense mean alpha
+  > 2.5x faint mean, faint mean < 0.05 void floor).
 | 1 | Branching hair threads + beads, A/B closer to target | pending | A/B shots `target.jpeg` vs build + thread-width/void/hub notes | ANALYST _(pending)_ |
 | 2 | Descriptor/hashes/content IDs identical, no version bump | pending | `web_hash` vectors + determinism tests green | ANALYST _(pending)_ |
 | 3 | Low budgets hold or tier-gated/cut | pending | `game_tools --headless --tier low` + tris/draws asserts vs WS0 baseline | ANALYST _(pending)_ |

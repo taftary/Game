@@ -489,10 +489,14 @@ void main() {
     float z = min(pc.redshift * max(clipc.w, 0.0), 0.5);
     vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
-    // Near-eye fade: the player spawns inside a filament, so puffs
-    // within a few Mpc of the eye would fill the screen as white
-    // slabs. Fade them out instead.
-    float efade = smoothstep(1.0, 6.0, vd);
+    // Size-relative near fade: the player flies through filaments,
+    // so a puff viewed from closer than ~its own length would fill
+    // the screen as a hard slab. Dissolve it before its quad edges
+    // resolve — distant puffs still paint the filament, and beads,
+    // grain, and node impostors keep nearby structure legible.
+    float fade_start = max(1.0, len * 0.35);
+    float fade_end = max(6.0, len * 1.25);
+    float efade = smoothstep(fade_start, fade_end, vd);
     v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure * efade);
 }";
 
@@ -501,22 +505,41 @@ layout(location = 0) in vec4 v_rgba;
 layout(location = 1) in vec2 v_uv;
 layout(location = 2) in float v_seed;
 layout(location = 0) out vec4 f_color;
+// Fract-only cell hash (no sin/exp per pixel — mobile fill-rate rule).
+float smoke_hash(vec2 c) {
+    return fract(v_seed * 0.173 + dot(c, vec2(12.9898, 78.233)));
+}
 void main() {
-    // Anisotropic sheath falloff: v_uv.x runs ALONG the filament
-    // (gentle taper), v_uv.y runs ACROSS it. Rim-zero via 1.0 - r2
-    // (corners discard, edges hit exactly zero — else full quads).
+    // Soft volumetric falloff: v_uv.x runs ALONG the filament,
+    // v_uv.y runs ACROSS it. Both axes dissolve fully at the quad rim
+    // (tips hit exactly zero — no cut edges up close) with zero slope
+    // at the core (no tent-ridge blade when magnified). Peak stays at
+    // 1.0: a distant puff's pixels only ever sample the core, so any
+    // renormalization above 1.0 would brighten the whole far field —
+    // the far-field grade lives in the CPU alpha + exposure knobs.
     float r2 = dot(v_uv, v_uv);
     if (r2 > 1.0) { discard; }
-    float ax = max(0.0, 1.0 - v_uv.x * v_uv.x * 0.35);
-    float fall = ax * max(0.0, 1.0 - r2);
+    float ax = 1.0 - v_uv.x * v_uv.x;
+    float radial = max(0.0, 1.0 - r2);
+    float fall = ax * ax * radial * radial;
     if (fall <= 0.0) { discard; }
-    // Cheap dust variation: 8x8 hash blocks over the sheath, softened
-    // by the falloff (no sin/exp per pixel — fill-rate friendly on
-    // mobile tile GPUs).
-    vec2 cell = floor((v_uv * 0.5 + 0.5) * 8.0);
-    float h = fract(v_seed * 0.173 + dot(cell, vec2(12.9898, 78.233)));
+    // Smooth value-noise dust: bilinear-smoothed 8x8 hash, so near
+    // puffs read as gas texture instead of block edges (still
+    // fract-only, no sin/exp per pixel).
+    vec2 g = (v_uv * 0.5 + 0.5) * 8.0;
+    vec2 id = floor(g);
+    vec2 f = fract(g);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float h = mix(mix(smoke_hash(id), smoke_hash(id + vec2(1.0, 0.0)), u.x),
+                  mix(smoke_hash(id + vec2(0.0, 1.0)), smoke_hash(id + vec2(1.0, 1.0)), u.x), u.y);
     float n = 0.72 + 0.28 * h;
-    f_color = vec4(v_rgba.rgb * v_rgba.a * fall * n, 1.0);
+    // White hot-center: desaturate toward the puff's own luminance at
+    // the quad core so dense sheaths read white-hot with blue edges.
+    // Pure arithmetic on v_rgba (no sin/exp — mobile fill-rate rule).
+    float core = radial * radial * radial;
+    float luma = dot(v_rgba.rgb, vec3(0.299, 0.587, 0.114));
+    vec3 col = mix(v_rgba.rgb, vec3(luma), core * 0.45);
+    f_color = vec4(col * v_rgba.a * fall * n, 1.0);
 }";
 
 // ---------------------------------------------------------------------------
@@ -711,9 +734,13 @@ const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
 /// 1-px lines/1.5-Mpc tubes concentrated it, so the zoomed-out
 /// inspector needs ~6x the old ribbon MAP grade to read at all; the
 /// immersive demo stacks a few puffs/px and keeps the lower grade to
-/// protect mobile fill-rate.
-const COSMIC_DEMO_SMOKE_EXPOSURE: f32 = 0.5;
-const COSMIC_MAP_SMOKE_EXPOSURE: f32 = 0.7;
+/// protect mobile fill-rate. Trimmed 2026-09-20 with the density-
+/// contrast pass (CPU faint floor now below the old grade, so the
+/// exposure no longer needs to carry faint-link visibility): DEMO
+/// 0.65 / MAP 0.85 — faint mist lands darker than the original grade,
+/// dense threads ~2x brighter (see `smoke_puffs` contrast note).
+const COSMIC_DEMO_SMOKE_EXPOSURE: f32 = 0.65;
+const COSMIC_MAP_SMOKE_EXPOSURE: f32 = 0.85;
 /// Sprite alpha exposure (grain, dwarf glow, node cores + halos).
 const COSMIC_DEMO_GLOW_EXPOSURE: f32 = 1.0;
 const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
@@ -7922,6 +7949,8 @@ mod tests {
             (SMOKE_VERT, "rl > 1e-10", "smoke side guard"),
             (SMOKE_VERT, "min_world", "smoke min-pixel clamp"),
             (SMOKE_FRAG, "1.0 - r2", "smoke rim-zero falloff"),
+            (SMOKE_FRAG, "1.0 - v_uv.x * v_uv.x", "smoke tip dissolve"),
+            (SMOKE_FRAG, "vec3(luma)", "smoke white hot-center"),
         ] {
             assert!(source.contains(literal), "{what} missing from its shader");
         }

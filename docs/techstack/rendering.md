@@ -337,9 +337,9 @@ push block `SmokePush` (MVP, eye, px_scale, exposure, redshift —
 keeps distant puffs visible in the zoomed-out inspector (without it
 they shrink subpixel and vanish). ~104k tris, inside the 500k Low
 budget with margin. Known costs/risks: inspector zoom-out stacks
-dozens of puffs/px — mitigated by tiny alpha (0.035–0.09) with the
- MAP smoke exposure at 0.7 (~6x the retired ribbon MAP grade, paying
- for the billboard area spread) vs 0.5 demo; follow-ups:
+ dozens of puffs/px — mitigated by small alpha with the
+ MAP smoke exposure at 0.85 (~5x the retired ribbon MAP grade, paying
+ for the billboard area spread) vs 0.65 demo; follow-ups:
  distance/frustum cull, Low grain-budget cut (grain still 800k
  points).
 
@@ -358,7 +358,38 @@ glow `PointList` (pick-ignored); faint-thread alpha floor `0.05 →
 `smoke51953 grain800000 beads59958 impostors18000`. Bloom write-once,
 redshift/near-eye/picking/marker pins all preserved (pinned by
 `cosmic_shader_safety_pins`, which keeps the `rl > 1e-10` side
-guard and the `1.0 - r2` rim-zero literal).
+guard and the `1.0 - r2` rim-zero literal plus the `vec3(luma)`
+white hot-center pin).
+
+White-smoke pass (2026-09-20, same v0.3.2): visibility + white
+sheaths, still render-only (no count, pipeline, or budget change —
+nominal headless stays `smoke51953 grain800000 beads59958
+impostors18000`). CPU: steep density contrast — base alpha
+`0.02+0.13d` and rgb floor dimmed (`0.10/0.12/0.35` at d=0, dense
+ceiling unchanged), so faint mist lands darker than the original
+grade while dense threads carry ~2x; white subset density-gated
+(`mix 0.15+0.55d`, every third core puff — faint smoke stays
+blue-dark). GPU: `SMOKE_FRAG` desaturates toward the puff's own
+luminance at the quad core (`core=(1-r2)³ × 0.45`,
+arithmetic-only); exposures `DEMO 0.65 / MAP 0.85`. Lesson
+recorded: falloff peak must stay at 1.0 — a distant puff's pixels
+only sample the core, so renormalizing peak brightness brightens
+the whole far field (an interim ×1.8 was reverted for exactly this
+reason).
+
+Close-up fix (2026-09-20, same v0.3.2): the stretched quads read as
+hard paper blades when magnified — three causes, all shader-side.
+`SMOKE_FRAG` falloff is now fully dissolving on both axes (`ax²`
+tips hit exactly zero instead of cutting at 65%, `radial²` core has
+zero slope instead of a tent ridge) with the peak kept at 1.0 — the
+far-field grade lives in the CPU alpha + exposure knobs, never in a
+peak renormalization (an interim ×1.8 was reverted: far pixels
+sample only the core, so it brightened the whole far field); the
+`8×8` hash dust is bilinear-smoothed value noise (still fract-only)
+so near puffs read as gas texture, not block edges. `SMOKE_VERT`
+near fade is size-relative (`0.35×len → 1.25×len`, floor `1→6 Mpc`)
+so a puff dissolves before its quad edges resolve on screen; beads,
+grain, and impostors keep nearby structure legible.
 
 Palette quick pass (update-2026-09-19-1933): grading-only retune on
 the same geometry — no pipeline, topology, or image changes, bloom
