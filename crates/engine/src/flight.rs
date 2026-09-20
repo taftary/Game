@@ -106,13 +106,15 @@ impl ThrustInput {
 }
 
 /// Ship state: frame chain (position + orientation) + active-frame
-/// velocity + mass/fuel. Velocity is active-frame length units per
-/// SI second (time stays SI in every frame; only length rescales).
+/// velocity + mass/fuel. Velocity is active-frame length units per SI
+/// second (only length rescales per frame — the commit path conserves
+/// `|v| × meters-per-unit` across frames, pinned by
+/// `commit_conserves_momentum_across_frames`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShipState {
     /// Position + orientation chain.
     pub chain: FrameChain,
-    /// Velocity in active-frame length units per second.
+    /// Velocity in active-frame length units per SI second.
     pub vel: DVec3,
     /// Mass in kg.
     pub mass_kg: f64,
@@ -121,7 +123,9 @@ pub struct ShipState {
 }
 
 impl ShipState {
-    /// Thrust acceleration in active-frame units/s².
+    /// Thrust acceleration in active-frame length per frame-time
+    /// squared (SI m/s² × `time_s²`/`length_m` — AU/day² in SolarSystem,
+    /// km/s² in Planetocentric).
     pub fn thrust_accel_frame(&self, params: &CraftParams, input: &ThrustInput) -> DVec3 {
         let units = FrameUnits::of(self.chain.active());
         let throttle = input.throttle.clamp(0.0, 1.0);
@@ -174,7 +178,8 @@ impl ShipState {
     }
 }
 
-/// Map an active-frame velocity into the parent frame (length units/s).
+/// Map an active-frame velocity into the parent frame (length units
+/// per SI second, matching the [`ShipState::vel`] convention).
 fn map_vel_to_parent(chain: &FrameChain, vel: DVec3) -> DVec3 {
     let frame = chain.active();
     let parent = frame.parent().expect("root has no parent velocity");
@@ -201,9 +206,16 @@ fn integrate_attitude(q: DQuat, rate: DVec3, dt: f64) -> DQuat {
     (DQuat::from_axis_angle(rate.normalize(), angle) * q).normalize()
 }
 
-/// One free-flight physics step (`dt_s` real seconds at ratio 1 —
-/// compression callers substep through here): attitude, optional
-/// damping, thrust + gravity on velocity Verlet.
+/// One free-flight physics step (`dt_s` SI seconds — the SolarSystem
+/// pin steps 86_400.0 for one day of thrust; compression callers substep
+/// through here): attitude, optional damping, thrust + gravity on
+/// velocity Verlet.
+///
+/// Unit caveat (pinned, not assumed): [`ShipState::vel`] is length per SI
+/// second, but [`ShipState::thrust_accel_frame`] carries the frame time
+/// unit squared — the two agree only when `time_s == 1`
+/// (Planetocentric/LocalEnu). Other frames inherit the pinned test
+/// behavior verbatim; future callers there must convert explicitly.
 pub fn step_free_flight(
     state: &mut ShipState,
     params: &CraftParams,

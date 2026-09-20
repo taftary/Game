@@ -12,8 +12,8 @@
 //! absorbed Galaxy Map / System Map / Planet View (orbit camera,
 //! filled dual-cell mesh, wireframe overlay, pentagon highlight,
 //! cell-chunk hover highlight + click-to-pin, inputs panel,
-//! read-only stats). A transition strip shows in-flight waypoint
-//! transitions; the dev widget (`` ` ``, `F6`–`F8` sub-tabs
+//! read-only stats). A transition strip shows in-flight fly-to
+//! easing progress; the dev widget (`` ` ``, `F6`–`F8` sub-tabs
 //! FPS/Console/Inspector) and the corner strip float over every tab.
 //! `F9`–`F11` toggle tab bar / left dock / right dock; `Esc` unwinds
 //! UI focus (closing the window exits).
@@ -29,12 +29,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use game::camera::CameraMode;
+use game::hud::HudInputs;
 use game::journey::{Journey, JourneyEvent, Layer};
 use game::transit::{SIM_DT_SECS, Transit, plan_cost};
 use game_debug::actions::{Action, ActionGroup, DROPDOWN_ORDER, digit_for_dimension_index};
 use game_debug::app::{App as DebugApp, ChromeState, Screen, ViewContent, WidgetTab};
+use game_debug::cosmic_camera::cosmic_tip_world;
+use game_debug::cosmic_player::CRUISE_SPEED_NOTCH;
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
+use game_debug::loader::{LoadPlan, LoadSource, LoadStep};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
 use game_debug::picking::{Ray, intersect_sphere, pick_cell, project_to_screen, ray_from_cursor};
 use game_debug::planet_viewer::{DebugMode, PlanetViewerState};
@@ -44,11 +48,16 @@ use game_debug::system_map::{SystemMapView, arrival_for, orbit_ring_points, plan
 use game_debug::text::GlyphAtlas;
 use game_debug::ui::{self, Layout, Rect};
 use game_engine::catalog::scheduler::SkyView;
+use game_engine::flight::{ShipMode, mode_of};
+use game_engine::frames::recenter;
 use game_engine::render::{
-    ExposureParams, FOV_Y, MAX_PITCH, OrbitCamera, ShaderKind, WORLD_TO_EQUATORIAL,
-    compile_glsl_to_spirv, create_instance, device_score, log_physical_device,
-    required_device_extensions, star_visibility, visible_hemisphere,
+    BLOOM_BLUR_FRAG, BLOOM_BRIGHT_FRAG, BloomBlurPush, BloomBrightPush, BloomParams,
+    BloomResolvePush, ExposureParams, FOV_Y, HdrSelection, MAX_PITCH, OrbitCamera, RESOLVE_VERT,
+    ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv, create_instance, device_score,
+    log_physical_device, required_device_extensions, resolve_frag_bloom, select_hdr_format,
+    star_visibility, visible_hemisphere,
 };
+use game_engine::universe::WebDescriptor;
 use game_engine::waypoints::WaypointId;
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -60,21 +69,21 @@ use vulkano::command_buffer::{
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags};
-use vulkano::format::{ClearValue, Format};
-use vulkano::image::sampler::{Filter, Sampler, SamplerCreateInfo};
+use vulkano::format::{ClearValue, Format, FormatFeatures};
+use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
 use vulkano::instance::Instance;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
-    AttachmentBlend, ColorBlendAttachmentState, ColorBlendState,
+    AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
 };
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition, VertexInputState};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
 use vulkano::pipeline::{
@@ -359,6 +368,180 @@ void main() {
     f_color = vec4(v_color, v_alpha);
 }";
 
+// Cosmic glow point sprites (update-2026-09-18-2328): soft Gaussian
+// mask (no hard edge — halo impostors fade out), premultiplied
+// additive output for the `One, One` blend, and an exaggerated
+// Hubble redshift tint from view depth (`clip.w`, spec §9.1: distant
+// filaments redden and dim). Cosmic views only — the shared map
+// shaders above stay byte-identical for galaxy/system/planet/sky.
+const GLOW_VERT: &str = r"#version 450
+layout(location = 0) in vec3 map_pos;
+layout(location = 1) in vec3 color;
+layout(location = 2) in vec3 misc;
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    float px_scale;
+    float exposure;
+    float redshift;
+} pc;
+layout(location = 0) out vec3 v_color;
+layout(location = 1) out float v_alpha;
+void main() {
+    vec4 clip = pc.mvp * vec4(map_pos, 1.0);
+    gl_Position = clip;
+    // `kind` 1 = world-unit size (halo impostors), scaled by
+    // `px_scale` over the perspective divide — the shared map-shader
+    // convention; `kind` 0 = fixed pixel size (cores, grain, glow).
+    float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
+    gl_PointSize = clamp(px, 1.0, 256.0);
+    // Bounded redshift depth: negative view depth clamps to 0 and the
+    // exaggerated term caps at 0.5, so both denominators stay >= 1.35
+    // — the tint can never divide by zero, flip a channel's sign, or
+    // feed Inf/NaN into the additive chain (the visual-issue fix).
+    // Coefficients softened in update-2026-09-19-1933: gentle redden,
+    // mild dim, so golden hubs survive at depth (red boost kept
+    // stronger than the blue kill — distant structures warm like the
+    // target's pink-tinged far filaments).
+    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
+    vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    float dim = 1.0 / (1.0 + 0.45 * z);
+    v_color = color * tint * dim;
+    v_alpha = misc.y * pc.exposure;
+}";
+
+const GLOW_FRAG: &str = r"#version 450
+layout(location = 0) in vec3 v_color;
+layout(location = 1) in float v_alpha;
+layout(location = 0) out vec4 f_color;
+void main() {
+    vec2 d = gl_PointCoord - vec2(0.5);
+    // Soft round sprite: exactly 0 at the rim (an exp() floor left
+    // faint square corners on screen — the visual-issue fix).
+    float t = max(0.0, 1.0 - 4.0 * dot(d, d));
+    float fall = t * t;
+    f_color = vec4(v_color * v_alpha * fall, 1.0);
+}";
+
+// Cosmic smoke filaments (smoke v2 display, Illustris-look WS3):
+// tangent-aligned stretched impostor records expanded in-shader into
+// filament-hugging quads (TriangleList, 6 verts per puff — two
+// triangles, no index buffer). The quad stretches 4× along the link
+// tangent (`misc.yzw`) and stays thin across, so sheaths read as
+// threads. No trig in the vertex shader (crosses + normalizes for the
+// frame); dust variation is a cheap 8x8 hash in the fragment shader.
+// Same bounded redshift treatment as the glow sprites, premultiplied
+// additive output.
+const SMOKE_VERT: &str = r"#version 450
+layout(location = 0) in vec4 pos_size; // puff center xyz, across-width Mpc
+layout(location = 1) in vec4 rgba;     // link rgb (hub-warmed), alpha
+layout(location = 2) in vec4 misc;     // noise seed, tangent xyz
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    vec4 eye;
+    float px_scale;
+    float exposure;
+    float redshift;
+} pc;
+layout(location = 0) out vec4 v_rgba;
+layout(location = 1) out vec2 v_uv;
+layout(location = 2) out float v_seed;
+void main() {
+    int vi = int(gl_VertexIndex);
+    // Two triangles: (-,-),(+,-),(+,-)/(-,-),(+,-),(-,+) pattern over
+    // 6 verts without an index buffer. x runs ALONG the filament,
+    // y runs ACROSS it.
+    vec2 corner = vec2((vi == 1 || vi == 2 || vi == 4) ? 1.0 : -1.0,
+                       (vi == 2 || vi == 4 || vi == 5) ? 1.0 : -1.0);
+    vec3 center = pos_size.xyz;
+    vec4 clipc0 = pc.mvp * vec4(center, 1.0);
+    // Minimum-pixel clamp on the ACROSS width (the retired ribbon's
+    // 1.5-px rule): without it, distant sheaths in the zoomed-out
+    // inspector shrink subpixel and vanish while near ones stay huge.
+    // The halo tier is allowed to vanish (overdraw relief); the core
+    // tier always passes a clamped width from the CPU.
+    float min_world = 2.0 * max(clipc0.w, 1e-6) / max(pc.px_scale, 1e-6);
+    float width = max(max(pos_size.w, 1e-6), min_world);
+    float len = width * 4.0;
+    vec3 view_dir = center - pc.eye.xyz;
+    float vd = length(view_dir);
+    view_dir = (vd > 1e-6) ? view_dir / vd : vec3(0.0, 0.0, 1.0);
+    vec3 axis = misc.yzw;
+    if (dot(axis, axis) < 1e-6) {
+        // Degenerate tangent (empty-set guard puff): fall back to a
+        // camera-facing square; its zero alpha rasterizes nothing.
+        vec3 up_ref = (abs(view_dir.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+        vec3 right0 = cross(view_dir, up_ref);
+        right0 = (length(right0) > 1e-10) ? normalize(right0) : vec3(1.0, 0.0, 0.0);
+        axis = normalize(cross(right0, view_dir));
+    } else {
+        axis = normalize(axis);
+    }
+    vec3 side = cross(view_dir, axis);
+    float rl = length(side);
+    side = (rl > 1e-10) ? side / rl : vec3(1.0, 0.0, 0.0);
+    vec3 world = center + axis * (corner.x * 0.5 * len) + side * (corner.y * 0.5 * width);
+    vec4 clipc = clipc0;
+    gl_Position = pc.mvp * vec4(world, 1.0);
+    v_uv = corner;
+    v_seed = misc.x;
+    // Same bounded redshift depth as the glow sprites (never divides
+    // by zero, never flips a channel sign).
+    float z = min(pc.redshift * max(clipc.w, 0.0), 0.5);
+    vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    float dim = 1.0 / (1.0 + 0.45 * z);
+    // Size-relative near fade: the player flies through filaments,
+    // so a puff viewed from closer than ~its own length would fill
+    // the screen as a hard slab. Dissolve it before its quad edges
+    // resolve — distant puffs still paint the filament, and beads,
+    // grain, and node impostors keep nearby structure legible.
+    float fade_start = max(1.0, len * 0.35);
+    float fade_end = max(6.0, len * 1.25);
+    float efade = smoothstep(fade_start, fade_end, vd);
+    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure * efade);
+}";
+
+const SMOKE_FRAG: &str = r"#version 450
+layout(location = 0) in vec4 v_rgba;
+layout(location = 1) in vec2 v_uv;
+layout(location = 2) in float v_seed;
+layout(location = 0) out vec4 f_color;
+// Fract-only cell hash (no sin/exp per pixel — mobile fill-rate rule).
+float smoke_hash(vec2 c) {
+    return fract(v_seed * 0.173 + dot(c, vec2(12.9898, 78.233)));
+}
+void main() {
+    // Soft volumetric falloff: v_uv.x runs ALONG the filament,
+    // v_uv.y runs ACROSS it. Both axes dissolve fully at the quad rim
+    // (tips hit exactly zero — no cut edges up close) with zero slope
+    // at the core (no tent-ridge blade when magnified). Peak stays at
+    // 1.0: a distant puff's pixels only ever sample the core, so any
+    // renormalization above 1.0 would brighten the whole far field —
+    // the far-field grade lives in the CPU alpha + exposure knobs.
+    float r2 = dot(v_uv, v_uv);
+    if (r2 > 1.0) { discard; }
+    float ax = 1.0 - v_uv.x * v_uv.x;
+    float radial = max(0.0, 1.0 - r2);
+    float fall = ax * ax * radial * radial;
+    if (fall <= 0.0) { discard; }
+    // Smooth value-noise dust: bilinear-smoothed 8x8 hash, so near
+    // puffs read as gas texture instead of block edges (still
+    // fract-only, no sin/exp per pixel).
+    vec2 g = (v_uv * 0.5 + 0.5) * 8.0;
+    vec2 id = floor(g);
+    vec2 f = fract(g);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float h = mix(mix(smoke_hash(id), smoke_hash(id + vec2(1.0, 0.0)), u.x),
+                  mix(smoke_hash(id + vec2(0.0, 1.0)), smoke_hash(id + vec2(1.0, 1.0)), u.x), u.y);
+    float n = 0.72 + 0.28 * h;
+    // White hot-center: desaturate toward the puff's own luminance at
+    // the quad core so dense sheaths read white-hot with blue edges.
+    // Pure arithmetic on v_rgba (no sin/exp — mobile fill-rate rule).
+    float core = radial * radial * radial;
+    float luma = dot(v_rgba.rgb, vec3(0.299, 0.587, 0.114));
+    vec3 col = mix(v_rgba.rgb, vec3(luma), core * 0.45);
+    f_color = vec4(col * v_rgba.a * fall * n, 1.0);
+}";
+
 // ---------------------------------------------------------------------------
 // GPU types (bin-local, mirroring the `game_tools` `MvpData` pattern).
 // ---------------------------------------------------------------------------
@@ -465,6 +648,110 @@ struct MapPush {
     px_scale: f32,
     exposure: f32,
 }
+
+/// Cosmic glow push constants: MVP + pixel size scale + exposure +
+/// exaggerated Hubble redshift strength per Mpc of view depth
+/// (update-2026-09-18-2328; 76 B < 128 B Vulkan 1.1 floor).
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct GlowPush {
+    mvp: [[f32; 4]; 4],
+    px_scale: f32,
+    exposure: f32,
+    redshift: f32,
+}
+
+/// Cosmic smoke push constants: MVP, camera eye (buffer frame),
+/// sprite scale (reserved), per-surface alpha exposure, redshift
+/// strength. 92 B total, under the 128 B Vulkan 1.1 floor.
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct SmokePush {
+    mvp: [[f32; 4]; 4],
+    eye: [f32; 4],
+    px_scale: f32,
+    exposure: f32,
+    redshift: f32,
+}
+
+/// Cosmic smoke puff: per-instance vertex layout for the smoke
+/// pipeline — three `vec4` attributes at instance rate, 48 B,
+/// mirroring [`game_debug::cosmic_web::SmokePuff`]: center + across
+/// width, color + alpha, noise seed + tangent xyz (~1.9 MB for the
+/// nominal 40k-puff web per surface).
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+struct SmokeVertex {
+    #[format(R32G32B32A32_SFLOAT)]
+    pos_size: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    rgba: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    misc: [f32; 4],
+}
+
+/// Precomputed per-frame cosmic draw state (update-2026-09-18-2328) —
+/// see `ViewerApp::cosmic_frame`. `eye` is the camera position in the
+/// surface's buffer frame (the smoke shader builds camera-facing
+/// billboards from it).
+struct CosmicFrame {
+    mvp: [[f32; 4]; 4],
+    px_scale: f32,
+    is_demo: bool,
+    eye: [f32; 3],
+    smoke: Subbuffer<[SmokeVertex]>,
+    glow: Subbuffer<[MapVertex]>,
+    viewport: Viewport,
+}
+
+/// Additive blend for the cosmic glow paths: source added at full
+/// strength (premultiplied in-shader), so overlapping strands and
+/// halos accumulate light. The shared alpha-blend pipelines are
+/// untouched.
+fn additive_blend() -> AttachmentBlend {
+    AttachmentBlend {
+        color_blend_op: BlendOp::Add,
+        src_color_blend_factor: BlendFactor::One,
+        dst_color_blend_factor: BlendFactor::One,
+        alpha_blend_op: BlendOp::Add,
+        src_alpha_blend_factor: BlendFactor::One,
+        dst_alpha_blend_factor: BlendFactor::One,
+    }
+}
+
+/// Deep-indigo clear color for the cosmic views (near-black violet —
+/// voids read as negative space against additive filaments). Deepened
+/// in update-2026-09-19-1933 so faint links can sink below it.
+const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
+
+/// Cosmic grade knobs (update-2026-09-19-1933), split per surface:
+/// the immersive Game Demo stacks a few puffs per pixel while the
+/// zoomed-out inspector stacks dozens, so one grade cannot serve both.
+/// Engine `BloomParams::spec_defaults()` (threshold 1.0, blur σ)
+/// stays the shared spec; only these bin-local values tune the look.
+/// Smoke alpha exposure (multiplies puff alpha in the vertex shader).
+/// A billboard puff spreads its energy over ~6–50 px where the retired
+/// 1-px lines/1.5-Mpc tubes concentrated it, so the zoomed-out
+/// inspector needs ~6x the old ribbon MAP grade to read at all; the
+/// immersive demo stacks a few puffs/px and keeps the lower grade to
+/// protect mobile fill-rate. Trimmed 2026-09-20 with the density-
+/// contrast pass (CPU faint floor now below the old grade, so the
+/// exposure no longer needs to carry faint-link visibility): DEMO
+/// 0.65 / MAP 0.85 — faint mist lands darker than the original grade,
+/// dense threads ~2x brighter (see `smoke_puffs` contrast note).
+const COSMIC_DEMO_SMOKE_EXPOSURE: f32 = 0.65;
+const COSMIC_MAP_SMOKE_EXPOSURE: f32 = 0.85;
+/// Sprite alpha exposure (grain, dwarf glow, node cores + halos).
+const COSMIC_DEMO_GLOW_EXPOSURE: f32 = 1.0;
+const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
+/// Scene exposure at the ACES resolve.
+const COSMIC_DEMO_EXPOSURE: f32 = 1.15;
+const COSMIC_MAP_EXPOSURE: f32 = 0.85;
+/// Bloom intensity at the resolve (spec default 0.85 lifted: the
+/// half-res 4-pass chain attenuates 1-px lines and small sprites
+/// hard, so the composite needs the push to reach the target glow).
+const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 2.2;
+const COSMIC_MAP_BLOOM_INTENSITY: f32 = 1.2;
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -600,6 +887,60 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
 fn run_headless(seed: Option<u64>) -> i32 {
     let viewer = PlanetViewerState::new();
     let mut debug_app = DebugApp::new();
+    // Demo boot: the Game Demo tab mounts the cosmic player scene —
+    // generated web, spawned player, chase camera tracking it.
+    assert_eq!(debug_app.screen, Screen::GameDemo);
+    assert_eq!(debug_app.screen_content(), Some(ViewContent::CosmicWeb));
+    assert!(!debug_app.cosmic.web.nodes.is_empty());
+    assert!(!debug_app.cosmic.web.links.is_empty());
+    assert_eq!(
+        debug_app.cosmic.camera.render_origin(),
+        debug_app.cosmic.player.position_mpc()
+    );
+    // Cinematic layout smoke (update 2026-09-18-2328, smoke
+    // billboards replace ribbons; Illustris-look WS1–WS4: stretched
+    // sheath quads, frayed strands, gold beads over the bifurcation /
+    // spine skeleton): the enrichment layer derives non-empty
+    // smoke/grain/bead/impostor clouds from the boot web.
+    // GPU-free — upload happens only in the windowed shell.
+    let layout_seed = debug_app.cosmic.seed;
+    let layout_origin = debug_app.cosmic.upload_origin;
+    let smoke =
+        game_debug::cosmic_web::smoke_puffs(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let grain =
+        game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let beads =
+        game_debug::cosmic_web::bead_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
+    assert!(!smoke.is_empty(), "smoke must emit puffs");
+    assert!(!grain.is_empty(), "grain must emit points");
+    assert!(!beads.is_empty(), "beads must emit points");
+    assert_eq!(
+        impostors.len(),
+        debug_app.cosmic.web.nodes.len() * 3,
+        "three impostors per node"
+    );
+    println!(
+        "cosmic_layout=smoke{} grain{} beads{} impostors{} ok",
+        smoke.len(),
+        grain.len(),
+        beads.len(),
+        impostors.len()
+    );
+    // Cruise smoke (update 2026-09-18-2027): five seconds of W must move
+    // the ship Mpc-scale — the old thrust law could not move it at all.
+    let cruise_p0 = debug_app.cosmic.player.position_mpc();
+    debug_app.cosmic.held.fwd = true;
+    for _ in 0..300 {
+        debug_app.cosmic.tick(1.0 / 60.0);
+    }
+    debug_app.cosmic.held.clear();
+    let cruise_moved = (debug_app.cosmic.player.position_mpc() - cruise_p0).length();
+    assert!(
+        cruise_moved > 1.0,
+        "headless cruise must move Mpc-scale, moved {cruise_moved}"
+    );
+    println!("cruise_selftest=moved{cruise_moved:.2}Mpc ok");
     // Unified shell smoke: F2 opens Dimensions on the active
     // waypoint, digits pick dropdown entries, F-keys jump the
     // widget to a sub-tab.
@@ -608,6 +949,8 @@ fn run_headless(seed: Option<u64>) -> i32 {
     assert!(debug_app.dropdown_open);
     assert!(debug_app.select_dimension_by_digit(1));
     assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::CosmicWeb));
+    // Cosmic Web tab mounts the shared web (fourth absorbed view).
+    assert_eq!(debug_app.screen_content(), Some(ViewContent::CosmicWeb));
     // Placeholder dimension: flat UI, no 3D content.
     assert!(debug_app.select_dimension_by_digit(8));
     assert_eq!(debug_app.screen, Screen::Dimensions(WaypointId::Aerial));
@@ -967,6 +1310,44 @@ fn draw_player_marker(items: &mut UiItems, origin: (f32, f32), tip: Option<(f32,
     items.text("YOU".to_owned(), mx + PLAYER_DOT, my - 6.0, C_PLAYER);
 }
 
+/// Target highlight ring radius, pixels.
+const TARGET_RING_R: f32 = 9.0;
+
+/// Target/selection ring: square outline around a projected viewport
+/// point as four thin UI-pass rects (the galaxy/system map
+/// selection-ring geometry). Pure geometry — unit-tested below.
+fn draw_target_ring(items: &mut UiItems, center: (f32, f32), r: f32, color: Color) {
+    let (x0, y0) = center;
+    for rect in [
+        Rect {
+            x: x0 - r,
+            y: y0 - r,
+            w: 2.0 * r,
+            h: 1.5,
+        },
+        Rect {
+            x: x0 - r,
+            y: y0 + r,
+            w: 2.0 * r,
+            h: 1.5,
+        },
+        Rect {
+            x: x0 - r,
+            y: y0 - r,
+            w: 1.5,
+            h: 2.0 * r,
+        },
+        Rect {
+            x: x0 + r,
+            y: y0 - r,
+            w: 1.5,
+            h: 2.0 * r,
+        },
+    ] {
+        items.solid(rect, color);
+    }
+}
+
 /// Checkbox square inside a label row.
 fn check_box(row: Rect, lh: f32) -> Rect {
     Rect {
@@ -1174,28 +1555,51 @@ impl UiItems {
     }
 }
 
-/// Game Demo tab body: presentation-accurate player HUD lines for
-/// the current journey layer — frame/waypoint, time state
-/// (real-time: the debug shell owns no compression clock), and the
-/// SOI/target readouts, hidden until travel features feed them.
-/// Zero debug data by construction (the chrome builders run
-/// separately and only when their toggles are on).
-fn build_demo_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
+/// Game Demo tab body: the shipping HUD fed by the live cosmic player
+/// (frame/time/target lines from `game::hud`; SOI stays `—` — no
+/// handoffs at this scale) plus the camera mode and the flight hint.
+/// Zero debug data by construction (the chrome builders run separately
+/// and only when their toggles are on). Takes `&mut` for the HUD's SOI
+/// hysteresis state.
+fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
+    let cosmic = &mut app.cosmic;
+    let target_label = cosmic.target_label();
+    let frame = cosmic.hud.update(&HudInputs {
+        ship: &cosmic.player.ship,
+        clock: &cosmic.player.clock,
+        executor: cosmic.player.exec.as_ref(),
+        target_label: target_label.as_deref(),
+        soi_weight: 0.0,
+        soi_events: &[],
+        body_label: None,
+    });
+    let mode_line = format!("cam:   {} · marker YOU", cosmic.camera.mode().label());
+    let speed_line = format!(
+        "speed: {:.3} Mpc/s · cruise {:.1}s",
+        cosmic.player.real_speed_mpc_s(),
+        cosmic.player.cruise.t_cross_s
+    );
     let mut rows = ui::PanelRows::new(area, 12.0);
     section_bar(items, rows.next(lh + 6.0, 4.0), "GAME DEMO");
     for (line, color) in [
+        (frame.frame_line, C_TEXT),
+        (frame.time_line, C_TEXT),
         (
-            format!(
-                "frame:  {:?} · {} (L{})",
-                app.journey.active_layer(),
-                app.active_waypoint().name(),
-                app.active_waypoint().number()
-            ),
-            C_TEXT,
+            frame
+                .soi
+                .map(|soi| soi.message)
+                .unwrap_or_else(|| "soi:    —".to_owned()),
+            C_DIM,
         ),
-        ("time:   real-time".to_owned(), C_TEXT),
-        ("soi:    —".to_owned(), C_DIM),
-        ("target: —".to_owned(), C_DIM),
+        (
+            frame
+                .target
+                .map(|target| target.line)
+                .unwrap_or_else(|| "target: —".to_owned()),
+            C_DIM,
+        ),
+        (mode_line, C_TEXT),
+        (speed_line, C_TEXT),
     ] {
         text_row(items, lh, rows.next(lh, 6.0), line, color);
     }
@@ -1203,9 +1607,180 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &DebugApp, area: Rect) {
         items,
         lh,
         rows.next(lh, 6.0),
-        "WASD walk · P camera · E/T/Q travel".to_owned(),
+        "mouse steer · WASD cruise · click target · E fly-to · Shift+wheel pace · P camera"
+            .to_owned(),
         C_DIM,
     );
+}
+
+/// Cosmic Web dimension tab (WS5 — fourth absorbed view): web stats +
+/// camera hints on the left, node selection readout on the right. The
+/// viewport renders the shared web through the inspector camera (3D
+/// pass); this builder only draws chrome + docks. Read-only: no field
+/// here mutates journey, transit, or viewer state.
+fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> UiItems {
+    let cosmic = &app.cosmic;
+    let inspector = &app.cosmic_inspector;
+    let lh = atlas.line_height();
+    let mut items = UiItems::default();
+    build_topbar(&mut items, lh, app, layout);
+
+    // ---- Left dock: COSMIC WEB ----
+    if layout.left.w >= 1.0 {
+        items.solid(layout.left, C_PANEL_BG);
+        let mut rows = ui::PanelRows::new(layout.left, 12.0);
+        section_bar(&mut items, rows.next(lh + 6.0, 4.0), "COSMIC WEB");
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!("seed {}", cosmic.seed),
+            C_TEXT,
+        );
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!(
+                "{} nodes · {} links · {} glow",
+                cosmic.web.nodes.len(),
+                cosmic.web.links.len(),
+                cosmic.web.glow_mpc.len()
+            ),
+            C_DIM,
+        );
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!(
+                "voids {:.1}% · home node {}",
+                cosmic.web.void_fraction * 100.0,
+                cosmic.web.home_node
+            ),
+            C_DIM,
+        );
+        section_bar(&mut items, rows.next(lh + 6.0, 4.0), "CAMERA");
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            format!(
+                "target {:+.0},{:+.0},{:+.0} D {:.0} Mpc",
+                inspector.camera.target().x,
+                inspector.camera.target().y,
+                inspector.camera.target().z,
+                inspector.camera.distance()
+            ),
+            C_DIM,
+        );
+        for hint in [
+            "wheel: zoom (log)",
+            "left-drag: orbit",
+            "right-drag: pan",
+            "click: select node",
+            "Home: top-down",
+        ] {
+            text_row(&mut items, lh, rows.next(lh, 6.0), hint.to_owned(), C_DIM);
+        }
+    }
+
+    // ---- Right dock: SELECTION ----
+    if layout.panel.w >= 1.0 {
+        items.solid(layout.panel, C_PANEL_BG);
+        let mut rows = ui::PanelRows::new(layout.panel, 12.0);
+        section_bar(&mut items, rows.next(lh + 6.0, 4.0), "SELECTION");
+        match inspector
+            .selected
+            .and_then(|i| cosmic.web.nodes.get(i as usize))
+        {
+            Some(node) => {
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("node {}", node.node_index),
+                    C_TEXT,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("mass {:.3e} M☉", node.mass_msun),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("r_vir {:.2} Mpc", node.virial_radius_mpc),
+                    C_DIM,
+                );
+                let links = cosmic
+                    .web
+                    .links
+                    .iter()
+                    .filter(|l| l.a == node.node_index || l.b == node.node_index)
+                    .count();
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("{links} links"),
+                    C_DIM,
+                );
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    cosmic.web.node_content_id(node.node_index),
+                    C_DIM,
+                );
+            }
+            None => {
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    "click a node".to_owned(),
+                    C_DIM,
+                );
+                let ship = cosmic.player.position_mpc();
+                text_row(
+                    &mut items,
+                    lh,
+                    rows.next(lh, 6.0),
+                    format!("player {:+.1},{:+.1},{:+.1} Mpc", ship.x, ship.y, ship.z),
+                    C_DIM,
+                );
+            }
+        }
+    }
+    // Target highlight: amber ring around the inspected node,
+    // projected through the inspector camera at the fixed web-center
+    // origin the tab buffers share (the galaxy-tab ring precedent —
+    // clamped into the viewport, hidden behind the camera).
+    if let Some(node) = inspector
+        .selected
+        .and_then(|i| cosmic.web.nodes.get(i as usize))
+    {
+        let vp = layout.viewport;
+        let view_proj = inspector.view_proj(vp.w / vp.h);
+        let world = Vec3::new(
+            node.position_mpc[0] as f32,
+            node.position_mpc[1] as f32,
+            node.position_mpc[2] as f32,
+        );
+        if let Some((sx, sy)) = project_to_screen(world, view_proj, vp) {
+            draw_target_ring(
+                &mut items,
+                (sx.clamp(vp.x, vp.x + vp.w), sy.clamp(vp.y, vp.y + vp.h)),
+                TARGET_RING_R,
+                C_WARN,
+            );
+        }
+    }
+    items
 }
 
 /// Placeholder dimension tab (S7): waypoint identity + live status,
@@ -1293,9 +1868,83 @@ fn controls_plan(area: Rect, lh: f32) -> ControlsPlan {
     ControlsPlan { rows }
 }
 
-/// Settings tab body: Controls section rendering the registry.
-fn build_settings_ui(items: &mut UiItems, lh: f32, area: Rect) {
-    let plan = controls_plan(area, lh);
+/// Settings → UNIVERSE section plan (v0.3.2 `settings-seed-loader`):
+/// the single editable seed field lives in the Settings left dock —
+/// full-width field, full-width Load button (touch-first targets),
+/// active-seed hint. Pure function of (`left`, `lh`) — the UI builder
+/// and the click router share this, so hit rects match drawn widgets
+/// by construction.
+pub struct SettingsLeftPlan {
+    pub header: Rect,
+    pub field: Rect,
+    pub load: Rect,
+    pub hint: Rect,
+}
+
+fn settings_left_plan(left: Rect, lh: f32) -> SettingsLeftPlan {
+    let pad = ui::DOCK_PAD;
+    let mut y = left.y + pad;
+    let header = Rect {
+        x: left.x,
+        y,
+        w: left.w,
+        h: lh + 8.0,
+    };
+    y += lh + 12.0;
+    let row = |y: &mut f32, h: f32| {
+        let rect = Rect {
+            x: left.x + pad,
+            y: *y,
+            w: (left.w - 2.0 * pad).max(0.0),
+            h,
+        };
+        *y += h + 4.0;
+        rect
+    };
+    let field = row(&mut y, lh + 6.0);
+    let load = row(&mut y, lh + 6.0);
+    let hint = row(&mut y, lh);
+    SettingsLeftPlan {
+        header,
+        field,
+        load,
+        hint,
+    }
+}
+
+/// Settings tab body: UNIVERSE seed editor (left dock — the single
+/// editable seed field in the shell) + Controls section rendering
+/// the registry in the viewport.
+fn build_settings_ui(items: &mut UiItems, lh: f32, app: &DebugApp, layout: Layout) {
+    if layout.left.w >= 1.0 {
+        items.solid(layout.left, C_PANEL_BG);
+        let dock = settings_left_plan(layout.left, lh);
+        section_bar(items, dock.header, "UNIVERSE");
+        items.solid(dock.field, C_FIELD_BG);
+        text_row(
+            items,
+            lh,
+            dock.field,
+            app.settings.seed_field.text.clone(),
+            C_TEXT,
+        );
+        let load_ok = app.settings.seed_field.text.parse::<u64>().is_ok();
+        items.solid(dock.load, if load_ok { C_BTN } else { C_BTN_OFF });
+        items.text(
+            "Load [Enter]".to_owned(),
+            dock.load.x + 8.0,
+            dock.load.y + lh - 2.0,
+            if load_ok { C_TEXT } else { C_DIM },
+        );
+        text_row(
+            items,
+            lh,
+            dock.hint,
+            format!("universe {} · R re-rolls · Enter applies", app.galaxy.seed),
+            C_DIM,
+        );
+    }
+    let plan = controls_plan(layout.viewport, lh);
     let mut last_group: Option<ActionGroup> = None;
     for row in &plan.rows {
         if Some(row.action.group()) != last_group {
@@ -1505,11 +2154,6 @@ fn build_planet_ui(
 /// readout + hints) + selection ring overlay in the viewport.
 /// `build_right_dock` stays sphere-specific; the map's right dock shows
 /// the selected star.
-struct GalaxyLeftRects {
-    field: Rect,
-    load: Rect,
-}
-
 struct GalaxyLeftPlan {
     header: Rect,
     seed_row: Rect,
@@ -1517,8 +2161,6 @@ struct GalaxyLeftPlan {
     cam_row: Rect,
     cam_header: Rect,
     hints: [Rect; 6],
-    seed_header: Rect,
-    rects: GalaxyLeftRects,
 }
 
 /// Left-dock row layout for the galaxy screen, derived from
@@ -1561,21 +2203,6 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
         row(&mut y),
         row(&mut y),
     ];
-    y += 4.0;
-    let seed_header = bar(&mut y);
-    let field_w = ((left.w - 2.0 * pad) * 0.62).max(0.0);
-    let field = Rect {
-        x: left.x + pad,
-        y,
-        w: field_w,
-        h: lh + 6.0,
-    };
-    let load = Rect {
-        x: field.x + field.w + 6.0,
-        y,
-        w: (left.x + left.w - pad - (field.x + field.w + 6.0)).max(0.0),
-        h: lh + 6.0,
-    };
     GalaxyLeftPlan {
         header,
         seed_row,
@@ -1583,8 +2210,6 @@ fn galaxy_left_plan(left: Rect, lh: f32) -> GalaxyLeftPlan {
         cam_row,
         cam_header,
         hints,
-        seed_header,
-        rects: GalaxyLeftRects { field, load },
     }
 }
 
@@ -1641,24 +2266,6 @@ fn build_galaxy_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -> Ui
         ]) {
             text_row(&mut items, lh, *rect, hint.to_owned(), C_DIM);
         }
-        // ---- Left dock: SEED (runtime plumbing) ----
-        section_bar(&mut items, plan.seed_header, "SEED");
-        items.solid(plan.rects.field, C_FIELD_BG);
-        text_row(
-            &mut items,
-            lh,
-            plan.rects.field,
-            galaxy.seed_field.text.clone(),
-            C_TEXT,
-        );
-        let load_ok = galaxy.seed_field.text.parse::<u64>().is_ok();
-        items.solid(plan.rects.load, if load_ok { C_BTN } else { C_BTN_OFF });
-        items.text(
-            "Load".to_owned(),
-            plan.rects.load.x + 8.0,
-            plan.rects.load.y + lh - 2.0,
-            if load_ok { C_TEXT } else { C_DIM },
-        );
     }
 
     // ---- Right dock: SELECTION ----
@@ -2469,6 +3076,41 @@ fn compose_overlay_ui(
             draw_player_marker(items, origin, tip);
         }
     }
+    // Cosmic marker: the ship projected through the player camera
+    // (demo tab only — the WS5 inspector shows the player point
+    // instead). Marker and scene share the upload-origin frame, so the
+    // dot rides the web with no relative jitter.
+    if app.screen == Screen::GameDemo {
+        let cosmic = &app.cosmic;
+        let vp = layout.viewport;
+        let main_vp = cosmic.camera.view_proj(vp.w / vp.h);
+        let ship_f64 = cosmic.player.position_mpc();
+        let ship = recenter(ship_f64, cosmic.upload_origin);
+        if let Some(dot) = world_to_pixels(main_vp, ship, vp) {
+            let eye_dist = (cosmic.camera.eye_world() - ship_f64).length() as f32;
+            let facing = cosmic.player.facing();
+            let facing_f32 = Vec3::new(facing.x as f32, facing.y as f32, facing.z as f32);
+            let tip = world_to_pixels(main_vp, cosmic_tip_world(ship, facing_f32, eye_dist), vp);
+            draw_player_marker(items, dot, tip);
+        }
+        // Target highlight (UX-3 affordance): amber ring around the
+        // selected fly-to node, projected through the player camera in
+        // the upload-origin frame the buffers share. Hidden when the
+        // node is behind the camera or off-screen — same rule as the
+        // ship marker. The ring tracks `target_node`, so it rides the
+        // destination through `E` fly-to until arrival / cancel /
+        // re-click clears it.
+        if let Some(node) = cosmic.player.target_node
+            && let Some(descriptor) = cosmic.web.nodes.get(node as usize)
+            && let Some(center) = world_to_pixels(
+                main_vp,
+                recenter(DVec3::from(descriptor.position_mpc), cosmic.upload_origin),
+                vp,
+            )
+        {
+            draw_target_ring(items, center, TARGET_RING_R, C_WARN);
+        }
+    }
     // Transition fade + notice banner (UMAP-017): a fullscreen black
     // ramp over the fresh layer, then a banner pill top-center of
     // the viewport. Both ride the UI pass (alpha-blended).
@@ -2497,24 +3139,94 @@ fn compose_overlay_ui(
         items.solid(pill, [0.05, 0.06, 0.10, 0.92]);
         items.text(text.to_owned(), pill.x + 12.0, pill.y + lh - 2.0, C_TEXT);
     }
+    // Staged universe load (settings-seed-loader): modal determinate
+    // progress over every tab. Composed into the dropdown buffer
+    // (drawn after all other UI — topmost by command order): one
+    // buffer draws solids before text, so composing here is the only
+    // way panel solids sit above screen text (same isolation as the
+    // dropdown). Full-window dim, viewport-centered panel with the
+    // seed, bar + percent, and the live step label (text + bar, never
+    // color-only). Input stays blocked while this is up (event gates);
+    // there is no cancel in v1.
+    if let Some(plan) = &app.loading {
+        let total = LoadPlan::total();
+        let done = plan.done().min(total);
+        let step_label = if done == 0 {
+            "Starting"
+        } else {
+            LoadStep::ALL[(done - 1).min(total - 1)].label()
+        };
+        let frac = plan.progress();
+        let vp = layout.viewport;
+        drop.solid(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: win_w,
+                h: win_h,
+            },
+            [0.0, 0.0, 0.0, 0.55],
+        );
+        let panel_w = 340.0_f32.min(vp.w - 20.0).max(0.0);
+        let panel_h = lh * 4.0 + 30.0;
+        let panel = Rect {
+            x: vp.x + (vp.w - panel_w) * 0.5,
+            y: vp.y + (vp.h - panel_h) * 0.5,
+            w: panel_w,
+            h: panel_h,
+        };
+        drop.solid(panel, C_PANEL_BG);
+        drop.text(
+            format!("LOADING UNIVERSE · seed {}", plan.seed),
+            panel.x + 12.0,
+            panel.y + lh + 2.0,
+            C_TEXT,
+        );
+        let track = Rect {
+            x: panel.x + 12.0,
+            y: panel.y + lh * 2.0 + 8.0,
+            w: (panel.w - 24.0).max(0.0),
+            h: 10.0,
+        };
+        drop.solid(track, C_FIELD_BG);
+        drop.solid(
+            Rect {
+                x: track.x,
+                y: track.y,
+                w: track.w * frac,
+                h: track.h,
+            },
+            C_BTN,
+        );
+        drop.text(
+            format!("{}% · {step_label}", (frac * 100.0).round() as u32),
+            panel.x + 12.0,
+            panel.y + lh * 3.0 + 14.0,
+            C_DIM,
+        );
+    }
 }
 
 /// Transition pill (S2): floating bottom-center overlay, drawn only
-/// while a transition is in flight. Overlays content — layout never
-/// shifts.
+/// while a fly-to leg is in flight (v0.3.2 — the journey-transition
+/// preview data is deleted; the pill shows live easing progress).
+/// Overlays content — layout never shifts.
 fn build_transition_strip(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32, win_h: f32) {
-    let Some(descriptor) = app.transitions.current else {
-        return;
+    let exec = match &app.cosmic.player.exec {
+        Some(exec) if mode_of(Some(exec)) == ShipMode::FlyTo => exec,
+        _ => return,
     };
+    let plan = exec.plan();
+    let now = app.cosmic.player.clock.sim_time_s();
+    let progress = ((now - plan.t_start_s) / plan.duration_s).clamp(0.0, 1.0);
+    let label = app
+        .cosmic
+        .target_label()
+        .unwrap_or_else(|| "node".to_owned());
     let pill = ui::transition_strip(win_w, win_h);
     items.solid(pill, C_PILL_BG);
     items.text(
-        format!(
-            "▶ {} → {} · {:.0}%",
-            descriptor.leg.from.name(),
-            descriptor.leg.to.name(),
-            descriptor.progress * 100.0
-        ),
+        format!("▶ FLY-TO {label} · {:.0}%", progress * 100.0),
         pill.x + ui::TOP_PAD,
         pill.y + (pill.h + lh) / 2.0 - 3.0,
         C_WARN,
@@ -2586,7 +3298,7 @@ fn build_widget_fps(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
     build_fps_tab(items, lh, &app.fps, body);
 }
 
-/// Widget Console body: the transition-event log feed (newest last,
+/// Widget Console body: the live fly-to event feed (newest last,
 /// clipped to the body).
 fn build_widget_console(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
     let row_h = lh + 4.0;
@@ -2617,10 +3329,25 @@ fn build_widget_console(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect
 /// state is touched).
 fn build_widget_inspector(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
     let mut rows = ui::PanelRows::new(body, 0.0);
+    let flyto = match &app.cosmic.player.exec {
+        Some(exec) if mode_of(Some(exec)) == ShipMode::FlyTo => {
+            let plan = exec.plan();
+            let now = app.cosmic.player.clock.sim_time_s();
+            let progress = ((now - plan.t_start_s) / plan.duration_s).clamp(0.0, 1.0);
+            format!(
+                "fly-to:     {} · {:.0}%",
+                app.cosmic
+                    .target_label()
+                    .unwrap_or_else(|| "node".to_owned()),
+                progress * 100.0
+            )
+        }
+        _ => "fly-to:     off".to_owned(),
+    };
     for line in [
         format!("layer:      {:?}", app.journey.active_layer()),
         format!("waypoint:   {}", app.active_waypoint().name()),
-        format!("transitions: {}", app.transitions.history_len()),
+        flyto,
         format!("console:     {} lines", app.console.len()),
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
@@ -2794,6 +3521,14 @@ struct ShaderSet {
     ui_frag: Arc<ShaderModule>,
     map_vert: Arc<ShaderModule>,
     map_frag: Arc<ShaderModule>,
+    glow_vert: Arc<ShaderModule>,
+    glow_frag: Arc<ShaderModule>,
+    smoke_vert: Arc<ShaderModule>,
+    smoke_frag: Arc<ShaderModule>,
+    post_vert: Arc<ShaderModule>,
+    bright_frag: Arc<ShaderModule>,
+    blur_frag: Arc<ShaderModule>,
+    resolve_frag: Arc<ShaderModule>,
 }
 
 impl ShaderSet {
@@ -2807,6 +3542,29 @@ impl ShaderSet {
             ui_frag: compile_shader(device, ShaderKind::Fragment, UI_FRAG, "ui fragment"),
             map_vert: compile_shader(device, ShaderKind::Vertex, MAP_VERT, "map vertex"),
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
+            glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
+            glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
+            smoke_vert: compile_shader(device, ShaderKind::Vertex, SMOKE_VERT, "smoke vertex"),
+            smoke_frag: compile_shader(device, ShaderKind::Fragment, SMOKE_FRAG, "smoke fragment"),
+            post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
+            bright_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                BLOOM_BRIGHT_FRAG,
+                "bloom bright fragment",
+            ),
+            blur_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                BLOOM_BLUR_FRAG,
+                "bloom blur fragment",
+            ),
+            resolve_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                &resolve_frag_bloom(),
+                "bloom resolve fragment",
+            ),
         }
     }
 }
@@ -3038,6 +3796,325 @@ fn build_map_pipeline(
     .expect("map graphics pipeline must create")
 }
 
+/// Cosmic glow point pipeline (update-2026-09-18-2328): `PointList`,
+/// premultiplied-additive blend, no depth write (overlaps accumulate;
+/// draw order decides nothing). Same vertex type as the map pipeline
+/// — only the shaders, blend, and push block differ.
+fn build_glow_pipeline(
+    device: &Arc<Device>,
+    shaders: &ShaderSet,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs = shaders
+        .glow_vert
+        .entry_point("main")
+        .expect("vertex entry point");
+    let fs = shaders
+        .glow_frag
+        .entry_point("main")
+        .expect("fragment entry point");
+    let vertex_input_state = MapVertex::per_vertex()
+        .definition(&vs)
+        .expect("glow vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::PointList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(additive_blend()),
+                    ..Default::default()
+                },
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("glow graphics pipeline must create")
+}
+
+/// Cosmic smoke-filament pipeline (smoke display): `TriangleList`
+/// over per-instance [`SmokeVertex`] records (the vertex shader
+/// expands `gl_VertexIndex` into camera-facing billboard quads),
+/// premultiplied-additive, no depth write (puffs accumulate like the
+/// glow sprites).
+fn build_smoke_pipeline(
+    device: &Arc<Device>,
+    shaders: &ShaderSet,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs = shaders
+        .smoke_vert
+        .entry_point("main")
+        .expect("vertex entry point");
+    let fs = shaders
+        .smoke_frag
+        .entry_point("main")
+        .expect("fragment entry point");
+    let vertex_input_state = SmokeVertex::per_instance()
+        .definition(&vs)
+        .expect("smoke vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(additive_blend()),
+                    ..Default::default()
+                },
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("smoke graphics pipeline must create")
+}
+
+// ---------------------------------------------------------------------------
+// HDR bloom post chain (update-2026-09-18-2328, cosmic views only).
+// ---------------------------------------------------------------------------
+
+/// HDR support probe: a candidate format must serve both as the scene
+/// color attachment and as the downstream sampler source (the
+/// `post::HDR_FORMAT_PREFERENCE` contract — mirrors
+/// `game_tools::hdr_support`).
+fn hdr_support(
+    physical_device: &vulkano::device::physical::PhysicalDevice,
+    format: Format,
+) -> bool {
+    physical_device
+        .format_properties(format)
+        .map(|props| {
+            props
+                .optimal_tiling_features
+                .contains(FormatFeatures::COLOR_ATTACHMENT | FormatFeatures::SAMPLED_IMAGE)
+        })
+        .unwrap_or(false)
+}
+
+/// HDR scene pass: HDR color + depth, both cleared (the `game_tools`
+/// scene-pass shape; the cosmic scene draws here in HDR mode).
+fn build_scene_pass(device: &Arc<Device>, hdr_format: Format) -> Arc<RenderPass> {
+    vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: hdr_format,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+            depth: {
+                format: DEPTH_FORMAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: DontCare,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {depth},
+        },
+    )
+    .expect("HDR scene render pass must create")
+}
+
+/// Post pass: one HDR color attachment, cleared (shared by the bright
+/// extract and every blur step — all are fullscreen overwrites).
+fn build_post_pass(device: &Arc<Device>, hdr_format: Format) -> Arc<RenderPass> {
+    vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: hdr_format,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        },
+    )
+    .expect("post render pass must create")
+}
+
+/// Fullscreen-triangle pipeline constructor (bright / blur / resolve):
+/// empty vertex input (everything derives from `gl_VertexIndex`), no
+/// depth test, no culling, no blending (every pass overwrites fully).
+/// The `game_tools` `build_resolve_pipeline` shape, generalized over
+/// the fragment module. `depth_state` must mirror the subpass:
+/// `Some(default)` where the subpass owns a depth attachment (main
+/// pass — VUID-06043), `None` where it does not (post pass).
+fn build_post_pipeline(
+    device: &Arc<Device>,
+    frag: &Arc<ShaderModule>,
+    vert: &Arc<ShaderModule>,
+    render_pass: &Arc<RenderPass>,
+    depth_state: Option<DepthStencilState>,
+    what: &str,
+) -> Arc<GraphicsPipeline> {
+    let vs = vert.entry_point("main").expect("vertex entry point");
+    let fs = frag.entry_point("main").expect("fragment entry point");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            // No vertex buffers (see the `game_tools` note: explicit
+            // empty state, not `None`).
+            vertex_input_state: Some(VertexInputState::default()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState::default(),
+            )),
+            depth_stencil_state: depth_state,
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .unwrap_or_else(|error| panic!("{what} graphics pipeline must create: {error:?}"))
+}
+
+/// Transient HDR image view (scene + bloom targets): single-sampled,
+/// no mipmaps, `COLOR_ATTACHMENT | SAMPLED` (the `game_tools`
+/// `create_hdr_view` shape).
+fn create_post_view(
+    allocator: &Arc<StandardMemoryAllocator>,
+    extent: [u32; 2],
+    format: Format,
+    what: &str,
+) -> Arc<ImageView> {
+    let image = Image::new(
+        allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [extent[0], extent[1], 1],
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("{what} image must create: {error}"));
+    ImageView::new_default(image).unwrap_or_else(|error| panic!("{what} view must create: {error}"))
+}
+
+/// One sampled-image descriptor set (image + sampler at bindings 0–1 —
+/// the `game_tools` `build_resolve_set` shape). The bloom-resolve set
+/// (two images) is built by binding its second pair explicitly.
+fn post_image_set(
+    allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline: &Arc<GraphicsPipeline>,
+    view: &Arc<ImageView>,
+    sampler: &Arc<Sampler>,
+    what: &str,
+) -> Arc<DescriptorSet> {
+    let layout = pipeline.layout().set_layouts()[0].clone();
+    DescriptorSet::new(
+        allocator.clone(),
+        layout,
+        [
+            WriteDescriptorSet::image_view(0, view.clone()),
+            WriteDescriptorSet::sampler(1, sampler.clone()),
+        ],
+        [],
+    )
+    .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error}"))
+}
+
+/// Per-window HDR bloom resources (cosmic views only): scene target +
+/// depth, half-res bloom chain targets, and the sampling sets. Each
+/// bloom target is written exactly once per frame and only read
+/// afterwards — never rewritten (an A/B ping-pong reuse pattern
+/// corrupted its images on Intel UHD 620, diagnosed via the
+/// `GAME_DEBUG_COSMIC_BLOOM=0` bisect). One frame executes at a time
+/// behind `previous_frame_end`, so one set of transients is enough.
+/// Rebuilt on swapchain recreate.
+struct HdrChain {
+    format: Format,
+    // Views live on through the framebuffers + descriptor sets below;
+    // only the framebuffers, sets, and extents are read per frame.
+    scene_fb: Arc<Framebuffer>,
+    bloom_a_fb: Arc<Framebuffer>,
+    bloom_b_fb: Arc<Framebuffer>,
+    bloom_c_fb: Arc<Framebuffer>,
+    bloom_d_fb: Arc<Framebuffer>,
+    bloom_e_fb: Arc<Framebuffer>,
+    half_extent: [u32; 2],
+    bright_set: Arc<DescriptorSet>,
+    blur_a_set: Arc<DescriptorSet>,
+    blur_b_set: Arc<DescriptorSet>,
+    blur_c_set: Arc<DescriptorSet>,
+    blur_d_set: Arc<DescriptorSet>,
+    /// Resolve set sampling scene + final bloom (E).
+    resolve_set: Arc<DescriptorSet>,
+    /// Resolve set sampling scene + bright extract (A): the
+    /// `GAME_DEBUG_COSMIC_BLOOM=0` path, where E is never written.
+    resolve_nobloom_set: Arc<DescriptorSet>,
+}
+
 fn upload_fill(
     allocator: &Arc<StandardMemoryAllocator>,
     viewer: &PlanetViewerState,
@@ -3166,6 +4243,123 @@ fn upload_map(
         verts,
     )
     .expect("galaxy map vertex buffer upload must succeed")
+}
+
+/// Upload the cosmic glow point buffer (update-2026-09-18-2328):
+/// particulate grain, then descriptor dwarf glow, then node impostors
+/// (core + halo), laid out by the shared [`cosmic_web`] helpers (one
+/// palette for both 3D surfaces). Positions are origin-relative Mpc;
+/// camera motion rides the MVP push, never this buffer. Rebuilt on
+/// reseed and on rebase (the tick moves the upload origin back under
+/// the ship past the rebase distance).
+fn upload_cosmic_glow(
+    allocator: &Arc<StandardMemoryAllocator>,
+    web: &WebDescriptor,
+    seed: u64,
+    origin: glam::DVec3,
+) -> Subbuffer<[MapVertex]> {
+    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::grain_cloud(web, seed, origin)
+        .iter()
+        .chain(game_debug::cosmic_web::glow_point_cloud(web, origin).iter())
+        .chain(game_debug::cosmic_web::bead_cloud(web, seed, origin).iter())
+        .chain(game_debug::cosmic_web::node_impostors(web, origin).iter())
+        .map(|(pos, color, misc)| MapVertex {
+            map_pos: *pos,
+            color: *color,
+            misc: *misc,
+        })
+        .collect();
+    if verts.is_empty() {
+        // Degenerate params guard (vulkano rejects zero-length vertex
+        // buffers): one transparent point, mirroring upload_sky_points.
+        verts.push(MapVertex {
+            map_pos: [0.0, 0.0, -900.0],
+            color: [0.0, 0.0, 0.0],
+            misc: [1.0, 0.0, 0.0],
+        });
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("cosmic glow vertex buffer upload must succeed")
+}
+
+/// Upload the cosmic smoke puffs as per-instance vertices (same
+/// origin frame as [`upload_cosmic_glow`], layout from
+/// [`cosmic_web`]). A degenerate empty set uploads one zero-alpha
+/// puff (rasterizes nothing — the radial falloff discards it).
+fn upload_cosmic_smoke(
+    allocator: &Arc<StandardMemoryAllocator>,
+    web: &WebDescriptor,
+    seed: u64,
+    origin: glam::DVec3,
+) -> Subbuffer<[SmokeVertex]> {
+    let mut verts: Vec<SmokeVertex> = game_debug::cosmic_web::smoke_puffs(web, seed, origin)
+        .iter()
+        .map(|p| SmokeVertex {
+            pos_size: [p.pos[0], p.pos[1], p.pos[2], p.size_mpc],
+            rgba: p.rgba,
+            misc: [p.seed, p.tangent[0], p.tangent[1], p.tangent[2]],
+        })
+        .collect();
+    if verts.is_empty() {
+        verts.push(SmokeVertex {
+            pos_size: [0.0, 0.0, 0.0, 1.0],
+            rgba: [0.0, 0.0, 0.0, 0.0],
+            misc: [0.0, 0.0, 0.0, 0.0],
+        });
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("cosmic smoke vertex buffer upload must succeed")
+}
+
+/// Upload the inspector player point: one origin-relative vertex (near-
+/// white, larger than any node sprite so it reads distinct). Rebuilt per
+/// frame while the Cosmic Web tab shows — the ship moves continuously.
+fn upload_cosmic_player_point(
+    allocator: &Arc<StandardMemoryAllocator>,
+    pos: [f32; 3],
+) -> Subbuffer<[MapVertex]> {
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        vec![MapVertex {
+            map_pos: pos,
+            color: [0.90, 0.96, 1.00],
+            misc: [6.0, 1.0, 0.0],
+        }],
+    )
+    .expect("cosmic player point upload must succeed")
 }
 
 /// Upload catalog-sky points as Backdrop sprites (`misc` = pixel size,
@@ -3378,6 +4572,7 @@ struct ViewerApp {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     sampler: Arc<Sampler>,
+    post_sampler: Arc<Sampler>,
     shaders: ShaderSet,
     fill_vertices: Subbuffer<[FillVertex]>,
     fill_indices: Subbuffer<[u32]>,
@@ -3385,6 +4580,20 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
+    /// Cosmic glow point buffer (grain + dwarf glow + node impostors,
+    /// update-2026-09-18-2328): uploaded relative to the demo upload
+    /// origin, rebuilt on reseed + rebase.
+    cosmic_glow: Subbuffer<[MapVertex]>,
+    /// Cosmic smoke puffs (instanced billboards, same origin frame).
+    cosmic_smoke: Subbuffer<[SmokeVertex]>,
+    /// Inspector glow buffer (fixed web-center origin, rebuilt on
+    /// reseed only — the tab never rebases).
+    cosmic_tab_glow: Subbuffer<[MapVertex]>,
+    /// Inspector smoke puffs (fixed web-center origin).
+    cosmic_tab_smoke: Subbuffer<[SmokeVertex]>,
+    /// Inspector player point (one vertex, rebuilt per frame while the
+    /// tab shows — the ship moves continuously).
+    cosmic_tab_player: Subbuffer<[MapVertex]>,
     /// Catalog sky runtime (scheduler + loader + cache + fallback) and
     /// its Backdrop point buffer, drawn first in the Planet View.
     sky: CatalogSky,
@@ -3422,6 +4631,9 @@ struct ViewerApp {
     /// Mouse-held walk direction from a Settings Controls row
     /// (hold-to-press parity for WASD): cleared on mouse release.
     mouse_walk: Option<WalkDir>,
+    /// Shift modifier state (tracked via `ModifiersChanged`): `Shift`+wheel
+    /// adjusts the cosmic cruise pace instead of zooming the camera.
+    shift_held: bool,
 }
 
 /// Hold-to-press walk direction (mouse parity for the WASD keys).
@@ -3448,6 +4660,17 @@ struct WindowContext {
     last_cursor: Option<(f32, f32)>,
     recreate_swapchain: bool,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
+    /// Selected HDR scene format (`None` = LDR bypass).
+    hdr_format: Option<Format>,
+    /// False when `GAME_DEBUG_COSMIC_BLOOM=0` (bright extract only,
+    /// blur passes skipped).
+    bloom_enabled: bool,
+    /// HDR scene pass (HDR color + depth, cosmic views only).
+    scene_pass: Arc<RenderPass>,
+    /// Shared post pass (bright extract + blur steps).
+    post_pass: Arc<RenderPass>,
+    /// Transient HDR bloom resources (`None` in LDR bypass).
+    hdr: Option<HdrChain>,
 }
 
 impl WindowContext {
@@ -3518,6 +4741,18 @@ impl ViewerApp {
             },
         )
         .expect("atlas sampler must create");
+        // Post-chain sampler (update-2026-09-18-2328): linear for the
+        // bright downsample, clamp-to-edge so blur taps never wrap.
+        let post_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                ..Default::default()
+            },
+        )
+        .expect("post sampler must create");
 
         // The windowed viewer opens at N=4: at the N=6 headless default
         // cells are subpixel (faces and pentagon sites unreadable), which
@@ -3528,16 +4763,13 @@ impl ViewerApp {
             WINDOWED_SUBDIV,
             WINDOWED_RADIUS,
         ));
-        // `--seed N` opens the viewer on universe N (galaxy + journey +
-        // system star 0, Milky Way dimension tab) instead of the
-        // default seed.
+        // `--seed N` opens the viewer on universe N: the staged
+        // loader runs on the first windowed frames (same machine as
+        // the Settings Load button) and the viewer stays on the
+        // default Game Demo tab, which shows the newly seeded cosmic
+        // web. The sky keeps the boot seed either way.
         if let Some(seed) = seed {
-            debug.galaxy.regenerate(seed);
-            debug.journey = Journey::new(seed);
-            let star0 = debug.galaxy.galaxy.stars[0].clone();
-            debug.system.load(seed, &star0);
-            debug.select_screen(Screen::Dimensions(WaypointId::MilkyWay));
-            debug.fx.notify(format!("Seed {seed} · --seed flag"));
+            debug.loading = Some(LoadPlan::new(seed, LoadSource::Boot));
         }
         let viewer = &debug.viewer;
         tracing::info!(
@@ -3552,6 +4784,35 @@ impl ViewerApp {
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
+        // Cosmic web for the demo tab (same master seed as the maps).
+        let cosmic_origin = debug.cosmic.upload_origin;
+        let cosmic_seed = debug.cosmic.seed;
+        let cosmic_glow = upload_cosmic_glow(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            cosmic_origin,
+        );
+        let cosmic_smoke = upload_cosmic_smoke(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            cosmic_origin,
+        );
+        // Inspector buffers at the fixed web-center origin (WS5).
+        let cosmic_tab_glow = upload_cosmic_glow(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            glam::DVec3::ZERO,
+        );
+        let cosmic_tab_smoke = upload_cosmic_smoke(
+            &memory_allocator,
+            &debug.cosmic.web,
+            cosmic_seed,
+            glam::DVec3::ZERO,
+        );
+        let cosmic_tab_player = upload_cosmic_player_point(&memory_allocator, [0.0, 0.0, 0.0]);
         // Catalog sky over the cooker layout (`assets/catalog`); missing
         // manifest ⇒ procedural fallback sky (model-only, logged). The
         // sky shares the universe seed so fallback content is stable
@@ -3563,6 +4824,14 @@ impl ViewerApp {
         // Shader modules compile once here; each window builds its own
         // pipelines from them (see `build_pipelines`).
         let shaders = ShaderSet::compile(&device);
+        // Build tag (update-2026-09-18-2328 round 2): proves which
+        // visual code is actually running — a stale `game_debug.exe`
+        // (e.g. relink blocked by a still-running viewer holding the
+        // exe lock) silently keeps the old look. If this line is
+        // missing from the log, the binary predates the fix.
+        tracing::info!(
+            "cosmic visual build r4: illustris-look (stretched sheath quads + frayed strands + gold beads over bifurcation/spine skeleton) + rim-zero aniso falloff + bounded tint + world halos + resolve clamp"
+        );
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),
             debug,
@@ -3575,6 +4844,7 @@ impl ViewerApp {
             command_buffer_allocator,
             descriptor_set_allocator,
             sampler,
+            post_sampler,
             shaders,
             fill_vertices,
             fill_indices,
@@ -3582,6 +4852,11 @@ impl ViewerApp {
             map_vertices,
             system_points,
             system_lines,
+            cosmic_glow,
+            cosmic_smoke,
+            cosmic_tab_glow,
+            cosmic_tab_smoke,
+            cosmic_tab_player,
             sky,
             sky_vertices,
             twilight_stage: 0,
@@ -3598,6 +4873,23 @@ impl ViewerApp {
             last_fps_tick: None,
             main: None,
             mouse_walk: None,
+            shift_held: false,
+        }
+    }
+
+    /// Cosmic demo tick: cruise from held input intent, track the
+    /// camera, rebase the buffers past 50 Mpc of travel.
+    /// Parked tabs clear stale thrust (keys never stick across
+    /// switches). The dt floor keeps the flight assert (`dt > 0`)
+    /// green on the very first frame.
+    fn tick_cosmic(&mut self, dt: f32) {
+        if !matches!(self.debug.screen, Screen::GameDemo) {
+            self.debug.cosmic.held.clear();
+            return;
+        }
+        if self.debug.cosmic.tick(dt.max(1e-6) as f64) {
+            self.debug.cosmic.rebased();
+            self.refresh_cosmic();
         }
     }
 
@@ -3641,43 +4933,210 @@ impl ViewerApp {
         );
     }
 
-    /// Route typed text into whichever field holds focus (seed field on
-    /// the galaxy screen, subdiv/radius on the planet screen). Every
-    /// `TextField::insert_char` guards on its own `focused` flag, so
-    /// pushing to all three is safe — only the focused one accepts.
-    /// Without this, the shortcut arms below (digits, U, R, E, Q, F,
-    /// T, G/B) swallow keystrokes meant for the seed field: digits are
-    /// the whole u64 seed alphabet, so typing a seed appears to do
-    /// nothing.
+    /// Rebuild the cosmic-web buffers at the demo upload origin (after
+    /// a reseed or a rebase sail-past). Camera motion between rebuilds
+    /// rides the MVP push, never these buffers. The inspector buffers
+    /// (fixed web-center origin) rebuild on reseed only.
+    fn refresh_cosmic(&mut self) {
+        let origin = self.debug.cosmic.upload_origin;
+        let seed = self.debug.cosmic.seed;
+        self.cosmic_glow =
+            upload_cosmic_glow(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        self.cosmic_smoke =
+            upload_cosmic_smoke(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        self.cosmic_tab_glow = upload_cosmic_glow(
+            &self.memory_allocator,
+            &self.debug.cosmic.web,
+            seed,
+            glam::DVec3::ZERO,
+        );
+        self.cosmic_tab_smoke = upload_cosmic_smoke(
+            &self.memory_allocator,
+            &self.debug.cosmic.web,
+            seed,
+            glam::DVec3::ZERO,
+        );
+        tracing::info!(
+            seed = self.debug.cosmic.seed,
+            nodes = self.debug.cosmic.web.nodes.len(),
+            links = self.debug.cosmic.web.links.len(),
+            "cosmic web buffers rebuilt",
+        );
+    }
+
+    /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328):
+    /// MVP + sprite scale + per-surface buffers + viewport, shared by
+    /// the LDR direct path and the HDR scene/resolve path so both
+    /// record identical draws. Also rebuilds the inspector player
+    /// point (the ship moves continuously).
+    fn cosmic_frame(&mut self, vp: Rect) -> CosmicFrame {
+        let (mvp, px_scale, is_demo, eye) = if self.debug.screen == Screen::GameDemo {
+            let camera = &self.debug.cosmic.camera;
+            // Eye in the demo buffer frame: world truth minus the
+            // upload (rebase) origin the demo buffers share.
+            let eye_w = camera.eye_world();
+            let origin = self.debug.cosmic.upload_origin;
+            (
+                camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                camera.px_scale(vp.h),
+                true,
+                [
+                    (eye_w.x - origin.x) as f32,
+                    (eye_w.y - origin.y) as f32,
+                    (eye_w.z - origin.z) as f32,
+                ],
+            )
+        } else {
+            let inspector = &self.debug.cosmic_inspector;
+            // Inspector buffers use the web-center (zero) origin, the
+            // same frame the inspector camera's eye is already in.
+            let e = inspector.camera.eye();
+            (
+                inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                inspector.camera.px_scale(vp.h),
+                false,
+                [e.x, e.y, e.z],
+            )
+        };
+        let (smoke, glow) = if is_demo {
+            (self.cosmic_smoke.clone(), self.cosmic_glow.clone())
+        } else {
+            (self.cosmic_tab_smoke.clone(), self.cosmic_tab_glow.clone())
+        };
+        if !is_demo {
+            let ship = self.debug.cosmic.player.position_mpc();
+            self.cosmic_tab_player = upload_cosmic_player_point(
+                &self.memory_allocator,
+                [ship.x as f32, ship.y as f32, ship.z as f32],
+            );
+        }
+        CosmicFrame {
+            mvp,
+            px_scale,
+            is_demo,
+            eye,
+            smoke,
+            glow,
+            viewport: Viewport {
+                offset: [vp.x, vp.y],
+                extent: [vp.w, vp.h],
+                depth_range: 0.0..=1.0,
+            },
+        }
+    }
+
+    /// Reseed the cosmic demo (web + player + camera + HUD) and rebuild
+    /// its buffers: `R` in the demo, `--seed` / seed-field loads.
+    fn reseed_cosmic(&mut self, seed: u64) {
+        self.debug.cosmic.reseed(seed);
+        self.refresh_cosmic();
+        self.debug.fx.trigger_fade();
+        self.debug.fx.notify(format!(
+            "Cosmic web seed {seed} · {} nodes",
+            self.debug.cosmic.web.nodes.len()
+        ));
+        tracing::info!(seed, "cosmic web reseeded");
+    }
+
+    /// Toggle fly-to on the click-selected node (`E` in the demo,
+    /// shared with the Controls row): a committed leg cancels with a
+    /// continuous hand-back, otherwise the selection engages (or hints
+    /// when there is no target / the leg is rejected).
+    fn toggle_fly_to(&mut self) {
+        use game_debug::cosmic_demo::EngageOutcome;
+
+        if self.debug.cosmic.player.cancel_fly_to() {
+            self.debug.fx.notify("Fly-to cancelled".to_owned());
+            return;
+        }
+        match self.debug.cosmic.engage_fly_to() {
+            EngageOutcome::Engaged => {
+                let label = self
+                    .debug
+                    .cosmic
+                    .target_label()
+                    .unwrap_or_else(|| "node".to_owned());
+                self.debug.fx.notify(format!("Fly-to engaged → {label}"));
+            }
+            EngageOutcome::NoTarget => {
+                self.debug
+                    .fx
+                    .notify("Click a node to target first · [E] engages".to_owned());
+            }
+            EngageOutcome::Failed => {
+                self.debug
+                    .fx
+                    .notify("Fly-to rejected: target inside arrival sphere".to_owned());
+            }
+        }
+    }
+
+    /// Route typed text into whichever field holds focus (seed field
+    /// on the Settings screen, subdiv/radius on the planet screen).
+    /// Every `TextField::insert_char` guards on its own `focused`
+    /// flag, so pushing to all three is safe — only the focused one
+    /// accepts. Without this, the shortcut arms below (digits, U, R,
+    /// E, Q, F, T, G/B) swallow keystrokes meant for the seed field:
+    /// digits are the whole u64 seed alphabet, so typing a seed
+    /// appears to do nothing.
     fn type_into_focused_fields(&mut self, text: &str) {
         for ch in text.chars() {
-            self.debug.galaxy.seed_field.insert_char(ch);
+            self.debug.settings.seed_field.insert_char(ch);
             self.debug.viewer.subdiv_field.insert_char(ch);
             self.debug.viewer.radius_field.insert_char(ch);
         }
         self.debug.viewer.sync_slider_from_field();
     }
 
-    /// Load a full universe for `seed` (seed plumbing, shared by the
-    /// `--seed` flag, the panel Load button, Enter, and `R`): galaxy +
-    /// buffers, journey reset, system back to star 0, screen back to
-    /// the Milky Way dimension tab.
-    fn load_galaxy_seed(&mut self, seed: u64) {
-        self.debug.galaxy.regenerate(seed);
-        self.debug.journey = Journey::new(seed);
-        let star0 = self.debug.galaxy.galaxy.stars[0].clone();
-        self.debug.system.load(seed, &star0);
-        self.transit_acc = 0.0;
-        self.refresh_map();
-        self.refresh_system();
-        self.debug
-            .select_screen(Screen::Dimensions(WaypointId::MilkyWay));
-        self.debug.fx.trigger_fade();
-        self.debug.fx.notify(format!(
-            "Seed {seed} · {} stars",
-            self.debug.galaxy.galaxy.stars.len()
-        ));
-        tracing::info!(seed, "universe seed loaded");
+    /// Start a staged universe load for `seed` (single load path for
+    /// the Settings Load button, Enter-on-field, `R` re-roll, and the
+    /// `--seed` boot flag): one [`LoadStep`] runs per frame in
+    /// `draw_main`, so the modal progress bar stays alive. Ignored
+    /// while a load is already in flight.
+    fn begin_load(&mut self, seed: u64, source: LoadSource) {
+        if self.debug.loading.is_none() {
+            self.debug.loading = Some(LoadPlan::new(seed, source));
+        }
+    }
+
+    /// Execute one staged load step (CPU regen or GPU re-upload). The
+    /// Finalize step fades over the current screen — a load never
+    /// switches tabs — and the notify closes out in `finish_load`
+    /// once every step has run.
+    fn exec_load_step(&mut self, seed: u64, step: LoadStep) {
+        match step {
+            LoadStep::Galaxy => self.debug.galaxy.regenerate(seed),
+            LoadStep::Journey => self.debug.journey = Journey::new(seed),
+            LoadStep::System => {
+                let star0 = self.debug.galaxy.galaxy.stars[0].clone();
+                self.debug.system.load(seed, &star0);
+            }
+            LoadStep::Cosmic => self.debug.cosmic.reseed(seed),
+            LoadStep::UploadMap => self.refresh_map(),
+            LoadStep::UploadSystem => {
+                self.transit_acc = 0.0;
+                self.refresh_system();
+            }
+            LoadStep::UploadCosmic => self.refresh_cosmic(),
+            LoadStep::Finalize => {
+                // Stay on the current screen: a load never switches
+                // tabs (the fade + notify announce the swap).
+                self.debug.fx.trigger_fade();
+            }
+        }
+    }
+
+    /// Close out a staged load: the Settings field mirrors the new
+    /// universe seed, and the notify confirms it.
+    fn finish_load(&mut self, plan: LoadPlan) {
+        let stars = self.debug.galaxy.galaxy.stars.len();
+        self.debug.settings.sync_seed(plan.seed);
+        let suffix = match plan.source {
+            LoadSource::Panel => format!("Seed {} · {stars} stars", plan.seed),
+            LoadSource::Boot => format!("Seed {} · --seed flag", plan.seed),
+        };
+        self.debug.fx.notify(suffix);
+        tracing::info!(seed = plan.seed, "universe seed loaded");
     }
 
     /// Recompute the hovered chunk from the current cursor: only with
@@ -3759,7 +5218,21 @@ impl ViewerApp {
         }
     }
 
-    fn build_pipelines(&self, swapchain: &Arc<Swapchain>) -> (Arc<RenderPass>, Pipelines) {
+    /// Window pipelines + the HDR scene/post passes. The HDR format
+    /// selection is a physical-device query (no window needed — the
+    /// `game_tools` boot pattern); `None` means LDR bypass (cosmic
+    /// views draw the same layouts direct-to-swapchain, minus bloom).
+    fn build_pipelines(
+        &self,
+        swapchain: &Arc<Swapchain>,
+    ) -> (
+        Arc<RenderPass>,
+        Pipelines,
+        Option<Format>,
+        bool,
+        Arc<RenderPass>,
+        Arc<RenderPass>,
+    ) {
         let render_pass = vulkano::single_pass_renderpass!(
             self.device.clone(),
             attachments: {
@@ -3782,13 +5255,175 @@ impl ViewerApp {
             },
         )
         .expect("render pass must create");
+        // `GAME_DEBUG_COSMIC_POST=0` forces the LDR direct path and
+        // `GAME_DEBUG_COSMIC_BLOOM=0` keeps HDR scene + resolve while
+        // skipping the bright/blur chain: diagnostic A/B switches for
+        // the post chain, and fallbacks for drivers that misbehave
+        // under HDR.
+        let post_disabled = std::env::var("GAME_DEBUG_COSMIC_POST").is_ok_and(|value| value == "0");
+        let bloom_enabled =
+            !std::env::var("GAME_DEBUG_COSMIC_BLOOM").is_ok_and(|value| value == "0");
+        let hdr_format = if post_disabled {
+            tracing::info!("GAME_DEBUG_COSMIC_POST=0: LDR bypass forced");
+            None
+        } else {
+            match select_hdr_format(|format| hdr_support(self.device.physical_device(), format)) {
+                HdrSelection::Hdr(format) => Some(format),
+                HdrSelection::LdrBypass => None,
+            }
+        };
+        // Scene + post passes exist regardless (cheap objects); the
+        // transient images driving them exist only in HDR mode.
+        let scene_format = hdr_format.unwrap_or(swapchain.image_format());
+        let scene_pass = build_scene_pass(&self.device, scene_format);
+        let post_pass = build_post_pass(&self.device, scene_format);
         let pipelines = Pipelines {
             fill: build_fill_pipeline(&self.device, &self.shaders, &render_pass),
             line: build_line_pipeline(&self.device, &self.shaders, &render_pass),
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
+            map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
+            smoke: build_smoke_pipeline(&self.device, &self.shaders, &render_pass),
+            glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
+            smoke_scene: build_smoke_pipeline(&self.device, &self.shaders, &scene_pass),
+            bright: build_post_pipeline(
+                &self.device,
+                &self.shaders.bright_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "bloom bright",
+            ),
+            blur: build_post_pipeline(
+                &self.device,
+                &self.shaders.blur_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "bloom blur",
+            ),
+            resolve: build_post_pipeline(
+                &self.device,
+                &self.shaders.resolve_frag,
+                &self.shaders.post_vert,
+                &render_pass,
+                // State present, test off (the UI-pipeline
+                // precedent): the main subpass owns a depth
+                // attachment (VUID-06043).
+                Some(DepthStencilState::default()),
+                "bloom resolve",
+            ),
         };
-        (render_pass, pipelines)
+        (
+            render_pass,
+            pipelines,
+            hdr_format,
+            bloom_enabled,
+            scene_pass,
+            post_pass,
+        )
+    }
+
+    /// Build (or rebuild, on swapchain recreate) the transient HDR
+    /// bloom resources for the window: scene target + depth, five
+    /// dedicated bloom targets A-E (write-once, never ping-ponged),
+    /// and their sampling sets. `None` in LDR
+    /// bypass (no transients — the cosmic draws go direct). Associated
+    /// function (not a method) so the recreate path can pass disjoint
+    /// `self` fields alongside the `&mut` window context.
+    fn build_hdr_chain(
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+        post_sampler: &Arc<Sampler>,
+        ctx: &WindowContext,
+    ) -> Option<HdrChain> {
+        let format = ctx.hdr_format?;
+        let extent = ctx.swapchain.image_extent();
+        let half = [extent[0].max(2) / 2, extent[1].max(2) / 2];
+        let scene_view = create_post_view(memory_allocator, extent, format, "HDR scene");
+        let scene_depth = create_depth_view(memory_allocator, extent);
+        let scene_fb = Framebuffer::new(
+            ctx.scene_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![scene_view.clone(), scene_depth.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("HDR scene framebuffer must create");
+        // Five dedicated bloom targets (A–E): bright→A, blur-H A→B,
+        // blur-V B→C, wide-H C→D, wide-V D→E(final). No target is
+        // ever rewritten — see the `HdrChain` doc.
+        let mut bloom_views = Vec::with_capacity(5);
+        let mut bloom_fbs = Vec::with_capacity(5);
+        for what in ["A", "B", "C", "D", "E"] {
+            let view = create_post_view(memory_allocator, half, format, what);
+            let fb = Framebuffer::new(
+                ctx.post_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![view.clone()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("bloom {what} framebuffer must create: {error:?}"));
+            bloom_views.push(view);
+            bloom_fbs.push(fb);
+        }
+        let pipes = &ctx.pipelines;
+        let bright_set = post_image_set(
+            descriptor_set_allocator,
+            &pipes.bright,
+            &scene_view,
+            post_sampler,
+            "bloom bright",
+        );
+        let mut blur_sets = Vec::with_capacity(4);
+        for (view, tag) in bloom_views.iter().zip(["A", "B", "C", "D"]) {
+            blur_sets.push(post_image_set(
+                descriptor_set_allocator,
+                &pipes.blur,
+                view,
+                post_sampler,
+                &format!("bloom blur {tag}"),
+            ));
+        }
+        // Resolve samples two images (scene + final bloom): the second
+        // pair is written against the same layout explicitly.
+        let resolve_layout = pipes.resolve.layout().set_layouts()[0].clone();
+        let resolve_pair = |bloom_view: &Arc<ImageView>, what: &str| {
+            DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                resolve_layout.clone(),
+                [
+                    WriteDescriptorSet::image_view(0, scene_view.clone()),
+                    WriteDescriptorSet::sampler(1, post_sampler.clone()),
+                    WriteDescriptorSet::image_view(2, bloom_view.clone()),
+                    WriteDescriptorSet::sampler(3, post_sampler.clone()),
+                ],
+                [],
+            )
+            .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error:?}"))
+        };
+        let resolve_set = resolve_pair(&bloom_views[4], "bloom resolve");
+        let resolve_nobloom_set = resolve_pair(&bloom_views[0], "bloom resolve nobloom");
+        let mut fbs = bloom_fbs.into_iter();
+        let mut sets = blur_sets.into_iter();
+        Some(HdrChain {
+            format,
+            scene_fb,
+            bloom_a_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_b_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_c_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_d_fb: fbs.next().expect("five bloom framebuffers"),
+            bloom_e_fb: fbs.next().expect("five bloom framebuffers"),
+            half_extent: half,
+            bright_set,
+            blur_a_set: sets.next().expect("four bloom sets"),
+            blur_b_set: sets.next().expect("four bloom sets"),
+            blur_c_set: sets.next().expect("four bloom sets"),
+            blur_d_set: sets.next().expect("four bloom sets"),
+            resolve_set,
+            resolve_nobloom_set,
+        })
     }
 }
 
@@ -3797,6 +5432,19 @@ struct Pipelines {
     line: Arc<GraphicsPipeline>,
     ui: Arc<GraphicsPipeline>,
     map: Arc<GraphicsPipeline>,
+    /// Cosmic glow sprites (additive, update-2026-09-18-2328).
+    map_glow: Arc<GraphicsPipeline>,
+    /// Cosmic smoke filaments (additive instanced billboards).
+    smoke: Arc<GraphicsPipeline>,
+    /// Scene-pass variants of the cosmic pipelines (HDR mode).
+    glow_scene: Arc<GraphicsPipeline>,
+    smoke_scene: Arc<GraphicsPipeline>,
+    /// Bloom bright extract (post pass).
+    bright: Arc<GraphicsPipeline>,
+    /// Separable blur step (post pass, axis via push).
+    blur: Arc<GraphicsPipeline>,
+    /// Bloom-composite ACES resolve (main pass).
+    resolve: Arc<GraphicsPipeline>,
 }
 
 fn window_size_dependent_setup(
@@ -3859,10 +5507,11 @@ impl ViewerApp {
             )
             .expect("swapchain must create")
         };
-        let (render_pass, pipelines) = self.build_pipelines(&swapchain);
+        let (render_pass, pipelines, hdr_format, bloom_enabled, scene_pass, post_pass) =
+            self.build_pipelines(&swapchain);
         let depth_view = create_depth_view(&self.memory_allocator, swapchain.image_extent());
         let framebuffers = window_size_dependent_setup(&images, &render_pass, &depth_view);
-        WindowContext {
+        let mut ctx = WindowContext {
             window,
             swapchain,
             render_pass,
@@ -3874,7 +5523,24 @@ impl ViewerApp {
             last_cursor: None,
             recreate_swapchain: false,
             previous_frame_end: Some(sync::now(self.device.clone()).boxed()),
+            hdr_format,
+            bloom_enabled,
+            scene_pass,
+            post_pass,
+            hdr: None,
+        };
+        ctx.hdr = Self::build_hdr_chain(
+            &self.memory_allocator,
+            &self.descriptor_set_allocator,
+            &self.post_sampler,
+            &ctx,
+        );
+        if let Some(chain) = ctx.hdr.as_ref() {
+            tracing::info!(format = ?chain.format, "HDR cosmic post chain active");
+        } else {
+            tracing::info!("LDR bypass: cosmic views draw direct-to-swapchain");
         }
+        ctx
     }
 
     /// Whether an event belongs to the window (`false` for stale ids
@@ -3928,6 +5594,9 @@ impl ViewerApp {
     fn main_window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.shift_held = modifiers.state().shift_key();
+            }
             WindowEvent::Resized(_) => {
                 if let Some(ctx) = self.main.as_mut() {
                     ctx.recreate_swapchain = true;
@@ -3986,6 +5655,17 @@ impl ViewerApp {
                             } else {
                                 self.debug.system.camera.rotate(dx, dy);
                             }
+                        } else if matches!(self.debug.screen, Screen::GameDemo) {
+                            // Cosmic demo: left-drag steers the ship nose
+                            // (Chase/FirstPerson follow it; Orbit keeps
+                            // its free-look angles). Checked before player
+                            // mode: on this tab there is no walker view,
+                            // so an armed walker must not swallow drags.
+                            self.debug.cosmic.steer(dx, dy);
+                        } else if content == Some(ViewContent::CosmicWeb) {
+                            // Cosmic inspector tab: left-drag orbits the
+                            // inspector camera (read-only).
+                            self.debug.cosmic_inspector.camera.rotate(dx, dy);
                         } else if self.debug.viewer.player.active {
                             // Player mode orbits the follow camera instead
                             // of the free global one (first/third person
@@ -4010,6 +5690,10 @@ impl ViewerApp {
                             self.debug.galaxy.camera.pan_screen(dx, dy, vp.h);
                         } else if content == Some(ViewContent::SystemMap) {
                             self.debug.system.camera.pan_screen(dx, dy, vp.h);
+                        } else if content == Some(ViewContent::CosmicWeb) {
+                            // Inspector pan (the demo tab never sets the
+                            // pan flag — it steers on left-drag).
+                            self.debug.cosmic_inspector.camera.pan_screen(dx, dy, vp.h);
                         }
                     }
                 }
@@ -4051,7 +5735,8 @@ impl ViewerApp {
                 }
                 if !pressed {
                     // Release: clear a mouse-held walk flag first
-                    // (Settings Controls hold-to-press parity).
+                    // (Settings Controls hold-to-press parity) — walker
+                    // and cosmic thrust alike, so neither sticks.
                     if self.mouse_walk.take().is_some() {
                         let viewer = &mut self.debug.viewer;
                         let mut keys = viewer.player.keys();
@@ -4060,6 +5745,7 @@ impl ViewerApp {
                         keys.west = false;
                         keys.east = false;
                         viewer.player.set_keys(keys);
+                        self.debug.cosmic.held.clear();
                         return;
                     }
                     // A press that barely traveled counts as a
@@ -4137,6 +5823,49 @@ impl ViewerApp {
                         // from screen state before committing, so the
                         // stale arm can never fire.
                     }
+                    // Cosmic inspector click: pick the nearest node into
+                    // the readout (read-only — no journey mutation).
+                    // The demo tab targets fly-to instead (below).
+                    if click
+                        && content == Some(ViewContent::CosmicWeb)
+                        && !matches!(self.debug.screen, Screen::GameDemo)
+                        && in_viewport
+                        && let Some((cx, cy)) = cursor
+                    {
+                        let layout = match self.main.as_ref() {
+                            Some(ctx) => {
+                                let (w, h) = ctx.size();
+                                app_layout(self.debug.chrome, w, h)
+                            }
+                            None => return,
+                        };
+                        let vp = layout.viewport;
+                        let web = &self.debug.cosmic.web;
+                        self.debug
+                            .cosmic_inspector
+                            .select_at(web, glam::DVec3::ZERO, (cx, cy), vp);
+                    }
+                    // Cosmic demo click: pick the nearest node as the
+                    // fly-to target (a miss clears it).
+                    if click
+                        && matches!(self.debug.screen, Screen::GameDemo)
+                        && in_viewport
+                        && let Some((cx, cy)) = cursor
+                    {
+                        let layout = match self.main.as_ref() {
+                            Some(ctx) => {
+                                let (w, h) = ctx.size();
+                                app_layout(self.debug.chrome, w, h)
+                            }
+                            None => return,
+                        };
+                        let vp = layout.viewport;
+                        if let Some(i) = self.debug.cosmic.select_node_at((cx, cy), vp) {
+                            self.debug
+                                .fx
+                                .notify(format!("Target node {i} · [E] fly-to"));
+                        }
+                    }
                     return;
                 }
                 let (cx, cy, w, h) = match self.main.as_ref() {
@@ -4153,6 +5882,11 @@ impl ViewerApp {
                 let lh = self.atlas.line_height();
                 // Chrome first, topmost surface wins: dropdown panel,
                 // top bar, corner strip, dev widget, settings rows.
+                // A staged universe load is modal: every click is
+                // ignored while it runs (no cancel in v1).
+                if self.debug.loading.is_some() {
+                    return;
+                }
                 if self.debug.dropdown_open {
                     let panel = ui::dropdown_panel(layout.nav);
                     for (index, waypoint) in DROPDOWN_ORDER.iter().enumerate() {
@@ -4206,6 +5940,16 @@ impl ViewerApp {
                     }
                 }
                 if self.debug.screen == Screen::Settings {
+                    // UNIVERSE editor (left dock): click focuses the
+                    // field, Load starts the staged load.
+                    let dock = settings_left_plan(layout.left, lh);
+                    self.debug.settings.seed_field.click(dock.field, cx, cy);
+                    if dock.load.contains(cx, cy)
+                        && let Ok(seed) = self.debug.settings.seed_field.text.parse::<u64>()
+                    {
+                        self.begin_load(seed, LoadSource::Panel);
+                        return;
+                    }
                     let plan = controls_plan(layout.viewport, lh);
                     for row in &plan.rows {
                         if row.rect.contains(cx, cy) {
@@ -4228,10 +5972,6 @@ impl ViewerApp {
                     return;
                 }
                 // Panel widgets (viewer window, both screens).
-                // A staged seed load (galaxy Load button) applies after
-                // this block: the block holds the viewer borrow, and the
-                // loader needs `&mut self`.
-                let mut pending_seed: Option<u64> = None;
                 let regenerated = {
                     let viewer = &mut self.debug.viewer;
                     let lh = self.atlas.line_height();
@@ -4239,37 +5979,22 @@ impl ViewerApp {
                         parse_subdivisions(&viewer.subdiv_field.text).is_ok_and(subdiv_warning);
                     let checker = viewer.debug_mode == DebugMode::Checker;
                     // Content-specific left dock first.
-                    match content {
-                        Some(ViewContent::PlanetView) => {
-                            let lrects = &planet_left_plan(layout.left, lh, checker).rects;
-                            if lrects.shader_button.contains(cx, cy) {
-                                viewer.cycle_debug_mode();
-                            }
-                            if let Some(track) = lrects.density_track
-                                && track.contains(cx, cy)
-                            {
-                                self.dragging_density = true;
-                                viewer.density_slider.drag_to(track, cx);
-                                viewer.sync_density_from_slider();
-                            }
-                            viewer.wire_cb.click(lrects.wire_box, cx, cy);
-                            viewer.pent_cb.click(lrects.pent_box, cx, cy);
-                            viewer.seam_cb.click(lrects.seam_box, cx, cy);
-                            viewer.sync_toggles();
+                    if let Some(ViewContent::PlanetView) = content {
+                        let lrects = &planet_left_plan(layout.left, lh, checker).rects;
+                        if lrects.shader_button.contains(cx, cy) {
+                            viewer.cycle_debug_mode();
                         }
-                        // Seed widgets with galaxy content: click focuses
-                        // the field, Load stages a seed (applied after
-                        // the viewer borrow ends, below).
-                        Some(ViewContent::GalaxyMap) => {
-                            let plan = galaxy_left_plan(layout.left, lh);
-                            self.debug.galaxy.seed_field.click(plan.rects.field, cx, cy);
-                            if plan.rects.load.contains(cx, cy)
-                                && let Ok(seed) = self.debug.galaxy.seed_field.text.parse::<u64>()
-                            {
-                                pending_seed = Some(seed);
-                            }
+                        if let Some(track) = lrects.density_track
+                            && track.contains(cx, cy)
+                        {
+                            self.dragging_density = true;
+                            viewer.density_slider.drag_to(track, cx);
+                            viewer.sync_density_from_slider();
                         }
-                        _ => {}
+                        viewer.wire_cb.click(lrects.wire_box, cx, cy);
+                        viewer.pent_cb.click(lrects.pent_box, cx, cy);
+                        viewer.seam_cb.click(lrects.seam_box, cx, cy);
+                        viewer.sync_toggles();
                     }
                     // Shared right dock.
                     let rrects =
@@ -4287,9 +6012,6 @@ impl ViewerApp {
                 };
                 if regenerated {
                     self.refresh_mesh();
-                }
-                if let Some(seed) = pending_seed {
-                    self.load_galaxy_seed(seed);
                 }
                 // Global camera presets: 2×2 VIEW grid retargets the free
                 // orbit camera (same as G/T/B/R) — planet content only.
@@ -4317,6 +6039,11 @@ impl ViewerApp {
                 self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // A staged universe load is modal: wheel input is
+                // ignored while it runs (no cancel in v1).
+                if self.debug.loading.is_some() {
+                    return;
+                }
                 let in_viewport = self.main.as_ref().is_some_and(|ctx| {
                     let (w, h) = ctx.size();
                     ctx.last_cursor.is_some_and(|(cx, cy)| {
@@ -4331,7 +6058,29 @@ impl ViewerApp {
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
                     };
                     let content = self.debug.screen_content();
-                    if content == Some(ViewContent::GalaxyMap) {
+                    if matches!(self.debug.screen, Screen::GameDemo) {
+                        if self.shift_held {
+                            // Cruise pace: wheel-up (positive scroll)
+                            // tightens the pace (faster), wheel-down
+                            // loosens it — one notch per wheel direction
+                            // (wheel alone still zooms the camera below).
+                            let factor = if scroll > 0.0 {
+                                1.0 / CRUISE_SPEED_NOTCH
+                            } else {
+                                CRUISE_SPEED_NOTCH
+                            };
+                            let t = self.debug.cosmic.cruise_speed_by(factor);
+                            self.debug
+                                .fx
+                                .notify(format!("Cruise pace {t:.1}s per scale length"));
+                        } else {
+                            // Cosmic zoom: wheel-up (positive scroll) moves
+                            // the player camera closer. Checked before player
+                            // mode for the same reason as drag-steer.
+                            let factor = (1.0 - 0.12 * scroll).max(0.05);
+                            self.debug.cosmic.camera.zoom(factor);
+                        }
+                    } else if content == Some(ViewContent::GalaxyMap) {
                         // Log zoom on the map: wheel-up (positive scroll)
                         // shrinks the camera distance.
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
@@ -4339,6 +6088,10 @@ impl ViewerApp {
                     } else if content == Some(ViewContent::SystemMap) {
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.system.camera.zoom_by(factor);
+                    } else if content == Some(ViewContent::CosmicWeb) {
+                        // Inspector log-zoom (demo zoom handled above).
+                        let factor = (1.0 - 0.12 * scroll).max(0.05);
+                        self.debug.cosmic_inspector.camera.zoom_by(factor);
                     } else if self.debug.viewer.player.active {
                         self.debug.viewer.player.zoom_camera(scroll);
                     } else {
@@ -4357,6 +6110,11 @@ impl ViewerApp {
                     },
                 ..
             } => {
+                // A staged universe load is modal: every key is
+                // ignored while it runs (no cancel in v1).
+                if self.debug.loading.is_some() {
+                    return;
+                }
                 // Player movement tracks press AND release so keys never
                 // stick; focused text fields keep every keystroke instead.
                 if let PhysicalKey::Code(code) = physical_key
@@ -4375,7 +6133,23 @@ impl ViewerApp {
                     let viewer = &mut self.debug.viewer;
                     let fields_free = !viewer.subdiv_field.focused
                         && !viewer.radius_field.focused
-                        && !self.debug.galaxy.seed_field.focused;
+                        && !self.debug.settings.seed_field.focused;
+                    // Cosmic demo: WASD/arrows are cruise intent (the tab
+                    // has no text fields; releases always clear).
+                    if matches!(self.debug.screen, Screen::GameDemo) {
+                        if fields_free || state == ElementState::Released {
+                            let pressed = state == ElementState::Pressed;
+                            let held = &mut self.debug.cosmic.held;
+                            match code {
+                                KeyCode::KeyW | KeyCode::ArrowUp => held.fwd = pressed,
+                                KeyCode::KeyS | KeyCode::ArrowDown => held.back = pressed,
+                                KeyCode::KeyA | KeyCode::ArrowLeft => held.left = pressed,
+                                KeyCode::KeyD | KeyCode::ArrowRight => held.right = pressed,
+                                _ => {}
+                            }
+                        }
+                        return;
+                    }
                     if viewer.player.active && fields_free {
                         let pressed = state == ElementState::Pressed;
                         let mut keys = viewer.player.keys();
@@ -4416,18 +6190,18 @@ impl ViewerApp {
                         self.debug.esc_unwind();
                     }
                     PhysicalKey::Code(KeyCode::Enter) => {
-                        // Enter confirms the focused field: seed field
-                        // loads the typed universe (or surfaces the miss),
-                        // planet fields just unfocus.
-                        if self.debug.galaxy.seed_field.focused {
-                            match self.debug.galaxy.seed_field.text.parse::<u64>() {
-                                Ok(seed) => self.load_galaxy_seed(seed),
+                        // Enter confirms the focused field: the Settings
+                        // seed field starts the staged load (or surfaces
+                        // the miss), planet fields just unfocus.
+                        if self.debug.settings.seed_field.focused {
+                            match self.debug.settings.seed_field.text.parse::<u64>() {
+                                Ok(seed) => self.begin_load(seed, LoadSource::Panel),
                                 Err(_) => self.debug.fx.notify(format!(
                                     "Invalid seed '{}'",
-                                    self.debug.galaxy.seed_field.text
+                                    self.debug.settings.seed_field.text
                                 )),
                             }
-                            self.debug.galaxy.seed_field.focused = false;
+                            self.debug.settings.seed_field.focused = false;
                         } else {
                             let viewer = &mut self.debug.viewer;
                             viewer.subdiv_field.focused = false;
@@ -4439,7 +6213,7 @@ impl ViewerApp {
                         viewer.subdiv_field.backspace();
                         viewer.radius_field.backspace();
                         viewer.sync_slider_from_field();
-                        self.debug.galaxy.seed_field.backspace();
+                        self.debug.settings.seed_field.backspace();
                     }
                     PhysicalKey::Code(KeyCode::F1) => {
                         self.debug.select_top_by_fkey(1);
@@ -4510,7 +6284,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                             && self.debug.screen_content() == Some(ViewContent::PlanetView)
                         {
                             let i = match physical_key {
@@ -4536,7 +6310,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                         {
                             self.debug.viewer.player.toggle();
                             self.update_hover();
@@ -4545,32 +6319,40 @@ impl ViewerApp {
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyP) => {
-                        // Player camera cycle (active player only).
+                        // Camera cycle: the cosmic camera on the demo tab,
+                        // else the player camera (active player only).
                         // A focused field keeps the keystroke instead.
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
-                            && viewer.player.active
+                            && !self.debug.settings.seed_field.focused
                         {
-                            self.debug.viewer.player.cycle_camera();
+                            if matches!(self.debug.screen, Screen::GameDemo) {
+                                self.debug.cosmic.camera.cycle();
+                            } else if viewer.player.active {
+                                self.debug.viewer.player.cycle_camera();
+                            }
                         } else if let Some(text) = text {
                             self.type_into_focused_fields(&text);
                         }
                     }
                     PhysicalKey::Code(KeyCode::KeyR) => {
-                        // R re-rolls the galaxy seed with galaxy content;
-                        // planet content keeps R = Right preset.
+                        // R re-rolls the seed with galaxy content; the
+                        // demo tab re-rolls the cosmic web; planet
+                        // content keeps R = Right preset.
                         let fields_free = {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free {
                             let content = self.debug.screen_content();
-                            if content == Some(ViewContent::GalaxyMap) {
-                                self.load_galaxy_seed(self.debug.galaxy.seed + 1);
+                            if matches!(self.debug.screen, Screen::GameDemo) {
+                                let seed = self.debug.cosmic.seed + 1;
+                                self.reseed_cosmic(seed);
+                            } else if content == Some(ViewContent::GalaxyMap) {
+                                self.begin_load(self.debug.galaxy.seed + 1, LoadSource::Panel);
                             } else if content == Some(ViewContent::PlanetView) {
                                 let radius = self.debug.viewer.radius;
                                 snap_global_camera(&mut self.camera, GlobalPreset::Right, radius);
@@ -4588,9 +6370,13 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
-                        if fields_free
+                        // Cosmic demo first: E toggles fly-to on the
+                        // click-selected node (shared with Controls).
+                        if fields_free && matches!(self.debug.screen, Screen::GameDemo) {
+                            self.toggle_fly_to();
+                        } else if fields_free
                             && self.debug.screen_content() == Some(ViewContent::GalaxyMap)
                             && let Some(i) = self.debug.galaxy.selected
                         {
@@ -4629,7 +6415,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free
                             && matches!(
@@ -4649,7 +6435,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free
                             && self.debug.screen_content() == Some(ViewContent::SystemMap)
@@ -4666,7 +6452,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free
                             && self.debug.screen_content() == Some(ViewContent::SystemMap)
@@ -4692,7 +6478,7 @@ impl ViewerApp {
                             let viewer = &self.debug.viewer;
                             !viewer.subdiv_field.focused
                                 && !viewer.radius_field.focused
-                                && !self.debug.galaxy.seed_field.focused
+                                && !self.debug.settings.seed_field.focused
                         };
                         if fields_free {
                             let content = self.debug.screen_content();
@@ -4711,7 +6497,7 @@ impl ViewerApp {
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
-                            && !self.debug.galaxy.seed_field.focused
+                            && !self.debug.settings.seed_field.focused
                             && self.debug.screen_content() == Some(ViewContent::PlanetView)
                         {
                             let preset = match physical_key {
@@ -4731,10 +6517,10 @@ impl ViewerApp {
                         // The focused seed field eats keystrokes first;
                         // otherwise printable input goes to the planet
                         // fields (their insert guards on focus).
-                        if self.debug.galaxy.seed_field.focused {
+                        if self.debug.settings.seed_field.focused {
                             if let Some(text) = text {
                                 for ch in text.chars() {
-                                    self.debug.galaxy.seed_field.insert_char(ch);
+                                    self.debug.settings.seed_field.insert_char(ch);
                                 }
                             }
                         } else if let Some(text) = text {
@@ -4783,7 +6569,9 @@ impl ViewerApp {
                 self.update_hover();
             }
             Action::CameraCycle => {
-                if self.debug.viewer.player.active {
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    self.debug.cosmic.camera.cycle();
+                } else if self.debug.viewer.player.active {
                     self.debug.viewer.player.cycle_camera();
                 }
             }
@@ -4794,8 +6582,11 @@ impl ViewerApp {
             Action::PresetBottom => self.snap_preset(GlobalPreset::Bottom),
             Action::PresetRight => self.snap_preset(GlobalPreset::Right),
             Action::RerollSeed => {
-                if self.debug.screen_content() == Some(ViewContent::GalaxyMap) {
-                    self.load_galaxy_seed(self.debug.galaxy.seed + 1);
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    let seed = self.debug.cosmic.seed + 1;
+                    self.reseed_cosmic(seed);
+                } else if self.debug.screen_content() == Some(ViewContent::GalaxyMap) {
+                    self.begin_load(self.debug.galaxy.seed + 1, LoadSource::Panel);
                 }
             }
             Action::TopDownSnap => {
@@ -4804,6 +6595,10 @@ impl ViewerApp {
                     self.debug.galaxy.camera.toggle_top_down();
                 } else if content == Some(ViewContent::SystemMap) {
                     self.debug.system.camera.toggle_top_down();
+                } else if content == Some(ViewContent::CosmicWeb)
+                    && !matches!(self.debug.screen, Screen::GameDemo)
+                {
+                    self.debug.cosmic_inspector.camera.toggle_top_down();
                 }
             }
             Action::TwilightCycle => {
@@ -4816,6 +6611,17 @@ impl ViewerApp {
             }
             Action::TravelOffer => self.travel_offer_toggle(),
             Action::TravelBegin => self.travel_begin(),
+            Action::FlyToToggle => self.toggle_fly_to(),
+            Action::CruiseSpeed => {
+                // Controls-row parity for the `Shift`+wheel pace action:
+                // a click steps one notch faster on the demo tab.
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    let t = self.debug.cosmic.cruise_speed_by(1.0 / CRUISE_SPEED_NOTCH);
+                    self.debug
+                        .fx
+                        .notify(format!("Cruise pace {t:.1}s per scale length"));
+                }
+            }
             Action::AscendLayer => self.ascend_layer(),
             Action::FocusToggle => self.focus_toggle(),
             Action::ConfirmField => self.confirm_focused_field(),
@@ -4823,8 +6629,20 @@ impl ViewerApp {
     }
 
     /// Arm a mouse-held walk direction (player must be active; the
-    /// release path clears it).
+    /// release path clears it). On the demo tab the same parity rows
+    /// drive cosmic cruise instead.
     fn hold_walk(&mut self, dir: WalkDir) {
+        if matches!(self.debug.screen, Screen::GameDemo) {
+            self.mouse_walk = Some(dir);
+            let held = &mut self.debug.cosmic.held;
+            match dir {
+                WalkDir::North => held.fwd = true,
+                WalkDir::South => held.back = true,
+                WalkDir::West => held.left = true,
+                WalkDir::East => held.right = true,
+            }
+            return;
+        }
         if !self.debug.viewer.player.active {
             return;
         }
@@ -4849,18 +6667,18 @@ impl ViewerApp {
         }
     }
 
-    /// Confirm the focused field (Enter parity): the seed field loads
-    /// the typed universe, planet fields just unfocus.
+    /// Confirm the focused field (Enter parity): the Settings seed
+    /// field starts the staged load, planet fields just unfocus.
     fn confirm_focused_field(&mut self) {
-        if self.debug.galaxy.seed_field.focused {
-            match self.debug.galaxy.seed_field.text.parse::<u64>() {
-                Ok(seed) => self.load_galaxy_seed(seed),
+        if self.debug.settings.seed_field.focused {
+            match self.debug.settings.seed_field.text.parse::<u64>() {
+                Ok(seed) => self.begin_load(seed, LoadSource::Panel),
                 Err(_) => self.debug.fx.notify(format!(
                     "Invalid seed '{}'",
-                    self.debug.galaxy.seed_field.text
+                    self.debug.settings.seed_field.text
                 )),
             }
-            self.debug.galaxy.seed_field.focused = false;
+            self.debug.settings.seed_field.focused = false;
         } else {
             let viewer = &mut self.debug.viewer;
             viewer.subdiv_field.focused = false;
@@ -4983,6 +6801,7 @@ impl ViewerApp {
             .unwrap_or(0.0)
             .clamp(0.0, 0.25);
         self.last_frame = Some(now);
+        self.tick_cosmic(dt);
         // Transit countdown: fixed-step accumulation of the
         // frame dt into sim ticks. Commit fires journey EnterOrbit at
         // duration; the arrival view lands bound to Earth.
@@ -5069,6 +6888,21 @@ impl ViewerApp {
         if win_w < 1.0 || win_h < 1.0 {
             return;
         }
+        // Staged universe load: one step per frame keeps the UI (and
+        // the modal progress bar) alive; a finished plan closes out
+        // with the field mirror + notify.
+        let next = self.debug.loading.as_mut().and_then(LoadPlan::advance);
+        if let Some(step) = next {
+            let seed = self
+                .debug
+                .loading
+                .as_ref()
+                .expect("plan outlives its step")
+                .seed;
+            self.exec_load_step(seed, step);
+        } else if let Some(plan) = self.debug.loading.take() {
+            self.finish_load(plan);
+        }
         {
             let ctx = self.main.as_mut().expect("main window must exist");
             ctx.previous_frame_end
@@ -5089,6 +6923,14 @@ impl ViewerApp {
                     create_depth_view(&self.memory_allocator, ctx.swapchain.image_extent());
                 ctx.framebuffers =
                     window_size_dependent_setup(&new_images, &ctx.render_pass, &ctx.depth_view);
+                // HDR transients track the swapchain extent (the passes
+                // and pipelines persist — only images/sets rebuild).
+                ctx.hdr = Self::build_hdr_chain(
+                    &self.memory_allocator,
+                    &self.descriptor_set_allocator,
+                    &self.post_sampler,
+                    ctx,
+                );
                 ctx.recreate_swapchain = false;
             }
         }
@@ -5096,6 +6938,12 @@ impl ViewerApp {
         let layout = app_layout(self.debug.chrome, win_w, win_h);
         let player_active = self.debug.viewer.player.active;
         let content = self.debug.screen_content();
+        // Cosmic draw state, precomputed once per frame (player point
+        // rebuild included): the LDR direct path and the HDR
+        // scene/resolve path below share it, so both record identical
+        // draws. `None` on non-cosmic tabs.
+        let cosmic_frame =
+            (content == Some(ViewContent::CosmicWeb)).then(|| self.cosmic_frame(layout.viewport));
 
         // Build frame UI (atlas insertions happen here) and sync the GPU
         // atlas before recording. The top bar + docks render inside the
@@ -5103,41 +6951,23 @@ impl ViewerApp {
         // composes on top so it floats over every tab.
         let mut items = match self.debug.screen {
             Screen::GameDemo => {
+                // v0.3.2 rebuild: the demo mounts only the cosmic player
+                // scene (journey maps live on in their dimension tabs).
                 let mut demo = UiItems::default();
                 build_topbar(&mut demo, self.atlas.line_height(), &self.debug, layout);
-                match content {
-                    Some(ViewContent::PlanetView) => {
-                        let sky_summary = self.sky.summary();
-                        let mut inner =
-                            build_planet_ui(&mut self.atlas, &self.debug, &sky_summary, layout);
-                        demo.solids.append(&mut inner.solids);
-                        demo.tris.append(&mut inner.tris);
-                        demo.texts.append(&mut inner.texts);
-                    }
-                    Some(ViewContent::GalaxyMap) => {
-                        let mut inner = build_galaxy_ui(&mut self.atlas, &self.debug, layout);
-                        demo.solids.append(&mut inner.solids);
-                        demo.tris.append(&mut inner.tris);
-                        demo.texts.append(&mut inner.texts);
-                    }
-                    Some(ViewContent::SystemMap) => {
-                        let mut inner = build_system_ui(&mut self.atlas, &self.debug, layout);
-                        demo.solids.append(&mut inner.solids);
-                        demo.tris.append(&mut inner.tris);
-                        demo.texts.append(&mut inner.texts);
-                    }
-                    None => {}
-                }
                 build_demo_ui(
                     &mut demo,
                     self.atlas.line_height(),
-                    &self.debug,
+                    &mut self.debug,
                     layout.viewport,
                 );
                 demo
             }
             Screen::Dimensions(WaypointId::MilkyWay) => {
                 build_galaxy_ui(&mut self.atlas, &self.debug, layout)
+            }
+            Screen::Dimensions(WaypointId::CosmicWeb) => {
+                build_cosmic_web_ui(&mut self.atlas, &self.debug, layout)
             }
             Screen::Dimensions(WaypointId::SolarSystem) => {
                 build_system_ui(&mut self.atlas, &self.debug, layout)
@@ -5161,7 +6991,7 @@ impl ViewerApp {
             Screen::Settings => {
                 let mut items = UiItems::default();
                 build_topbar(&mut items, self.atlas.line_height(), &self.debug, layout);
-                build_settings_ui(&mut items, self.atlas.line_height(), layout.viewport);
+                build_settings_ui(&mut items, self.atlas.line_height(), &self.debug, layout);
                 items
             }
         };
@@ -5249,17 +7079,221 @@ impl ViewerApp {
         .expect("command buffer builder must create");
         // Orbit backdrop (UMAP-020): the arrival target's atmosphere
         // color, scaled to a near-black space read; the default tint
-        // otherwise. Descriptor palette straight to the frame.
-        let backdrop: [f32; 4] = self
-            .debug
-            .viewer
-            .arrival
-            .as_ref()
-            .map(|arrival| {
-                let c = arrival.atmosphere.color;
-                [c[0] * 0.07, c[1] * 0.07, c[2] * 0.07 + 0.02, 1.0]
-            })
-            .unwrap_or([0.02, 0.03, 0.08, 1.0]);
+        // otherwise. Cosmic views clear to deep indigo instead
+        // (update-2026-09-18-2328) so voids read as negative space
+        // against the additive filaments. Descriptor palette straight
+        // to the frame.
+        let backdrop: [f32; 4] = if content == Some(ViewContent::CosmicWeb) {
+            COSMIC_BACKDROP
+        } else {
+            self.debug
+                .viewer
+                .arrival
+                .as_ref()
+                .map(|arrival| {
+                    let c = arrival.atmosphere.color;
+                    [c[0] * 0.07, c[1] * 0.07, c[2] * 0.07 + 0.02, 1.0]
+                })
+                .unwrap_or([0.02, 0.03, 0.08, 1.0])
+        };
+        // HDR cosmic pre-pass (update-2026-09-18-2328): the scene and
+        // bloom chain run offscreen before the main pass begins; the
+        // views loop below only resolves into the swapchain image. LDR
+        // bypass skips this block and draws direct-to-swapchain in the
+        // loop instead.
+        if let Some(frame) = cosmic_frame.as_ref()
+            && let Some(hdr) = ctx.hdr.as_ref()
+        {
+            let pipes = &ctx.pipelines;
+            let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+            let bloom = BloomParams::spec_defaults();
+            // Per-surface grade (update-2026-09-19-1933): the
+            // inspector's zoomed-out view stacks dozens of puffs/px
+            // where the immersive demo stacks a few — one exposure
+            // can't serve both.
+            let (smoke_exposure, glow_exposure) = if frame.is_demo {
+                (COSMIC_DEMO_SMOKE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+            } else {
+                (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+            };
+            // Scene: indigo clear, smoke then glow.
+            builder
+                .begin_render_pass(
+                    RenderPassBeginInfo {
+                        clear_values: vec![
+                            Some(COSMIC_BACKDROP.into()),
+                            Some(ClearValue::Depth(1.0)),
+                        ],
+                        ..RenderPassBeginInfo::framebuffer(hdr.scene_fb.clone())
+                    },
+                    SubpassBeginInfo {
+                        contents: SubpassContents::Inline,
+                        ..Default::default()
+                    },
+                )
+                .expect("HDR scene pass must begin")
+                .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
+                .expect("viewport must set")
+                .bind_pipeline_graphics(pipes.smoke_scene.clone())
+                .expect("pipeline must bind")
+                .bind_vertex_buffers(0, frame.smoke.clone())
+                .expect("vertex buffer must bind")
+                .push_constants(
+                    pipes.smoke_scene.layout().clone(),
+                    0,
+                    SmokePush {
+                        mvp: frame.mvp,
+                        eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                        px_scale: frame.px_scale,
+                        exposure: smoke_exposure,
+                        redshift,
+                    },
+                )
+                .expect("smoke push constants must upload");
+            // SAFETY: per-instance puff records, 6 verts per billboard
+            // (two triangles); instance count is the puff count, no
+            // index buffer bound.
+            unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
+                .expect("HDR scene smoke draw must record");
+            builder
+                .bind_pipeline_graphics(pipes.glow_scene.clone())
+                .expect("pipeline must bind")
+                .bind_vertex_buffers(0, frame.glow.clone())
+                .expect("vertex buffer must bind")
+                .push_constants(
+                    pipes.glow_scene.layout().clone(),
+                    0,
+                    GlowPush {
+                        mvp: frame.mvp,
+                        px_scale: frame.px_scale,
+                        exposure: glow_exposure,
+                        redshift,
+                    },
+                )
+                .expect("glow push constants must upload");
+            // SAFETY: same PointList contract as the galaxy map.
+            unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
+                .expect("HDR scene glow draw must record");
+            builder
+                .end_render_pass(Default::default())
+                .expect("HDR scene pass must end");
+            // Bloom chain at half res: bright extract, then four H/V
+            // separable blur passes through dedicated targets A-E
+            // (write-once, never ping-ponged). Final bloom lands in
+            // E, which the resolve samples.
+            let half_vp = Viewport {
+                offset: [0.0, 0.0],
+                extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            };
+            let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
+            builder
+                .begin_render_pass(
+                    RenderPassBeginInfo {
+                        clear_values: vec![Some(black)],
+                        ..RenderPassBeginInfo::framebuffer(hdr.bloom_a_fb.clone())
+                    },
+                    SubpassBeginInfo {
+                        contents: SubpassContents::Inline,
+                        ..Default::default()
+                    },
+                )
+                .expect("bloom bright pass must begin")
+                .set_viewport(0, [half_vp.clone()].into_iter().collect())
+                .expect("viewport must set")
+                .bind_pipeline_graphics(pipes.bright.clone())
+                .expect("pipeline must bind")
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipes.bright.layout().clone(),
+                    0,
+                    hdr.bright_set.clone(),
+                )
+                .expect("bloom bright set must bind")
+                .push_constants(
+                    pipes.bright.layout().clone(),
+                    0,
+                    BloomBrightPush {
+                        threshold: bloom.threshold,
+                    },
+                )
+                .expect("bloom bright push must upload");
+            // SAFETY: fullscreen-triangle pipeline, no vertex input
+            // — 3 unbuffered vertices are the whole draw.
+            unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom bright draw must record");
+            builder
+                .end_render_pass(Default::default())
+                .expect("bloom bright pass must end");
+            let hw = hdr.half_extent[0] as f32;
+            let hh = hdr.half_extent[1] as f32;
+            // Dedicated targets per step (see `HdrChain`): bright→A,
+            // H:A→B, V:B→C, wide-H:C→D, wide-V:D→E(final). No target
+            // is ever rewritten. `GAME_DEBUG_COSMIC_BLOOM=0` skips the
+            // chain: the resolve then adds the sharp bright extract.
+            let blur_steps = if ctx.bloom_enabled {
+                vec![
+                    (
+                        hdr.bloom_b_fb.clone(),
+                        hdr.blur_a_set.clone(),
+                        [1.0 / hw, 0.0],
+                    ),
+                    (
+                        hdr.bloom_c_fb.clone(),
+                        hdr.blur_b_set.clone(),
+                        [0.0, 1.0 / hh],
+                    ),
+                    (
+                        hdr.bloom_d_fb.clone(),
+                        hdr.blur_c_set.clone(),
+                        [2.0 / hw, 0.0],
+                    ),
+                    (
+                        hdr.bloom_e_fb.clone(),
+                        hdr.blur_d_set.clone(),
+                        [0.0, 2.0 / hh],
+                    ),
+                ]
+            } else {
+                Vec::new()
+            };
+            for (dst, set, step) in &blur_steps {
+                builder
+                    .begin_render_pass(
+                        RenderPassBeginInfo {
+                            clear_values: vec![Some(black)],
+                            ..RenderPassBeginInfo::framebuffer(dst.clone())
+                        },
+                        SubpassBeginInfo {
+                            contents: SubpassContents::Inline,
+                            ..Default::default()
+                        },
+                    )
+                    .expect("bloom blur pass must begin")
+                    .set_viewport(0, [half_vp.clone()].into_iter().collect())
+                    .expect("viewport must set")
+                    .bind_pipeline_graphics(pipes.blur.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.blur.layout().clone(),
+                        0,
+                        set.clone(),
+                    )
+                    .expect("bloom blur set must bind")
+                    .push_constants(
+                        pipes.blur.layout().clone(),
+                        0,
+                        BloomBlurPush { step: *step },
+                    )
+                    .expect("bloom blur push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex
+                // input — 3 unbuffered vertices are the whole draw.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom blur draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom blur pass must end");
+            }
+        }
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -5340,6 +7374,142 @@ impl ViewerApp {
                     // no index buffer is bound for this `PointList` draw.
                     unsafe { builder.draw(self.map_vertices.len() as u32, 1, 0, 0) }
                         .expect("map draw must record");
+                } else if view == ViewContent::CosmicWeb {
+                    // Cosmic player scene (update-2026-09-18-2328): HDR
+                    // mode resolves the pre-recorded scene + bloom over
+                    // the full window; LDR bypass draws smoke + glow
+                    // direct-to-swapchain. Both arms share the
+                    // precomputed frame, so the draws are identical.
+                    // The demo tab renders the player-immersive view;
+                    // the Cosmic Web tab renders through the inspector
+                    // camera (fixed-center buffers + live player point).
+                    let frame = cosmic_frame
+                        .as_ref()
+                        .expect("cosmic view must precompute its frame");
+                    let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+                    let (smoke_exposure, glow_exposure) = if frame.is_demo {
+                        (COSMIC_DEMO_SMOKE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+                    } else {
+                        (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+                    };
+                    let (resolve_exposure, bloom_intensity) = if frame.is_demo {
+                        (COSMIC_DEMO_EXPOSURE, COSMIC_DEMO_BLOOM_INTENSITY)
+                    } else {
+                        (COSMIC_MAP_EXPOSURE, COSMIC_MAP_BLOOM_INTENSITY)
+                    };
+                    if let Some(hdr) = ctx.hdr.as_ref() {
+                        let full_vp = Viewport {
+                            offset: [0.0, 0.0],
+                            extent: [win_w, win_h],
+                            depth_range: 0.0..=1.0,
+                        };
+                        // Full bloom chain: scene + final bloom (E).
+                        // `GAME_DEBUG_COSMIC_BLOOM=0`: scene + bright
+                        // extract (A) — E is never written there.
+                        let resolve_set = if ctx.bloom_enabled {
+                            hdr.resolve_set.clone()
+                        } else {
+                            hdr.resolve_nobloom_set.clone()
+                        };
+                        builder
+                            .set_viewport(0, [full_vp.clone()].into_iter().collect())
+                            .expect("viewport must set")
+                            .bind_pipeline_graphics(ctx.pipelines.resolve.clone())
+                            .expect("pipeline must bind")
+                            .bind_descriptor_sets(
+                                PipelineBindPoint::Graphics,
+                                ctx.pipelines.resolve.layout().clone(),
+                                0,
+                                resolve_set,
+                            )
+                            .expect("bloom resolve set must bind")
+                            .push_constants(
+                                ctx.pipelines.resolve.layout().clone(),
+                                0,
+                                BloomResolvePush {
+                                    exposure: resolve_exposure,
+                                    intensity: bloom_intensity,
+                                },
+                            )
+                            .expect("bloom resolve push must upload");
+                        // SAFETY: fullscreen-triangle pipeline, no vertex
+                        // input — 3 unbuffered vertices are the whole
+                        // draw.
+                        unsafe { builder.draw(3, 1, 0, 0) }
+                            .expect("bloom resolve draw must record");
+                    } else {
+                        let glow_len = frame.glow.len();
+                        builder
+                            .set_viewport(0, [viewport].into_iter().collect())
+                            .expect("viewport must set")
+                            .bind_pipeline_graphics(ctx.pipelines.smoke.clone())
+                            .expect("pipeline must bind")
+                            .bind_vertex_buffers(0, frame.smoke.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                ctx.pipelines.smoke.layout().clone(),
+                                0,
+                                SmokePush {
+                                    mvp: frame.mvp,
+                                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                                    px_scale: frame.px_scale,
+                                    exposure: smoke_exposure,
+                                    redshift,
+                                },
+                            )
+                            .expect("smoke push constants must upload");
+                        // SAFETY: per-instance puff records, 6 verts
+                        // per billboard; no index buffer bound.
+                        unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
+                            .expect("cosmic smoke draw must record");
+                        builder
+                            .bind_pipeline_graphics(ctx.pipelines.map_glow.clone())
+                            .expect("pipeline must bind")
+                            .bind_vertex_buffers(0, frame.glow.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                ctx.pipelines.map_glow.layout().clone(),
+                                0,
+                                GlowPush {
+                                    mvp: frame.mvp,
+                                    px_scale: frame.px_scale,
+                                    exposure: glow_exposure,
+                                    redshift,
+                                },
+                            )
+                            .expect("glow push constants must upload");
+                        // SAFETY: same PointList contract as the galaxy map.
+                        unsafe { builder.draw(glow_len as u32, 1, 0, 0) }
+                            .expect("cosmic glow draw must record");
+                    }
+                    if !frame.is_demo {
+                        // Inspector player point (precomputed in the
+                        // frame): drawn last through the alpha map
+                        // pipeline — after the resolve in HDR mode, so
+                        // the marker stays legible over the glow. The
+                        // pipeline bind is explicit: the previously
+                        // bound pipeline here is `resolve` (HDR) or
+                        // `map_glow` (LDR), whose push layouts are
+                        // incompatible with `MapPush` (VUID-06425).
+                        builder
+                            .bind_pipeline_graphics(ctx.pipelines.map.clone())
+                            .expect("pipeline must bind")
+                            .bind_vertex_buffers(0, self.cosmic_tab_player.clone())
+                            .expect("vertex buffer must bind")
+                            .push_constants(
+                                ctx.pipelines.map.layout().clone(),
+                                0,
+                                MapPush {
+                                    mvp: frame.mvp,
+                                    px_scale: frame.px_scale,
+                                    exposure: 1.0,
+                                },
+                            )
+                            .expect("map push constants must upload");
+                        // SAFETY: single-vertex PointList, no index buffer.
+                        unsafe { builder.draw(1, 1, 0, 0) }
+                            .expect("cosmic player point draw must record");
+                    }
                 } else if view == ViewContent::SystemMap {
                     // System map: orbit rings through the line pipeline,
                     // star + planets through the map point pipeline — both
@@ -5724,10 +7894,71 @@ mod tests {
             (ShaderKind::Fragment, UI_FRAG, "ui frag"),
             (ShaderKind::Vertex, MAP_VERT, "map vert"),
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
+            (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
+            (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
+            (ShaderKind::Vertex, SMOKE_VERT, "smoke vert"),
+            (ShaderKind::Fragment, SMOKE_FRAG, "smoke frag"),
         ] {
             if let Err(error) = compile_glsl_to_spirv(kind, source) {
                 panic!("{what} must compile: {error}");
             }
+        }
+    }
+
+    #[test]
+    fn cosmic_vertex_inputs_match_vertex_fields() {
+        // Regression pin for the windowed startup panic
+        // (update-2026-09-18-2328): vulkano maps shader inputs to
+        // vertex-struct fields BY NAME at pipeline creation — naga
+        // compilation cannot catch a mismatch, and there is no
+        // GPU-free way to run the real check, so the names are pinned
+        // here. `SmokeVertex { pos_size, rgba, misc }`
+        // (per-instance), `MapVertex { map_pos, color, misc }`.
+        for (source, name, what) in [
+            (SMOKE_VERT, "in vec4 pos_size;", "smoke pos_size"),
+            (SMOKE_VERT, "in vec4 rgba;", "smoke rgba"),
+            (SMOKE_VERT, "in vec4 misc;", "smoke misc"),
+            (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
+            (GLOW_VERT, "in vec3 color;", "glow color"),
+            (GLOW_VERT, "in vec3 misc;", "glow misc"),
+        ] {
+            assert!(
+                source.contains(name),
+                "{what} input missing from its vertex shader"
+            );
+        }
+    }
+
+    #[test]
+    fn cosmic_shader_safety_pins() {
+        // Regression pins for the visual-issue fix
+        // (update-2026-09-18-2328): the sprite falloff must hit
+        // exactly zero at the rim (else full quads), and the redshift
+        // depth term must be clamped non-negative and capped (else
+        // Inf/NaN/negative channels decorrelate into rainbow squares).
+        // The smoke shader must pin the same redshift clamp, must
+        // guard the billboard normalization, and must hit zero radial
+        // falloff at the puff rims (else full quads). String pins,
+        // because neither naga nor any GPU-free test can evaluate the
+        // shaders.
+        for (source, literal, what) in [
+            (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
+            (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
+            (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
+            (SMOKE_VERT, "max(clipc.w, 0.0)", "smoke depth clamp"),
+            (SMOKE_VERT, "rl > 1e-10", "smoke side guard"),
+            (SMOKE_VERT, "min_world", "smoke min-pixel clamp"),
+            (SMOKE_FRAG, "1.0 - r2", "smoke rim-zero falloff"),
+            (SMOKE_FRAG, "1.0 - v_uv.x * v_uv.x", "smoke tip dissolve"),
+            (SMOKE_FRAG, "vec3(luma)", "smoke white hot-center"),
+        ] {
+            assert!(source.contains(literal), "{what} missing from its shader");
+        }
+        for source in [GLOW_VERT, SMOKE_VERT] {
+            assert!(
+                source.contains(", 0.5)"),
+                "redshift cap missing from a cosmic vertex shader"
+            );
         }
     }
 
@@ -5751,6 +7982,22 @@ mod tests {
             bytes <= 128,
             "MapPush is {bytes} B, over the 128 B Vulkan 1.1 floor"
         );
+    }
+
+    #[test]
+    fn cosmic_push_constants_fit_vulkan_floor() {
+        // Cosmic blocks: glow (MVP + scale + exposure + redshift) and
+        // smoke (MVP + eye + scale + exposure + redshift, 92 B) must
+        // stay under the 128 B Vulkan 1.1 floor on every tier.
+        for (bytes, what) in [
+            (std::mem::size_of::<GlowPush>(), "GlowPush"),
+            (std::mem::size_of::<SmokePush>(), "SmokePush"),
+        ] {
+            assert!(
+                bytes <= 128,
+                "{what} is {bytes} B, over the 128 B Vulkan 1.1 floor"
+            );
+        }
     }
 
     #[test]
@@ -6017,6 +8264,171 @@ mod tests {
     }
 
     #[test]
+    fn draw_target_ring_emits_four_rects() {
+        let mut items = UiItems::default();
+        draw_target_ring(&mut items, (100.0, 100.0), TARGET_RING_R, C_WARN);
+        assert_eq!(items.solids.len(), 4, "top/bottom/left/right bars");
+        assert!(items.tris.is_empty());
+        assert!(items.texts.is_empty());
+        assert!(
+            items.solids.iter().all(|(_, color)| *color == C_WARN),
+            "ring rides one color"
+        );
+        let r = TARGET_RING_R;
+        for want in [
+            Rect {
+                x: 100.0 - r,
+                y: 100.0 - r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: 100.0 - r,
+                y: 100.0 + r,
+                w: 2.0 * r,
+                h: 1.5,
+            },
+            Rect {
+                x: 100.0 - r,
+                y: 100.0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+            Rect {
+                x: 100.0 + r,
+                y: 100.0 - r,
+                w: 1.5,
+                h: 2.0 * r,
+            },
+        ] {
+            assert!(
+                items.solids.iter().any(|(rect, _)| *rect == want),
+                "ring missing bar {want:?}"
+            );
+        }
+    }
+
+    /// Count amber (target-ring) solids in a composed frame.
+    fn warn_solids(items: &UiItems) -> usize {
+        items
+            .solids
+            .iter()
+            .filter(|(_, color)| *color == C_WARN)
+            .count()
+    }
+
+    #[test]
+    fn demo_target_ring_overlays_selected_node() {
+        // `DebugApp::new` boots on the Game Demo tab with a fixed seed,
+        // so the projection below is deterministic.
+        let mut atlas = GlyphAtlas::new(UI_PX);
+        let mut app = DebugApp::new();
+        assert_eq!(app.screen, Screen::GameDemo);
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let compose = |app: &DebugApp, atlas: &mut GlyphAtlas| {
+            let mut items = UiItems::default();
+            let mut drop = UiItems::default();
+            compose_overlay_ui(
+                &mut items,
+                &mut drop,
+                atlas,
+                app,
+                layout,
+                (1280.0, 720.0),
+                None,
+            );
+            items
+        };
+        let baseline = warn_solids(&compose(&app, &mut atlas));
+        // Pick a node the default demo camera actually shows, through
+        // the same recenter + projection the overlay uses.
+        let vp = layout.viewport;
+        let main_vp = app.cosmic.camera.view_proj(vp.w / vp.h);
+        let (index, center) = app
+            .cosmic
+            .web
+            .nodes
+            .iter()
+            .find_map(|node| {
+                let world = recenter(DVec3::from(node.position_mpc), app.cosmic.upload_origin);
+                world_to_pixels(main_vp, world, vp).map(|at| (node.node_index, at))
+            })
+            .expect("default demo view must show at least one node");
+        app.cosmic.player.target_node = Some(index);
+        let items = compose(&app, &mut atlas);
+        assert_eq!(
+            warn_solids(&items),
+            baseline + 4,
+            "selected node gets one 4-rect ring"
+        );
+        let (cx, cy) = center;
+        assert!(
+            items.solids.iter().any(|(rect, color)| *color == C_WARN
+                && *rect
+                    == Rect {
+                        x: cx - TARGET_RING_R,
+                        y: cy - TARGET_RING_R,
+                        w: 2.0 * TARGET_RING_R,
+                        h: 1.5,
+                    }),
+            "ring top bar centers on the projected node"
+        );
+        // Clearing the target clears the ring.
+        app.cosmic.player.target_node = None;
+        assert_eq!(warn_solids(&compose(&app, &mut atlas)), baseline);
+    }
+
+    #[test]
+    fn inspector_selected_ring_overlays_node() {
+        let mut atlas = GlyphAtlas::new(UI_PX);
+        let mut app = DebugApp::new();
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let build =
+            |app: &DebugApp, atlas: &mut GlyphAtlas| build_cosmic_web_ui(atlas, app, layout);
+        let baseline = warn_solids(&build(&app, &mut atlas));
+        // Pick a node strictly inside the default inspector viewport
+        // (the ring clamps, so the test pins the unclamped center).
+        let vp = layout.viewport;
+        let view_proj = app.cosmic_inspector.view_proj(vp.w / vp.h);
+        let (index, center) = app
+            .cosmic
+            .web
+            .nodes
+            .iter()
+            .find_map(|node| {
+                let world = Vec3::new(
+                    node.position_mpc[0] as f32,
+                    node.position_mpc[1] as f32,
+                    node.position_mpc[2] as f32,
+                );
+                project_to_screen(world, view_proj, vp).and_then(|(sx, sy)| {
+                    (sx >= vp.x && sx <= vp.x + vp.w && sy >= vp.y && sy <= vp.y + vp.h)
+                        .then_some((node.node_index, (sx, sy)))
+                })
+            })
+            .expect("default inspector view must show at least one node");
+        app.cosmic_inspector.selected = Some(index);
+        let items = build(&app, &mut atlas);
+        assert_eq!(
+            warn_solids(&items),
+            baseline + 4,
+            "inspected node gets one 4-rect ring"
+        );
+        let (cx, cy) = center;
+        assert!(
+            items.solids.iter().any(|(rect, color)| *color == C_WARN
+                && *rect
+                    == Rect {
+                        x: cx - TARGET_RING_R,
+                        y: cy - TARGET_RING_R,
+                        w: 2.0 * TARGET_RING_R,
+                        h: 1.5,
+                    }),
+            "ring top bar centers on the projected node"
+        );
+    }
+
+    #[test]
     fn follow_marker_arrow_visible_and_oriented() {
         use game_debug::player_view::MoveKeys;
 
@@ -6189,19 +8601,25 @@ mod tests {
         ] {
             assert!(widget.contains(needle), "widget fps missing {needle}");
         }
-        // Widget Console body: the transition-event log feed.
+        // Widget Console body: the real fly-to event feed.
+        use game_debug::cosmic_player::CosmicEvent;
+
+        app.cosmic
+            .player
+            .events
+            .push(CosmicEvent::TargetSelected { node: 5 });
         app.sync_console();
         app.select_widget_tab(WidgetTab::Console);
         let mut widget = UiItems::default();
         build_widget(&mut widget, lh, &app, 1280.0, 720.0);
         let console = joined(&widget);
-        assert!(console.contains("solar-system -> neighborhood"));
+        assert!(console.contains("web/seed:1234/node:5"));
         // Widget Inspector body: journey summary.
         app.select_widget_tab(WidgetTab::Inspector);
         let mut widget = UiItems::default();
         build_widget(&mut widget, lh, &app, 1280.0, 720.0);
         let inspector = joined(&widget);
-        for needle in ["layer:", "waypoint:", "transitions:"] {
+        for needle in ["layer:", "waypoint:", "fly-to:"] {
             assert!(inspector.contains(needle), "inspector missing {needle}");
         }
         // Corner strip lives inside the top bar: three toggles with
@@ -6212,19 +8630,35 @@ mod tests {
         for needle in ["DOCK-L [F9]", "DOCK-R [F10]", "DEV 60 [`]"] {
             assert!(strip.contains(needle), "corner strip missing {needle}");
         }
-        // Transition pill: shows the in-flight preview leg…
-        let mut items = UiItems::default();
-        build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
-        let pill = joined(&items);
-        assert!(pill.contains("solar-system → neighborhood"));
-        // …and stays silent with no transition in flight.
-        app.transitions.current = None;
+        // Transition pill: silent with no leg in flight…
         let mut items = UiItems::default();
         build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
         assert!(items.texts.is_empty());
+        // …and showing live easing progress once fly-to commits.
+        use game_engine::flight::{FlyToExec, Target, plan_fly_to};
+        use game_engine::frames::FrameId;
+
+        let home = DVec3::from(app.cosmic.web.home().position_mpc);
+        let target = Target::new(FrameId::Cosmological, home).expect("finite target");
+        let plan = plan_fly_to(
+            FrameId::Cosmological,
+            app.cosmic.player.position_mpc(),
+            &target,
+            0.0,
+        )
+        .expect("plannable leg");
+        let mut exec = FlyToExec::new(plan);
+        exec.commit().expect("commits once");
+        app.cosmic.player.exec = Some(exec);
+        app.cosmic.player.target_node = Some(app.cosmic.web.home_node);
+        let mut items = UiItems::default();
+        build_transition_strip(&mut items, lh, &app, 1280.0, 720.0);
+        let pill = joined(&items);
+        assert!(pill.contains("FLY-TO"), "pill missing fly-to: {pill}");
+        assert!(pill.contains('%'), "pill missing progress: {pill}");
         // Settings Controls: every registry action as a labeled row.
         let mut settings = UiItems::default();
-        build_settings_ui(&mut settings, lh, layout.viewport);
+        build_settings_ui(&mut settings, lh, &app, layout);
         let settings = joined(&settings);
         for needle in [
             "Chrome",
@@ -6247,7 +8681,7 @@ mod tests {
         assert!(ph.contains("INACTIVE"));
         // Demo tab: HUD lines, no debug data.
         let mut demo = UiItems::default();
-        build_demo_ui(&mut demo, lh, &app, layout.viewport);
+        build_demo_ui(&mut demo, lh, &mut app, layout.viewport);
         let demo = joined(&demo);
         for needle in ["GAME DEMO", "frame:", "time:", "soi:", "target:"] {
             assert!(demo.contains(needle), "demo missing {needle}");
@@ -6269,7 +8703,7 @@ mod tests {
         let mut items = UiItems::default();
         let mut drop = UiItems::default();
         build_topbar(&mut items, lh, &app, layout);
-        build_settings_ui(&mut items, lh, layout.viewport);
+        build_settings_ui(&mut items, lh, &app, layout);
         compose_overlay_ui(
             &mut items,
             &mut drop,
@@ -6319,5 +8753,140 @@ mod tests {
         let text_quads: usize = items.texts.iter().map(|t| t.text.chars().count()).sum();
         assert_eq!(verts.len(), items.solids.len() * 6 + text_quads * 6);
         assert!((verts.len() as u64) < MAX_UI_VERTS);
+    }
+
+    #[test]
+    fn settings_seed_editor_lives_in_left_dock() {
+        let layout = ui::layout(1280.0, 720.0);
+        let dock = settings_left_plan(layout.left, 19.0);
+        // Full-width widgets inside the dock, flowing top-down.
+        for rect in [dock.field, dock.load, dock.hint] {
+            assert!(rect.x >= layout.left.x, "{rect:?}");
+            assert!(
+                rect.x + rect.w <= layout.left.x + layout.left.w + 1e-3,
+                "{rect:?}"
+            );
+        }
+        assert!(dock.header.y < dock.field.y);
+        assert!(dock.field.y < dock.load.y);
+        assert!(dock.load.y < dock.hint.y);
+        // The built screen carries the editor plus the registry.
+        let atlas = GlyphAtlas::new(UI_PX);
+        let lh = atlas.line_height();
+        let app = DebugApp::new();
+        let mut items = UiItems::default();
+        build_settings_ui(&mut items, lh, &app, layout);
+        let texts = items
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in [
+            "UNIVERSE",
+            "Load [Enter]",
+            "universe 1234",
+            "Toggle left dock [F9]",
+        ] {
+            assert!(texts.contains(needle), "settings missing {needle}");
+        }
+        // The Milky Way dock keeps the seed read-only (no editor).
+        let mut galaxy = UiItems::default();
+        let galaxy_ui = build_galaxy_ui(&mut GlyphAtlas::new(UI_PX), &app, layout);
+        galaxy.texts = galaxy_ui.texts;
+        let dock_text = galaxy
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dock_text.contains("seed 1234"), "dock keeps read-only seed");
+        assert!(
+            !dock_text.contains("Load"),
+            "dock editor is gone: {dock_text}"
+        );
+    }
+
+    #[test]
+    fn settings_load_button_dims_on_invalid_seed() {
+        let layout = ui::layout(1280.0, 720.0);
+        let atlas = GlyphAtlas::new(UI_PX);
+        let lh = atlas.line_height();
+        let mut app = DebugApp::new();
+        app.settings.seed_field.text = "abc".to_owned();
+        let dock = settings_left_plan(layout.left, lh);
+        let mut items = UiItems::default();
+        build_settings_ui(&mut items, lh, &app, layout);
+        assert!(
+            items
+                .solids
+                .iter()
+                .any(|(rect, color)| *rect == dock.load && *color == C_BTN_OFF),
+            "invalid seed dims the Load button"
+        );
+    }
+
+    #[test]
+    fn loader_modal_overlays_seed_bar_and_step() {
+        let mut app = DebugApp::new();
+        app.loading = Some(LoadPlan::new(7, LoadSource::Panel));
+        // One step ran: progress is 1/8 with the first step's label.
+        let step = app
+            .loading
+            .as_mut()
+            .expect("plan")
+            .advance()
+            .expect("first step");
+        assert_eq!(step, LoadStep::Galaxy);
+        let layout = app_layout(app.chrome, 1280.0, 720.0);
+        let mut items = UiItems::default();
+        let mut drop = UiItems::default();
+        compose_overlay_ui(
+            &mut items,
+            &mut drop,
+            &mut GlyphAtlas::new(UI_PX),
+            &app,
+            layout,
+            (1280.0, 720.0),
+            None,
+        );
+        // Topmost isolation (same rule as the dropdown): the modal
+        // lives in the drop buffer, never in the main buffer.
+        let main_texts = items
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !main_texts.contains("LOADING"),
+            "modal must not leak into the main buffer"
+        );
+        let drop_texts = drop
+            .texts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drop_texts.contains("LOADING UNIVERSE · seed 7"),
+            "modal titles the seed: {drop_texts}"
+        );
+        assert!(
+            drop_texts.contains("13%") && drop_texts.contains(LoadStep::Galaxy.label()),
+            "modal shows progress + step: {drop_texts}"
+        );
+        // Full-window dim + panel + track + fill ride the drop buffer.
+        assert!(!drop.solids.is_empty());
+        assert!(
+            drop.solids.iter().any(|(rect, _)| *rect
+                == Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1280.0,
+                    h: 720.0,
+                }),
+            "dim covers the full window"
+        );
     }
 }

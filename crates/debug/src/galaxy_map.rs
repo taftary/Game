@@ -21,10 +21,10 @@ use glam::Vec3;
 
 use crate::map_camera::{DEFAULT_PITCH, DEFAULT_YAW, MapOrbitCamera};
 use crate::picking::project_to_screen;
-use crate::ui::{Rect, TextField};
+use crate::ui::Rect;
 
-/// Seed the map opens on (overridden by `--seed`; the viewer panel
-/// field edits it at runtime).
+/// Seed the map opens on (overridden by `--seed`; edited at runtime
+/// on the Settings screen — the docks show the seed read-only).
 pub const DEFAULT_GALAXY_SEED: u64 = 1234;
 
 /// Closest the camera may zoom: vertical half-extent in compressed ly
@@ -165,9 +165,6 @@ pub struct GalaxyMapView {
     pub nebulae: Vec<NebulaSprite>,
     pub backdrop: Vec<BackdropSprite>,
     pub selected: Option<u32>,
-    /// Seed text field (viewer panel): edited at runtime, applied on
-    /// Load/Enter. Always mirrors `seed` after `new`/`regenerate`.
-    pub seed_field: TextField,
 }
 
 impl GalaxyMapView {
@@ -180,14 +177,13 @@ impl GalaxyMapView {
             nebulae: nebula_sprites(seed, DEFAULT_NEBULA_COUNT),
             backdrop: backdrop_sprites(seed, DEFAULT_BACKDROP_COUNT),
             selected: None,
-            seed_field: TextField::new(&seed.to_string()),
         };
         view.regenerate(seed);
         view
     }
 
     /// Re-roll everything for `seed` (camera resets to the default 3D
-    /// framing, selection clears, field mirrors the seed).
+    /// framing, selection clears).
     pub fn regenerate(&mut self, seed: u64) {
         self.seed = seed;
         self.galaxy = generate_galaxy(seed, DEFAULT_STAR_COUNT);
@@ -195,7 +191,6 @@ impl GalaxyMapView {
         self.nebulae = nebula_sprites(seed, DEFAULT_NEBULA_COUNT);
         self.backdrop = backdrop_sprites(seed, DEFAULT_BACKDROP_COUNT);
         self.selected = None;
-        self.seed_field = TextField::new(&seed.to_string());
     }
 
     /// Click-select: project every star through the current
@@ -326,7 +321,6 @@ mod tests {
         assert_eq!(view.selected, None);
         assert_eq!(view.camera, framing_camera());
         assert_eq!(view.galaxy.stars.len(), DEFAULT_STAR_COUNT as usize);
-        assert_eq!(view.seed_field.text, "2");
     }
 
     #[test]

@@ -10,7 +10,10 @@
 //! `F1`–`F3`, backquote, `F6`–`F8`, `F9`–`F10`, dropdown-captured
 //! digits and `Esc`. Content keys (`WASD`/arrows, `U`, `P`, `E`,
 //! `T`, `Q`, `F`, `R`, `G`/`B`, `Home`, `1`–`6` shader modes, `F5`
-//! twilight) are reserved for the tab content.
+//! twilight) are reserved for the tab content. `E` is context-dependent
+//! by design (travel-begin on the galaxy/system tabs, fly-to in the
+//! cosmic demo) — the `T` dual-binding precedent (travel offer / top
+//! preset) covers shared keys with per-content meaning.
 
 use game_engine::waypoints::WaypointId;
 
@@ -109,9 +112,15 @@ pub enum Action {
     TopDownSnap,
     TwilightCycle,
     ShaderMode(usize),
-    // Travel (content keys, map contexts).
+    // Travel (content keys, map contexts; `E` is context-dependent:
+    // travel-begin on the galaxy/system tabs, fly-to engage/cancel in
+    // the cosmic demo — the existing `T` dual-binding precedent).
     TravelOffer,
     TravelBegin,
+    FlyToToggle,
+    // Cosmic-demo cruise pace (`Shift`+wheel; the Controls row steps one
+    // notch faster — update 2026-09-18-2027).
+    CruiseSpeed,
     AscendLayer,
     FocusToggle,
     ConfirmField,
@@ -148,6 +157,8 @@ impl Action {
             Action::ShaderMode(_) => "1-6",
             Action::TravelOffer => "T",
             Action::TravelBegin => "E",
+            Action::FlyToToggle => "E",
+            Action::CruiseSpeed => "Shift+wheel",
             Action::AscendLayer => "Q",
             Action::FocusToggle => "F",
             Action::ConfirmField => "Enter",
@@ -183,6 +194,8 @@ impl Action {
             Action::ShaderMode(_) => "Debug shader mode",
             Action::TravelOffer => "Arm/withdraw travel",
             Action::TravelBegin => "Begin travel",
+            Action::FlyToToggle => "Engage/cancel fly-to",
+            Action::CruiseSpeed => "Adjust cruise pace",
             Action::AscendLayer => "Ascend journey layer",
             Action::FocusToggle => "Toggle planet focus",
             Action::ConfirmField => "Confirm field",
@@ -218,6 +231,8 @@ impl Action {
             | Action::ShaderMode(_) => ActionGroup::Camera,
             Action::TravelOffer
             | Action::TravelBegin
+            | Action::FlyToToggle
+            | Action::CruiseSpeed
             | Action::AscendLayer
             | Action::FocusToggle
             | Action::ConfirmField => ActionGroup::Travel,
@@ -247,7 +262,7 @@ impl Action {
 
     /// Every static (non-parameterized) action, for the Controls list
     /// and the parity test.
-    pub const ALL_STATIC: [Action; 28] = [
+    pub const ALL_STATIC: [Action; 30] = [
         Action::ToggleLeftDock,
         Action::ToggleRightDock,
         Action::ToggleDevWidget,
@@ -273,6 +288,8 @@ impl Action {
         Action::TwilightCycle,
         Action::TravelOffer,
         Action::TravelBegin,
+        Action::FlyToToggle,
+        Action::CruiseSpeed,
         Action::AscendLayer,
         Action::FocusToggle,
         Action::ConfirmField,
@@ -327,7 +344,7 @@ mod tests {
 
     #[test]
     fn registry_size_is_pinned() {
-        // 28 static + 10 dimensions + 6 shader modes.
-        assert_eq!(all_actions().len(), 44);
+        // 30 static + 10 dimensions + 6 shader modes.
+        assert_eq!(all_actions().len(), 46);
     }
 }

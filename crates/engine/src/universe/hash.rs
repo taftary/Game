@@ -19,6 +19,9 @@
 //! - orbit radii: nano-AU (`1e9`)
 //! - planet radius/gravity: milli-units (`1e3`)
 //! - atmosphere color/density, resource bias: `1e6` / `1e3`
+//! - web node/glow positions: milli-Mpc (`1e3`)
+//! - web node masses: giga-solar-mass units (`mass_msun / 1e9`, quantum 1)
+//! - web virial radii, link densities: `1e3`
 //!
 //! ```
 //! use game_engine::universe::{generate_galaxy, galaxy_hash};
@@ -32,6 +35,7 @@
 use super::descriptors::{
     GalaxyDescriptor, PlanetDescriptor, PlanetType, SpectralClass, SystemDescriptor,
 };
+use super::web::WebDescriptor;
 use crate::core::quantize_f64;
 
 /// FNV-1a 64 offset basis / prime (same constants as
@@ -163,6 +167,55 @@ pub fn galaxy_hash(galaxy: &GalaxyDescriptor) -> u64 {
     acc
 }
 
+/// Hash one cosmic web: version stamp + seed + counts + nodes, links,
+/// and glow points in canonical order. Masses hash in giga-solar-mass
+/// units, positions in milli-Mpc — 1-ulp value-transform drift (from the
+/// stage-C `exp`/`cbrt` or stage-D `sqrt`) vanishes in the quantum.
+///
+/// Lattice-exact positions may sit exactly on half-quantum points (dyadic
+/// cell-center fractions); those are stable across platforms anyway
+/// because every op in the position path (+,-,*,/ on integers and dyadic
+/// rationals) is exactly rounded per IEEE-754 — identical inputs replay
+/// identical bits, so the committed vectors pin them.
+pub fn web_hash(web: &WebDescriptor) -> u64 {
+    let mut h = FnvFold::new();
+    h.write_u32(web.universe_version);
+    h.write_u64(web.seed);
+    h.write_u32(web.nodes.len() as u32);
+    let mut acc = h.finish();
+    for node in &web.nodes {
+        h = FnvFold(acc);
+        h.write_u32(node.node_index);
+        for c in node.position_mpc {
+            h.write_i64(quantize_f64(c, 1_000.0));
+        }
+        h.write_i64(quantize_f64(node.mass_msun / 1.0e9, 1.0));
+        h.write_i64(quantize_f64(node.virial_radius_mpc, 1_000.0));
+        acc = h.finish();
+    }
+    h = FnvFold(acc);
+    h.write_u32(web.links.len() as u32);
+    acc = h.finish();
+    for link in &web.links {
+        h = FnvFold(acc);
+        h.write_u32(link.a);
+        h.write_u32(link.b);
+        h.write_i64(quantize_f64(f64::from(link.density), 1_000.0));
+        acc = h.finish();
+    }
+    h = FnvFold(acc);
+    h.write_u32(web.glow_mpc.len() as u32);
+    acc = h.finish();
+    for g in &web.glow_mpc {
+        h = FnvFold(acc);
+        for c in g {
+            h.write_i64(quantize_f64(f64::from(*c), 1_000.0));
+        }
+        acc = h.finish();
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::generate::{generate_galaxy, generate_system};
@@ -219,7 +272,7 @@ mod tests {
         // change updates these alongside a UNIVERSE_VERSION bump.
         assert_eq!(
             galaxy_hash(&generate_galaxy(1234, 100)),
-            9_108_908_582_122_754_794
+            4_159_227_938_759_867_464
         );
         let galaxy = generate_galaxy(1234, 100);
         assert_eq!(

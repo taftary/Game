@@ -12,6 +12,7 @@
 | Planet chunk stream (descent) | fade ≤2 s acceptable | ≤1.5 s | ≤1 s |
 | Depth bands per frame (v0.2.0) | ≤3 passes, one transient D32F depth image (demo-pinned) | ≤3 until ADR-007 tier data lands | same as Medium |
 | Post chain per frame (v0.2.0) | +1 fullscreen resolve pass, one transient HDR image (16F preferred, packed-float fallback, content-preserving LDR bypass) | same | same |
+| Cosmic bloom per frame, cosmic views only, debug shell (update-2026-09-18-2328) | +1 bright + 4 blur passes at ½ res on five dedicated targets (A–E), 5 transient HDR images + scene depth (6 total); LDR bypass draws the same layouts direct (no post) | same | same |
 | Cosmic-web cue raymarch (v0.2.0) | 64x64 source grid, ≤16 steps, analytic fallback available | 128x128, ≤32 steps | 256x256, ≤64 steps |
 
 Budgets are enforced by the `tools` renderer smoke + device profiles, not by vibes. Any feature that blows Low tier is cut or tier-gated.

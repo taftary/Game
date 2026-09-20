@@ -53,6 +53,15 @@ existing nowhere (`issue-2026-09-14-2113`, `issue-2026-09-15-1144`,
   player marker uses only `world_to_pixels`.
 - Follow opens south of the player looking north; FirstPerson hides
   the marker by design.
+- **Bloom images must never be ping-ponged** (Intel UHD 620 driver bug):
+  every HDR bloom target is written once, then only read.
+  See `docs/reports/2026-09-19-intel-hdr-bloom-corruption.md`.
+
+## Known hardware issues (read before changing post-processing / HDR)
+
+Detailed reports live in [`docs/reports/`](docs/reports/). Summary:
+
+- **Intel UHD 620 bloom ping-pong corruption** ([report](docs/reports/2026-09-19-intel-hdr-bloom-corruption.md)): reusing an image as both color attachment (write) and shader input (read) in the same command buffer produces silent driver-level corruption (colored squares). Vulkan validation is blind to this. **Rule:** every bloom target must be written exactly once, then only read. Never ping-pong. See `HdrChain` in `crates/debug/src/main.rs` for the pattern.
 
 ## Docs maintenance
 

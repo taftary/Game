@@ -9,12 +9,14 @@
 //! Photosensitivity (`docs/game/controls.md`): the fade is a single
 //! black ramp — no flash-white, no strobe, no oscillation.
 //!
-//! No literal spinner: universe loads are synchronous (generate +
-//! upload complete before the next frame), so there is no async gap to
-//! cover. The notice banner is the fallback surface this milestone —
-//! invalid seeds, offers, and arrivals all land on it instead of
-//! crashing or failing silently. A true async spinner belongs to M2
-//! descent streaming, where chunk loads can miss budget.
+//! Staged universe loads (v0.3.2 `settings-seed-loader`) run one
+//! [`crate::loader::LoadStep`] per frame behind a modal determinate
+//! progress bar, so there is no async gap to cover — the bar reports
+//! honest per-step progress on the UI thread. A true async spinner
+//! still belongs to M2 descent streaming, where chunk loads can miss
+//! budget. The notice banner remains the fallback surface for
+//! outcomes: invalid seeds, offers, and arrivals all land on it
+//! instead of crashing or failing silently.
 
 use std::time::{Duration, Instant};
 

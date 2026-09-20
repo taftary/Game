@@ -82,6 +82,19 @@ commit when it reaches `done` (workflow rule:
 |---|---|---|
 | [`unified-debug-view`](../../plans/v0.3.1/unified-debug-view/) | done | dev tooling (ADR-022) |
 
+## v0.3.2 — Cosmic-scale player (main game notion)
+
+Work happens on branch `v0.3.2`; the feature lands as exactly one
+commit when it reaches `done` (workflow rule:
+[`plans/README.md`](../../plans/README.md) § *7. Version branch*).
+
+| Feature | Status | Spec section |
+|---|---|---|
+| [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | done | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
+| [`settings-seed-loader`](../../plans/v0.3.2/settings-seed-loader/) | done | dev tooling (single Settings seed editor + staged load progress) |
+| [`cosmic-web-mass-rank-fix`](../../plans/v0.3.2/cosmic-web-mass-rank-fix/) | in-progress | bugfix: densest peak now gets rarest mass (UNIVERSE_VERSION 2→3) |
+| [`cosmic-web-illustris-look`](../../plans/v0.3.2/cosmic-web-illustris-look/) | in-review | render-only enrichment: branching hair threads + smoke-v2 sheath + gold beads toward the Illustris target (no descriptor/hash change) |
+
 ## Post-v0.3 (unscheduled)
 
 - **Colony milestones (historical labels):** M2 descent slice, M3 surface
@@ -92,8 +105,19 @@ commit when it reaches `done` (workflow rule:
 - **Audio:** deferred to navigation-engine spec v0.5 (spec §10, ADR-006
   in [`../decisions/`](../decisions/)).
 - **Post-v1 candidates:** subterranean geometry
-  ([`../game/journey.md`](../game/journey.md) L8), traversable universe
-  layer (L1), landable moons (L4).
+  ([`../game/journey.md`](../game/journey.md) L8), landable moons (L4).
+  (The traversable-universe-layer (L1) entry is retired: v0.3.2 lands
+  the player-traversable cosmic web as the demo's starting dimension;
+  region streaming, sheet rendering, and frame handoff stay follow-ups
+  per ADR-023.)
+- **Cosmic web roadmap** (decisions 2026-09-19): stability-first ordering.
+  Immediate: perf measurement + tier budgets → LOD/culling → cheap wins
+  (redshift rescale, braid strip, marker caching) → filament ribbons.
+  One batched descriptor change (UNIVERSE_VERSION bump): dominant long
+  filaments + sheet/density export + sheet sprite render. Volumetric
+  raymarching deferred to discrete-GPU tiers only. Compute-grain dropped
+  (build-time cost, not per-frame). SDSS overlay deferred (data-ingest
+  project). 2LPT deferred until nested grids exist.
 
 ## Open product items (spec §10 — must not be silently dropped)
 

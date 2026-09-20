@@ -40,9 +40,9 @@ from first boot to endgame — before a single line of implementation is planned
 - Any player-facing plan requires UX acceptance rows before implementation.
 - Debug-only screens (`game_debug`) are exempt from full UX review
   **except presentation-accurate player-facing surfaces inside debug
-  shells** (e.g. the Game Demo tab, ADR-022) — those require UX
-  consultation like any player-facing surface. Debug UI must still not
-  leak into the release binary.
+  shells** (e.g. the Game Demo tab, ADR-022 as extended by ADR-023) —
+  those require UX consultation like any player-facing surface. Debug
+  UI must still not leak into the release binary.
 
 ## Refuses
 

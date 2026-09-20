@@ -263,12 +263,166 @@ System Map and Planet View (current `HexSphere` as dual-cell fans
 with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
-stats). The dev widget (`` ` `` toggle, `F6`–`F8` sub-tabs) hosts FPS
-(live frame-health), the Console (transition-event log feed) and the
-Inspector (journey summary); a transition pill floats bottom-center
-while a waypoint transition is in flight, and three toggle buttons
+stats); the Cosmic Web tab (v0.3.2, ADR-023; cinematic refresh in
+update-2026-09-18-2328, smoke in update-2026-09-20-0645 replacing the
+update-2026-09-19-1245 ribbons) mounts the
+absorbed cosmic-web inspector (instanced smoke-billboard filaments
+through the additive smoke `TriangleList` pipeline, grain + gas veil +
+3-layer node impostors through the additive glow `PointList`
+pipeline, own orbit/pan/zoom camera, live player point). The Game Demo tab renders the same web as the
+player-immersive scene (one glow draw + one smoke draw per surface,
+buffers relative to an upload origin, camera recentered on the same
+origin with a 50 Mpc rebase). Both cosmic views render through an
+HDR scene target with a real bloom chain (bright extract + 2-scale
+separable blur + ACES resolve composite) on capable devices, LDR
+bypass otherwise. The dev widget
+(`` ` `` toggle, `F6`–`F8` sub-tabs) hosts FPS
+(live frame-health), the Console (fly-to event feed) and the
+Inspector (journey summary); a fly-to pill floats bottom-center
+while a fly-to leg is in flight (live easing progress, hidden
+otherwise), and three toggle buttons
 live inside the always-visible top bar (left dock, right dock, dev
 widget with FPS value). Viewer state is preserved across screen switches.
+
+Camera & screen-space contract, cosmic extension (v0.3.2, ADR-023):
+the space camera (`debug::cosmic_camera`: Chase/Orbit/FirstPerson)
+uses the un-flipped `directx::perspective` with MapOrbitCamera-style
+distance-derived near/far; the cosmic player marker goes through
+`world_to_pixels` + the shared dot/arrow/`YOU` path pin-for-pin with
+the sphere marker (FirstPerson hides it by construction — eye-plane
+`w ≤ 0`); the inspector player point is map content (one-vertex
+point draw), never the UI marker. Points/lines carry no faces, so no
+front-face/cull state is involved on either cosmic surface.
+
+Cinematic refresh (update-2026-09-18-2328): the cosmic draws use two
+new additive (`One`, `One`, premultiplied in-shader) pipelines —
+glow points (rim-zero quadratic-falloff sprite mask, per-sprite
+alpha, emissive colors above 1.0 on cluster cores; halos are
+world-sized `kind`-1 sprites, cores/grain/glow fixed-pixel `kind` 0)
+and braid lines (per-vertex rgba) — both carrying a bounded
+exaggerated Hubble redshift tint from view depth (`clip.w` clamped
+non-negative and capped, spec §9.1; unbounded tint decorrelated
+channels into rainbow squares on screen). The shared alpha `map`/`line`
+pipelines and every other surface are untouched. In HDR mode the
+same draws record into an offscreen HDR scene pass (indigo clear),
+then five dedicated bloom targets (A–E) at half-res: bright extract
+→ A, H blur A → B, V blur B → C, wide-H C → D, wide-V D → E (final).
+Every target is written exactly once, then only read — never ping-
+ponged (Intel UHD 620 corruption workaround, see
+`docs/reports/2026-09-19-intel-hdr-bloom-corruption.md`). The
+bloom-composite ACES resolve reads scene + E into the swapchain
+image; the inspector marker and all UI draw after the resolve. Fullscreen
+passes reuse `RESOLVE_VERT` empty-vertex-input triangles with
+the `post.rs` NDC-top-row UV contract (`v_uv = vec2(pos.x, 1.0 -
+pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,
+`resolve_frag_bloom`) and `BloomParams` live in
+`engine::render::post`, the GPU half follows the `game_tools`
+`ResolvePass` precedent, and transients rebuild with the swapchain.
+
+Smoke filaments (update-2026-09-20-0645, replaces update-2026-09-19-1245
+P1 ribbons): `cosmic_web.rs` emits one compact `SmokePuff` per puff
+(pos, world diameter, rgba, noise seed — 48 B GPU, ~2.5 MB nominal
+for ~52k puffs vs ~1.2M ribbon tris). `main.rs` uploads them as
+per-instance vertices; `SMOKE_VERT` expands `gl_VertexIndex` into
+camera-facing billboard quads (billboard frame = 1 cross +
+normalize, no trig in the vertex shader; centers reuse the same
+`braid_point` derivation the grain pass uses, so grain still
+textures the smoke), world diameters 2–6.5 Mpc, hub warming baked on
+CPU, bounded redshift tint, and a 1→6 Mpc near-eye fade (the player
+spawns inside a filament — unfaded puffs fill the screen as white
+slabs). `SMOKE_FRAG` applies rim-zero radial falloff × a cheap 4x4
+hash dust term (no sin/exp per pixel — mobile fill-rate friendly);
+push block `SmokePush` (MVP, eye, px_scale, exposure, redshift —
+92 B) carries the per-surface grade. A 2-px minimum-world-size clamp
+keeps distant puffs visible in the zoomed-out inspector (without it
+they shrink subpixel and vanish). ~104k tris, inside the 500k Low
+budget with margin. Known costs/risks: inspector zoom-out stacks
+ dozens of puffs/px — mitigated by small alpha with the
+ MAP smoke exposure at 0.85 (~5x the retired ribbon MAP grade, paying
+ for the billboard area spread) vs 0.65 demo; follow-ups:
+ distance/frustum cull, Low grain-budget cut (grain still 800k
+ points).
+
+Illustris-look pass (`cosmic-web-illustris-look`, v0.3.2): render-only
+enrichment toward the Illustris projection target — no descriptor,
+hash, pipeline, or budget change. Strands fray `3–7` per link across
+one or two seeded arms (long links `>20 Mpc` split arms, so
+sub-threads diverge); smoke puffs become tangent-aligned stretched
+sheaths (`3–8 Mpc` long × `0.3–1.0 Mpc` thin, `4×` stretch in-shader,
+tighter `0.35 Mpc` jitter, core + faint-halo tiers, junction warming
+at degree-`≥3` bifurcations, anisotropic falloff + `8×8` hash dust);
+gold beads (`≤60k`, `cosmic_web/bead` stream, spine sub-segments,
+mass-graded emissive) string dwarf glitter along threads and ride the
+glow `PointList` (pick-ignored); faint-thread alpha floor `0.05 →
+0.03` so weak threads sink into the backdrop. Nominal headless:
+`smoke51953 grain800000 beads59958 impostors18000`. Bloom write-once,
+redshift/near-eye/picking/marker pins all preserved (pinned by
+`cosmic_shader_safety_pins`, which keeps the `rl > 1e-10` side
+guard and the `1.0 - r2` rim-zero literal plus the `vec3(luma)`
+white hot-center pin).
+
+White-smoke pass (2026-09-20, same v0.3.2): visibility + white
+sheaths, still render-only (no count, pipeline, or budget change —
+nominal headless stays `smoke51953 grain800000 beads59958
+impostors18000`). CPU: steep density contrast — base alpha
+`0.02+0.13d` and rgb floor dimmed (`0.10/0.12/0.35` at d=0, dense
+ceiling unchanged), so faint mist lands darker than the original
+grade while dense threads carry ~2x; white subset density-gated
+(`mix 0.15+0.55d`, every third core puff — faint smoke stays
+blue-dark). GPU: `SMOKE_FRAG` desaturates toward the puff's own
+luminance at the quad core (`core=(1-r2)³ × 0.45`,
+arithmetic-only); exposures `DEMO 0.65 / MAP 0.85`. Lesson
+recorded: falloff peak must stay at 1.0 — a distant puff's pixels
+only sample the core, so renormalizing peak brightness brightens
+the whole far field (an interim ×1.8 was reverted for exactly this
+reason).
+
+Close-up fix (2026-09-20, same v0.3.2): the stretched quads read as
+hard paper blades when magnified — three causes, all shader-side.
+`SMOKE_FRAG` falloff is now fully dissolving on both axes (`ax²`
+tips hit exactly zero instead of cutting at 65%, `radial²` core has
+zero slope instead of a tent ridge) with the peak kept at 1.0 — the
+far-field grade lives in the CPU alpha + exposure knobs, never in a
+peak renormalization (an interim ×1.8 was reverted: far pixels
+sample only the core, so it brightened the whole far field); the
+`8×8` hash dust is bilinear-smoothed value noise (still fract-only)
+so near puffs read as gas texture, not block edges. `SMOKE_VERT`
+near fade is size-relative (`0.35×len → 1.25×len`, floor `1→6 Mpc`)
+so a puff dissolves before its quad edges resolve on screen; beads,
+grain, and impostors keep nearby structure legible.
+
+Palette quick pass (update-2026-09-19-1933): grading-only retune on
+the same geometry — no pipeline, topology, or image changes, bloom
+write-once rule trivially preserved. Filament braid ramps regraded to
+dim-indigo → blue-violet with the alpha floor at 0.05 (faint links
+sink to the deepened backdrop `[0.008, 0.005, 0.024]`, voids read
+dark) and dense strands premultiplying to ~1.95 in blue, past the
+bloom threshold (1.0): the half-res 4-pass blur chain keeps only ~1/4
+of a 1-px line's over-threshold energy and dilutes point sources
+~1/(2πσ²), so braid emissive and node-core size/brightness must sit
+well above threshold to bloom visibly. Strands also warm toward amber
+near hub endpoints (convex mix by `1 − √taper`) — the target's
+golden-red infusion around clusters. The descriptor glow points
+became a **gas veil**: world-sized soft sprites (2.8 Mpc, α 0.045)
+hugging the links so filaments sit in faint blue mist. Node impostors
+mass-stratify harder (shared `mass_level` ramp re-centered 1e12–3e14
+M☉ so ordinary cluster hubs read golden, cores 3–12 px at up to 5.0
+emissive on a deep-gold ramp, halos cyan→amber, 2.5–6 Mpc — narrowed
+so near-camera halos hit the 256 px point-size clamp as a smaller,
+dimmer smudge; the real fix is quad impostors (still open after the
+smoke update).
+The redshift depth cue softened (`COSMIC_REDSHIFT_PER_MPC` 0.004 →
+0.002, saturation 125 → 250 Mpc; red boost 0.75z over blue kill
+0.7z, dim 0.45z) so gold survives and distant structures warm like
+the target's pink-tinged far filaments; safety clamps unchanged.
+Grade knobs are per-surface bin-local consts in
+`main.rs` (`COSMIC_DEMO_*` / `COSMIC_MAP_*`): smoke/sprite alpha
+exposure (`SmokePush.exposure` scales puff alpha in-shader;
+`GlowPush.exposure` already existed) plus resolve
+exposure/bloom intensity — the zoomed-out inspector stacks dozens
+of puffs per pixel where the immersive demo stacks a few, so one
+grade cannot serve both. Engine `BloomParams::spec_defaults()`
+(threshold, blur σ) stays untouched.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,

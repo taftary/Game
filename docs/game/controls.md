@@ -26,16 +26,42 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
 - Headless demo: `cargo run -p game` runs a scripted 20 Hz walk
   (straight leg, curving leg, turn-in-place leg, idle) through all four
   modes, logging lon/lat/heading (interactive `winit` binding deferred).
-- Debug viewer (`cargo run -p game_debug`, one window, ADR-022): top
-  bar `F1` = Game Demo (default tab — interactive, presentation-
-  accurate, HUD on, chrome hidden), `F2` = Dimensions dropdown (ten
-  waypoints, digits `1`–`0` pick while open, `●` marks the active
-  journey layer), `F3` = Settings (Controls section lists every
-  action with its key; every row is clickable). Milky Way / Solar
-  System / Earth dimension tabs mount the absorbed Galaxy Map /
-  System Map / Planet View with their docks (260/300 px + padding)
-  and content keys; other
-  dimension tabs are placeholders with `INACTIVE` badges.
+- Debug viewer (`cargo run -p game_debug`, one window, ADR-022 as
+  extended by ADR-023): top bar `F1` = Game Demo (default tab —
+  interactive, presentation-accurate, HUD on, chrome hidden),
+  `F2` = Dimensions dropdown (ten waypoints, digits `1`–`0` pick
+  while open, `●` marks the active journey layer), `F3` = Settings
+  (UNIVERSE section: the single editable seed field + `Load [Enter]`;
+  Controls section lists every action with its key; every row is
+  clickable). Loading a universe runs staged (one step per frame)
+  behind a modal determinate progress bar that floats above all UI;
+  the shell stays on the current screen. Milky Way / Solar System /
+  Earth dimension tabs mount
+  the absorbed Galaxy Map / System Map / Planet View with their
+  docks (260/300 px + padding) and content keys; the Cosmic Web tab
+  (digit `1`) mounts the absorbed cosmic-web inspector (orbit/pan/
+  log-zoom, click-node readout, live player point, `Home` top-down
+  snap); other dimension tabs are placeholders with `INACTIVE`
+  badges.
+- Game Demo tab (v0.3.2 `cosmic-scale-player` — the main game
+  notion: a player in space navigating the Cosmic Scale, amended by
+  update-2026-09-18-2027): the player is a marker (`YOU` dot + heading
+  arrow) with its own camera in the generated cosmic web, spawned
+  inside a filament near the home galaxy. Mouse drag steers the nose;
+  `W`/`S` = cruise forward/backward, `A`/`D` = lateral cruise (arrows
+  mirror WASD) — full input crosses the local scale length (nearest-node
+  distance, r_vir-scaled floor) in ~20 s with eased momentum, release
+  coasts; `Shift`+wheel adjusts the pace (2–600 s crossing time);
+  `P` cycles Chase (default) → Orbit (drag orbits, wheel zooms) →
+  FirstPerson (marker hidden); wheel zooms the Chase/Orbit camera;
+  click a node to target it (amber ring marker, also on the Cosmic Web
+  tab's clicked node), `E` engages/cancels the eased fly-to (any
+  cruise input also cancels); `R` re-seeds the web. The shipping HUD
+  shows frame (cosmological/Mpc), time (real-time or compressed ratio),
+  live cruise speed (Mpc/s), and the fly-to target with distance + ETA;
+  SOI stays `—` (no handoffs at this scale). `E` is context-dependent
+  by design: fly-to in the demo, travel-begin on the galaxy/system tabs
+  (the `T` dual-binding precedent: travel offer / top preset).
 - Dev widget (`` ` `` toggle; `F6`/`F7`/`F8` = FPS/Console/Inspector
   sub-tabs): floats over every tab. Console carries the transition-
   event log; a transition pill floats bottom-center while a waypoint
@@ -55,10 +81,12 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   `plans/v0.0.1/universe-maps-3d`): 3D perspective views — wheel = log zoom,
   left-drag = orbit, right/middle-drag = pan, click = select
   star/planet, `Home` = top-down snap toggle (classic north-up /
-  east-right framing); Milky Way tab
-  `E` drills into the selected star's system, `R` re-rolls the seed, seed
-  field + Load (or Enter) loads a typed universe (`--seed N` flag does
-  the same at startup); Solar System tab `F` toggles L4 planet focus, `T`
+   east-right framing); Milky Way tab
+   `E` drills into the selected star's system, `R` re-rolls the seed
+   through the staged loader, the seed itself is typed on the Settings
+   tab (`Load [Enter]` applies; `--seed N` flag shows the same loader
+   at startup and stays on the Game Demo tab); loads never switch
+   screens. Solar System tab `F` toggles L4 planet focus, `T`
   arms/withdraws the travel offer, `E` begins the timed transit
   (cancellable with `T`/`Q` before commit), `Q` ascends one journey
   layer. The player marker is a center dot plus a heading
