@@ -2,8 +2,9 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-20; ARCHITECT + TECHLEAD breakdown in
-`plan.md`; ADR-025 accepted)
+`done` (PO sign-off 2026-09-20; ARCHITECT + TECHLEAD breakdown in
+`plan.md`; ADR-025 accepted; ANALYST audit + SECURITY review recorded
+in `plan.md` DoD table; single commit on branch `v0.3.3`)
 
 ## Context
 

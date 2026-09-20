@@ -927,6 +927,41 @@ fn run_headless(seed: Option<u64>) -> i32 {
         beads.len(),
         impostors.len()
     );
+    // Field sidecar self-check (`web-field-export`, ADR-025): the export
+    // entry point returns the identical descriptor, the tracer band
+    // holds, and the sidecar fits its memory budget. Timings print for
+    // the plan.md record (the +120 ms NFR3 budget is a release-desktop
+    // number; dev-profile absolutes are recorded, not gated).
+    {
+        use game_engine::universe::{
+            CosmicWebParams, WebFieldBudget, generate_cosmic_web, generate_cosmic_web_with_field,
+        };
+        let params = CosmicWebParams::nominal();
+        let t0 = Instant::now();
+        let plain = generate_cosmic_web(1337, &params);
+        let plain_ms = t0.elapsed();
+        let t1 = Instant::now();
+        let (via_field, field) =
+            generate_cosmic_web_with_field(1337, &params, WebFieldBudget::Full);
+        let field_ms = t1.elapsed();
+        assert_eq!(plain, via_field, "export must not move the descriptor");
+        assert!(
+            (900_000..=1_200_000).contains(&field.tracers.len()),
+            "nominal tracer band broken: {}",
+            field.tracers.len()
+        );
+        let bytes =
+            field.tracers.len() * size_of::<game_engine::universe::WebTracer>() + field.grid.len();
+        assert!(bytes <= 20 * 1024 * 1024, "sidecar over budget: {bytes} B");
+        println!(
+            "web_field=tracers{} plain_ms{} field_ms{} delta_ms{} mb{} ok",
+            field.tracers.len(),
+            plain_ms.as_millis(),
+            field_ms.as_millis(),
+            field_ms.as_millis().saturating_sub(plain_ms.as_millis()),
+            bytes / (1024 * 1024)
+        );
+    }
     // Cruise smoke (update 2026-09-18-2027): five seconds of W must move
     // the ship Mpc-scale — the old thrust law could not move it at all.
     let cruise_p0 = debug_app.cosmic.player.position_mpc();

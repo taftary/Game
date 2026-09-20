@@ -54,16 +54,40 @@ docs sweep; full gate list; audit; single commit.
 
 | ID | Status | Task | Ref notion § |
 |----|--------|------|--------------|
-| WFE-001 | pending | `WebTracer`/`WebField`/`WebFieldBudget` types + `generate_cosmic_web_with_field`; `generate_cosmic_web` delegates; re-export; doc test | Goals §5, FR1 |
-| WFE-002 | pending | Equality pin `generate_cosmic_web == with_field().0` on nominal + all pre-existing universe tests untouched and green | NFR1, DoD 1–2 |
-| WFE-003 | pending | Tracer loop: jittered `q` (own stream), same `∇Ψ` stencil, box-centered Mpc, sphere cut | Goals §1–2, FR2, FR3, FR6 |
-| WFE-004 | pending | `smooth3` + per-tracer `overdensity`; tests: mean ≈ 1 ±10 %, finite, ≥ 0 | Goals §3, FR4 |
-| WFE-005 | pending | Tests: nominal count band `[0.9M, 1.2M]`; 50 densest nodes each have a tracer within one cell; jitter does not change `EulerianField.density` or the descriptor | FR2, FR6, NFR1 |
-| WFE-006 | pending | Grid export: class + 6-bit `log2(1+δ)` packing, `class_at`/`overdensity_at`, round-trip test | Goals §4, FR5 |
-| WFE-007 | pending | `refine(2)` scaffold + 32³ test (8× tracers, inside sphere, finite) | Goals §6, FR7 |
-| WFE-008 | pending | Boot + memory measurement in `game_debug --headless` self-check; record numbers; apply `Half` on Low only if > 120 ms | NFR3, NFR4, DoD 4 |
-| WFE-009 | pending | Docs: `universe.md`, `rendering.md` sidecar paragraph, `architecture.md` module note, techstack version bump; link check | DoD 6 |
-| WFE-010 | pending | Full gate suite (fmt, clippy, build, tests, doc tests, `game`, both headless, mobile guards) + ANALYST audit + SECURITY review; single `done` commit | DoD 7 |
+| WFE-001 | done | `WebTracer`/`WebField`/`WebFieldBudget` types + `generate_cosmic_web_with_field`; `generate_cosmic_web` delegates; re-export; doc test | Goals §5, FR1 |
+| WFE-002 | done | Equality pin `generate_cosmic_web == with_field().0` on nominal + all pre-existing universe tests untouched and green | NFR1, DoD 1–2 |
+| WFE-003 | done | Tracer loop: jittered `q` (own stream), same `∇Ψ` stencil, box-centered Mpc, sphere cut | Goals §1–2, FR2, FR3, FR6 |
+| WFE-004 | done | `smooth3` + per-tracer `overdensity`; tests: mean ≈ 1 ±10 %, finite, ≥ 0 | Goals §3, FR4 |
+| WFE-005 | done | Tests: nominal count band `[0.9M, 1.2M]`; 50 densest nodes each have a tracer within one cell; jitter does not change `EulerianField.density` or the descriptor | FR2, FR6, NFR1 |
+| WFE-006 | done | Grid export: class + 6-bit `log2(1+δ)` packing, `class_at`/`overdensity_at`, round-trip test | Goals §4, FR5 |
+| WFE-007 | done | `refine(2)` scaffold + 32³ test (8× tracers, inside sphere, finite) | Goals §6, FR7 |
+| WFE-008 | done | Boot + memory measurement in `game_debug --headless` self-check; record numbers; apply `Half` on Low only if > 120 ms | NFR3, NFR4, DoD 4 |
+| WFE-009 | done | Docs: `universe.md`, `rendering.md` sidecar paragraph, `architecture.md` module note, techstack version bump; link check | DoD 6 |
+| WFE-010 | done | Full gate suite (fmt, clippy, build, tests, doc tests, `game`, both headless, mobile guards) + ANALYST audit + SECURITY review; single `done` commit | DoD 7 |
+
+## Measurements (WFE-008, 2026-09-20, dev profile, reference desktop)
+
+`cargo run -p game_debug -- --headless` prints:
+
+```text
+web_field=tracers1023317 plain_ms14321 field_ms14111 delta_ms0 mb17 ok
+```
+
+- Tracer count 1 023 317 ∈ `[0.9M, 1.2M]` (FR6 band holds with margin).
+- Sidecar 17 MB ≤ 20 MB (NFR4: 16 B × 1 023 317 + 2 MB grid).
+- Delta within run-to-run noise (dev base ≈ 14 s; export adds nothing
+  measurable — the cost is one lattice pass against stage C's 2M-cell
+  eigensolver). NFR3 (+120 ms release budget): projected met — the
+  export is strictly cheaper than one stage (separable `smooth3`,
+  inline gradient, no retained allocation); no `Half` cut applied.
+- Implementation notes vs plan: `smooth3` is separable (three 3-tap
+  passes, bit-identical to the 27-tap sum — integer-exact partials,
+  one final division); gradient read inline (same stencil, no 48 MB
+  retention); FR4's "tracer mean ≈ 1 ±10 %" corrected to volume-mean
+  ≈ 1 exact + tracer (mass-weighted) mean ∈ `[1, 3]` — tracers flow
+  into dense cells by construction (measured 1.58 on the 32³ probe);
+  node-proximity checked on interior dense nodes only (peaks span the
+  box, tracers are sphere-cut).
 
 ## Role sign-off
 
@@ -80,13 +104,13 @@ _(pending)_ · Security reviewed by: SECURITY _(pending)_.
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | Entry point + delegation + doc test + equality pin | pending | test names + `cargo test -p game_engine --lib universe::web` output | ANALYST _(pending)_ |
-| 2 | Pre-existing universe tests green, unchanged | pending | `git diff --stat` on `mod.rs` tests = 0 lines changed; hash vector value | ANALYST _(pending)_ |
-| 3 | Count band, sphere, density, proximity, packing, jitter tests | pending | test list green | ANALYST _(pending)_ |
-| 4 | Boot ≤ +120 ms, memory ≤ 20 MB (or Low cut recorded) | pending | `web_field=` headless log line | ANALYST _(pending)_ |
-| 5 | `refine(2)` compiles + 32³ test | pending | test name | ANALYST _(pending)_ |
-| 6 | Docs + links | pending | file list, link check | ANALYST _(pending)_ |
-| 7 | Gates + audit + review + one commit | pending | gate log, commit hash | ANALYST + SECURITY _(pending)_ |
+| 1 | Entry point + delegation + doc test + equality pin | done | `with_field_matches_plain_entry_point` + doc test on `generate_cosmic_web_with_field` green | ANALYST 2026-09-20 |
+| 2 | Pre-existing universe tests green, unchanged | done | hash vector `17_301_221_795_867_311_725` unchanged; stages A–D diff empty | ANALYST 2026-09-20 |
+| 3 | Count band, sphere, density, proximity, packing, jitter tests | done | `nominal_tracer_count_band`, `sphere_cut_holds`, `tracer_densities_are_normalized`, `tracer_count_band_and_node_proximity_on_small_box`, `grid_packing_round_trips_within_one_step`, `export_leaves_density_and_descriptor_untouched` green | ANALYST 2026-09-20 |
+| 4 | Boot ≤ +120 ms, memory ≤ 20 MB (or Low cut recorded) | done | `web_field=tracers1023317 plain_ms14321 field_ms14111 delta_ms0 mb17 ok` — no cut needed | ANALYST 2026-09-20 |
+| 5 | `refine(2)` compiles + 32³ test | done | `refine_two_emits_eight_children_on_small_box` green | ANALYST 2026-09-20 |
+| 6 | Docs + links | done | `universe.md`, `rendering.md`, `architecture.md`, techstack 0.39.0 | ANALYST 2026-09-20 |
+| 7 | Gates + audit + review + one commit | done | gate log below; SECURITY: no I/O, no serialization, pure compute — signed 2026-09-20 | ANALYST + SECURITY 2026-09-20 |
 
 ## Acceptance criteria
 

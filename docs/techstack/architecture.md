@@ -47,9 +47,11 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
                   # + icosa-net UV unwrap (uv) + flat chunk map (chunk_flat)
     waypoints.rs # ten player-facing scale waypoints over FrameChain;
                  # deterministic transition descriptors and event queue
-    universe/    # seeds, web/nodes (stage 0, v0.3.2) + galaxy/system/planet
-                 # generation (M5 shipped stages 1–2: descriptors + hashes;
-                 # stage 3 lands with descent/surface)
+     universe/    # seeds, web/nodes (stage 0, v0.3.2) + galaxy/system/planet
+                  # generation (M5 shipped stages 1–2: descriptors + hashes;
+                  # stage 3 lands with descent/surface); web/field_export.rs
+                  # (v0.3.3, ADR-025) adds the non-hashed render sidecar
+                  # (tracers + packed grid) — engine stays render-free
      hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
                   # cell-chunk identity (`ChunkId` = cell index, ADR-010)
     sim/         # colonies, robots, resources, tick

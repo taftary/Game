@@ -1,12 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.38.0 (2026-09-20, v0.3.3 cut — docs only: ADR-025
-  field-based cosmic render accepted; eight planned features under
-  `plans/v0.3.3/` (capture harness → `WebField` export → tracer splats
-  → depth window → hub hierarchy → mip bloom → grid gas veil → vista
-  intro); v0.3.2 `cosmic-web-mass-rank-fix` + `cosmic-web-illustris-look`
-  closed `done`; code unchanged from 0.37.0 — headless still
-  `smoke51953 grain800000 beads59958 impostors18000`)
+- **Version:** 0.39.0 (2026-09-20, v0.3.3 `web-field-export` done:
+  non-hashed `WebField` sidecar shipped — 1 023 317 tracers at nominal,
+  17 MB, +0 ms dev-profile delta; equality + band + memory pins green;
+  headless prints `web_field=`; seven v0.3.3 features remain planned)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

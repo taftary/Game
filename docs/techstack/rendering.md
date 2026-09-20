@@ -424,17 +424,20 @@ of puffs per pixel where the immersive demo stacks a few, so one
 grade cannot serve both. Engine `BloomParams::spec_defaults()`
 (threshold, blur σ) stays untouched.
 
-**v0.3.3 direction (ADR-025, planned 2026-09-20 — nothing below is
-implemented yet; each paragraph above is rewritten by the feature
-that retires it).** The v0.3.2 cosmic renderer decorates the link
+**v0.3.3 direction (ADR-025 — `web-field-export` shipped 2026-09-20:
+`engine::universe::web` exports the non-hashed `WebField` sidecar
+(≈ 1M Zel'dovich tracers with smoothed overdensity + the 128³ T-web
+class/density grid; measured nominal: 1 023 317 tracers, 17 MB, +0 ms
+dev-profile delta); the paragraphs below stay as written until the
+feature named in each rewrites them).** The v0.3.2 cosmic renderer decorates the link
 graph (straight `a↔b` segments → smoke quads, grain, beads, 3-per-node
 impostors) and cannot produce the reference's curved/branching gas
 bodies, walls, dark voids, or hub hierarchy
 (`docs/reports/2026-09-19-cosmic-web-visual-architecture.md` § 11).
 v0.3.3 renders the **field** instead: `engine::universe::web` exports
 a non-hashed `WebField` sidecar (≈ 1M Zel'dovich tracers with a
-smoothed overdensity + the 128³ T-web class/density grid;
-`web-field-export`); the debug cosmic surfaces draw adaptive-kernel
+smoothed overdensity + the 128³ T-web class/density grid —
+`web-field-export`, shipped, see above); the debug cosmic surfaces draw adaptive-kernel
 additive tracer splats coloured by one density ramp
 (`cosmic-tracer-splat`, retires grain + beads); a shared window term
 — visibility fog `1/(1+(d/L)²)` on every cosmic draw + an inspector
