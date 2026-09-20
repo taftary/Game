@@ -264,12 +264,12 @@ with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
 stats); the Cosmic Web tab (v0.3.2, ADR-023; cinematic refresh in
-update-2026-09-18-2328) mounts the absorbed cosmic-web inspector
-(seeded braid strands through the additive webline `LineList`
-pipeline, grain + dwarf glow + emissive node impostors through the
-additive glow `PointList` pipeline, own orbit/pan/zoom camera, live
-player point). The Game Demo tab renders the same web as the
-player-immersive scene (one glow draw + one braid draw per surface,
+update-2026-09-18-2328, ribbons in update-2026-09-19-1245) mounts the
+absorbed cosmic-web inspector (instanced ribbon filaments through
+the additive ribbon `TriangleList` pipeline, grain + gas veil +
+3-layer node impostors through the additive glow `PointList`
+pipeline, own orbit/pan/zoom camera, live player point). The Game Demo tab renders the same web as the
+player-immersive scene (one glow draw + one ribbon draw per surface,
 buffers relative to an upload origin, camera recentered on the same
 origin with a 50 Mpc rebase). Both cosmic views render through an
 HDR scene target with a real bloom chain (bright extract + 2-scale
@@ -318,6 +318,24 @@ pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,
 `engine::render::post`, the GPU half follows the `game_tools`
 `ResolvePass` precedent, and transients rebuild with the swapchain.
 
+Ribbon filaments (update-2026-09-19-1245 P1): `cosmic_web.rs` emits
+one compact `StrandRecord` per braid strand (root, trunk, lateral
+basis, wander, twist, link rgba — 96 B, ~3.8 MB nominal vs ~34 MB of
+baked `LineList` verts). `main.rs` uploads them as per-instance
+vertices; `RIBBON_VERT` expands `gl_VertexIndex` into camera-facing
+ribbon quads (the same `braid_point` math the grain pass reuses, so
+grain still textures the tubes), world-space half-width 0.75 Mpc
+with a 1.5-px minimum, melt profile + endpoint amber warming +
+bounded redshift tint, and a 1→6 Mpc near-eye fade (the player
+spawns inside a filament — unfaded ribbons fill the screen as white
+slabs). `RIBBON_FRAG` applies rim-zero lateral falloff; push block
+`RibbonPush` (MVP, eye, px_scale, exposure, redshift, width, subdiv —
+100 B) carries the per-surface grade. ~1.2M tris, inside the 3M
+desktop budget. Known costs/risks: vertex braid math (~24M trig
+evaluations/frame) measured fine on UHD 620 (60/59.5 fps debug at
+1296×759); if a tier struggles, cut ribbon subdivisions or draw
+indexed (22 unique verts/strand vs 60 expanded).
+
 Palette quick pass (update-2026-09-19-1933): grading-only retune on
 the same geometry — no pipeline, topology, or image changes, bloom
 write-once rule trivially preserved. Filament braid ramps regraded to
@@ -327,13 +345,21 @@ dark) and dense strands premultiplying to ~1.95 in blue, past the
 bloom threshold (1.0): the half-res 4-pass blur chain keeps only ~1/4
 of a 1-px line's over-threshold energy and dilutes point sources
 ~1/(2πσ²), so braid emissive and node-core size/brightness must sit
-well above threshold to bloom visibly. Node impostors mass-stratify
-harder (shared `mass_level` ramp re-centered 1e12–3e14 M☉ so ordinary
-cluster hubs read golden, cores 3–12 px at up to 5.0 emissive, halos
-warm-graded, 3–8 Mpc). The redshift depth cue softened
-(`COSMIC_REDSHIFT_PER_MPC` 0.004 → 0.002, saturation 125 → 250 Mpc;
-gentler tint/dim coefficients) so gold survives at depth, safety
-clamps unchanged. Grade knobs are per-surface bin-local consts in
+well above threshold to bloom visibly. Strands also warm toward amber
+near hub endpoints (convex mix by `1 − √taper`) — the target's
+golden-red infusion around clusters. The descriptor glow points
+became a **gas veil**: world-sized soft sprites (2.8 Mpc, α 0.045)
+hugging the links so filaments sit in faint blue mist. Node impostors
+mass-stratify harder (shared `mass_level` ramp re-centered 1e12–3e14
+M☉ so ordinary cluster hubs read golden, cores 3–12 px at up to 5.0
+emissive on a deep-gold ramp, halos cyan→amber, 2.5–6 Mpc — narrowed
+so near-camera halos hit the 256 px point-size clamp as a smaller,
+dimmer smudge; the real fix is the ribbon update's quad impostors).
+The redshift depth cue softened (`COSMIC_REDSHIFT_PER_MPC` 0.004 →
+0.002, saturation 125 → 250 Mpc; red boost 0.75z over blue kill
+0.7z, dim 0.45z) so gold survives and distant structures warm like
+the target's pink-tinged far filaments; safety clamps unchanged.
+Grade knobs are per-surface bin-local consts in
 `main.rs` (`COSMIC_DEMO_*` / `COSMIC_MAP_*`): line/sprite alpha
 exposure (a new `WebLinePush.exposure` field scales braid alpha
 in-shader; `GlowPush.exposure` already existed) plus resolve

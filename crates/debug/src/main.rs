@@ -399,9 +399,11 @@ void main() {
     // — the tint can never divide by zero, flip a channel's sign, or
     // feed Inf/NaN into the additive chain (the visual-issue fix).
     // Coefficients softened in update-2026-09-19-1933: gentle redden,
-    // mild dim, so golden hubs survive at depth.
+    // mild dim, so golden hubs survive at depth (red boost kept
+    // stronger than the blue kill — distant structures warm like the
+    // target's pink-tinged far filaments).
     float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
-    vec3 tint = vec3(1.0 + 0.55 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
     v_color = color * tint * dim;
     v_alpha = misc.y * pc.exposure;
@@ -420,40 +422,100 @@ void main() {
     f_color = vec4(v_color * v_alpha * fall, 1.0);
 }";
 
-// Cosmic braid lines (update-2026-09-18-2328): per-vertex rgba from
-// the `cosmic_web` braid layout, same redshift treatment as the glow
-// sprites, premultiplied additive output. 1-px `LineList` segments —
-// the braid density comes from strand count, not line width.
-const WEBLINE_VERT: &str = r"#version 450
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec4 rgba;
+// Cosmic ribbon filaments (update-2026-09-19-1245 P1): instanced
+// strand records expanded in-shader into camera-facing ribbon quads
+// (TriangleList, 6 verts per segment — no CPU-baked lines). Same
+// redshift treatment as the glow sprites, premultiplied additive
+// output, rim-zero Gaussian lateral falloff in the fragment shader.
+// The vertex math mirrors `cosmic_web::braid_point` (trunk + shared
+// wander + per-strand twist, all tapered at the nodes).
+const RIBBON_VERT: &str = r"#version 450
+layout(location = 0) in vec4 rec_a;    // strand root xyz, wander phase
+layout(location = 1) in vec4 rec_raw;  // trunk vec xyz, wander amplitude
+layout(location = 2) in vec4 rec_u;    // lateral basis u xyz, twist phase
+layout(location = 3) in vec4 rec_v;    // lateral basis v xyz, twist windings
+layout(location = 4) in vec4 rec_mix;  // mix_u, mix_v, link density, -
+layout(location = 5) in vec4 rec_rgba; // link rgb, mid-strand alpha
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
-    float redshift;
+    vec4 eye;
+    float px_scale;
     float exposure;
+    float redshift;
+    float width_mpc;
+    float subdiv;
 } pc;
 layout(location = 0) out vec4 v_rgba;
+layout(location = 1) out float v_lat;
+const float PI = 3.141592653589793;
+const float TAU = 6.283185307179586;
+const float AMP = 1.5; // braid amplitude — mirrors BRAID_AMPLITUDE_MPC
+vec3 braid_point(float t) {
+    float taper = sin(PI * t);
+    float wu = sin(TAU * t + rec_a.w) * rec_raw.w * taper;
+    float wv = cos(TAU * t * 0.7 + rec_a.w) * rec_raw.w * taper;
+    float ang = TAU * rec_v.w * t + rec_u.w;
+    float ou = (wu + sin(ang) * rec_mix.x * AMP) * taper;
+    float ov = (wv + cos(ang) * rec_mix.y * AMP) * taper;
+    return rec_a.xyz + rec_raw.xyz * t + rec_u.xyz * ou + rec_v.xyz * ov;
+}
 void main() {
-    vec4 clip = pc.mvp * vec4(position, 1.0);
-    gl_Position = clip;
+    int vi = int(gl_VertexIndex);
+    int seg = vi / 6;
+    int corner = vi - seg * 6;
+    float t0 = float(seg) / pc.subdiv;
+    float t1 = float(seg + 1) / pc.subdiv;
+    vec3 p0 = braid_point(t0);
+    vec3 p1 = braid_point(t1);
+    // Two triangles per segment quad: (p0-, p0+, p1-), (p0+, p1-, p1+).
+    float tt = (corner == 0 || corner == 1 || corner == 3) ? t0 : t1;
+    vec3 base = (corner == 0 || corner == 1 || corner == 3) ? p0 : p1;
+    float lat = (corner == 0 || corner == 2 || corner == 4) ? -1.0 : 1.0;
+    // Camera-facing side: ribbon normal is the view axis, so the quad
+    // spans the segment direction x the view direction.
+    vec3 mid = (p0 + p1) * 0.5;
+    vec3 seg_dir = p1 - p0;
+    vec3 side = cross(seg_dir, pc.eye.xyz - mid);
+    float sl = length(side);
+    side = (sl > 1e-10) ? side / sl : normalize(cross(seg_dir, vec3(0.0, 1.0, 0.0)) + vec3(1e-6, 0.0, 0.0));
+    // Width profile melts into the hubs (same sqrt-sin as the alpha
+    // melt); the min-pixel clamp keeps distant filaments visible.
+    float melt = sqrt(max(sin(PI * tt), 0.0));
+    vec4 clipc = pc.mvp * vec4(base, 1.0);
+    float wmin = 1.5 * max(clipc.w, 1e-6) / pc.px_scale;
+    float w = max(pc.width_mpc * melt, wmin);
+    vec3 world = base + side * (lat * 0.5 * w);
+    gl_Position = pc.mvp * vec4(world, 1.0);
+    v_lat = lat;
+    // Endpoint warming: strands melt into warm amber near the hubs,
+    // staying blue-violet mid-strand (convex mix, like the old CPU
+    // palette pass).
+    float warm = (1.0 - melt) * 0.55;
+    vec3 rgb = mix(rec_rgba.rgb, vec3(1.05, 0.72, 0.42), warm);
     // Same bounded redshift depth as the glow sprites (never divides
-    // by zero, never flips a channel sign); coefficients softened in
-    // update-2026-09-19-1933 so dense blue filaments keep their hue
-    // and golden hubs survive at depth.
-    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
-    vec3 tint = vec3(1.0 + 0.55 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    // by zero, never flips a channel sign).
+    float z = min(pc.redshift * max(clipc.w, 0.0), 0.5);
+    vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
-    // Alpha-side per-surface exposure: premultiplied output is
-    // rgb × a, so alpha scales the result linearly without touching
-    // the hue.
-    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure);
+    // Near-eye fade: the player spawns inside a filament, so ribbons
+    // within a few Mpc of the eye would fill the screen as white
+    // slabs (same reason the halo clamp smudges). Fade them out
+    // instead.
+    float ed = length(pc.eye.xyz - mid);
+    float efade = smoothstep(1.0, 6.0, ed);
+    v_rgba = vec4(rgb * tint * dim, rec_rgba.a * melt * pc.exposure * efade);
 }";
 
-const WEBLINE_FRAG: &str = r"#version 450
+const RIBBON_FRAG: &str = r"#version 450
 layout(location = 0) in vec4 v_rgba;
+layout(location = 1) in float v_lat;
 layout(location = 0) out vec4 f_color;
 void main() {
-    f_color = vec4(v_rgba.rgb * v_rgba.a, 1.0);
+    // Rim-zero lateral falloff: soft tube, no hard edge (the sprite
+    // convention, squared parabola).
+    float fall = 1.0 - v_lat * v_lat;
+    fall = fall * fall;
+    f_color = vec4(v_rgba.rgb * v_rgba.a * fall, 1.0);
 }";
 
 // ---------------------------------------------------------------------------
@@ -575,38 +637,55 @@ struct GlowPush {
     redshift: f32,
 }
 
-/// Cosmic braid-line push constants: MVP + redshift strength +
-/// per-surface alpha exposure (72 B < 128 B Vulkan 1.1 floor).
-/// `exposure` scales alpha only (update-2026-09-19-1933): the
-/// zoomed-out inspector stacks ~50 strands per pixel where the
-/// immersive demo stacks a few, so the two surfaces grade
-/// independently or one of them is always wrong.
+/// Cosmic ribbon push constants: MVP, camera eye (buffer frame),
+/// sprite scale, per-surface alpha exposure, redshift strength,
+/// ribbon half-width (Mpc) and segments per strand. 100 B total,
+/// under the 128 B Vulkan 1.1 floor.
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct WebLinePush {
+struct RibbonPush {
     mvp: [[f32; 4]; 4],
-    redshift: f32,
+    eye: [f32; 4],
+    px_scale: f32,
     exposure: f32,
+    redshift: f32,
+    width_mpc: f32,
+    subdiv: f32,
 }
 
-/// Cosmic braid line vertex: origin-relative Mpc position + linear
-/// rgba (update-2026-09-18-2328; the alpha melts strands into nodes).
+/// Cosmic ribbon strand record: per-instance vertex layout for the
+/// ribbon pipeline (update-2026-09-19-1245 P1) — six `vec4`
+/// attributes at instance rate, 96 B, mirroring
+/// [`game_debug::cosmic_web::StrandRecord`] (f64 trunk/basis fields
+/// demoted to f32: Mpc coords need ~1e-4 precision, f32 has ~1e-7
+/// relative).
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
-struct GlowLineVertex {
-    #[format(R32G32B32_SFLOAT)]
-    position: [f32; 3],
+struct StrandVertex {
     #[format(R32G32B32A32_SFLOAT)]
-    rgba: [f32; 4],
+    rec_a: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    rec_raw: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    rec_u: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    rec_v: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    rec_mix: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    rec_rgba: [f32; 4],
 }
 
 /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328) —
-/// see `ViewerApp::cosmic_frame`.
+/// see `ViewerApp::cosmic_frame`. `eye` is the camera position in the
+/// surface's buffer frame (update-2026-09-19-1245 P1: the ribbon
+/// shader builds camera-facing quads from it).
 struct CosmicFrame {
     mvp: [[f32; 4]; 4],
     px_scale: f32,
     is_demo: bool,
-    braid: Subbuffer<[GlowLineVertex]>,
+    eye: [f32; 3],
+    braid: Subbuffer<[StrandVertex]>,
     glow: Subbuffer<[MapVertex]>,
     viewport: Viewport,
 }
@@ -636,9 +715,14 @@ const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
 /// zoomed-out inspector stacks ~50, so one grade cannot serve both.
 /// Engine `BloomParams::spec_defaults()` (threshold 1.0, blur σ)
 /// stays the shared spec; only these bin-local values tune the look.
-/// Line alpha exposure (multiplies braid alpha in the vertex shader).
-const COSMIC_DEMO_LINE_EXPOSURE: f32 = 1.0;
-const COSMIC_MAP_LINE_EXPOSURE: f32 = 0.14;
+/// Ribbon half-width in Mpc (update-2026-09-19-1245 P1): world-space
+/// thickness (PO decision 2026-09-19) with a 1.5-px in-shader minimum
+/// so distant filaments stay visible.
+/// Line alpha exposure (multiplies braid alpha in the vertex shader;
+/// ribbons cover far more pixels than 1-px lines did, so the demo grade
+/// drops below 1.0).
+const COSMIC_DEMO_LINE_EXPOSURE: f32 = 0.55;
+const COSMIC_MAP_LINE_EXPOSURE: f32 = 0.12;
 /// Sprite alpha exposure (grain, dwarf glow, node cores + halos).
 const COSMIC_DEMO_GLOW_EXPOSURE: f32 = 1.0;
 const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
@@ -650,6 +734,11 @@ const COSMIC_MAP_EXPOSURE: f32 = 0.85;
 /// hard, so the composite needs the push to reach the target glow).
 const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 2.2;
 const COSMIC_MAP_BLOOM_INTENSITY: f32 = 1.2;
+
+/// Ribbon half-width in Mpc (update-2026-09-19-1245 P1): full tube
+/// ~1.5 Mpc at mid-strand, melting into the hubs; the vertex shader
+/// enforces a 1.5-px minimum so distant filaments never vanish.
+const RIBBON_HALF_WIDTH_MPC: f32 = 0.75;
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -795,26 +884,27 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.camera.render_origin(),
         debug_app.cosmic.player.position_mpc()
     );
-    // Cinematic layout smoke (update 2026-09-18-2328): the enrichment
-    // layer derives non-empty braid/grain/impostor clouds from the
-    // boot web. GPU-free — upload happens only in the windowed shell.
+    // Cinematic layout smoke (update 2026-09-18-2328, ribbons in
+    // update-2026-09-19-1245): the enrichment layer derives non-empty
+    // strand-record/grain/impostor clouds from the boot web. GPU-free
+    // — upload happens only in the windowed shell.
     let layout_seed = debug_app.cosmic.seed;
     let layout_origin = debug_app.cosmic.upload_origin;
-    let braid =
-        game_debug::cosmic_web::braid_segments(&debug_app.cosmic.web, layout_seed, layout_origin);
+    let strands =
+        game_debug::cosmic_web::strand_records(&debug_app.cosmic.web, layout_seed, layout_origin);
     let grain =
         game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
     let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
-    assert!(!braid.is_empty(), "braid must emit segments");
+    assert!(!strands.is_empty(), "ribbons must emit strand records");
     assert!(!grain.is_empty(), "grain must emit points");
     assert_eq!(
         impostors.len(),
-        debug_app.cosmic.web.nodes.len() * 2,
-        "two impostors per node"
+        debug_app.cosmic.web.nodes.len() * 3,
+        "three impostors per node"
     );
     println!(
-        "cosmic_layout=braid{} grain{} impostors{} ok",
-        braid.len(),
+        "cosmic_layout=strands{} grain{} impostors{} ok",
+        strands.len(),
         grain.len(),
         impostors.len()
     );
@@ -3414,8 +3504,8 @@ struct ShaderSet {
     map_frag: Arc<ShaderModule>,
     glow_vert: Arc<ShaderModule>,
     glow_frag: Arc<ShaderModule>,
-    webline_vert: Arc<ShaderModule>,
-    webline_frag: Arc<ShaderModule>,
+    ribbon_vert: Arc<ShaderModule>,
+    ribbon_frag: Arc<ShaderModule>,
     post_vert: Arc<ShaderModule>,
     bright_frag: Arc<ShaderModule>,
     blur_frag: Arc<ShaderModule>,
@@ -3435,17 +3525,12 @@ impl ShaderSet {
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
             glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
             glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
-            webline_vert: compile_shader(
-                device,
-                ShaderKind::Vertex,
-                WEBLINE_VERT,
-                "webline vertex",
-            ),
-            webline_frag: compile_shader(
+            ribbon_vert: compile_shader(device, ShaderKind::Vertex, RIBBON_VERT, "ribbon vertex"),
+            ribbon_frag: compile_shader(
                 device,
                 ShaderKind::Fragment,
-                WEBLINE_FRAG,
-                "webline fragment",
+                RIBBON_FRAG,
+                "ribbon fragment",
             ),
             post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
             bright_frag: compile_shader(
@@ -3757,25 +3842,27 @@ fn build_glow_pipeline(
     .expect("glow graphics pipeline must create")
 }
 
-/// Cosmic braid-line pipeline (update-2026-09-18-2328): `LineList`
-/// over [`GlowLineVertex`] (per-vertex rgba), premultiplied-additive,
-/// no depth write (strands accumulate like the glow sprites).
-fn build_webline_pipeline(
+/// Cosmic ribbon-filament pipeline (update-2026-09-19-1245 P1):
+/// `TriangleList` over per-instance [`StrandVertex`] records (the
+/// vertex shader expands `gl_VertexIndex` into camera-facing ribbon
+/// quads), premultiplied-additive, no depth write (tubes accumulate
+/// like the glow sprites).
+fn build_ribbon_pipeline(
     device: &Arc<Device>,
     shaders: &ShaderSet,
     render_pass: &Arc<RenderPass>,
 ) -> Arc<GraphicsPipeline> {
     let vs = shaders
-        .webline_vert
+        .ribbon_vert
         .entry_point("main")
         .expect("vertex entry point");
     let fs = shaders
-        .webline_frag
+        .ribbon_frag
         .entry_point("main")
         .expect("fragment entry point");
-    let vertex_input_state = GlowLineVertex::per_vertex()
+    let vertex_input_state = StrandVertex::per_instance()
         .definition(&vs)
-        .expect("webline vertex layout must match shader");
+        .expect("ribbon vertex layout must match shader");
     let (layout, stages) = pipeline_layout_for(device, vs, fs);
     let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
     GraphicsPipeline::new(
@@ -3785,7 +3872,7 @@ fn build_webline_pipeline(
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
             input_assembly_state: Some(InputAssemblyState {
-                topology: PrimitiveTopology::LineList,
+                topology: PrimitiveTopology::TriangleList,
                 ..Default::default()
             }),
             viewport_state: Some(ViewportState::default()),
@@ -3813,7 +3900,7 @@ fn build_webline_pipeline(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .expect("webline graphics pipeline must create")
+    .expect("ribbon graphics pipeline must create")
 }
 
 // ---------------------------------------------------------------------------
@@ -4192,31 +4279,50 @@ fn upload_cosmic_glow(
     .expect("cosmic glow vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic braid lines as colored segments (same origin
-/// frame as [`upload_cosmic_glow`], layout from [`cosmic_web`]). A
-/// degenerate empty set uploads one zero-length, zero-alpha segment
-/// (rasterizes nothing).
+/// Upload the cosmic ribbon strand records as per-instance vertices
+/// (same origin frame as [`upload_cosmic_glow`], layout from
+/// [`cosmic_web`]). A degenerate empty set uploads one zero-alpha
+/// record (rasterizes nothing — the melt profile zeroes it anyway).
 fn upload_cosmic_braid(
     allocator: &Arc<StandardMemoryAllocator>,
     web: &WebDescriptor,
     seed: u64,
     origin: glam::DVec3,
-) -> Subbuffer<[GlowLineVertex]> {
-    let mut verts: Vec<GlowLineVertex> = game_debug::cosmic_web::braid_segments(web, seed, origin)
+) -> Subbuffer<[StrandVertex]> {
+    let mut verts: Vec<StrandVertex> = game_debug::cosmic_web::strand_records(web, seed, origin)
         .iter()
-        .map(|(pos, rgba)| GlowLineVertex {
-            position: *pos,
-            rgba: *rgba,
+        .map(|r| StrandVertex {
+            rec_a: [r.a[0], r.a[1], r.a[2], r.wander[0] as f32],
+            rec_raw: [
+                r.raw[0] as f32,
+                r.raw[1] as f32,
+                r.raw[2] as f32,
+                r.wander[1] as f32,
+            ],
+            rec_u: [
+                r.u[0] as f32,
+                r.u[1] as f32,
+                r.u[2] as f32,
+                r.twist[0] as f32,
+            ],
+            rec_v: [
+                r.v[0] as f32,
+                r.v[1] as f32,
+                r.v[2] as f32,
+                r.twist[1] as f32,
+            ],
+            rec_mix: [r.twist[2] as f32, r.twist[3] as f32, 0.0, 0.0],
+            rec_rgba: r.rgba,
         })
         .collect();
     if verts.is_empty() {
-        verts.push(GlowLineVertex {
-            position: [0.0, 0.0, 0.0],
-            rgba: [0.0, 0.0, 0.0, 0.0],
-        });
-        verts.push(GlowLineVertex {
-            position: [0.0, 0.0, 0.0],
-            rgba: [0.0, 0.0, 0.0, 0.0],
+        verts.push(StrandVertex {
+            rec_a: [0.0, 0.0, 0.0, 0.0],
+            rec_raw: [0.0, 0.0, 0.0, 0.0],
+            rec_u: [0.0, 0.0, 0.0, 0.0],
+            rec_v: [0.0, 0.0, 0.0, 0.0],
+            rec_mix: [0.0, 0.0, 0.0, 0.0],
+            rec_rgba: [0.0, 0.0, 0.0, 0.0],
         });
     }
     Buffer::from_iter(
@@ -4485,12 +4591,12 @@ struct ViewerApp {
     /// origin, rebuilt on reseed + rebase.
     cosmic_glow: Subbuffer<[MapVertex]>,
     /// Cosmic braid lines (colored LineList, same origin frame).
-    cosmic_braid: Subbuffer<[GlowLineVertex]>,
+    cosmic_braid: Subbuffer<[StrandVertex]>,
     /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
     cosmic_tab_glow: Subbuffer<[MapVertex]>,
     /// Inspector braid lines (fixed web-center origin).
-    cosmic_tab_braid: Subbuffer<[GlowLineVertex]>,
+    cosmic_tab_braid: Subbuffer<[StrandVertex]>,
     /// Inspector player point (one vertex, rebuilt per frame while the
     /// tab shows — the ship moves continuously).
     cosmic_tab_player: Subbuffer<[MapVertex]>,
@@ -4870,19 +4976,32 @@ impl ViewerApp {
     /// record identical draws. Also rebuilds the inspector player
     /// point (the ship moves continuously).
     fn cosmic_frame(&mut self, vp: Rect) -> CosmicFrame {
-        let (mvp, px_scale, is_demo) = if self.debug.screen == Screen::GameDemo {
+        let (mvp, px_scale, is_demo, eye) = if self.debug.screen == Screen::GameDemo {
             let camera = &self.debug.cosmic.camera;
+            // Eye in the demo buffer frame: world truth minus the
+            // upload (rebase) origin the demo buffers share.
+            let eye_w = camera.eye_world();
+            let origin = self.debug.cosmic.upload_origin;
             (
                 camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
                 camera.px_scale(vp.h),
                 true,
+                [
+                    (eye_w.x - origin.x) as f32,
+                    (eye_w.y - origin.y) as f32,
+                    (eye_w.z - origin.z) as f32,
+                ],
             )
         } else {
             let inspector = &self.debug.cosmic_inspector;
+            // Inspector buffers use the web-center (zero) origin, the
+            // same frame the inspector camera's eye is already in.
+            let e = inspector.camera.eye();
             (
                 inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
                 inspector.camera.px_scale(vp.h),
                 false,
+                [e.x, e.y, e.z],
             )
         };
         let (braid, glow) = if is_demo {
@@ -4901,6 +5020,7 @@ impl ViewerApp {
             mvp,
             px_scale,
             is_demo,
+            eye,
             braid,
             glow,
             viewport: Viewport {
@@ -5169,9 +5289,9 @@ impl ViewerApp {
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
             map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
-            web_line: build_webline_pipeline(&self.device, &self.shaders, &render_pass),
+            ribbon: build_ribbon_pipeline(&self.device, &self.shaders, &render_pass),
             glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
-            webline_scene: build_webline_pipeline(&self.device, &self.shaders, &scene_pass),
+            ribbon_scene: build_ribbon_pipeline(&self.device, &self.shaders, &scene_pass),
             bright: build_post_pipeline(
                 &self.device,
                 &self.shaders.bright_frag,
@@ -5320,11 +5440,11 @@ struct Pipelines {
     map: Arc<GraphicsPipeline>,
     /// Cosmic glow sprites (additive, update-2026-09-18-2328).
     map_glow: Arc<GraphicsPipeline>,
-    /// Cosmic braid lines (additive RGBA, update-2026-09-18-2328).
-    web_line: Arc<GraphicsPipeline>,
+    /// Cosmic ribbon filaments (additive instanced, update-2026-09-19-1245).
+    ribbon: Arc<GraphicsPipeline>,
     /// Scene-pass variants of the cosmic pipelines (HDR mode).
     glow_scene: Arc<GraphicsPipeline>,
-    webline_scene: Arc<GraphicsPipeline>,
+    ribbon_scene: Arc<GraphicsPipeline>,
     /// Bloom bright extract (post pass).
     bright: Arc<GraphicsPipeline>,
     /// Separable blur step (post pass, axis via push).
@@ -7020,24 +7140,36 @@ impl ViewerApp {
                 .expect("HDR scene pass must begin")
                 .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
                 .expect("viewport must set")
-                .bind_pipeline_graphics(pipes.webline_scene.clone())
+                .bind_pipeline_graphics(pipes.ribbon_scene.clone())
                 .expect("pipeline must bind")
                 .bind_vertex_buffers(0, frame.braid.clone())
                 .expect("vertex buffer must bind")
                 .push_constants(
-                    pipes.webline_scene.layout().clone(),
+                    pipes.ribbon_scene.layout().clone(),
                     0,
-                    WebLinePush {
+                    RibbonPush {
                         mvp: frame.mvp,
-                        redshift,
+                        eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                        px_scale: frame.px_scale,
                         exposure: line_exposure,
+                        redshift,
+                        width_mpc: RIBBON_HALF_WIDTH_MPC,
+                        subdiv: game_debug::cosmic_web::BRAID_SUBDIVISIONS as f32,
                     },
                 )
-                .expect("webline push constants must upload");
-            // SAFETY: buffer holds exactly the uploaded braid
-            // segments, no index buffer bound.
-            unsafe { builder.draw(frame.braid.len() as u32, 1, 0, 0) }
-                .expect("HDR scene braid draw must record");
+                .expect("ribbon push constants must upload");
+            // SAFETY: per-instance strand records, 6 verts per segment
+            // (two triangles) × subdivisions per strand; instance
+            // count is the record count, no index buffer bound.
+            unsafe {
+                builder.draw(
+                    game_debug::cosmic_web::BRAID_SUBDIVISIONS as u32 * 6,
+                    frame.braid.len() as u32,
+                    0,
+                    0,
+                )
+            }
+            .expect("HDR scene ribbon draw must record");
             builder
                 .bind_pipeline_graphics(pipes.glow_scene.clone())
                 .expect("pipeline must bind")
@@ -7321,28 +7453,40 @@ impl ViewerApp {
                         unsafe { builder.draw(3, 1, 0, 0) }
                             .expect("bloom resolve draw must record");
                     } else {
-                        let (braid_len, glow_len) = (frame.braid.len(), frame.glow.len());
+                        let glow_len = frame.glow.len();
                         builder
                             .set_viewport(0, [viewport].into_iter().collect())
                             .expect("viewport must set")
-                            .bind_pipeline_graphics(ctx.pipelines.web_line.clone())
+                            .bind_pipeline_graphics(ctx.pipelines.ribbon.clone())
                             .expect("pipeline must bind")
                             .bind_vertex_buffers(0, frame.braid.clone())
                             .expect("vertex buffer must bind")
                             .push_constants(
-                                ctx.pipelines.web_line.layout().clone(),
+                                ctx.pipelines.ribbon.layout().clone(),
                                 0,
-                                WebLinePush {
+                                RibbonPush {
                                     mvp: frame.mvp,
-                                    redshift,
+                                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                                    px_scale: frame.px_scale,
                                     exposure: line_exposure,
+                                    redshift,
+                                    width_mpc: RIBBON_HALF_WIDTH_MPC,
+                                    subdiv: game_debug::cosmic_web::BRAID_SUBDIVISIONS as f32,
                                 },
                             )
-                            .expect("webline push constants must upload");
-                        // SAFETY: buffer holds exactly the uploaded braid
-                        // segments, no index buffer bound.
-                        unsafe { builder.draw(braid_len as u32, 1, 0, 0) }
-                            .expect("cosmic braid draw must record");
+                            .expect("ribbon push constants must upload");
+                        // SAFETY: per-instance strand records, 6 verts
+                        // per segment × subdivisions per strand; no
+                        // index buffer bound.
+                        unsafe {
+                            builder.draw(
+                                game_debug::cosmic_web::BRAID_SUBDIVISIONS as u32 * 6,
+                                frame.braid.len() as u32,
+                                0,
+                                0,
+                            )
+                        }
+                        .expect("cosmic ribbon draw must record");
                         builder
                             .bind_pipeline_graphics(ctx.pipelines.map_glow.clone())
                             .expect("pipeline must bind")
@@ -7777,8 +7921,8 @@ mod tests {
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
             (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
             (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
-            (ShaderKind::Vertex, WEBLINE_VERT, "webline vert"),
-            (ShaderKind::Fragment, WEBLINE_FRAG, "webline frag"),
+            (ShaderKind::Vertex, RIBBON_VERT, "ribbon vert"),
+            (ShaderKind::Fragment, RIBBON_FRAG, "ribbon frag"),
         ] {
             if let Err(error) = compile_glsl_to_spirv(kind, source) {
                 panic!("{what} must compile: {error}");
@@ -7793,11 +7937,16 @@ mod tests {
         // vertex-struct fields BY NAME at pipeline creation — naga
         // compilation cannot catch a mismatch, and there is no
         // GPU-free way to run the real check, so the names are pinned
-        // here. `GlowLineVertex { position, rgba }`,
-        // `MapVertex { map_pos, color, misc }`.
+        // here. `StrandVertex { rec_a, rec_raw, rec_u, rec_v,
+        // rec_mix, rec_rgba }` (per-instance), `MapVertex { map_pos,
+        // color, misc }`.
         for (source, name, what) in [
-            (WEBLINE_VERT, "in vec3 position;", "webline position"),
-            (WEBLINE_VERT, "in vec4 rgba;", "webline rgba"),
+            (RIBBON_VERT, "in vec4 rec_a;", "ribbon rec_a"),
+            (RIBBON_VERT, "in vec4 rec_raw;", "ribbon rec_raw"),
+            (RIBBON_VERT, "in vec4 rec_u;", "ribbon rec_u"),
+            (RIBBON_VERT, "in vec4 rec_v;", "ribbon rec_v"),
+            (RIBBON_VERT, "in vec4 rec_mix;", "ribbon rec_mix"),
+            (RIBBON_VERT, "in vec4 rec_rgba;", "ribbon rec_rgba"),
             (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
             (GLOW_VERT, "in vec3 color;", "glow color"),
             (GLOW_VERT, "in vec3 misc;", "glow misc"),
@@ -7816,17 +7965,26 @@ mod tests {
         // exactly zero at the rim (else full quads), and the redshift
         // depth term must be clamped non-negative and capped (else
         // Inf/NaN/negative channels decorrelate into rainbow squares).
+        // The ribbon shader must pin the same redshift clamp, must
+        // guard the camera-facing side normalization, and must hit
+        // zero lateral falloff at the ribbon rims (else full quads).
         // String pins, because neither naga nor any GPU-free test can
         // evaluate the shaders.
         for (source, literal, what) in [
             (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
             (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
             (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
-            (WEBLINE_VERT, "max(clip.w, 0.0)", "webline depth clamp"),
+            (RIBBON_VERT, "max(clipc.w, 0.0)", "ribbon depth clamp"),
+            (RIBBON_VERT, "sl > 1e-10", "ribbon side guard"),
+            (
+                RIBBON_FRAG,
+                "1.0 - v_lat * v_lat",
+                "ribbon rim-zero falloff",
+            ),
         ] {
             assert!(source.contains(literal), "{what} missing from its shader");
         }
-        for source in [GLOW_VERT, WEBLINE_VERT] {
+        for source in [GLOW_VERT, RIBBON_VERT] {
             assert!(
                 source.contains(", 0.5)"),
                 "redshift cap missing from a cosmic vertex shader"
@@ -7858,12 +8016,13 @@ mod tests {
 
     #[test]
     fn cosmic_push_constants_fit_vulkan_floor() {
-        // Update-2026-09-18-2328 blocks: glow (MVP + scale + exposure
-        // + redshift) and webline (MVP + redshift) must stay under the
-        // 128 B Vulkan 1.1 floor on every tier.
+        // Cosmic blocks: glow (MVP + scale + exposure + redshift) and
+        // ribbon (MVP + eye + scale + exposure + redshift + width +
+        // subdiv, 100 B) must stay under the 128 B Vulkan 1.1 floor on
+        // every tier.
         for (bytes, what) in [
             (std::mem::size_of::<GlowPush>(), "GlowPush"),
-            (std::mem::size_of::<WebLinePush>(), "WebLinePush"),
+            (std::mem::size_of::<RibbonPush>(), "RibbonPush"),
         ] {
             assert!(
                 bytes <= 128,

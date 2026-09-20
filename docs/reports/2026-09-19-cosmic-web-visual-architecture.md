@@ -4,6 +4,13 @@
 **Scope:** end-to-end description of how the cosmic web is generated, enriched, and rendered to produce the current visual
 **Status:** reference report — no changes to code
 
+Reference images: [`images/target.jpeg`](images/target.jpeg) (Illustris-style
+goal: gaseous blue filaments, golden-red hubs, dark voids) vs.
+[`images/current.png`](images/current.png) (this build after
+update-2026-09-19-1933). Remaining known gap: filament *thickness* —
+1-px strands, volumetric ribbons are planned in
+`plans/v0.3.2/cosmic-scale-player/update-2026-09-19-1245`.
+
 ---
 
 ## 1. Overview
@@ -114,26 +121,30 @@ The base descriptor is enriched with three deterministic visual layers.
 These are render-only — they never feed back into selection, flight,
 or saves.
 
-### 3a. Braided filament strands (`braid_segments`)
+### 3a. Ribbon filament strands (`strand_records`)
 
-Each filament link gets 1-3 strands (by density) twisting around the
-link trunk:
+Each filament link gets 1-3 strand records (by density) expanded
+on-GPU into camera-facing ribbon quads (update-2026-09-19-1245 P1 —
+the 1-px `LineList` wireframe is retired):
 
-- **10 subdivisions** per strand, polyline segments.
-- **Shared trunk wander**: low-frequency sinusoidal wobble that all
-  strands of a link follow (phase, amplitude from seeded RNG).
-- **Per-strand twist**: sinusoidal orbit around the trunk with
-  random phase, windings (1-2), and lateral mix.
-- **Taper**: `sin(t * Pi)` so strands melt to zero at node endpoints,
-  creating smooth transitions into cluster hubs.
-- **Lateral amplitude**: ~1.5 Mpc (`BRAID_AMPLITUDE_MPC`).
-- **Colors** (update-2026-09-19-1933): dim indigo `[0.18, 0.22, 0.60]`
-  at low density grading to bright blue-violet `[0.48, 0.57, 1.95]` at
-  full density — the blue channel sits past the bloom threshold after
-  premultiplication so dense filaments glow.
-- **Alpha**: 0.05-1.00 by density (floor dropped from 0.18 in
-  update-2026-09-19-1933 so voids read dark), multiplied by √taper
-  (not taper directly).
+- **Record**: root `a`, trunk `raw`, lateral basis `(u, v)`, wander
+  `(phase, amplitude)`, twist `(phase, windings, mix_u, mix_v)`,
+  link `rgba` — 96 B, ~3.8 MB for the nominal web (was ~34 MB of
+  baked line verts per surface).
+- **Expansion**: one instance per strand, 6 verts per segment × 10
+  subdivisions; the vertex shader evaluates the same `braid_point`
+  math (trunk + shared wander + per-strand twist, sinusoidal, tapered
+  to the hubs) the grain pass reuses — ~1.2M tris total.
+- **Camera-facing**: ribbon side = segment × view axis
+  (guarded normalization), world-space half-width 0.75 Mpc with a
+  1.5-px minimum, width × melt profile melting into the hubs.
+- **Near-eye fade**: smoothstep 1→6 Mpc on eye-to-midpoint distance
+  (the player spawns inside a filament).
+- **Colors**: dim indigo `[0.18, 0.22, 0.60]` at low density grading
+  to bright blue-violet `[0.48, 0.57, 1.95]` at full density, warmed
+  toward amber near hub endpoints in-shader.
+- **Alpha**: 0.05-1.00 by density, × melt profile × per-surface
+  exposure × near-fade.
 
 ### 3b. Particulate grain (`grain_cloud`)
 
@@ -148,27 +159,35 @@ Up to 800,000 sprite points along the braid strands:
 
 ### 3c. Node impostors (`node_impostors`)
 
-Two sprites per node:
+Three layered sprites per node (update-2026-09-19-1245: a white
+pinpoint added so cluster light varies white→gold→amber like the
+target, instead of one flat gold):
 
-- **Hot core**: mass-graded emissive color (blue-white dwarfs to
-  golden giants, RGB from `[0.60, 0.68, 1.00]` to `[1.00, 0.88, 0.62]`
-  via the shared `mass_level` ramp — re-centered 1e12–3e14 M☉ in
-  update-2026-09-19-1933 so ordinary cluster hubs read golden),
-  multiplied by emissive factor 1.5-5.0x to cross the bloom threshold.
-  Fixed pixel size (3-12 px — big enough that the blur chain keeps a
-  visible halo). This is the bloom target — the bright cores produce
-  the soft glow halos.
-- **Soft halo**: mass-warmed cyan→gold, faint (alpha 0.14-0.24 by
-  mass), world-sized in Mpc (3-8 Mpc diameter based on the same
+- **White pinpoint**: near-white `[1.05, 1.00, 0.95]` × (1.2-3.2x),
+  smallest (1.5-3.5 px), fixed pixel size. Dwarfs read blue-white
+  through the falloff, giants white-gold.
+- **Golden mid core**: mass-graded emissive color (blue-white dwarfs
+  `[0.60, 0.68, 1.00]` to deep-golden giants `[1.00, 0.82, 0.50]`
+  via the shared `mass_level` ramp, 1e12.3–1e15 M☉ — small hubs stay
+  blue-white), multiplied by emissive factor 1.5-5.0x to cross the
+  bloom threshold. Fixed pixel size (3-12 px — big enough that the
+  blur chain keeps a visible halo). This is the bloom target.
+- **Soft halo**: cyan→amber by mass, faint (alpha 0.12-0.20),
+  world-sized in Mpc (2.5-6 Mpc diameter based on the same
   `mass_level` grade — `node_impostors` never reads
-  `virial_radius_mpc`). Shrinks with distance.
+  `virial_radius_mpc`). Shrinks with distance. Band narrowed from
+  3-8 Mpc in the second pass so near-camera halos hit the 256 px
+  point-size clamp as a smaller, dimmer smudge (real fix: quad
+  impostors in the ribbon update).
 
-### 3d. Base descriptor glow (`glow_point_cloud`)
+### 3d. Base descriptor glow (`glow_point_cloud`) — the gas veil
 
-Dwarf glow points from the descriptor: lavender `[0.55, 0.54, 0.90]`,
-1.5 px, alpha 0.09 (lowered from 0.12 in update-2026-09-19-1933 for
-void-darkness headroom). These fill the filament bodies with a dim
-particulate haze.
+Dwarf glow points from the descriptor, reworked in the second pass of
+update-2026-09-19-1933 from fixed-pixel specks to a **gas veil**:
+world-sized soft sprites (2.8 Mpc diameter, kind 1) in faint blue
+`[0.45, 0.50, 1.00]`, alpha 0.045. They hug the links (the descriptor
+emits glow along filaments only, never in voids), so filaments sit in
+a volumetric-looking mist like the target reference.
 
 ---
 
@@ -177,13 +196,13 @@ particulate haze.
 ### Pipelines (in `crates/debug/src/main.rs`)
 
 Three pipeline types (five compiled objects — LDR + HDR scene variants
-for Glow and Webline, shared Map). Glow and Webline are additive;
+for Glow and Ribbon, shared Map). Glow and Ribbon are additive;
 Map is standard alpha:
 
 | Pipeline | Topology | Blend | Role |
 |----------|----------|-------|------|
-| **Glow** | `PointList` | additive (`SrcColor=One, DstColor=One`) | Grain, dwarf glow, node cores + halos |
-| **Webline** | `LineList` | additive | Braid filament strands |
+| **Glow** | `PointList` | additive (`SrcColor=One, DstColor=One`) | Grain, gas veil, node cores + halos |
+| **Ribbon** | `TriangleList` (instanced strand records) | additive | Filament tubes (Gaussian lateral falloff) |
 | **Map** | `PointList` | standard alpha | Inspector player marker |
 
 All cosmic pipelines use **no depth write** — overlapping sprites and
@@ -197,14 +216,14 @@ hubs survive at depth; safety clamps unchanged):
 
 ```
 z = min(redshift * max(clip.w, 0), 0.5)
-tint = (1 + 0.55*z, 1, 1/(1 + 0.7*z))
+tint = (1 + 0.75*z, 1, 1/(1 + 0.7*z))
 dimming = 1/(1 + 0.45*z)
 ```
 
 This makes distant structures progressively redder and dimmer, providing
 depth cueing without a volumetric pass. Both shaders also take a
-per-surface **alpha exposure** multiplier (`WebLinePush.exposure` added
-in update-2026-09-19-1933; `GlowPush.exposure` pre-existing): the
+per-surface **alpha exposure** multiplier (`RibbonPush.exposure`
+scales ribbon alpha; `GlowPush.exposure` pre-exists): the
 zoomed-out inspector stacks ~50 strands per pixel where the immersive
 demo stacks a few, so the two surfaces grade independently
 (`COSMIC_MAP_*` vs `COSMIC_DEMO_*` consts in `main.rs`).
@@ -289,13 +308,13 @@ swapchain (no bloom, no tonemap).
 | Element | Color | Notes |
 |---------|-------|-------|
 | Background/clear | `[0.008, 0.005, 0.024]` | Near-black violet |
-| Filament strands (low density) | `[0.18, 0.22, 0.60]`, alpha 0.05 | Dim indigo, recedes into voids |
-| Filament strands (high density) | `[0.48, 0.57, 1.95]`, alpha 1.0 | Blue-violet, blooms |
+| Filament ribbons (low density) | `[0.18, 0.22, 0.60]`, alpha 0.05 | Dim indigo, recedes into voids |
+| Filament ribbons (high density) | `[0.48, 0.57, 1.95]`, alpha 1.0 | Blue-violet tubes, bloom; warms amber near hubs |
+| Gas veil (dwarf glow) | `[0.45, 0.50, 1.00]`, 2.8 Mpc | Alpha 0.045, world-sized mist |
 | Grain particles | lavender-white, alpha 0.08 | Brightness 0.35-0.9 |
-| Dwarf glow points | `[0.55, 0.54, 0.90]` | Alpha 0.09 |
-| Node cores (dwarfs) | `[0.60, 0.68, 1.00]` | Blue-white, emissive x1.5 |
-| Node cores (giants) | `[1.00, 0.88, 0.62]` | Golden, emissive x5.0 |
-| Node halos | cyan→gold by mass | Alpha 0.14-0.24, world-sized |
+| Node pinpoints | `[1.05, 1.00, 0.95]` × 1.2-3.2 | Near-white, 1.5-3.5 px |
+| Node cores, dwarfs → giants | `[0.60, 0.68, 1.00]` → `[1.00, 0.82, 0.50]` | Blue-white → deep gold, emissive x1.5-5.0 |
+| Node halos | cyan→amber by mass | Alpha 0.12-0.20, 2.5-6 Mpc world-sized |
 
 (Palette values current as of update-2026-09-19-1933.)
 
@@ -355,17 +374,27 @@ swapchain (no bloom, no tonemap).
 - **No depth occlusion**: depth test with writes off and nothing writing
   depth; distant node cores shine through foreground filaments. Combined
   with saturation, depth ordering beyond 250 Mpc collapses.
-- **gl_PointSize clamp at 256 px** (`main.rs:396`): near-camera
-  world-sized halos saturate silently.
-- **Zero culling / LOD**: ~2.18 M vertices and ~1 M additive sprites
+- **gl_PointSize clamp at 256 px** (glow shader): near-camera
+  world-sized halos saturate silently (mitigated by the narrowed
+  2.5–6 Mpc band; real fix = P2 quad impostors).
+- **Zero culling / LOD**: ~2.4M ribbon verts and ~1M additive sprites
   are drawn every frame regardless of camera distance or frustum.
-- **Braid vertex duplication**: LineList emits 20 verts/strand vs 11
-  for a strip (+82% vertex traffic on 1.22 M braid verts).
+- **Ribbon vertex cost**: the ribbon shader evaluates ~12
+  `braid_point` calls per segment (~600 trig/strand, ~24M/frame at
+  full draw) — measured fine on UHD 620 (60/59.5 fps debug at
+  1296×759), but headroom is thin. Fallbacks, in order: cut
+  `BRAID_SUBDIVISIONS` 10→6-8, draw indexed (22 unique verts/strand
+  vs 60 expanded), distance strand culling (P5 LOD).
+- **Near-eye ribbon slabs**: fixed by the 1→6 Mpc eye fade
+  (update-2026-09-19-1245 P1) — unfaded camera-adjacent ribbons fill
+  the screen white.
 - **Env kill-switches**: `GAME_DEBUG_COSMIC_POST=0` forces LDR;
   `GAME_DEBUG_COSMIC_BLOOM=0` keeps HDR scene but skips blur chain
   (`main.rs:5115-5117`). Present in code, not previously documented.
-- **Dual buffer sets**: ~137 MB resident (demo + inspector), inspector
-  rebuilt redundantly on every demo rebase (`main.rs:4806-4831`).
+- **Dual buffer sets**: ~100 MB resident (demo + inspector; braid
+  dropped ~34 MB → ~4 MB with strand records, glow/grain unchanged),
+  inspector rebuilt redundantly on every demo rebase
+  (`main.rs:refresh_cosmic`).
 - **Player marker**: 1-vertex `Buffer::from_iter` allocated every frame
   (`main.rs:4861-4864`).
 
@@ -417,13 +446,15 @@ swapchain (no bloom, no tonemap).
 
 > The cosmic web is a **seeded Zel'dovich perturbation** on a 128^3
 > lattice producing ~6000 nodes + ~20000 filament links, enriched with
-> **braided strand polylines** (1-3 per link, sinusoidal twist, tapered
-> at endpoints), **particulate grain** (~800K sprites), and **emissive
-> node impostors** (bloom-target cores + world-sized halos). Rendered
-> through **additive point/line pipelines** on a deep indigo clear,
-> with **HDR bloom** (bright extract + 2-scale separable Gaussian blur +
-> ACES resolve, five dedicated write-once targets) and **Hubble redshift
-> tinting** in the vertex shader. Generation replays identically per
+> **ribbon strand records** (1-3 per link, expanded on-GPU into
+> camera-facing tubes with Gaussian falloff), **particulate grain**
+> (~800K sprites), a **gas veil** (world-sized mist sprites), and
+> **3-layer node impostors** (white pinpoint + gold core + amber
+> halo). Rendered through **additive ribbon/triangle + point
+> pipelines** on a deep indigo clear, with **HDR bloom** (bright
+> extract + 2-scale separable Gaussian blur + ACES resolve, five
+> dedicated write-once targets) and **Hubble redshift tinting** in
+> the vertex shader. Generation replays identically per
 > `(seed, version, params)` on every platform (hash quantized to hide
 > 1-ulp libm drift). Enrichment is render-only, uses std sin/cos (same-
 > platform replay only, not cross-platform bit-identical), and never

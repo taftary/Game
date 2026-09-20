@@ -8,7 +8,7 @@
 //!
 //! This module also owns the CPU-side vertex layout both 3D surfaces
 //! share ([`node_point_cloud`], [`link_segments`], [`glow_point_cloud`]
-//! plus the cinematic enrichment layer [`braid_segments`],
+//! plus the cinematic enrichment layer [`strand_records`],
 //! [`grain_cloud`], [`node_impostors`]): one source of truth for
 //! positions (origin-relative Mpc f32), colors, and sprite sizes. The
 //! binary maps the tuples onto its GPU vertex types at upload.
@@ -108,21 +108,20 @@ impl Default for CosmicWebInspector {
 }
 
 /// Shared mass→[0,1] grading level for every node visual (color,
-/// size, emissive): 1e12 M☉ → 0, ~3e14 M☉ → 1. Re-centered in
-/// update-2026-09-19-1933 (was 1e12.7–1e15.4): the target reference
-/// reads golden at ordinary cluster hubs (~1e14), not only at the
-/// rarest giants, so the warm ramp must start earlier.
+/// size, emissive): 1e12.3 M☉ → 0, 1e15 M☉ → 1. Small hubs stay
+/// blue-white; only ≥1e14 M☉ clusters go golden (target's varied
+/// cluster light, not one flat gold).
 fn mass_level(mass_msun: f64) -> f32 {
-    ((mass_msun.log10() - 12.0) / 2.5).clamp(0.0, 1.0) as f32
+    ((mass_msun.log10() - 12.3) / 2.7).clamp(0.0, 1.0) as f32
 }
 
-/// Mass-graded node tint: blue-white dwarfs → golden giants (the
+/// Mass-graded node tint: blue-white dwarfs → deep golden giants (the
 /// gold end deepened in update-2026-09-19-1933 so massive hubs read
-/// like the target reference, not pale yellow).
+/// like the target reference — orange-gold, not pale yellow).
 /// Shared by the demo and inspector uploads (one palette, two surfaces).
 pub fn node_color(mass_msun: f64) -> [f32; 3] {
     let l = mass_level(mass_msun);
-    [0.60 + 0.40 * l, 0.68 + 0.20 * l, 1.00 - 0.38 * l]
+    [0.60 + 0.40 * l, 0.68 + 0.14 * l, 1.00 - 0.50 * l]
 }
 
 /// Node pixel size from mass (2–5 px sprite floor for legibility).
@@ -149,10 +148,13 @@ pub fn node_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f
         .collect()
 }
 
-/// Dwarf glow points as tuples (`misc = (1.5 px, 0.09 alpha, kind
-/// 0)` — dim filament body; the additive chain saturates fast, so
-/// alphas stay small by design and were lowered further in
-/// update-2026-09-19-1933 so sparse regions let voids read dark).
+/// Dwarf glow points as tuples — the **gas veil**
+/// (update-2026-09-19-1933, second pass): world-sized soft sprites
+/// (`misc = (2.8 Mpc diameter, 0.045 alpha, kind 1)`) hugging the
+/// descriptor's glow positions along the links, so filaments sit in a
+/// faint blue mist like the target reference instead of on bare
+/// black. Alpha stays tiny: the additive chain saturates fast, and
+/// the points never enter voids (they emit along links only).
 pub fn glow_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     web.glow_mpc
         .iter()
@@ -163,8 +165,8 @@ pub fn glow_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f
                     (f64::from(g[1]) - origin.y) as f32,
                     (f64::from(g[2]) - origin.z) as f32,
                 ],
-                [0.55, 0.54, 0.90],
-                [1.5, 0.09, 0.0],
+                [0.45, 0.50, 1.00],
+                [2.8, 0.045, 1.0],
             )
         })
         .collect()
@@ -295,8 +297,8 @@ fn braid_point(
 
 /// One link's full braid shape: lateral basis, shared trunk wander,
 /// and the strand parameters. Derived from a per-link sub-stream keyed
-/// by the canonical endpoint pair (`seed ^ (a << 32 | b)`), so the line
-/// pass ([`braid_segments`]) and the grain pass ([`grain_cloud`])
+/// by the canonical endpoint pair (`seed ^ (a << 32 | b)`), so the
+/// ribbon pass ([`strand_records`]) and the grain pass ([`grain_cloud`])
 /// derive identical strands independently — no shared stream state,
 /// no cross-link coupling, replay-identical per (seed, link).
 struct BraidShape {
@@ -341,12 +343,40 @@ fn braid_shape(seed: u64, link: &WebLink, pa: [f64; 3], pb: [f64; 3]) -> BraidSh
     }
 }
 
-/// Braided filament strands as flattened `(position, rgba)` endpoint
-/// pairs (origin-relative Mpc f32) for an additive colored-`LineList`
-/// pipeline. Strand count follows link density (1–3); color grades
-/// from dim indigo (faint) to bright cyan-violet (dense) with alpha
-/// melting into the endpoint nodes.
-pub fn braid_segments(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<([f32; 3], [f32; 4])> {
+/// One braid strand's GPU-expansion record
+/// (`update-2026-09-19-1245` P1): everything the ribbon vertex shader
+/// needs to rebuild the strand — same [`braid_shape`] derivation the
+/// grain pass uses, so grain still textures the drawn ribbons.
+/// Compact (~100 B/strand, ~4 MB for the nominal web) vs the retired
+/// baked `braid_segments` (~34 MB of `LineList` vertices per
+/// surface). Origin-relative `a` only; trunk/basis/wander are
+/// translation-invariant. `rgba` is the link-level density color at
+/// mid-strand — the shader applies endpoint warming, redshift, and
+/// the melt profile per vertex.
+pub struct StrandRecord {
+    /// Strand start = node `a` position, origin-relative Mpc f32.
+    pub a: [f32; 3],
+    /// Trunk vector `pb − pa`, Mpc f64 precision for shader replay.
+    pub raw: [f64; 3],
+    /// Lateral basis (orthonormal-adjacent), unit f64.
+    pub u: [f64; 3],
+    /// Lateral basis, unit f64.
+    pub v: [f64; 3],
+    /// Shared trunk wander: phase (rad), amplitude (Mpc).
+    pub wander: [f64; 2],
+    /// Strand twist: phase (rad), windings, lateral mix_u, mix_v.
+    pub twist: [f64; 4],
+    /// Link-level color (density ramp) + mid-strand alpha.
+    pub rgba: [f32; 4],
+}
+
+/// Braided filament strands as compact per-strand records
+/// (origin-relative Mpc f32 where it matters) for the instanced
+/// ribbon pipeline. Strand count follows link density (1–3); the
+/// density palette grades from dim indigo (faint) to blue-violet
+/// past the bloom threshold (dense), alpha melting into the endpoint
+/// nodes (the shader's melt profile, not baked here).
+pub fn strand_records(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<StrandRecord> {
     let mut out = Vec::new();
     for link in &web.links {
         let pa = web.nodes[link.a as usize].position_mpc;
@@ -354,46 +384,29 @@ pub fn braid_segments(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<([f3
         let raw = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
         let shape = braid_shape(seed, link, pa, pb);
         let density = f64::from(link.density);
-        // Filament palette (update-2026-09-19-1933): dim indigo →
-        // bright blue-violet by density. Dense strands premultiply to
-        // ~1.7 in blue — well past the bloom threshold (1.0), because
-        // the blur chain keeps only ~1/4 of a 1-px line's over-
-        // threshold energy: crossings and dense links bloom hard,
-        // mid-density stays crisp, faint links sink to backdrop level
-        // so voids read dark. Bands pinned by the enrichment tests:
-        // rgb ≤ 2.0, monotonic in density.
+        // Filament palette: dim indigo → bright blue-violet by
+        // density. Bands pinned by the enrichment tests: rgb ≤ 2.0,
+        // monotonic in density, alpha ≤ 1.0.
         let rgb = [
             0.18 + 0.30 * density,
             0.22 + 0.35 * density,
             0.60 + 1.35 * density,
         ];
-        // Alpha floor near zero: dozens of strands cross per pixel and
-        // the additive chain saturates fast, so low-density links must
-        // start almost invisible or voids never darken. The high
-        // ceiling is what pushes dense strands past the bloom
-        // threshold (premult = rgb × alpha = 1.95 in blue at d = 1).
         let alpha = 0.05 + 0.95 * density;
         for strand in &shape.strands {
-            for s in 0..BRAID_SUBDIVISIONS {
-                for end in [s, s + 1] {
-                    let t = end as f64 / BRAID_SUBDIVISIONS as f64;
-                    let p = braid_point(pa, raw, shape.u, shape.v, &shape.wander, strand, t);
-                    let melt = (std::f64::consts::PI * t).sin().sqrt().max(0.0);
-                    out.push((
-                        [
-                            (p[0] - origin.x) as f32,
-                            (p[1] - origin.y) as f32,
-                            (p[2] - origin.z) as f32,
-                        ],
-                        [
-                            rgb[0] as f32,
-                            rgb[1] as f32,
-                            rgb[2] as f32,
-                            (alpha * melt) as f32,
-                        ],
-                    ));
-                }
-            }
+            out.push(StrandRecord {
+                a: [
+                    (pa[0] - origin.x) as f32,
+                    (pa[1] - origin.y) as f32,
+                    (pa[2] - origin.z) as f32,
+                ],
+                raw,
+                u: shape.u,
+                v: shape.v,
+                wander: [shape.wander.phase, shape.wander.amplitude],
+                twist: [strand.phase, strand.windings, strand.mix_u, strand.mix_v],
+                rgba: [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, alpha as f32],
+            });
         }
     }
     out
@@ -484,15 +497,17 @@ pub fn grain_cloud(
     out
 }
 
-/// Node impostors as `(position, color, misc)` tuples: two sprites per
-/// node — an emissive hot core (channels > 1.0, mass-graded, the bloom
-/// threshold's target; `kind` 0 = fixed pixel size) plus a soft
-/// pale-cyan halo (`kind` 1 = world-unit diameter in Mpc, so it
-/// shrinks with distance instead of plastering fixed-size quads over
-/// the whole web — the visual-issue fix). Pure function of node
-/// mass/position (no RNG): same node → same impostors, everywhere.
+/// Node impostors as `(position, color, misc)` tuples: three sprites
+/// per node — a white-hot pinpoint core (near-white, fixed pixel
+/// size), the mass-graded golden mid core (emissive, the bloom
+/// threshold's target), plus a soft amber halo (`kind` 1 =
+/// world-unit diameter in Mpc, so it shrinks with distance instead of
+/// plastering fixed-size quads over the whole web). Layered like the
+/// target's cluster light (white center → gold → red-amber edge)
+/// instead of one flat gold. Pure function of node mass/position (no
+/// RNG): same node → same impostors, everywhere.
 pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-    let mut out = Vec::with_capacity(web.nodes.len() * 2);
+    let mut out = Vec::with_capacity(web.nodes.len() * 3);
     for node in &web.nodes {
         let l = mass_level(node.mass_msun);
         let pos = [
@@ -501,33 +516,34 @@ pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32
             (node.position_mpc[2] - origin.z) as f32,
         ];
         let base = node_color(node.mass_msun);
-        // Emissive enough to cross the bloom threshold (1.0) without
-        // flooding the additive chain. Mass-stratified and pushed hard
-        // (update-2026-09-19-1933): giants reach the 5.0 test band max
-        // with big fixed-px cores, because the half-res blur chain
-        // dilutes point sources ~1/(2πσ²) — only large, very bright
-        // cores survive the chain as visible golden blooms (max
-        // channel 1.0 × 5.0 = 5.0 band).
+        // White-hot pinpoint: near-white at every mass (dwarfs read
+        // blue-white through the falloff, giants white-gold), fixed
+        // pixel size, emissive. Band-checked: 1.05 × 3.2 ≤ 5.0.
+        let pin = 1.2 + 2.0 * l;
+        out.push((
+            pos,
+            [1.05 * pin, 1.00 * pin, 0.95 * pin],
+            [1.5 + 2.0 * l, 1.0, 0.0],
+        ));
+        // Golden mid core: mass-graded, emissive (1.5–5.0x), fixed
+        // pixel size (3–12 px — big enough that the bloom chain keeps
+        // a visible halo).
         let emissive = 1.5 + 3.5 * l;
-        // Hot core: near-white, emissive, fixed pixel size (3–12 px —
-        // big enough for the bloom chain to keep a visible halo).
         out.push((
             pos,
             [base[0] * emissive, base[1] * emissive, base[2] * emissive],
             [3.0 + 9.0 * l, 1.0, 0.0],
         ));
-        // Halo: large, faint, world-sized (Mpc diameter). Cool cyan
-        // for dwarfs warming toward gold for giants
-        // (update-2026-09-19-1933); alpha lifts with mass so cluster
-        // hubs glow wider. Diameter stays in the pinned 2–8 Mpc band.
+        // Halo: large, faint, world-sized (2.5–6 Mpc diameter), cool
+        // cyan for dwarfs warming to amber for giants.
         out.push((
             pos,
             [
-                (0.55 + 0.30 * l) * (0.5 + 0.5 * l),
-                (0.72 + 0.10 * l) * (0.5 + 0.5 * l),
-                (1.00 - 0.25 * l) * (0.5 + 0.5 * l),
+                (0.60 + 0.40 * l) * (0.5 + 0.5 * l),
+                (0.68 - 0.05 * l) * (0.5 + 0.5 * l),
+                (0.95 - 0.45 * l) * (0.5 + 0.5 * l),
             ],
-            [3.0 + 5.0 * l, 0.14 + 0.10 * l, 1.0],
+            [2.5 + 3.5 * l, 0.12 + 0.08 * l, 1.0],
         ));
     }
     out
@@ -647,79 +663,74 @@ mod tests {
     }
 
     #[test]
-    fn braid_strand_counts_follow_density() {
-        // Dense link → 3 strands, faint link → 1 strand; each strand
-        // emits 2 verts per subdivision.
-        let braided = braid_segments(&toy_web(), 7, DVec3::ZERO);
-        assert_eq!(braided.len(), (3 + 1) * 2 * BRAID_SUBDIVISIONS);
-        // The dense link's strands actually leave the trunk: some
-        // midpoint vert sits laterally off the segment.
-        let dense: Vec<[f32; 3]> = braided
+    fn strand_record_counts_follow_density() {
+        // Dense link → 3 records, faint link → 1 record; the two
+        // toy links have orthogonal trunks so records split by `raw`.
+        let records = strand_records(&toy_web(), 7, DVec3::ZERO);
+        assert_eq!(records.len(), 3 + 1);
+        let dense = records
             .iter()
-            .take(3 * 2 * BRAID_SUBDIVISIONS)
-            .map(|v| v.0)
-            .collect();
-        let lateral = dense
+            .filter(|r| (r.raw[0] - 30.0).abs() < 1e-6)
+            .count();
+        let faint = records
             .iter()
-            .map(|p| (p[1] * p[1] + p[2] * p[2]).sqrt())
-            .fold(0.0_f32, f32::max);
-        assert!(
-            lateral > 1e-6 && lateral <= 2.0 * BRAID_AMPLITUDE_MPC as f32,
-            "braid must leave the trunk within its amplitude bound: {lateral}"
-        );
+            .filter(|r| (r.raw[1] - 40.0).abs() < 1e-6)
+            .count();
+        assert_eq!((dense, faint), (3, 1));
     }
 
     #[test]
-    fn braid_replays_identically_and_tapers_at_endpoints() {
+    fn strand_records_replay_identically_and_start_at_node_a() {
         let web = toy_web();
-        let a = braid_segments(&web, 7, DVec3::ZERO);
-        let b = braid_segments(&web, 7, DVec3::ZERO);
-        assert_eq!(a, b);
-        // Endpoints melt into the nodes: the first vert of each strand
-        // sits on node `a` (taper = 0 at t = 0).
-        assert!((a[0].0[0]).abs() < 1e-3 && (a[0].0[1]).abs() < 1e-3 && (a[0].0[2]).abs() < 1e-3);
-        // Every vert stays within the amplitude bound of its segment.
-        let segs = [
-            ([0.0, 0.0, 0.0], [30.0, 0.0, 0.0]),
-            ([0.0, 0.0, 0.0], [0.0, 40.0, 0.0]),
-        ];
-        for (pos, _) in &a {
-            let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
-            let near = segs.iter().any(|(s, e)| {
-                let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
-                let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                let t = ((p[0] - s[0]) * d[0] + (p[1] - s[1]) * d[1] + (p[2] - s[2]) * d[2]) / l2;
-                let t = t.clamp(0.0, 1.0);
-                let q = [s[0] + d[0] * t, s[1] + d[1] * t, s[2] + d[2] * t];
-                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
-                    <= 2.0 * BRAID_AMPLITUDE_MPC + 1e-3
-            });
-            assert!(near, "braid vert drifted off every segment: {p:?}");
+        // a[0] sits on node 0 (taper = 0 at t = 0 puts the ribbon
+        // root exactly on the hub).
+        let first = &strand_records(&web, 7, DVec3::ZERO)[0];
+        assert!((f64::from(first.a[0])).abs() < 1e-3);
+        assert!((f64::from(first.a[1])).abs() < 1e-3);
+        assert!((f64::from(first.a[2])).abs() < 1e-3);
+        // CPU-side shape bound (the GPU expands the same braid
+        // math): mid-strand stays within the amplitude bound.
+        for link in &web.links {
+            let pa = web.nodes[link.a as usize].position_mpc;
+            let pb = web.nodes[link.b as usize].position_mpc;
+            let raw = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let shape = braid_shape(7, link, pa, pb);
+            for strand in &shape.strands {
+                let p = braid_point(pa, raw, shape.u, shape.v, &shape.wander, strand, 0.5);
+                let lateral = ((p[0] - (pa[0] + raw[0] * 0.5)).powi(2)
+                    + (p[1] - (pa[1] + raw[1] * 0.5)).powi(2)
+                    + (p[2] - (pa[2] + raw[2] * 0.5)).powi(2))
+                .sqrt();
+                assert!(
+                    lateral <= 2.0 * BRAID_AMPLITUDE_MPC + 1e-3,
+                    "braid shape escaped its amplitude bound: {lateral}"
+                );
+            }
         }
     }
 
     #[test]
-    fn braid_colors_grade_with_density() {
-        // Mean endpoint color of the dense link must beat the faint
-        // link on every channel (same melt schedule both sides).
-        let braided = braid_segments(&toy_web(), 7, DVec3::ZERO);
-        let mean = |verts: &[([f32; 3], [f32; 4])]| {
-            let mut acc = [0.0_f64; 4];
-            for v in verts {
-                for (channel, sum) in acc.iter_mut().enumerate() {
-                    *sum += f64::from(v.1[channel]);
-                }
+    fn strand_record_colors_grade_with_density() {
+        // Every dense-link record must beat every faint-link record on
+        // every channel (records carry the link-level palette; the
+        // shader only re-scales it by the melt profile).
+        let records = strand_records(&toy_web(), 7, DVec3::ZERO);
+        let dense: Vec<&StrandRecord> = records
+            .iter()
+            .filter(|r| (r.raw[0] - 30.0).abs() < 1e-6)
+            .collect();
+        let faint: Vec<&StrandRecord> = records
+            .iter()
+            .filter(|r| (r.raw[1] - 40.0).abs() < 1e-6)
+            .collect();
+        assert_eq!((dense.len(), faint.len()), (3, 1));
+        for d in &dense {
+            for c in 0..4 {
+                assert!(
+                    d.rgba[c] > faint[0].rgba[c],
+                    "dense record must outshine faint on channel {c}"
+                );
             }
-            let n = verts.len() as f64;
-            [acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n]
-        };
-        let dense = mean(&braided[..3 * 2 * BRAID_SUBDIVISIONS]);
-        let faint = mean(&braided[3 * 2 * BRAID_SUBDIVISIONS..]);
-        for c in 0..4 {
-            assert!(
-                dense[c] > faint[c],
-                "dense link must outshine faint on channel {c}: {dense:?} vs {faint:?}"
-            );
         }
     }
 
@@ -765,51 +776,62 @@ mod tests {
     }
 
     #[test]
-    fn impostors_emit_core_and_halo_per_node() {
+    fn impostors_emit_three_layered_sprites_per_node() {
         let web = toy_web();
         let impostors = node_impostors(&web, DVec3::ZERO);
-        assert_eq!(impostors.len(), web.nodes.len() * 2);
+        assert_eq!(impostors.len(), web.nodes.len() * 3);
         for i in 0..web.nodes.len() {
-            let (core, halo) = (&impostors[2 * i], &impostors[2 * i + 1]);
-            // Same position (the hub).
-            assert_eq!(core.0, halo.0);
-            // Core is emissive (bloom target), fixed pixel size, fully
-            // opaque; halo is world-sized (kind 1, Mpc) and fainter.
-            assert!(
-                core.1.iter().any(|c| *c > 1.0),
-                "core must be emissive: {:?}",
-                core.1
+            let (pin, mid, halo) = (
+                &impostors[3 * i],
+                &impostors[3 * i + 1],
+                &impostors[3 * i + 2],
             );
-            assert_eq!(core.2[2], 0.0, "core must be pixel-sized");
+            // Same position (the hub).
+            assert_eq!(pin.0, mid.0);
+            assert_eq!(mid.0, halo.0);
+            // White pinpoint: near-white, smallest, fixed pixel size.
+            assert!(pin.1[0] >= pin.1[1] && pin.1[1] >= pin.1[2] - 1e-6);
+            assert!(pin.2[0] < mid.2[0], "pinpoint must be smallest");
+            assert_eq!(pin.2[2], 0.0, "pinpoint must be pixel-sized");
+            // Golden mid core: emissive (a channel > 1.0), fixed pixel
+            // size; halo is world-sized (kind 1, Mpc) and fainter.
+            assert!(
+                mid.1.iter().any(|c| *c > 1.0),
+                "mid core must be emissive: {:?}",
+                mid.1
+            );
+            assert_eq!(mid.2[2], 0.0, "mid core must be pixel-sized");
             assert_eq!(halo.2[2], 1.0, "halo must be world-sized");
             assert!(
                 (2.0..=8.0).contains(&halo.2[0]),
                 "halo world diameter out of band: {}",
                 halo.2[0]
             );
-            assert!(halo.2[1] < core.2[1], "halo must be fainter");
+            assert!(halo.2[1] < mid.2[1], "halo must be fainter");
         }
-        // Mass grading: the 1e15 node outshines the 5e12 node.
-        let heavy = impostors[0].1;
-        let light = impostors[2].1;
+        // Mass grading: the 1e15 node outshines the 5e12 node on the
+        // mid core's every channel.
+        let heavy = impostors[1].1;
+        let light = impostors[4].1;
         for c in 0..3 {
-            assert!(heavy[c] > light[c], "heavy core must outshine light");
+            assert!(heavy[c] > light[c], "heavy mid core must outshine light");
         }
     }
 
     #[test]
     fn enrichment_layouts_are_origin_relative() {
         // Rebase invariant for the new layouts: shifting the origin
-        // shifts every point by exactly the delta (demo rebase-safe).
+        // shifts every strand root by exactly the delta (demo
+        // rebase-safe; trunk/basis/wander are translation-invariant).
         let web = toy_web();
         let a = DVec3::ZERO;
         let b = DVec3::new(10.0, -4.0, 2.0);
-        let pa = braid_segments(&web, 7, a);
-        let pb = braid_segments(&web, 7, b);
+        let pa = strand_records(&web, 7, a);
+        let pb = strand_records(&web, 7, b);
         assert_eq!(pa.len(), pb.len());
-        for (p, q) in pa.iter().zip(pb.iter()).take(50) {
+        for (p, q) in pa.iter().zip(pb.iter()) {
             for axis in 0..3 {
-                let delta = f64::from(p.0[axis]) - f64::from(q.0[axis]);
+                let delta = f64::from(p.a[axis]) - f64::from(q.a[axis]);
                 let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
                 assert!(
                     (delta - want).abs() < 1e-3,
@@ -854,19 +876,19 @@ mod tests {
         let web = web();
         let origin = DVec3::ZERO;
         let seed = 1234;
-        for (pos, rgba) in braid_segments(&web, seed, origin) {
+        for record in strand_records(&web, seed, origin) {
             for axis in 0..3 {
-                assert!(pos[axis].is_finite(), "braid pos not finite");
+                assert!(record.a[axis].is_finite(), "strand root not finite");
                 assert!(
-                    rgba[axis].is_finite() && (0.0..=2.0).contains(&rgba[axis]),
-                    "braid color out of band: {:?}",
-                    rgba
+                    (record.rgba[axis]).is_finite() && (0.0..=2.0).contains(&record.rgba[axis]),
+                    "strand color out of band: {:?}",
+                    record.rgba
                 );
             }
             assert!(
-                rgba[3].is_finite() && (0.0..=1.0).contains(&rgba[3]),
-                "braid alpha out of band: {:?}",
-                rgba
+                record.rgba[3].is_finite() && (0.0..=1.0).contains(&record.rgba[3]),
+                "strand alpha out of band: {:?}",
+                record.rgba
             );
         }
         let points = grain_cloud(&web, seed, origin)

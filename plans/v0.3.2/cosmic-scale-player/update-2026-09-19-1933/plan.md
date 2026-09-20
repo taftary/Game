@@ -43,6 +43,29 @@ Parent update notion: [`notion.md`](notion.md)
   2.2) vs `COSMIC_MAP_*` (0.14 / 0.3 / 0.85 / 1.2). Engine
   `BloomParams::spec_defaults()` (threshold 1.0, blur σ) untouched.
 
+### Phase 1b — Second pass: gas, red areas, halo blob (user feedback)
+
+User screenshot review ("check the lines, the gaz part and the red
+area") vs. target drove three more knob moves, same constraints:
+
+- **Gas veil**: `glow_point_cloud` reworked from fixed-pixel specks
+  (1.5 px, α 0.09, kind 0) to world-sized soft sprites (2.8 Mpc, α
+  0.045, kind 1) hugging the links — filaments sit in faint blue mist
+  like the target; voids untouched (glow emits along links only).
+  Overdraw measured fine: 60 fps / 16.7 ms avg on UHD 620.
+- **Red/warm areas**: braid strands warm toward amber `[1.05, 0.72,
+  0.42]` near hub endpoints (convex mix by `1 − √taper`; monotonic
+  density grading and the ≤ 2.0 band preserved); giant halos go
+  cyan→amber (`[1.0, 0.63, 0.50]` at l = 1); giant cores deepened to
+  `[1.00, 0.82, 0.50]`; redshift red boost 0.55z → 0.75z (blue kill
+  unchanged) so distant structures warm like the target's pink-tinged
+  far filaments.
+- **Halo clamp blob** (grey smudge near the player visible in the user
+  screenshot = the known 256 px `gl_PointSize` clamp): halo diameter
+  band narrowed 3–8 → 2.5–6 Mpc, alpha 0.14+0.10l → 0.12+0.08l —
+  smaller, dimmer smudge. Real fix stays in the deferred ribbon
+  update (quad impostors).
+
 ### Phase 2 — Visual iteration
 
 Build, run the viewer, capture both surfaces (Game Demo default tab,
@@ -76,16 +99,17 @@ reviewed by SECURITY: _(pending)_
 | UPD-20260919-1933-003 | done | Regrade `node_color` + `node_impostors` (shared `mass_level` re-centered, golden cores to 5.0, warm halos) + `glow_point_cloud` alpha | §In-scope |
 | UPD-20260919-1933-004 | done | Soften redshift (`COSMIC_REDSHIFT_PER_MPC` 0.002, tint `0.55/0.7/0.45`) keeping safety clamps | §In-scope |
 | UPD-20260919-1933-005 | done | Deepen `COSMIC_BACKDROP`; per-surface grade consts + `WebLinePush.exposure` field | §In-scope |
-| UPD-20260919-1933-006 | in-review | Screenshot both surfaces vs. target; 6 tuning rounds (r1–r6 captures); **user visual sign-off pending** | DoD 1 |
+| UPD-20260919-1933-006 | in-review | Screenshot both surfaces vs. target; 8 tuning rounds (r1–r8 captures); **user visual sign-off pending** | DoD 1 |
 | UPD-20260919-1933-007 | done | Enrichment + engine determinism tests green (13/13 cosmic_web, 181/181 game_debug, 296/296 engine); no pins needed repair | DoD 2, 3 |
-| UPD-20260919-1933-008 | done | Full quality gates green (fmt, clippy `-D warnings`, build, test, doc test, `game`, both `--headless`) | DoD 4 |
+| UPD-20260919-1933-008 | done | Full quality gates green (fmt, clippy `-D warnings`, build, test, doc test, `game`, both `--headless`) — re-run after Phase 1b | DoD 4 |
 | UPD-20260919-1933-009 | done | Docs: `rendering.md` palette-pass §, architecture report values, techstack README 0.33.5 | DoD 5 |
+| UPD-20260919-1933-010 | done | Phase 1b (user feedback): gas veil (world-sized glow sprites), red/warm areas (endpoint amber, amber halos, deeper gold, 0.75z red), halo-clamp blob mitigation | §In-scope |
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence |
 |-------|----------------------------|--------|----------|
-| 1 | Before/after screenshots, both surfaces, user sign-off | partial | r1–r6 captures (before = user-provided build screenshot); r6 demo: golden hubs + blue-violet glowing filaments + dark voids; r6 inspector: readable web + golden nodes after per-surface grade fix. **Sign-off pending** |
+| 1 | Before/after screenshots, both surfaces, user sign-off | partial | r1–r8 captures (before = user-provided build screenshot). r6: golden hubs + blue-violet glowing filaments + dark voids ("a lot better" — user). r7/r8 (feedback pass): gas-veil mist on filaments, amber/red hub accents, halo-blob smudge reduced; inspector balanced. **Sign-off pending** |
 | 2 | Enrichment tests green (bands respected) | ✅ | `cargo test -p game_debug --lib cosmic_web`: 13/13 ok; full lib 181/181 |
 | 3 | Descriptor hash unchanged; determinism green | ✅ | No engine file touched (`git diff --stat`: cosmic_web.rs + main.rs only); engine suite 296/296 |
 | 4 | All quality.md gates green | ✅ | fmt / clippy -D warnings / build / test --workspace --all-targets / doc tests / `cargo run --bin game` / `game_debug --headless` / `game_tools --headless --tier low` all ok 2026-09-19 |
@@ -115,3 +139,10 @@ reviewed by SECURITY: _(pending)_
 
 **Next steps after this update:** ribbon update
 (`update-2026-09-19-1245`, P1+P2 remaining), then P3 sparkle / P5 LOD.
+
+**Evening follow-up:** user rejected the graded wireframe ("lines
+dominant, one flat gold, lines not good at all") → P1 ribbons
+executed against the 1245 draft (instanced `TriangleList` ribbon
+pipeline, 3-layer node light, `WebLinePush` deleted; rb1–rb2
+screenshots). This update's palette work (ramps, gas veil, per-surface
+grades, redshift) carries over unchanged under the ribbons.

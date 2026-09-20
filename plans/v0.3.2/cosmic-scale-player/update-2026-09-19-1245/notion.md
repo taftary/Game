@@ -4,7 +4,7 @@ Parent feature: [`../notion.md`](../notion.md)
 
 ## Status
 
-`draft`
+`in-progress` (P1 ribbons landed; P2 quad impostors still open)
 
 ## Reason for update
 
@@ -17,6 +17,15 @@ falloff, and their brightness never crosses the bloom threshold (max
 ~0.6 < 1.0), so they never glow. This update closes that gap by
 replacing hard wireframe with GPU-expanded ribbon quads, upgrading the
 cluster glow, and retuning the palette.
+
+**Execution note (2026-09-19, evening): P1 ribbons landed** — user
+rejected the palette-graded wireframe ("lines dominant, one flat
+gold"), so P1 executed against this draft: `strand_records` (96
+B/record) + instanced `TriangleList` ribbon pipeline with rim-zero
+lateral falloff, plus a 3-layer node light (white pinpoint + gold mid
++ amber halo) restoring blue-white small hubs. `WebLinePush` deleted;
+rb1–rb2 screenshots; 60/59.5 fps on UHD 620. P2 (quad impostors,
+`virial_radius_mpc` halos) still open.
 
 ## Roles
 
