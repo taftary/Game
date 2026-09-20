@@ -410,12 +410,15 @@ float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab
 
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
+layout(location = 2) out float v_kind;
 void main() {
     vec4 clip = pc.mvp * vec4(map_pos, 1.0);
     gl_Position = clip;
     // `kind` 1 = world-unit size (halo impostors), scaled by
     // `px_scale` over the perspective divide — the shared map-shader
-    // convention; `kind` 0 = fixed pixel size (cores, grain, glow).
+    // convention; `kind` 0 = fixed pixel size (cores, grain, glow);
+    // `kind` 2 = hub core with an in-sprite radial ramp
+    // (`cosmic-hub-hierarchy`).
     float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
     gl_PointSize = clamp(px, 1.0, 256.0);
     // Bounded redshift depth: negative view depth clamps to 0 and the
@@ -434,11 +437,13 @@ void main() {
     // `kind >= 1` so the navigation goal never fades out.
     float vis = cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, int(misc.z + 0.5));
     v_alpha = misc.y * pc.exposure * vis;
+    v_kind = misc.z;
 }";
 
 const GLOW_FRAG: &str = r"#version 450
 layout(location = 0) in vec3 v_color;
 layout(location = 1) in float v_alpha;
+layout(location = 2) in float v_kind;
 layout(location = 0) out vec4 f_color;
 void main() {
     vec2 d = gl_PointCoord - vec2(0.5);
@@ -446,7 +451,13 @@ void main() {
     // faint square corners on screen — the visual-issue fix).
     float t = max(0.0, 1.0 - 4.0 * dot(d, d));
     float fall = t * t;
-    f_color = vec4(v_color * v_alpha * fall, 1.0);
+    vec3 col = v_color;
+    // Hub core (`cosmic-hub-hierarchy`, `kind` 2): white-hot center →
+    // pale yellow → orange rim inside the sprite (arithmetic-only).
+    float r = length(d) * 2.0;
+    vec3 core = mix(vec3(1.0, 0.97, 0.85), vec3(1.0, 0.55, 0.25), smoothstep(0.2, 0.5, r));
+    col = (v_kind > 1.5) ? core : col;
+    f_color = vec4(col * v_alpha * fall, 1.0);
 }";
 
 // Cosmic tracer splats (`cosmic-tracer-splat`, ADR-025): one additive
@@ -1161,19 +1172,43 @@ fn run_headless(seed: Option<u64>) -> i32 {
     );
     // Cinematic layout smoke (update 2026-09-18-2328, smoke
     // billboards replace ribbons; `cosmic-tracer-splat`: grain + beads
-    // retired, tracer splats render the field instead): the smoke /
-    // splat / impostor clouds derive non-empty from the boot web.
+    // retired, tracer splats render the field instead;
+    // `cosmic-hub-hierarchy`: tiered hubs + member galaxies replace the
+    // 3-per-node impostors): the smoke / splat / hub / member clouds
+    // derive non-empty from the boot web.
     // GPU-free — upload happens only in the windowed shell.
     let layout_seed = debug_app.cosmic.seed;
     let layout_origin = debug_app.cosmic.upload_origin;
     let smoke =
         game_debug::cosmic_web::smoke_puffs(&debug_app.cosmic.web, layout_seed, layout_origin);
-    let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
     assert!(!smoke.is_empty(), "smoke must emit puffs");
-    assert_eq!(
-        impostors.len(),
-        debug_app.cosmic.web.nodes.len() * 3,
-        "three impostors per node"
+    // Hub tiers + members (CHH-005): sprite totals + the goal-tier
+    // check (FR6 — the spawn's first fly-to goal reads Tier A/B, or
+    // the highlight ring carries it per the recorded UX-1 fallback).
+    let (hub_impostors, hub_members, goal_tier) = {
+        use game_debug::cosmic_hubs::{HubTier, hub_impostors, hub_members};
+        let web = &debug_app.cosmic.web;
+        let impostors = hub_impostors(web, layout_origin);
+        let members = hub_members(web, layout_seed, layout_origin);
+        assert!(!impostors.is_empty(), "hubs must emit impostors");
+        assert!(!members.is_empty(), "hubs must emit members");
+        let goal = web
+            .strongest_link_from(web.home_node)
+            .map(|link| {
+                let far = if link.a == web.home_node {
+                    link.b
+                } else {
+                    link.a
+                };
+                far as usize
+            })
+            .unwrap_or(web.home_node as usize);
+        let tier = HubTier::of(goal, web.nodes.len());
+        (impostors.len(), members.len(), tier)
+    };
+    println!(
+        "cosmic_hubs=impostors{} members{} goal_tier{:?} ok",
+        hub_impostors, hub_members, goal_tier
     );
     // Splat counts per tier + Low overdraw estimate (CTS-006/008):
     // stride subsets of the same field, so Low ⊂ Medium ⊂ High.
@@ -1192,12 +1227,13 @@ fn run_headless(seed: Option<u64>) -> i32 {
         (low.len(), med.len(), high.len(), overdraw)
     };
     println!(
-        "cosmic_layout=smoke{} splatsL{} splatsM{} splatsH{} impostors{} overdrawL{:.1} ok",
+        "cosmic_layout=smoke{} splatsL{} splatsM{} splatsH{} hubs{} members{} overdrawL{:.1} ok",
         smoke.len(),
         splats_low,
         splats_med,
         splats_high,
-        impostors.len(),
+        hub_impostors,
+        hub_members,
         overdraw_low
     );
     // Slab relief (`cosmic-depth-window` NFR5): fraction of Low splats
@@ -2570,7 +2606,18 @@ fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -
                     &mut items,
                     lh,
                     rows.next(lh, 6.0),
-                    format!("node {}", node.node_index),
+                    format!(
+                        "node {} · tier {}",
+                        node.node_index,
+                        match game_debug::cosmic_hubs::HubTier::of(
+                            node.node_index as usize,
+                            cosmic.web.nodes.len()
+                        ) {
+                            game_debug::cosmic_hubs::HubTier::A => "A",
+                            game_debug::cosmic_hubs::HubTier::B => "B",
+                            game_debug::cosmic_hubs::HubTier::C => "C",
+                        }
+                    ),
                     C_TEXT,
                 );
                 text_row(
@@ -5233,19 +5280,29 @@ fn upload_cosmic_glow(
     seed: u64,
     origin: glam::DVec3,
 ) -> Subbuffer<[MapVertex]> {
-    // `cosmic-tracer-splat` retired the grain + bead clouds: the glow
-    // buffer now holds the dwarf-glow gas veil + node impostors only
-    // (impostors retire in `cosmic-hub-hierarchy`, the veil in
-    // `cosmic-gas-veil-v2`).
-    let _ = seed;
+    // `cosmic-hub-hierarchy`: the glow buffer holds the dwarf-glow gas
+    // veil + hub member galaxies + tiered hub impostors (the 3-per-node
+    // `node_impostors` are retired). Upload order is draw order for the
+    // alpha-blended point draw — members before impostors so cores
+    // top the scatter.
+    let to_vertex = |(pos, color, misc): &([f32; 3], [f32; 3], [f32; 3])| MapVertex {
+        map_pos: *pos,
+        color: *color,
+        misc: *misc,
+    };
     let mut verts: Vec<MapVertex> = game_debug::cosmic_web::glow_point_cloud(web, origin)
         .iter()
-        .chain(game_debug::cosmic_web::node_impostors(web, origin).iter())
-        .map(|(pos, color, misc)| MapVertex {
-            map_pos: *pos,
-            color: *color,
-            misc: *misc,
-        })
+        .map(to_vertex)
+        .chain(
+            game_debug::cosmic_hubs::hub_members(web, seed, origin)
+                .iter()
+                .map(to_vertex),
+        )
+        .chain(
+            game_debug::cosmic_hubs::hub_impostors(web, origin)
+                .iter()
+                .map(to_vertex),
+        )
         .collect();
     if verts.is_empty() {
         // Degenerate params guard (vulkano rejects zero-length vertex
@@ -9573,6 +9630,7 @@ mod tests {
             (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
             (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
             (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
+            (GLOW_FRAG, "smoothstep(0.2, 0.5, r)", "hub kind-2 core ramp"),
             (
                 SPLAT_FRAG,
                 "1.0 - 4.0 * dot(d, d)",

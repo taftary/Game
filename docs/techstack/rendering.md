@@ -518,6 +518,21 @@ home depth. Measured: voids dark (≥ 10 distinct in
 splat shot (window off = identity), slab keeps 12 % of Low splats
 (8.3× fill relief).
 
+Hub hierarchy (`cosmic-hub-hierarchy`, shipped 2026-09-20): hubs
+tiered by mass rank (A = top 1 %, B = next 10 %, C = rest) into the
+glow `PointList` — A: white-hot pin + `kind`-2 core with an
+in-sprite radial ramp (white-yellow → orange) + world-sized
+pink-amber halo, plus a member-galaxy scatter (NFW-like `r ∝ u²`
+under `cosmic_web/members`, 60 % pink-red / 30 % orange / 10 %
+white, ≤ 40k); B: `kind`-2 core + small halo + members; C: one warm
+2 px bead below the bloom threshold. Bloom inputs tiered by
+construction (A pins/cores ≥ 3.0, B cores ≈ 1.5, C beads ≤ 0.9);
+Tier A/B impostors take the 0.25 fog floor. The 3-per-node
+`node_impostors` (+ `mass_level`/`node_color`/`node_size_px`/
+`node_point_cloud`) are retired. Nominal headless: 6720 impostors +
+20 512 members; spawn goal Tier C (pinned — highlight ring carries
+it, vista frames Tier A).
+
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,
 naga compile helper, 1.1-floor boot).

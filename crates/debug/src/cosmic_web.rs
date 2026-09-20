@@ -116,47 +116,6 @@ impl Default for CosmicWebInspector {
     }
 }
 
-/// Shared mass→[0,1] grading level for every node visual (color,
-/// size, emissive): 1e12.3 M☉ → 0, 1e15 M☉ → 1. Small hubs stay
-/// blue-white; only ≥1e14 M☉ clusters go golden (target's varied
-/// cluster light, not one flat gold).
-fn mass_level(mass_msun: f64) -> f32 {
-    ((mass_msun.log10() - 12.3) / 2.7).clamp(0.0, 1.0) as f32
-}
-
-/// Mass-graded node tint: blue-white dwarfs → deep golden giants (the
-/// gold end deepened in update-2026-09-19-1933 so massive hubs read
-/// like the target reference — orange-gold, not pale yellow).
-/// Shared by the demo and inspector uploads (one palette, two surfaces).
-pub fn node_color(mass_msun: f64) -> [f32; 3] {
-    let l = mass_level(mass_msun);
-    [0.60 + 0.40 * l, 0.68 + 0.14 * l, 1.00 - 0.50 * l]
-}
-
-/// Node pixel size from mass (2–5 px sprite floor for legibility).
-pub fn node_size_px(mass_msun: f64) -> f32 {
-    2.0 + 3.0 * mass_level(mass_msun)
-}
-
-/// Halo nodes as `(position, color, misc)` tuples in origin-relative
-/// Mpc f32: `misc = (pixel size, alpha, kind 0)`.
-pub fn node_point_cloud(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-    web.nodes
-        .iter()
-        .map(|node| {
-            (
-                [
-                    (node.position_mpc[0] - origin.x) as f32,
-                    (node.position_mpc[1] - origin.y) as f32,
-                    (node.position_mpc[2] - origin.z) as f32,
-                ],
-                node_color(node.mass_msun),
-                [node_size_px(node.mass_msun), 1.0, 0.0],
-            )
-        })
-        .collect()
-}
-
 /// Dwarf glow points as tuples — the **gas veil**
 /// (update-2026-09-19-1933, second pass): world-sized soft sprites
 /// (`misc = (2.8 Mpc diameter, 0.045 alpha, kind 1)`) hugging the
@@ -697,58 +656,6 @@ fn ihalf3(rng: &mut SeededRng) -> f64 {
     rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 1.5
 }
 
-/// Node impostors as `(position, color, misc)` tuples: three sprites
-/// per node — a white-hot pinpoint core (near-white, fixed pixel
-/// size), the mass-graded golden mid core (emissive, the bloom
-/// threshold's target), plus a soft amber halo (`kind` 1 =
-/// world-unit diameter in Mpc, so it shrinks with distance instead of
-/// plastering fixed-size quads over the whole web). Layered like the
-/// target's cluster light (white center → gold → red-amber edge)
-/// instead of one flat gold. Pure function of node mass/position (no
-/// RNG): same node → same impostors, everywhere.
-pub fn node_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-    let mut out = Vec::with_capacity(web.nodes.len() * 3);
-    for node in &web.nodes {
-        let l = mass_level(node.mass_msun);
-        let pos = [
-            (node.position_mpc[0] - origin.x) as f32,
-            (node.position_mpc[1] - origin.y) as f32,
-            (node.position_mpc[2] - origin.z) as f32,
-        ];
-        let base = node_color(node.mass_msun);
-        // White-hot pinpoint: near-white at every mass (dwarfs read
-        // blue-white through the falloff, giants white-gold), fixed
-        // pixel size, emissive. Band-checked: 1.05 × 3.2 ≤ 5.0.
-        let pin = 1.2 + 2.0 * l;
-        out.push((
-            pos,
-            [1.05 * pin, 1.00 * pin, 0.95 * pin],
-            [1.5 + 2.0 * l, 1.0, 0.0],
-        ));
-        // Golden mid core: mass-graded, emissive (1.5–5.0x), fixed
-        // pixel size (3–12 px — big enough that the bloom chain keeps
-        // a visible halo).
-        let emissive = 1.5 + 3.5 * l;
-        out.push((
-            pos,
-            [base[0] * emissive, base[1] * emissive, base[2] * emissive],
-            [3.0 + 9.0 * l, 1.0, 0.0],
-        ));
-        // Halo: large, faint, world-sized (2.5–6 Mpc diameter), cool
-        // cyan for dwarfs warming to amber for giants.
-        out.push((
-            pos,
-            [
-                (0.60 + 0.40 * l) * (0.5 + 0.5 * l),
-                (0.68 - 0.05 * l) * (0.5 + 0.5 * l),
-                (0.95 - 0.45 * l) * (0.5 + 0.5 * l),
-            ],
-            [2.5 + 3.5 * l, 0.12 + 0.08 * l, 1.0],
-        ));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,19 +779,8 @@ mod tests {
     fn clouds_cover_nodes_links_and_glow() {
         let web = web();
         let origin = DVec3::ZERO;
-        assert_eq!(node_point_cloud(&web, origin).len(), web.nodes.len());
         assert_eq!(glow_point_cloud(&web, origin).len(), web.glow_mpc.len());
         assert_eq!(link_segments(&web, origin).len(), web.links.len() * 2);
-        // Mass grading: the heaviest node is yellower and bigger than
-        // the lightest.
-        let mut by_mass = web.nodes.clone();
-        by_mass.sort_by(|a, b| a.mass_msun.total_cmp(&b.mass_msun));
-        let light = node_color(by_mass[0].mass_msun);
-        let heavy = node_color(by_mass[by_mass.len() - 1].mass_msun);
-        assert!(heavy[0] > light[0] && heavy[2] < light[2]);
-        assert!(
-            node_size_px(by_mass[by_mass.len() - 1].mass_msun) > node_size_px(by_mass[0].mass_msun)
-        );
     }
 
     #[test]
@@ -962,49 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn impostors_emit_three_layered_sprites_per_node() {
-        let web = toy_web();
-        let impostors = node_impostors(&web, DVec3::ZERO);
-        assert_eq!(impostors.len(), web.nodes.len() * 3);
-        for i in 0..web.nodes.len() {
-            let (pin, mid, halo) = (
-                &impostors[3 * i],
-                &impostors[3 * i + 1],
-                &impostors[3 * i + 2],
-            );
-            // Same position (the hub).
-            assert_eq!(pin.0, mid.0);
-            assert_eq!(mid.0, halo.0);
-            // White pinpoint: near-white, smallest, fixed pixel size.
-            assert!(pin.1[0] >= pin.1[1] && pin.1[1] >= pin.1[2] - 1e-6);
-            assert!(pin.2[0] < mid.2[0], "pinpoint must be smallest");
-            assert_eq!(pin.2[2], 0.0, "pinpoint must be pixel-sized");
-            // Golden mid core: emissive (a channel > 1.0), fixed pixel
-            // size; halo is world-sized (kind 1, Mpc) and fainter.
-            assert!(
-                mid.1.iter().any(|c| *c > 1.0),
-                "mid core must be emissive: {:?}",
-                mid.1
-            );
-            assert_eq!(mid.2[2], 0.0, "mid core must be pixel-sized");
-            assert_eq!(halo.2[2], 1.0, "halo must be world-sized");
-            assert!(
-                (2.0..=8.0).contains(&halo.2[0]),
-                "halo world diameter out of band: {}",
-                halo.2[0]
-            );
-            assert!(halo.2[1] < mid.2[1], "halo must be fainter");
-        }
-        // Mass grading: the 1e15 node outshines the 5e12 node on the
-        // mid core's every channel.
-        let heavy = impostors[1].1;
-        let light = impostors[4].1;
-        for c in 0..3 {
-            assert!(heavy[c] > light[c], "heavy mid core must outshine light");
-        }
-    }
-
-    #[test]
     fn enrichment_layouts_are_origin_relative() {
         // Rebase invariant for the new layouts: shifting the origin
         // shifts every strand root by exactly the delta (demo
@@ -1018,18 +871,6 @@ mod tests {
         for (p, q) in pa.iter().zip(pb.iter()) {
             for axis in 0..3 {
                 let delta = f64::from(p.a[axis]) - f64::from(q.a[axis]);
-                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
-                assert!(
-                    (delta - want).abs() < 1e-3,
-                    "axis {axis}: {delta} vs {want}"
-                );
-            }
-        }
-        let ia = node_impostors(&web, a);
-        let ib = node_impostors(&web, b);
-        for (p, q) in ia.iter().zip(ib.iter()) {
-            for axis in 0..3 {
-                let delta = f64::from(p.0[axis]) - f64::from(q.0[axis]);
                 let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
                 assert!(
                     (delta - want).abs() < 1e-3,
@@ -1066,7 +907,6 @@ mod tests {
         }
         let points = glow_point_cloud(&web, origin)
             .into_iter()
-            .chain(node_impostors(&web, origin))
             .collect::<Vec<_>>();
         assert!(!points.is_empty());
         for (pos, color, misc) in &points {
@@ -1099,8 +939,8 @@ mod tests {
         let web = web();
         let a = DVec3::ZERO;
         let b = DVec3::new(10.0, -4.0, 2.0);
-        let pa = node_point_cloud(&web, a);
-        let pb = node_point_cloud(&web, b);
+        let pa = glow_point_cloud(&web, a);
+        let pb = glow_point_cloud(&web, b);
         for (p, q) in pa.iter().zip(pb.iter()).take(50) {
             for axis in 0..3 {
                 let delta = f64::from(p.0[axis]) - f64::from(q.0[axis]);

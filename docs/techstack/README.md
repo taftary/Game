@@ -1,11 +1,10 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.42.0 (2026-09-20, v0.3.3 `cosmic-depth-window`
-  done: shared fog/slab window term on every cosmic draw (per-
-  instance FOV, S/wheel/bracket controls, demo fog slider, filled
-  `slab` preset — dark voids, 8.3× fill relief, inspector framing
-  byte-identical with the window off); four v0.3.3 features remain
-  planned)
+- **Version:** 0.43.0 (2026-09-20, v0.3.3 `cosmic-hub-hierarchy`
+  done: mass-rank tiers A/B/C with member scatter replace the
+  3-per-node impostors (6720 + 20 512 pts; ≤ 15 blazing at slab;
+  spawn goal pinned Tier C with ring fallback); three v0.3.3
+  features remain planned)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
