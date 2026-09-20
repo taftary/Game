@@ -18,6 +18,7 @@ pub mod cosmic_demo;
 pub mod cosmic_player;
 pub mod cosmic_splat;
 pub mod cosmic_web;
+pub mod cosmic_window;
 pub mod fps;
 pub mod fx;
 pub mod galaxy_map;

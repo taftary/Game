@@ -80,7 +80,12 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   current cosmic surface (Game Demo or Cosmic Web tab) to
   `captures/<surface>-<seed>-<ts>.png` and logs the path to the
   Console — exploration only; reproducible evidence comes from
-  `game_debug --capture` presets (see `docs/techstack/rendering.md`). Map content
+  `game_debug --capture` presets (see `docs/techstack/rendering.md`).
+  `S` toggles the inspector slab view (Cosmic Web tab: 30 Mpc slice
+  at the orbit depth, 20° near-orthographic; `Shift+wheel` scrolls
+  the slice, `[`/`]` resize it; readout in the dock); the demo fog
+  length rides a dev-widget slider (`F8` Inspector tab, 30–400 Mpc,
+  Console-logged). Map content
   (`plans/v0.0.1/universe-maps`,
   `plans/v0.0.1/universe-maps-3d`): 3D perspective views — wheel = log zoom,
   left-drag = orbit, right/middle-drag = pan, click = select

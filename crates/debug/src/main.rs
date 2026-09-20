@@ -376,6 +376,16 @@ void main() {
 // Hubble redshift tint from view depth (`clip.w`, spec §9.1: distant
 // filaments redden and dim). Cosmic views only — the shared map
 // shaders above stay byte-identical for galaxy/system/planet/sky.
+/// Shared depth-window GLSL (`cosmic-depth-window`): the authority is
+/// `game_debug::cosmic_window::COSMIC_WINDOW_GLSL` — pasted verbatim
+/// into `GLOW_VERT`, `SMOKE_VERT`, and `SPLAT_VERT` below (pinned
+/// byte-identical by `cosmic_window_snippet_shared`; `concat!` cannot
+/// take consts, so paste + pin instead of composition).
+/// Visibility fog `1/(1+(d/L)²)` × slab window, arithmetic-only
+/// (`smoothstep`, `/`, `*`) — no `exp`, no depth-buffer read (points
+/// write none). `kind >= 1` (hub impostor halos + cores) gets the
+/// 0.25 fog floor so the navigation goal stays visible at any
+/// distance.
 const GLOW_VERT: &str = r"#version 450
 layout(location = 0) in vec3 map_pos;
 layout(location = 1) in vec3 color;
@@ -385,7 +395,19 @@ layout(push_constant) uniform PushConstants {
     float px_scale;
     float exposure;
     float redshift;
+    float fog_l;
+    float slab_center;
+    float slab_half;
 } pc;
+
+float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
+    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
+    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
+    float vis = fog * slab;
+    vis = (kind >= 1) ? max(vis, 0.25) : vis;
+    return vis;
+}
+
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
 void main() {
@@ -408,7 +430,10 @@ void main() {
     vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
     v_color = color * tint * dim;
-    v_alpha = misc.y * pc.exposure;
+    // Depth window (`cosmic-depth-window`): fog × slab, hub floor on
+    // `kind >= 1` so the navigation goal never fades out.
+    float vis = cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, int(misc.z + 0.5));
+    v_alpha = misc.y * pc.exposure * vis;
 }";
 
 const GLOW_FRAG: &str = r"#version 450
@@ -443,6 +468,9 @@ layout(push_constant) uniform PushConstants {
     float redshift;
     float h0;
     float alpha_k;
+    float fog_l;
+    float slab_center;
+    float slab_half;
 } pc;
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
@@ -455,6 +483,15 @@ vec3 density_ramp(float log2od) {
     col = mix(col, vec3(1.00, 0.45, 0.40), clamp((log2od - 3.0) / (4.5 - 3.0), 0.0, 1.0));
     return col;
 }
+
+float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
+    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
+    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
+    float vis = fog * slab;
+    vis = (kind >= 1) ? max(vis, 0.25) : vis;
+    return vis;
+}
+
 void main() {
     uint q = packed & 65535u;
     float log2od = float(q) / 65535.0 * 16.0 - 8.0;
@@ -470,6 +507,9 @@ void main() {
     // Constant energy per splat: dense clumps are bright because they
     // hold many particles, not because each is bigger.
     float alpha = pc.alpha_k / max(px * px, 1.0) * pc.exposure;
+    // Depth window (`cosmic-depth-window`): splats never take the hub
+    // floor (kind 0) — fully fogged or out-of-slab vertices add zero.
+    alpha *= cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, 0);
     // Near-eye fade (the v0.3.2 white-flash lesson): kernels closer
     // than 2h dissolve instead of filling the screen.
     float dist = length(pos - pc.eye.xyz);
@@ -535,10 +575,22 @@ layout(push_constant) uniform PushConstants {
     float px_scale;
     float exposure;
     float redshift;
+    float fog_l;
+    float slab_center;
+    float slab_half;
 } pc;
 layout(location = 0) out vec4 v_rgba;
 layout(location = 1) out vec2 v_uv;
 layout(location = 2) out float v_seed;
+
+float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
+    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
+    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
+    float vis = fog * slab;
+    vis = (kind >= 1) ? max(vis, 0.25) : vis;
+    return vis;
+}
+
 void main() {
     int vi = int(gl_VertexIndex);
     // Two triangles: (-,-),(+,-),(+,-)/(-,-),(+,-),(-,+) pattern over
@@ -591,7 +643,10 @@ void main() {
     float fade_start = max(1.0, len * 0.35);
     float fade_end = max(6.0, len * 1.25);
     float efade = smoothstep(fade_start, fade_end, vd);
-    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure * efade);
+    // Depth window (`cosmic-depth-window`): smoke never takes the hub
+    // floor (kind 0) — fully fogged or out-of-slab vertices add zero.
+    float wvis = cosmic_window_vis(clipc0.w, pc.fog_l, pc.slab_center, pc.slab_half, 0);
+    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure * efade * wvis);
 }";
 
 const SMOKE_FRAG: &str = r"#version 450
@@ -745,7 +800,8 @@ struct MapPush {
 
 /// Cosmic glow push constants: MVP + pixel size scale + exposure +
 /// exaggerated Hubble redshift strength per Mpc of view depth
-/// (update-2026-09-18-2328; 76 B < 128 B Vulkan 1.1 floor).
+/// (update-2026-09-18-2328) + depth-window terms (`cosmic-depth-
+/// window`, 88 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct GlowPush {
@@ -753,6 +809,9 @@ struct GlowPush {
     px_scale: f32,
     exposure: f32,
     redshift: f32,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
 }
 
 /// Cosmic tracer-splat vertex (`cosmic-tracer-splat`): origin-relative
@@ -769,7 +828,8 @@ struct SplatVertex {
 
 /// Cosmic splat push constants: MVP + buffer-frame eye (near-eye
 /// fade) + pixel scale + exposure + redshift + kernel scale +
-/// constant-energy numerator. 100 B < 128 B Vulkan 1.1 floor.
+/// constant-energy numerator + depth-window terms
+/// (`cosmic-depth-window`, 112 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct SplatPush {
@@ -780,11 +840,15 @@ struct SplatPush {
     redshift: f32,
     h0: f32,
     alpha_k: f32,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
 }
 
 /// Cosmic smoke push constants: MVP, camera eye (buffer frame),
 /// sprite scale (reserved), per-surface alpha exposure, redshift
-/// strength. 92 B total, under the 128 B Vulkan 1.1 floor.
+/// strength + depth-window terms (`cosmic-depth-window`, 104 B total,
+/// under the 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct SmokePush {
@@ -793,6 +857,9 @@ struct SmokePush {
     px_scale: f32,
     exposure: f32,
     redshift: f32,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
 }
 
 /// Cosmic smoke puff: per-instance vertex layout for the smoke
@@ -814,7 +881,9 @@ struct SmokeVertex {
 /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328) —
 /// see `ViewerApp::cosmic_frame`. `eye` is the camera position in the
 /// surface's buffer frame (the smoke shader builds camera-facing
-/// billboards from it).
+/// billboards from it). Depth-window terms (`cosmic-depth-window`):
+/// `fog_l` (Mpc, ≤ 0 = off), `slab_center`/`slab_half` (Mpc view
+/// depth, `slab_half` ≤ 0 = off).
 struct CosmicFrame {
     mvp: [[f32; 4]; 4],
     px_scale: f32,
@@ -823,6 +892,9 @@ struct CosmicFrame {
     smoke: Subbuffer<[SmokeVertex]>,
     glow: Subbuffer<[MapVertex]>,
     splats: Subbuffer<[SplatVertex]>,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
     viewport: Viewport,
 }
 
@@ -1128,6 +1200,45 @@ fn run_headless(seed: Option<u64>) -> i32 {
         impostors.len(),
         overdraw_low
     );
+    // Slab relief (`cosmic-depth-window` NFR5): fraction of Low splats
+    // inside the nominal slab window (30 Mpc at the home depth under
+    // the 20° slab camera) — the draws that survive; the rest add ~0
+    // through the window term. Separate line so the CTS layout pin
+    // above stays byte-stable.
+    {
+        use game_debug::cosmic_splat::{SplatTier, splat_records};
+        use game_debug::cosmic_window::SlabState;
+        let web = &debug_app.cosmic.web;
+        let field = &debug_app.cosmic.field;
+        let low = splat_records(field, web, glam::DVec3::ZERO, SplatTier::Low);
+        let mut cam = debug_app.cosmic_inspector.camera.clone();
+        cam.set_fov_keep_framing(20.0);
+        let eye = cam.eye();
+        let fwd = (cam.target() - eye).normalize_or_zero();
+        let home = web.home().position_mpc;
+        let home_depth = ((home[0] as f32 - eye.x) * fwd.x
+            + (home[1] as f32 - eye.y) * fwd.y
+            + (home[2] as f32 - eye.z) * fwd.z)
+            .max(0.0);
+        let slab = SlabState::default_on();
+        let half = slab.thickness_mpc * 0.5 + 5.0;
+        let mut keep = 0usize;
+        for r in &low {
+            let depth = ((r.pos[0] - eye.x) * fwd.x
+                + (r.pos[1] - eye.y) * fwd.y
+                + (r.pos[2] - eye.z) * fwd.z)
+                .max(0.0);
+            if (depth - home_depth).abs() <= half {
+                keep += 1;
+            }
+        }
+        println!(
+            "slab_relief=keep{} total{} frac{:.2} ok",
+            keep,
+            low.len(),
+            keep as f64 / low.len().max(1) as f64
+        );
+    }
     // Field sidecar self-check (`web-field-export`, ADR-025): the export
     // entry point returns the identical descriptor, the tracer band
     // holds, and the sidecar fits its memory budget. Timings print for
@@ -1557,10 +1668,19 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     }
     let is_demo = preset.surface_is_demo;
     let aspect = w as f32 / h as f32;
-    let (mvp, px_scale, eye, origin) = if is_demo {
+    // Depth window (`cosmic-depth-window` CDW-007): the `slab` preset
+    // narrows to 20° (framing kept by the distance rescale) and windows
+    // a 30 Mpc slice at the home node's view depth — the target's
+    // composition. `inspector` stays full-depth 60°.
+    if request.view == CaptureView::Slab {
+        debug.cosmic_inspector.camera.set_fov_keep_framing(20.0);
+        debug.cosmic_inspector.slab = game_debug::cosmic_window::SlabState::default_on();
+    }
+    let (mvp, px_scale, eye, origin, fog_l, slab_center, slab_half) = if is_demo {
         let camera = &debug.cosmic.camera;
         let eye_w = camera.eye_world();
         let origin = debug.cosmic.upload_origin;
+        let fog_l = debug.cosmic.fog_l_mpc;
         (
             camera.view_proj(aspect).to_cols_array_2d(),
             camera.px_scale(h as f32),
@@ -1570,15 +1690,33 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
                 (eye_w.z - origin.z) as f32,
             ],
             origin,
+            fog_l,
+            0.0,
+            0.0,
         )
     } else {
         let inspector = &debug.cosmic_inspector;
         let e = inspector.camera.eye();
+        // Slab center: home-node view depth under the preset camera.
+        let (slab_center, slab_half) = if inspector.slab.on {
+            let home = debug.cosmic.web.home().position_mpc;
+            let fwd = (inspector.camera.target() - e).normalize_or_zero();
+            let depth = ((home[0] as f32 - e.x) * fwd.x
+                + (home[1] as f32 - e.y) * fwd.y
+                + (home[2] as f32 - e.z) * fwd.z)
+                .max(0.0);
+            (depth, inspector.slab.thickness_mpc * 0.5)
+        } else {
+            (0.0, 0.0)
+        };
         (
             inspector.view_proj(aspect).to_cols_array_2d(),
             inspector.camera.px_scale(h as f32),
             [e.x, e.y, e.z],
             DVec3::ZERO,
+            0.0,
+            slab_center,
+            slab_half,
         )
     };
     let extent = [w, h];
@@ -1603,6 +1741,9 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         smoke,
         glow,
         splats,
+        fog_l,
+        slab_center,
+        slab_half,
         viewport: Viewport {
             offset: [0.0, 0.0],
             extent: [w as f32, h as f32],
@@ -2392,9 +2533,27 @@ fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -
             "right-drag: pan",
             "click: select node",
             "Home: top-down",
+            "S: slab mode",
+            "Shift+wheel: slab depth",
+            "[/]: slab thickness",
         ] {
             text_row(&mut items, lh, rows.next(lh, 6.0), hint.to_owned(), C_DIM);
         }
+        // Depth-window readout (`cosmic-depth-window` FR3).
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            if inspector.slab.on {
+                format!(
+                    "slab {} Mpc @ {:.0} Mpc · 20°",
+                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                )
+            } else {
+                "slab off".to_owned()
+            },
+            C_DIM,
+        );
     }
 
     // ---- Right dock: SELECTION ----
@@ -3991,16 +4150,34 @@ fn build_widget(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32, win_h:
             C_TEXT,
         );
     }
-    let body = Rect {
-        x: widget.x + ui::DOCK_PAD,
-        y: widget.y + ui::WIDGET_TAB_H + 4.0,
-        w: (widget.w - 2.0 * ui::DOCK_PAD).max(0.0),
-        h: (widget.h - ui::WIDGET_TAB_H - 12.0).max(0.0),
-    };
+    let body = widget_body_rect(widget);
     match app.widget_tab {
         WidgetTab::Fps => build_widget_fps(items, lh, app, body),
         WidgetTab::Console => build_widget_console(items, lh, app, body),
         WidgetTab::Inspector => build_widget_inspector(items, lh, app, body),
+    }
+}
+
+/// Widget body rect from the widget rect (shared by the draw and the
+/// fog-slider hit-test — one formula, two callers).
+fn widget_body_rect(widget: Rect) -> Rect {
+    Rect {
+        x: widget.x + ui::DOCK_PAD,
+        y: widget.y + ui::WIDGET_TAB_H + 4.0,
+        w: (widget.w - 2.0 * ui::DOCK_PAD).max(0.0),
+        h: (widget.h - ui::WIDGET_TAB_H - 12.0).max(0.0),
+    }
+}
+
+/// Demo-fog slider track (`cosmic-depth-window` FR5, debug-only):
+/// after the 4 inspector text rows + label row (all `lh + 4`), a
+/// 20 px track. Shared by the widget draw and the mouse hit-test.
+fn fog_slider_track(body: Rect, lh: f32) -> Rect {
+    Rect {
+        x: body.x,
+        y: body.y + 5.0 * (lh + 4.0),
+        w: body.w,
+        h: 20.0,
     }
 }
 
@@ -4064,6 +4241,28 @@ fn build_widget_inspector(items: &mut UiItems, lh: f32, app: &DebugApp, body: Re
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
     }
+    // Demo-fog slider (`cosmic-depth-window` FR5, debug-only): the
+    // track rect is shared with the mouse hit-test
+    // (`fog_slider_track`).
+    text_row(
+        items,
+        lh,
+        rows.next(lh, 4.0),
+        format!("demo fog:   {:.0} Mpc", app.cosmic.fog_l_mpc),
+        C_TEXT,
+    );
+    let track = fog_slider_track(body, lh);
+    items.solid(track, C_TRACK);
+    let knob_value = ui::Slider::new(30, 400, app.cosmic.fog_l_mpc as u32);
+    items.solid(
+        Rect {
+            x: knob_value.knob_x(track) - 5.0,
+            y: track.y + 1.0,
+            w: 10.0,
+            h: track.h - 2.0,
+        },
+        C_KNOB,
+    );
 }
 
 /// Widget FPS body: live numbers + a sparkline of the newest
@@ -5234,6 +5433,9 @@ fn record_cosmic_hdr_prepass(
                 px_scale: frame.px_scale,
                 exposure: smoke_exposure,
                 redshift,
+                fog_l: frame.fog_l,
+                slab_center: frame.slab_center,
+                slab_half: frame.slab_half,
             },
         )
         .expect("smoke push constants must upload");
@@ -5255,6 +5457,9 @@ fn record_cosmic_hdr_prepass(
                 px_scale: frame.px_scale,
                 exposure: glow_exposure,
                 redshift,
+                fog_l: frame.fog_l,
+                slab_center: frame.slab_center,
+                slab_half: frame.slab_half,
             },
         )
         .expect("glow push constants must upload");
@@ -5279,6 +5484,9 @@ fn record_cosmic_hdr_prepass(
                 redshift,
                 h0: SPLAT_H0,
                 alpha_k: splat_alpha_k,
+                fog_l: frame.fog_l,
+                slab_center: frame.slab_center,
+                slab_half: frame.slab_half,
             },
         )
         .expect("splat push constants must upload");
@@ -5487,6 +5695,9 @@ fn record_cosmic_view_arm(
                     px_scale: frame.px_scale,
                     exposure: smoke_exposure,
                     redshift,
+                    fog_l: frame.fog_l,
+                    slab_center: frame.slab_center,
+                    slab_half: frame.slab_half,
                 },
             )
             .expect("smoke push constants must upload");
@@ -5507,6 +5718,9 @@ fn record_cosmic_view_arm(
                     px_scale: frame.px_scale,
                     exposure: glow_exposure,
                     redshift,
+                    fog_l: frame.fog_l,
+                    slab_center: frame.slab_center,
+                    slab_half: frame.slab_half,
                 },
             )
             .expect("glow push constants must upload");
@@ -5530,6 +5744,9 @@ fn record_cosmic_view_arm(
                     redshift,
                     h0: SPLAT_H0,
                     alpha_k: splat_alpha_k,
+                    fog_l: frame.fog_l,
+                    slab_center: frame.slab_center,
+                    slab_half: frame.slab_half,
                 },
             )
             .expect("splat push constants must upload");
@@ -5810,6 +6027,9 @@ struct ViewerApp {
     /// Astronomical): keys the sky-luminance input of the star
     /// fade-in (exposure-tone-mapping DoD-2 captures).
     twilight_stage: u8,
+    /// Fog-slider drag in the widget Inspector tab
+    /// (`cosmic-depth-window` FR5, debug-only).
+    dragging_fog: bool,
     /// Windowed screenshot request (`F12`, `cosmic-capture-harness`):
     /// the next frame copies its swapchain image to a host buffer and
     /// writes `captures/<surface>-<seed>-<ts>.png`. Exploration only —
@@ -6089,6 +6309,7 @@ impl ViewerApp {
             sky,
             sky_vertices,
             twilight_stage: 0,
+            dragging_fog: false,
             pending_capture: false,
             transit_acc: 0.0,
             atlas_image: None,
@@ -6212,34 +6433,54 @@ impl ViewerApp {
     /// record identical draws. Also rebuilds the inspector player
     /// point (the ship moves continuously).
     fn cosmic_frame(&mut self, vp: Rect) -> CosmicFrame {
-        let (mvp, px_scale, is_demo, eye) = if self.debug.screen == Screen::GameDemo {
-            let camera = &self.debug.cosmic.camera;
-            // Eye in the demo buffer frame: world truth minus the
-            // upload (rebase) origin the demo buffers share.
-            let eye_w = camera.eye_world();
-            let origin = self.debug.cosmic.upload_origin;
-            (
-                camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
-                camera.px_scale(vp.h),
-                true,
-                [
-                    (eye_w.x - origin.x) as f32,
-                    (eye_w.y - origin.y) as f32,
-                    (eye_w.z - origin.z) as f32,
-                ],
-            )
-        } else {
-            let inspector = &self.debug.cosmic_inspector;
-            // Inspector buffers use the web-center (zero) origin, the
-            // same frame the inspector camera's eye is already in.
-            let e = inspector.camera.eye();
-            (
-                inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
-                inspector.camera.px_scale(vp.h),
-                false,
-                [e.x, e.y, e.z],
-            )
-        };
+        // Depth window (`cosmic-depth-window`): the demo fades past
+        // ~2 fog lengths into the backdrop (length on the dev-widget
+        // slider, default 90 Mpc); the inspector shows the
+        // full depth unless slab mode windows it.
+        let (mvp, px_scale, is_demo, eye, fog_l, slab_center, slab_half) =
+            if self.debug.screen == Screen::GameDemo {
+                let camera = &self.debug.cosmic.camera;
+                // Eye in the demo buffer frame: world truth minus the
+                // upload (rebase) origin the demo buffers share.
+                let eye_w = camera.eye_world();
+                let origin = self.debug.cosmic.upload_origin;
+                let fog_l = self.debug.cosmic.fog_l_mpc;
+                (
+                    camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                    camera.px_scale(vp.h),
+                    true,
+                    [
+                        (eye_w.x - origin.x) as f32,
+                        (eye_w.y - origin.y) as f32,
+                        (eye_w.z - origin.z) as f32,
+                    ],
+                    fog_l,
+                    0.0,
+                    0.0,
+                )
+            } else {
+                let inspector = &self.debug.cosmic_inspector;
+                // Inspector buffers use the web-center (zero) origin, the
+                // same frame the inspector camera's eye is already in.
+                let e = inspector.camera.eye();
+                let (slab_center, slab_half) = if inspector.slab.on {
+                    (
+                        inspector.slab.center_mpc,
+                        inspector.slab.thickness_mpc * 0.5,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                (
+                    inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                    inspector.camera.px_scale(vp.h),
+                    false,
+                    [e.x, e.y, e.z],
+                    0.0,
+                    slab_center,
+                    slab_half,
+                )
+            };
         let (smoke, glow, splats) = if is_demo {
             (
                 self.cosmic_smoke.clone(),
@@ -6268,12 +6509,51 @@ impl ViewerApp {
             smoke,
             glow,
             splats,
+            fog_l,
+            slab_center,
+            slab_half,
             viewport: Viewport {
                 offset: [vp.x, vp.y],
                 extent: [vp.w, vp.h],
                 depth_range: 0.0..=1.0,
             },
         }
+    }
+
+    /// Toggle the inspector slab (`S` on the Cosmic Web tab,
+    /// `cosmic-depth-window` FR3): slab mode narrows to 20°
+    /// near-orthographic (framing kept by the distance rescale) around
+    /// a 30 Mpc slice at the orbit target's view depth; toggling back
+    /// restores 60° and the previous framing. Scroll roams the full
+    /// sphere depth (clamp ±2600 Mpc — the `SlabState::scroll` radius
+    /// is absolute view depth here, not target-relative).
+    fn toggle_cosmic_slab(&mut self) {
+        use game_debug::cosmic_window::SlabState;
+        let inspector = &mut self.debug.cosmic_inspector;
+        if inspector.slab.on {
+            inspector.slab = SlabState::off();
+            inspector.camera.set_fov_keep_framing(60.0);
+            self.debug.fx.notify("slab off".to_owned());
+        } else {
+            let eye = inspector.camera.eye();
+            let fwd = (inspector.camera.target() - eye).normalize_or_zero();
+            let t = inspector.camera.target();
+            let depth =
+                ((t.x - eye.x) * fwd.x + (t.y - eye.y) * fwd.y + (t.z - eye.z) * fwd.z).max(0.0);
+            let mut slab = SlabState::default_on();
+            slab.center_mpc = depth;
+            inspector.slab = slab;
+            inspector.camera.set_fov_keep_framing(20.0);
+            self.debug.fx.notify(format!(
+                "slab {} Mpc @ {:.0} Mpc",
+                inspector.slab.thickness_mpc, depth
+            ));
+        }
+        tracing::info!(
+            on = self.debug.cosmic_inspector.slab.on,
+            fov = self.debug.cosmic_inspector.camera.fov_y(),
+            "cosmic slab toggled"
+        );
     }
 
     /// Reseed the cosmic demo (web + player + camera + HUD) and rebuild
@@ -6870,7 +7150,18 @@ impl ViewerApp {
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x as f32, position.y as f32);
                 let content = self.debug.screen_content();
-                if self.dragging_slider {
+                if self.dragging_fog {
+                    // Demo-fog slider drag (`cosmic-depth-window` FR5).
+                    if let Some(ctx) = self.main.as_ref() {
+                        let (w, h) = ctx.size();
+                        let lh = self.atlas.line_height();
+                        let track = fog_slider_track(widget_body_rect(ui::widget_rect(w, h)), lh);
+                        let mut slider =
+                            ui::Slider::new(30, 400, self.debug.cosmic.fog_l_mpc as u32);
+                        slider.drag_to(track, cursor.0);
+                        self.debug.cosmic.fog_l_mpc = slider.value as f32;
+                    }
+                } else if self.dragging_slider {
                     if let Some(ctx) = self.main.as_ref() {
                         let (w, h) = ctx.size();
                         let viewer = &mut self.debug.viewer;
@@ -7038,6 +7329,14 @@ impl ViewerApp {
                     self.dragging_orbit = false;
                     self.dragging_slider = false;
                     self.dragging_density = false;
+                    // Demo-fog slider release (`cosmic-depth-window`
+                    // FR5): Console logs the settled value.
+                    if self.dragging_fog {
+                        self.dragging_fog = false;
+                        let line = format!("demo fog {:.0} Mpc", self.debug.cosmic.fog_l_mpc);
+                        tracing::info!("{line}");
+                        self.debug.console.push(line);
+                    }
                     self.press_cursor = None;
                     if click
                         && content == Some(ViewContent::PlanetView)
@@ -7201,6 +7500,20 @@ impl ViewerApp {
                                 self.debug.select_widget_tab(*tab);
                             }
                         }
+                        // Demo-fog slider (`cosmic-depth-window` FR5):
+                        // Inspector tab body only.
+                        if self.debug.widget_tab == WidgetTab::Inspector {
+                            let body = widget_body_rect(widget);
+                            let track = fog_slider_track(body, self.atlas.line_height());
+                            if track.contains(cx, cy) {
+                                self.dragging_fog = true;
+                                let mut slider =
+                                    ui::Slider::new(30, 400, self.debug.cosmic.fog_l_mpc as u32);
+                                slider.drag_to(track, cx);
+                                self.debug.cosmic.fog_l_mpc = slider.value as f32;
+                                return;
+                            }
+                        }
                         return;
                     }
                 }
@@ -7354,9 +7667,29 @@ impl ViewerApp {
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.system.camera.zoom_by(factor);
                     } else if content == Some(ViewContent::CosmicWeb) {
-                        // Inspector log-zoom (demo zoom handled above).
-                        let factor = (1.0 - 0.12 * scroll).max(0.05);
-                        self.debug.cosmic_inspector.camera.zoom_by(factor);
+                        if self.shift_held {
+                            // Slab scroll (`cosmic-depth-window` FR3):
+                            // Shift+wheel steps the slice depth by T/4
+                            // per notch when slab mode is on; plain
+                            // wheel keeps the orbit zoom below.
+                            let inspector = &mut self.debug.cosmic_inspector;
+                            if inspector.slab.on {
+                                let notches = if scroll > 0.0 { 1 } else { -1 };
+                                inspector.slab.scroll(notches, 2600.0);
+                                self.debug.fx.notify(format!(
+                                    "slab {} Mpc @ {:.0} Mpc",
+                                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                                ));
+                            } else {
+                                // Inspector log-zoom (demo zoom handled above).
+                                let factor = (1.0 - 0.12 * scroll).max(0.05);
+                                self.debug.cosmic_inspector.camera.zoom_by(factor);
+                            }
+                        } else {
+                            // Inspector log-zoom (demo zoom handled above).
+                            let factor = (1.0 - 0.12 * scroll).max(0.05);
+                            self.debug.cosmic_inspector.camera.zoom_by(factor);
+                        }
                     } else if self.debug.viewer.player.active {
                         self.debug.viewer.player.zoom_camera(scroll);
                     } else {
@@ -7640,6 +7973,58 @@ impl ViewerApp {
                             self.type_into_focused_fields(&text);
                         }
                     }
+                    PhysicalKey::Code(KeyCode::KeyS) => {
+                        // Inspector slab toggle (`cosmic-depth-window`
+                        // FR3): Cosmic Web tab only, fields keep the
+                        // keystroke. (GameDemo S is thrust — handled
+                        // above and returned early.)
+                        let viewer = &self.debug.viewer;
+                        if !viewer.subdiv_field.focused
+                            && !viewer.radius_field.focused
+                            && !self.debug.settings.seed_field.focused
+                            && self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                            && !matches!(self.debug.screen, Screen::GameDemo)
+                        {
+                            self.toggle_cosmic_slab();
+                        } else if let Some(text) = text {
+                            self.type_into_focused_fields(&text);
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::BracketLeft) => {
+                        // Slab thinner (`cosmic-depth-window` FR3):
+                        // Cosmic Web tab, slab on.
+                        if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                            && !matches!(self.debug.screen, Screen::GameDemo)
+                        {
+                            let inspector = &mut self.debug.cosmic_inspector;
+                            if inspector.slab.on {
+                                inspector
+                                    .slab
+                                    .set_thickness(inspector.slab.thickness_mpc - 10.0);
+                                self.debug.fx.notify(format!(
+                                    "slab {} Mpc @ {:.0} Mpc",
+                                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                                ));
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::BracketRight) => {
+                        // Slab thicker (`cosmic-depth-window` FR3).
+                        if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                            && !matches!(self.debug.screen, Screen::GameDemo)
+                        {
+                            let inspector = &mut self.debug.cosmic_inspector;
+                            if inspector.slab.on {
+                                inspector
+                                    .slab
+                                    .set_thickness(inspector.slab.thickness_mpc + 10.0);
+                                self.debug.fx.notify(format!(
+                                    "slab {} Mpc @ {:.0} Mpc",
+                                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                                ));
+                            }
+                        }
+                    }
                     PhysicalKey::Code(KeyCode::KeyE) => {
                         // Drill down: armed galaxy star → SystemMap.
                         // Instant faded map navigation (the timed transit
@@ -7891,6 +8276,36 @@ impl ViewerApp {
             }
             Action::TwilightCycle => {
                 self.twilight_stage = (self.twilight_stage + 1) % 4;
+            }
+            Action::SlabToggle => {
+                // Settings Controls parity for S (same tab gate).
+                if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                    && !matches!(self.debug.screen, Screen::GameDemo)
+                {
+                    self.toggle_cosmic_slab();
+                }
+            }
+            Action::SlabThinner | Action::SlabThicker => {
+                // Settings Controls parity for [/] (same tab gate).
+                if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                    && !matches!(self.debug.screen, Screen::GameDemo)
+                {
+                    let inspector = &mut self.debug.cosmic_inspector;
+                    if inspector.slab.on {
+                        let delta = if matches!(action, Action::SlabThinner) {
+                            -10.0
+                        } else {
+                            10.0
+                        };
+                        inspector
+                            .slab
+                            .set_thickness(inspector.slab.thickness_mpc + delta);
+                        self.debug.fx.notify(format!(
+                            "slab {} Mpc @ {:.0} Mpc",
+                            inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                        ));
+                    }
+                }
             }
             Action::ShaderMode(i) => {
                 if let Some(&mode) = DebugMode::ALL.get(i) {
@@ -9203,6 +9618,24 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_window_snippet_shared() {
+        // CDW-002/A-4: one `COSMIC_WINDOW_GLSL` source of truth,
+        // byte-identical in every cosmic vertex shader (the lib const
+        // is the authority — the binary pastes it verbatim).
+        use game_debug::cosmic_window::COSMIC_WINDOW_GLSL;
+        for (source, what) in [
+            (GLOW_VERT, "glow"),
+            (SMOKE_VERT, "smoke"),
+            (SPLAT_VERT, "splat"),
+        ] {
+            assert!(
+                source.contains(COSMIC_WINDOW_GLSL),
+                "{what} shader drifted from the shared window snippet"
+            );
+        }
+    }
+
+    #[test]
     fn fill_push_constants_fit_vulkan_floor() {
         // Vulkan 1.1 guarantees only 128 B of push constants; the fill
         // block (MVP + flags + hover/pin ids) must stay under it on every
@@ -9226,10 +9659,9 @@ mod tests {
 
     #[test]
     fn cosmic_push_constants_fit_vulkan_floor() {
-        // Cosmic blocks: glow (MVP + scale + exposure + redshift) and
-        // smoke (MVP + eye + scale + exposure + redshift, 92 B) must
-        // stay under the 128 B Vulkan 1.1 floor on every tier.
-        // Splat adds the eye + kernel constants (100 B).
+        // Cosmic blocks: glow (88 B with the depth-window terms),
+        // smoke (104 B) and splat (112 B) must stay under the 128 B
+        // Vulkan 1.1 floor on every tier.
         for (bytes, what) in [
             (std::mem::size_of::<GlowPush>(), "GlowPush"),
             (std::mem::size_of::<SmokePush>(), "SmokePush"),

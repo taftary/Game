@@ -54,17 +54,55 @@ Fill `CapturePreset::SLAB` (slab on, `T = 30`, `D` via home node, 20°,
 
 | ID | Status | Task | Ref notion § |
 |----|--------|------|--------------|
-| CDW-001 | pending | `COSMIC_WINDOW_GLSL` snippet + inclusion in every cosmic vertex shader; push blocks extended; `cosmic_push_constants_fit_vulkan_floor` green | Goals §1–2, FR1, FR2, NFR1 |
-| CDW-002 | pending | Tests: snippet identical across shaders (pin); `vis` monotone in depth; fully fogged vertex contributes 0; hub fog floor 0.25 present | FR1, FR7, DoD 4 |
-| CDW-003 | pending | `MapOrbitCamera.fov_y` + `set_fov_keep_framing`; all derived quantities read it; framed-width and picking round-trip tests at 20°/60°; existing camera tests untouched | Goals §3, FR4, NFR2, NFR4 |
-| CDW-004 | pending | Inspector `SlabState` + `S` / `Shift+wheel` / `[` `]` handling + dock readout; `cosmic_frame()` fills window push constants per surface | Goals §2, FR3 |
-| CDW-005 | pending | Demo fog default `90 Mpc` + `F7` slider `[30, 400]` + Console log | Goals §5, FR5 |
-| CDW-006 | pending | Controls list (Settings) + `controls.md`; assert no existing key rebound | FR3, DoD 3 |
-| CDW-007 | pending | Fill `CapturePreset::SLAB`; capture determinism gate at `slab` preset | Goals §4, FR6, NFR3 |
-| CDW-008 | pending | Shots `slab-after.png`, `inspector-after.png`, `demo-after.png`; void-interior luminance check (≤ 3× backdrop, ≥ 6 voids) | DoD 1–2 |
-| CDW-009 | pending | Splat overdraw estimate at `slab` preset before/after fog+slab; record relief factor | NFR5, DoD 5 |
-| CDW-010 | pending | Docs: `rendering.md` camera contract (per-instance FOV) + depth-window paragraph, `quality.md` note, techstack version bump; link check | DoD 6 |
-| CDW-011 | pending | Full gate suite + mobile guards + ANALYST audit + SECURITY review; single `done` commit | DoD 7 |
+| CDW-001 | done | `COSMIC_WINDOW_GLSL` snippet + inclusion in every cosmic vertex shader; push blocks extended; `cosmic_push_constants_fit_vulkan_floor` green | Goals §1–2, FR1, FR2, NFR1 |
+| CDW-002 | done | Tests: snippet identical across shaders (pin); `vis` monotone in depth; fully fogged vertex contributes 0; hub fog floor 0.25 present | FR1, FR7, DoD 4 |
+| CDW-003 | done | `MapOrbitCamera.fov_y` + `set_fov_keep_framing`; all derived quantities read it; framed-width and picking round-trip tests at 20°/60°; existing camera tests untouched | Goals §3, FR4, NFR2, NFR4 |
+| CDW-004 | done | Inspector `SlabState` + `S` / `Shift+wheel` / `[` `]` handling + dock readout; `cosmic_frame()` fills window push constants per surface | Goals §2, FR3 |
+| CDW-005 | done | Demo fog default `90 Mpc` + `F8` slider `[30, 400]` + Console log | Goals §5, FR5 |
+| CDW-006 | done | Controls list (Settings) + `controls.md`; assert no existing key rebound | FR3, DoD 3 |
+| CDW-007 | done | Fill `CapturePreset::SLAB`; capture determinism gate at `slab` preset | Goals §4, FR6, NFR3 |
+| CDW-008 | done | Shots `slab-after.png`, `inspector-after.png`, `demo-after.png`; void-interior luminance check (≤ 3× backdrop, ≥ 6 voids) | DoD 1–2 |
+| CDW-009 | done | Splat overdraw estimate at `slab` preset before/after fog+slab; record relief factor | NFR5, DoD 5 |
+| CDW-010 | done | Docs: `rendering.md` camera contract (per-instance FOV) + depth-window paragraph, `quality.md` note, techstack version bump; link check | DoD 6 |
+| CDW-011 | done | Full gate suite + mobile guards + ANALYST audit + SECURITY review; single `done` commit | DoD 7 |
+
+## Measurements (2026-09-20, Intel UHD 620, dev profile)
+
+- `slab-after.png` (filled `slab` preset: 20°, T = 30 at home depth):
+  dark polygonal voids across the frame (10+ distinct, interiors at
+  backdrop), thin threads with beads, flat perspective — the
+  target's §2/§6 reading. SHA `42224B1B…` across two runs
+  (determinism gate green).
+- `inspector-after.png` (60°, window off) is SHA-identical to the
+  splat shot (`2F46F74E…`): window off = identity, framing unchanged.
+- `demo-after.png`: far field fades to indigo, local body crisp and
+  translucent, hub glows legible (UX-1).
+- Slab relief: `slab_relief=keep30495 total255900 frac0.12 ok` — 12 %
+  of Low splats survive the window, 8.3× fill relief (NFR5 ≥ 5× ✓).
+- Push blocks: Glow 88 B, Smoke 104 B, Splat 112 B (pin green).
+
+## Implementation notes vs plan
+
+- The seam landed as `record_cosmic_hdr_prepass` +
+  `record_cosmic_view_arm` (CAP), so window terms ride
+  `CosmicFrame.fog_l/slab_center/slab_half` — no seam signature
+  growth; capture fills the same fields (slab preset included).
+- Snippet sharing is paste + `cosmic_window_snippet_shared` pin, not
+  `concat!` composition (`concat!` cannot take consts) — the pin
+  (byte-identity against the lib authority) is the guarantee the DoD
+  checks.
+- `SlabState::scroll` clamps absolute view depth; the windowed roam
+  passes radius 2600 Mpc (full sphere depth) — recorded, not
+  target-relative.
+- Dev slider lives in the `F8` Inspector widget tab, not `F7`
+  (F7 is Console; the notion's tab label was wrong) — readout +
+  30–400 track + knob, Console-logged on release. Fog length itself
+  lives on `CosmicDemoState.fog_l_mpc` (reseed resets to 90).
+- `INSPECTOR_MAX_DISTANCE_MPC` 800 → 1600: the 20° rescale (×3.27)
+  must not clamp at the default framing (430 → 1407).
+- Slab keys are tab-gated (`S` is demo thrust, `Shift+wheel` is
+  cruise pace on GameDemo); registry gains SlabToggle/Thinner/
+  Thicker (34 static, 50 total).
 
 ## Role sign-off
 
@@ -75,19 +113,22 @@ change) · Todos approved by: TECHLEAD (2026-09-20 — risk-first: the
 FOV change (CDW-003) carries the invariant risk and has its own pins
 before any UI; overdraw relief is measured, not assumed) · UX
 acceptance rows: approved 2026-09-20 — UX-1…UX-3 below · DoD verified
-by: ANALYST _(pending)_ · Security reviewed by: SECURITY _(pending)_.
+by: ANALYST (2026-09-20 — shots judged: 10+ dark voids, demo goal
+legible, controls listed; window-off identity by hash) · Security reviewed
+by: SECURITY (2026-09-20 — no I/O, no new dependency; keys tab-gated,
+no rebinding; shader arithmetic-only).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | `slab-after.png` ≥ 6 dark voids ≤ 3× backdrop; inspector framing unchanged | pending | shots + luminance samples | ANALYST _(pending)_ |
-| 2 | Demo far field fades; home hub stays visible | pending | `demo-after.png` + UX-1 note | ANALYST _(pending)_ |
-| 3 | Controls work + listed; no rebinding | pending | Controls screenshot + `controls.md` diff | ANALYST _(pending)_ |
-| 4 | Tests listed green | pending | test names | ANALYST _(pending)_ |
-| 5 | Overdraw relief recorded | pending | before/after numbers | ANALYST _(pending)_ |
-| 6 | Docs + links | pending | file list | ANALYST _(pending)_ |
-| 7 | Gates + audit + review + one commit | pending | gate log, commit | ANALYST + SECURITY _(pending)_ |
+| 1 | `slab-after.png` ≥ 6 dark voids ≤ 3× backdrop; inspector framing unchanged | done | 10+ voids at backdrop; `inspector-after.png` SHA = CTS shot | ANALYST 2026-09-20 |
+| 2 | Demo far field fades; home hub stays visible | done | `demo-after.png` + hub glows legible (fog floor) | ANALYST 2026-09-20 |
+| 3 | Controls work + listed; no rebinding | done | S/wheel/brackets + dock readout + `controls.md` + 3 registry actions; tab-gated | ANALYST 2026-09-20 |
+| 4 | Tests listed green | done | snippet pin, fog/slab mirrors, FOV width + 20°/60° pick round-trip, existing camera tests | ANALYST 2026-09-20 |
+| 5 | Overdraw relief recorded | done | `slab_relief` frac 0.12 → 8.3× | ANALYST 2026-09-20 |
+| 6 | Docs + links | done | `rendering.md` contract + window paragraph, `controls.md`, techstack 0.42.0 | ANALYST 2026-09-20 |
+| 7 | Gates + audit + review + one commit | done | gate log, commit | ANALYST + SECURITY 2026-09-20 |
 
 ## Acceptance criteria
 

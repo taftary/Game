@@ -23,6 +23,11 @@ the CPU reference in `engine::render::cue`; the GPU veil row above
 supersedes it as the shipped budget once `cosmic-gas-veil-v2` lands
 (the v0.2.0 row is then removed by that feature's docs sweep).
 
+Note (v0.3.3 `cosmic-depth-window`, shipped): the inspector slab
+window keeps 12 % of Low splats at the nominal framing (8.3× fill
+relief, `slab_relief` headless line); demo fog `L = 90` Mpc is a
+visibility term only (no culling, no frame-time claim).
+
 Thermal: sustained 15-min session must not throttle below Low-tier fps on reference phones (named in M6, see [`../milestones/`](../milestones/) and ADR-007 in [`../decisions/`](../decisions/)).
 
 ---

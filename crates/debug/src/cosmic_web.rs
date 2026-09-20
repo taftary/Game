@@ -20,6 +20,7 @@
 //! selection, flight, or saves), so the stage-0 descriptor, its hash,
 //! and `UNIVERSE_VERSION` are untouched.
 
+use super::cosmic_window::SlabState;
 use super::map_camera::{DEFAULT_PITCH, DEFAULT_YAW, MapOrbitCamera};
 use super::picking::project_to_screen;
 use super::ui::Rect;
@@ -36,8 +37,10 @@ pub const COSMIC_PICK_RADIUS_PX: f32 = 8.0;
 pub const INSPECTOR_DISTANCE_MPC: f32 = 430.0;
 /// Inspector zoom band, Mpc.
 pub const INSPECTOR_MIN_DISTANCE_MPC: f32 = 10.0;
-/// Inspector zoom band, Mpc.
-pub const INSPECTOR_MAX_DISTANCE_MPC: f32 = 800.0;
+/// Inspector zoom band, Mpc. Sized so the slab-mode 20° FOV rescale
+/// (×3.27 distance at the default framing) never clamps:
+/// 430 × 3.27 ≈ 1407 < 1600.
+pub const INSPECTOR_MAX_DISTANCE_MPC: f32 = 1600.0;
 
 /// Read-only inspector state for the Cosmic Web dimension tab.
 pub struct CosmicWebInspector {
@@ -46,6 +49,8 @@ pub struct CosmicWebInspector {
     pub camera: MapOrbitCamera,
     /// Selected node index (readout only — never fed back anywhere).
     pub selected: Option<u32>,
+    /// Slab window state (`cosmic-depth-window`): thin-slice view.
+    pub slab: SlabState,
 }
 
 impl CosmicWebInspector {
@@ -62,6 +67,7 @@ impl CosmicWebInspector {
                 250.0,
             ),
             selected: None,
+            slab: SlabState::off(),
         }
     }
 
@@ -835,6 +841,31 @@ mod tests {
             None
         );
         assert_eq!(inspector.selected, None);
+    }
+
+    #[test]
+    fn select_at_round_trips_at_both_slab_fovs() {
+        // CDW A-2: picking and drawing share one matrix at any FOV —
+        // clicking a node's projection selects it at 60° and at 20°.
+        let web = web();
+        let home = web.home();
+        let world = Vec3::new(
+            home.position_mpc[0] as f32,
+            home.position_mpc[1] as f32,
+            home.position_mpc[2] as f32,
+        );
+        for fov in [60.0, 20.0] {
+            let mut inspector = CosmicWebInspector::new();
+            inspector.camera.set_fov_keep_framing(fov);
+            let view_proj = inspector.view_proj(800.0 / 600.0);
+            let (sx, sy) =
+                project_to_screen(world, view_proj, vp()).expect("home node must project");
+            let picked = inspector.select_at(&web, DVec3::ZERO, (sx, sy), vp());
+            assert!(
+                picked.is_some(),
+                "click on the home node must select at {fov}°"
+            );
+        }
     }
 
     #[test]

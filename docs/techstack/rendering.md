@@ -43,14 +43,22 @@ convention existing nowhere in writing.
    Headings are compass bearings (0 = north, + toward east, clockwise
    seen from above), and turn input must steer toward the avatar's own
    right (`facing × up` is screen-right in FirstPerson).
-5. **Camera defaults:** Follow opens **south of a north-facing player,
+5. **Per-instance FOV (`cosmic-depth-window`, v0.3.3):
+   `MapOrbitCamera` carries its own `fov_y` (default `FOV_Y`); the
+   slab inspector narrows to 20° with a distance rescale that keeps
+   the framed width. `px_scale`, `pixels_per_unit`
+   (`world_per_pixel`), `projection_matrix`, and picking all derive
+   from the instance FOV, so drawing and picking share one matrix at
+   any FOV (pinned by the 20°/60° round-trip test).
+6. **Camera defaults:** Follow opens **south of a north-facing player,
    looking north** (thrust walks up-screen, east right-screen).
    FirstPerson looks along the heading with up = surface normal; the
    player marker is hidden there by design (screen-up IS the heading).
-6. **Picking (inverse path):** `ray_from_cursor` unprojects with
+7. **Picking (inverse path):** `ray_from_cursor` unprojects with
    `ndc = (2u−1, 1−2v)` on the sphere viewport. Any new unproject must
-   use the same signs.
-7. **Markers (forward path):** world → pixels goes only through
+   use the same signs. The cosmic inspector picks `web.nodes` through
+   its own instance-FOV matrix (same rule, same signs).
+8. **Markers (forward path):** world → pixels goes only through
    `world_to_pixels` (sphere player marker dot + arrow tip) — never a
    re-derived or snapped mapping.
 
@@ -492,6 +500,23 @@ Grain + bead clouds, constants, streams, and tests are gone
 path until `cosmic-gas-veil-v2`. Nominal headless:
 `smoke51953 splatsL255900 splatsM511800 splatsH1023599
 impostors18000 overdrawL2.0`.
+
+Depth window (`cosmic-depth-window`, shipped 2026-09-20): one shared
+GLSL term (`cosmic_window_vis`: fog `1/(1+(d/L)²)` × slab window
+with a 5 Mpc smoothstep edge, hub floor 0.25 on `kind ≥ 1`) pasted
+into the glow/smoke/splat vertex shaders (single authority:
+`debug::cosmic_window::COSMIC_WINDOW_GLSL`, pinned byte-identical)
+and pushed per surface (`fog_l`, `slab_center`, `slab_half` extend
+`GlowPush`/`SmokePush`/`SplatPush` to 88/104/112 B — still under the
+128 B floor). Demo runs fog `L = 90` Mpc (dev-slider `[30, 400]` in
+the widget Inspector tab, Console-logged); the inspector shows full
+depth until `S` opens the slab (30 Mpc default at the orbit target's
+depth, 20° near-ortho with framing kept, `Shift+wheel` scrolls,
+`[`/`]` resize). The `slab` capture preset is that framing at the
+home depth. Measured: voids dark (≥ 10 distinct in
+`slab-after.png`), `inspector-after.png` byte-identical to the
+splat shot (window off = identity), slab keeps 12 % of Low splats
+(8.3× fill relief).
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,

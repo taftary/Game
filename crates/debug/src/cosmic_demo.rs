@@ -94,6 +94,10 @@ pub struct CosmicDemoState {
     /// without teleporting the ship — Mpc units cannot resolve
     /// real-time thrust inside a test-length run.
     pub depth_fraction_override: Option<f64>,
+    /// Demo fog length in Mpc (`cosmic-depth-window` FR5): visibility
+    /// fog `1/(1+(d/L)²)` on the immersive view. Dev-widget slider in
+    /// `[30, 400]` (default 90); reseed resets it.
+    pub fog_l_mpc: f32,
 }
 
 impl CosmicDemoState {
@@ -117,6 +121,7 @@ impl CosmicDemoState {
             held: HeldThrust::default(),
             upload_origin,
             depth_fraction_override: None,
+            fog_l_mpc: super::cosmic_window::COSMIC_DEMO_FOG_MPC,
         }
     }
 

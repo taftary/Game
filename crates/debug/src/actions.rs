@@ -113,6 +113,9 @@ pub enum Action {
     TopDownSnap,
     TwilightCycle,
     ShaderMode(usize),
+    SlabToggle,
+    SlabThinner,
+    SlabThicker,
     // Travel (content keys, map contexts; `E` is context-dependent:
     // travel-begin on the galaxy/system tabs, fly-to engage/cancel in
     // the cosmic demo — the existing `T` dual-binding precedent).
@@ -157,6 +160,9 @@ impl Action {
             Action::TopDownSnap => "Home",
             Action::TwilightCycle => "F5",
             Action::ShaderMode(_) => "1-6",
+            Action::SlabToggle => "S",
+            Action::SlabThinner => "[",
+            Action::SlabThicker => "]",
             Action::TravelOffer => "T",
             Action::TravelBegin => "E",
             Action::FlyToToggle => "E",
@@ -195,6 +201,9 @@ impl Action {
             Action::TopDownSnap => "Top-down snap",
             Action::TwilightCycle => "Cycle twilight stage",
             Action::ShaderMode(_) => "Debug shader mode",
+            Action::SlabToggle => "Toggle cosmic slab view",
+            Action::SlabThinner => "Thinner cosmic slab",
+            Action::SlabThicker => "Thicker cosmic slab",
             Action::TravelOffer => "Arm/withdraw travel",
             Action::TravelBegin => "Begin travel",
             Action::FlyToToggle => "Engage/cancel fly-to",
@@ -232,7 +241,10 @@ impl Action {
             | Action::RerollSeed
             | Action::TopDownSnap
             | Action::TwilightCycle
-            | Action::ShaderMode(_) => ActionGroup::Camera,
+            | Action::ShaderMode(_)
+            | Action::SlabToggle
+            | Action::SlabThinner
+            | Action::SlabThicker => ActionGroup::Camera,
             Action::TravelOffer
             | Action::TravelBegin
             | Action::FlyToToggle
@@ -266,7 +278,7 @@ impl Action {
 
     /// Every static (non-parameterized) action, for the Controls list
     /// and the parity test.
-    pub const ALL_STATIC: [Action; 31] = [
+    pub const ALL_STATIC: [Action; 34] = [
         Action::ToggleLeftDock,
         Action::ToggleRightDock,
         Action::ToggleDevWidget,
@@ -291,6 +303,9 @@ impl Action {
         Action::RerollSeed,
         Action::TopDownSnap,
         Action::TwilightCycle,
+        Action::SlabToggle,
+        Action::SlabThinner,
+        Action::SlabThicker,
         Action::TravelOffer,
         Action::TravelBegin,
         Action::FlyToToggle,
@@ -349,7 +364,7 @@ mod tests {
 
     #[test]
     fn registry_size_is_pinned() {
-        // 31 static + 10 dimensions + 6 shader modes.
-        assert_eq!(all_actions().len(), 47);
+        // 34 static + 10 dimensions + 6 shader modes.
+        assert_eq!(all_actions().len(), 50);
     }
 }
