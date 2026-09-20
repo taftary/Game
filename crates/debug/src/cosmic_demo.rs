@@ -18,7 +18,9 @@ use super::ui::Rect;
 use game::hud::Hud;
 use game_engine::flight::{FlyToExec, Target, plan_fly_to};
 use game_engine::frames::FrameId;
-use game_engine::universe::{CosmicWebParams, WebDescriptor, generate_cosmic_web};
+use game_engine::universe::{
+    CosmicWebParams, WebDescriptor, WebField, WebFieldBudget, generate_cosmic_web_with_field,
+};
 use glam::{DQuat, DVec3};
 
 /// Mouse-steer sensitivity (rad/px): gentler than the map orbit rate —
@@ -72,6 +74,11 @@ pub struct CosmicDemoState {
     pub params: CosmicWebParams,
     /// The generated web both surfaces render.
     pub web: WebDescriptor,
+    /// Render sidecar for the web (ADR-025 `cosmic-tracer-splat` /
+    /// `cosmic-gas-veil-v2` source): displaced tracers + packed grid.
+    /// Generated with the web, reseeded with it — never hashed, never
+    /// saved, never read by gameplay.
+    pub field: WebField,
     /// Live player (ship + clock + fly-to slot + events).
     pub player: CosmicPlayerState,
     /// The player's own camera (tracks the ship every tick).
@@ -90,10 +97,10 @@ pub struct CosmicDemoState {
 }
 
 impl CosmicDemoState {
-    /// Generate the web and spawn the player (boot path).
+    /// Generate the web (+ render sidecar) and spawn the player (boot path).
     pub fn new(seed: u64) -> Self {
         let params = CosmicWebParams::nominal();
-        let web = generate_cosmic_web(seed, &params);
+        let (web, field) = generate_cosmic_web_with_field(seed, &params, WebFieldBudget::Full);
         let player = CosmicPlayerState::spawn(&web);
         let mut camera = CosmicCamera::new(params.descriptor_radius_mpc as f32);
         camera.track(player.position_mpc(), player.facing());
@@ -103,6 +110,7 @@ impl CosmicDemoState {
             seed,
             params,
             web,
+            field,
             player,
             camera,
             hud: Hud::new(),

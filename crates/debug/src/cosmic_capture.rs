@@ -172,6 +172,25 @@ pub fn encode_png_rgba8(
     Ok(out)
 }
 
+/// Fraction of pixels with all three channels at or above
+/// `threshold` (DoD wash checks, e.g. `cosmic-tracer-splat` near-eye:
+/// no frame with > 50 % of pixels above the bloom threshold).
+/// Pure CPU over RGBA8 top-first bytes.
+pub fn bright_fraction_rgba8(pixels: &[u8], threshold: u8) -> f64 {
+    if pixels.is_empty() {
+        return 0.0;
+    }
+    let mut bright = 0usize;
+    let mut total = 0usize;
+    for px in pixels.chunks_exact(4) {
+        total += 1;
+        if px[0] >= threshold && px[1] >= threshold && px[2] >= threshold {
+            bright += 1;
+        }
+    }
+    bright as f64 / total.max(1) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +322,20 @@ mod tests {
     }
 
     #[test]
+    fn bright_fraction_counts_white_pixels() {
+        assert_eq!(bright_fraction_rgba8(&[], 200), 0.0);
+        // 2x2: one white, one gray, two black.
+        let pixels = [
+            255, 255, 255, 255, 200, 200, 200, 255, 0, 0, 0, 255, 199, 199, 199, 255,
+        ];
+        assert!((bright_fraction_rgba8(&pixels, 200) - 0.5).abs() < 1e-9);
+        assert!((bright_fraction_rgba8(&pixels, 255) - 0.25).abs() < 1e-9);
+        // Single-channel brights don't count (bloom needs all three).
+        let red = [255, 0, 0, 255];
+        assert_eq!(bright_fraction_rgba8(&red, 200), 0.0);
+    }
+
+    #[test]
     fn encode_png_round_trip_top_row_first() {
         let (w, h) = (5u32, 3u32);
         // Distinct rows so a flip would fail the comparison below.
@@ -324,5 +357,31 @@ mod tests {
         reader.next_frame(&mut decoded).expect("png frame");
         let row_len = w as usize * 4;
         assert_eq!(&decoded[..row_len], &pixels[..row_len]);
+    }
+
+    /// Near-eye wash pin (`cosmic-tracer-splat` DoD 5): the committed
+    /// `demo-after.png` (boot framing inside a filament — spawn sits in
+    /// one by construction) must show no white flash — fewer than half
+    /// its pixels above the bright bar. CPU-only over the committed
+    /// shot: a standing invariant, not a grade lock (future features
+    /// replace the shot and re-record the number in their plan).
+    #[test]
+    fn demo_after_shot_has_no_white_flash() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../plans/v0.3.3/cosmic-tracer-splat/shots/demo-after.png"
+        );
+        let bytes = std::fs::read(path).expect("demo-after.png must exist");
+        let decoder = png::Decoder::new(bytes.as_slice());
+        let mut reader = decoder.read_info().expect("png header");
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        let mut pixels = vec![0u8; reader.output_buffer_size()];
+        reader.next_frame(&mut pixels).expect("png frame");
+        let frac = bright_fraction_rgba8(&pixels, 200);
+        eprintln!("demo-after bright fraction (>=200): {frac:.4}");
+        assert!(
+            frac < 0.5,
+            "white flash: {frac:.3} of demo-after.png pixels are bright"
+        );
     }
 }

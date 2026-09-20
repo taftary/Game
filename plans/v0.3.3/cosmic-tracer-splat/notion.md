@@ -2,8 +2,9 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-20; UX consulted; ARCHITECT + TECHLEAD
-breakdown in `plan.md`)
+`done` (PO sign-off 2026-09-20; UX consulted; ARCHITECT + TECHLEAD
+breakdown in `plan.md`; ANALYST audit + SECURITY review recorded in
+`plan.md` DoD table; single commit on branch `v0.3.3`)
 
 ## Context
 

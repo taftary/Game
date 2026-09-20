@@ -325,9 +325,7 @@ P1 ribbons): `cosmic_web.rs` emits one compact `SmokePuff` per puff
 for ~52k puffs vs ~1.2M ribbon tris). `main.rs` uploads them as
 per-instance vertices; `SMOKE_VERT` expands `gl_VertexIndex` into
 camera-facing billboard quads (billboard frame = 1 cross +
-normalize, no trig in the vertex shader; centers reuse the same
-`braid_point` derivation the grain pass uses, so grain still
-textures the smoke), world diameters 2–6.5 Mpc, hub warming baked on
+normalize, no trig in the vertex shader), world diameters 2–6.5 Mpc, hub warming baked on
 CPU, bounded redshift tint, and a 1→6 Mpc near-eye fade (the player
 spawns inside a filament — unfaded puffs fill the screen as white
 slabs). `SMOKE_FRAG` applies rim-zero radial falloff × a cheap 4x4
@@ -338,10 +336,9 @@ keeps distant puffs visible in the zoomed-out inspector (without it
 they shrink subpixel and vanish). ~104k tris, inside the 500k Low
 budget with margin. Known costs/risks: inspector zoom-out stacks
  dozens of puffs/px — mitigated by small alpha with the
- MAP smoke exposure at 0.85 (~5x the retired ribbon MAP grade, paying
- for the billboard area spread) vs 0.65 demo; follow-ups:
- distance/frustum cull, Low grain-budget cut (grain still 800k
- points).
+  MAP smoke exposure at 0.85 (~5x the retired ribbon MAP grade, paying
+  for the billboard area spread) vs 0.65 demo; follow-ups:
+  distance/frustum cull (the splat path already strides by tier).
 
 Illustris-look pass (`cosmic-web-illustris-look`, v0.3.2): render-only
 enrichment toward the Illustris projection target — no descriptor,
@@ -351,11 +348,11 @@ sub-threads diverge); smoke puffs become tangent-aligned stretched
 sheaths (`3–8 Mpc` long × `0.3–1.0 Mpc` thin, `4×` stretch in-shader,
 tighter `0.35 Mpc` jitter, core + faint-halo tiers, junction warming
 at degree-`≥3` bifurcations, anisotropic falloff + `8×8` hash dust);
-gold beads (`≤60k`, `cosmic_web/bead` stream, spine sub-segments,
-mass-graded emissive) string dwarf glitter along threads and ride the
-glow `PointList` (pick-ignored); faint-thread alpha floor `0.05 →
-0.03` so weak threads sink into the backdrop. Nominal headless:
-`smoke51953 grain800000 beads59958 impostors18000`. Bloom write-once,
+faint-thread alpha floor `0.05 → 0.03` so weak threads sink into the
+backdrop (the bead/glow-point strings retired in v0.3.3
+`cosmic-tracer-splat`). Nominal headless:
+`smoke51953 splatsL255900 splatsM511800 splatsH1023599 impostors18000`.
+Bloom write-once,
 redshift/near-eye/picking/marker pins all preserved (pinned by
 `cosmic_shader_safety_pins`, which keeps the `rl > 1e-10` side
 guard and the `1.0 - r2` rim-zero literal plus the `vec3(luma)`
@@ -364,7 +361,8 @@ white hot-center pin).
 White-smoke pass (2026-09-20, same v0.3.2): visibility + white
 sheaths, still render-only (no count, pipeline, or budget change —
 nominal headless stays `smoke51953 grain800000 beads59958
-impostors18000`). CPU: steep density contrast — base alpha
+impostors18000`; grain + beads retired the same day by v0.3.3
+`cosmic-tracer-splat`). CPU: steep density contrast — base alpha
 `0.02+0.13d` and rgb floor dimmed (`0.10/0.12/0.35` at d=0, dense
 ceiling unchanged), so faint mist lands darker than the original
 grade while dense threads carry ~2x; white subset density-gated
@@ -388,8 +386,8 @@ sample only the core, so it brightened the whole far field); the
 `8×8` hash dust is bilinear-smoothed value noise (still fract-only)
 so near puffs read as gas texture, not block edges. `SMOKE_VERT`
 near fade is size-relative (`0.35×len → 1.25×len`, floor `1→6 Mpc`)
-so a puff dissolves before its quad edges resolve on screen; beads,
-grain, and impostors keep nearby structure legible.
+so a puff dissolves before its quad edges resolve on screen; splats
+(near-eye fade in-shader) and impostors keep nearby structure legible.
 
 Palette quick pass (update-2026-09-19-1933): grading-only retune on
 the same geometry — no pipeline, topology, or image changes, bloom
@@ -439,7 +437,7 @@ a non-hashed `WebField` sidecar (≈ 1M Zel'dovich tracers with a
 smoothed overdensity + the 128³ T-web class/density grid —
 `web-field-export`, shipped, see above); the debug cosmic surfaces draw adaptive-kernel
 additive tracer splats coloured by one density ramp
-(`cosmic-tracer-splat`, retires grain + beads); a shared window term
+(`cosmic-tracer-splat`, shipped 2026-09-20, retires grain + beads); a shared window term
 — visibility fog `1/(1+(d/L)²)` on every cosmic draw + an inspector
 slab mode with a 20° near-orthographic FOV (`cosmic-depth-window`;
 the camera contract gains a per-instance `fov_y` on `MapOrbitCamera`
@@ -475,6 +473,25 @@ SHA256 on the Intel UHD 620). `slab`/`vista` presets are reserved
 framings until `cosmic-depth-window` / `cosmic-vista-intro` fill them.
 Windowed `F12` (Settings › Controls `Save PNG capture`) writes the
 current cosmic surface to `captures/` for exploration only.
+
+Tracer splats (`cosmic-tracer-splat`, shipped 2026-09-20): one
+additive point sprite per `WebField` tracer through a pipeline
+variant of the glow `PointList` (same pass, same blend — no new pass
+or draw). Vertex: world kernel `h = 2·(1+δ)^(-1/3)` clamped
+`[0.5, 4]` Mpc → `[1.5, 64]` px, constant-energy alpha (`k/px²`,
+per-surface `k`: demo 1.0, map 0.2 — grade round 1, 2026-09-20: the
+inspector stacks the full depth column and needed 5× less energy
+than the immersive view; fog replaces the knob), 5-stop density
+ramp (indigo → lavender → white → yellow → pink-red) with emissive
+`1+0.5·max(0, log2(1+δ)−1.5)`, class-B warm core lobe + class-C hub
+tint from the packed vertex word (`pos[3] + u32`: 16 B, Low 300k =
+4.8 MB), `smoothstep(h, 2h, dist)` near-eye fade, bounded Hubble
+tint. Fragment: rim-zero `(1−4d²)²` + warm core, arithmetic-only.
+Grain + bead clouds, constants, streams, and tests are gone
+(`rg grain_cloud|bead_cloud` = 0); braid helpers stay for the smoke
+path until `cosmic-gas-veil-v2`. Nominal headless:
+`smoke51953 splatsL255900 splatsM511800 splatsH1023599
+impostors18000 overdrawL2.0`.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,

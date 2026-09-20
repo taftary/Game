@@ -57,7 +57,7 @@ use game_engine::render::{
     log_physical_device, required_device_extensions, resolve_frag_bloom, select_hdr_format,
     star_visibility, visible_hemisphere,
 };
-use game_engine::universe::WebDescriptor;
+use game_engine::universe::{WebDescriptor, WebField};
 use game_engine::waypoints::WaypointId;
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -424,6 +424,98 @@ void main() {
     f_color = vec4(v_color * v_alpha * fall, 1.0);
 }";
 
+// Cosmic tracer splats (`cosmic-tracer-splat`, ADR-025): one additive
+// point sprite per Zel'dovich tracer, kernel size + color from local
+// density (the Illustris particle-splat look). The vertex stage may use
+// `exp2`/`log2` (per-vertex, not per-pixel); the fragment stays
+// arithmetic-only (mobile fill-rate rule). Density ramp stops match
+// `cosmic_splat::DENSITY_RAMP_STOPS` (pinned by
+// `cosmic_shader_safety_pins`); the vertex unpack mirrors
+// `cosmic_splat::splat_pack` bit-for-bit.
+const SPLAT_VERT: &str = r"#version 450
+layout(location = 0) in vec3 pos;
+layout(location = 1) in uint packed;
+layout(push_constant) uniform PushConstants {
+    mat4 mvp;
+    vec4 eye;
+    float px_scale;
+    float exposure;
+    float redshift;
+    float h0;
+    float alpha_k;
+} pc;
+layout(location = 0) out vec3 v_color;
+layout(location = 1) out float v_alpha;
+layout(location = 2) out float v_b;
+vec3 density_ramp(float log2od) {
+    vec3 col = vec3(0.10, 0.08, 0.35);
+    col = mix(col, vec3(0.35, 0.32, 0.80), clamp((log2od - (-2.0)) / (0.0 - (-2.0)), 0.0, 1.0));
+    col = mix(col, vec3(0.85, 0.85, 1.00), clamp((log2od - 0.0) / (1.5 - 0.0), 0.0, 1.0));
+    col = mix(col, vec3(1.00, 0.92, 0.60), clamp((log2od - 1.5) / (3.0 - 1.5), 0.0, 1.0));
+    col = mix(col, vec3(1.00, 0.45, 0.40), clamp((log2od - 3.0) / (4.5 - 3.0), 0.0, 1.0));
+    return col;
+}
+void main() {
+    uint q = packed & 65535u;
+    float log2od = float(q) / 65535.0 * 16.0 - 8.0;
+    uint tint = (packed >> 16u) & 3u;
+    uint b = (packed >> 18u) & 1u;
+    float od = exp2(log2od);
+    // Adaptive kernel h = h0 * (1+d)^(-1/3), clamped [0.5, 4] Mpc.
+    float h = clamp(pc.h0 * exp2(-log2(max(od, 1e-3)) / 3.0), 0.5, 4.0);
+    vec4 clip = pc.mvp * vec4(pos, 1.0);
+    gl_Position = clip;
+    float px = clamp(h * pc.px_scale / max(clip.w, 1e-6), 1.5, 64.0);
+    gl_PointSize = px;
+    // Constant energy per splat: dense clumps are bright because they
+    // hold many particles, not because each is bigger.
+    float alpha = pc.alpha_k / max(px * px, 1.0) * pc.exposure;
+    // Near-eye fade (the v0.3.2 white-flash lesson): kernels closer
+    // than 2h dissolve instead of filling the screen.
+    float dist = length(pos - pc.eye.xyz);
+    alpha *= smoothstep(h, 2.0 * h, dist);
+    // Bounded redshift depth (the glow-shader treatment, same clamps).
+    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
+    vec3 hubble = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    float dim = 1.0 / (1.0 + 0.45 * z);
+    // Density ramp + emissive (dense cores cross the bloom threshold)
+    // + class-C hub tint toward pink-red.
+    vec3 ramp = density_ramp(log2od);
+    float emissive = 1.0 + 0.5 * max(0.0, log2od - 1.5);
+    vec3 tinted = mix(ramp, vec3(1.0, 0.5, 0.55), float(tint) / 3.0 * 0.6);
+    v_color = tinted * emissive * hubble * dim;
+    v_alpha = alpha;
+    v_b = float(b);
+}";
+
+const SPLAT_FRAG: &str = r"#version 450
+layout(location = 0) in vec3 v_color;
+layout(location = 1) in float v_alpha;
+layout(location = 2) in float v_b;
+layout(location = 0) out vec4 f_color;
+void main() {
+    vec2 d = gl_PointCoord - vec2(0.5);
+    // Rim-zero kernel (the glow-shader falloff, same literal).
+    float t = max(0.0, 1.0 - 4.0 * dot(d, d));
+    float fall = t * t;
+    vec3 col = v_color;
+    // Class-B galaxy core: warm 2 px lobe on top of the kernel.
+    float core = max(0.0, 1.0 - dot(d, d) * 16.0);
+    col = mix(col, vec3(1.0, 0.85, 0.55) * 2.0, core * v_b);
+    f_color = vec4(col * v_alpha * fall, 1.0);
+}";
+
+/// World-space kernel scale: `h = h0 * (1+d)^(-1/3)` Mpc.
+const SPLAT_H0: f32 = 2.0;
+/// Constant-energy numerator: `alpha = k / max(px^2, 1)`. Per-surface
+/// grade (round 1, 2026-09-20): the zoomed-out inspector stacks the
+/// full 500 Mpc depth column (~7× the demo's per-px energy), so the
+/// map runs 0.2 while the immersive demo keeps 1.0. `cosmic-depth-
+/// window` fog replaces this knob with a real depth term.
+const SPLAT_ALPHA_K_DEMO: f32 = 1.0;
+/// See [`SPLAT_ALPHA_K_DEMO`].
+const SPLAT_ALPHA_K_MAP: f32 = 0.2;
+
 // Cosmic smoke filaments (smoke v2 display, Illustris-look WS3):
 // tangent-aligned stretched impostor records expanded in-shader into
 // filament-hugging quads (TriangleList, 6 verts per puff — two
@@ -663,6 +755,33 @@ struct GlowPush {
     redshift: f32,
 }
 
+/// Cosmic tracer-splat vertex (`cosmic-tracer-splat`): origin-relative
+/// Mpc position + packed density/class word (see
+/// `cosmic_splat::splat_pack`). 16 B — Low holds 300k in 4.8 MB.
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+struct SplatVertex {
+    #[format(R32G32B32_SFLOAT)]
+    pos: [f32; 3],
+    #[format(R32_UINT)]
+    packed: u32,
+}
+
+/// Cosmic splat push constants: MVP + buffer-frame eye (near-eye
+/// fade) + pixel scale + exposure + redshift + kernel scale +
+/// constant-energy numerator. 100 B < 128 B Vulkan 1.1 floor.
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+struct SplatPush {
+    mvp: [[f32; 4]; 4],
+    eye: [f32; 4],
+    px_scale: f32,
+    exposure: f32,
+    redshift: f32,
+    h0: f32,
+    alpha_k: f32,
+}
+
 /// Cosmic smoke push constants: MVP, camera eye (buffer frame),
 /// sprite scale (reserved), per-surface alpha exposure, redshift
 /// strength. 92 B total, under the 128 B Vulkan 1.1 floor.
@@ -703,6 +822,7 @@ struct CosmicFrame {
     eye: [f32; 3],
     smoke: Subbuffer<[SmokeVertex]>,
     glow: Subbuffer<[MapVertex]>,
+    splats: Subbuffer<[SplatVertex]>,
     viewport: Viewport,
 }
 
@@ -968,34 +1088,45 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.player.position_mpc()
     );
     // Cinematic layout smoke (update 2026-09-18-2328, smoke
-    // billboards replace ribbons; Illustris-look WS1–WS4: stretched
-    // sheath quads, frayed strands, gold beads over the bifurcation /
-    // spine skeleton): the enrichment layer derives non-empty
-    // smoke/grain/bead/impostor clouds from the boot web.
+    // billboards replace ribbons; `cosmic-tracer-splat`: grain + beads
+    // retired, tracer splats render the field instead): the smoke /
+    // splat / impostor clouds derive non-empty from the boot web.
     // GPU-free — upload happens only in the windowed shell.
     let layout_seed = debug_app.cosmic.seed;
     let layout_origin = debug_app.cosmic.upload_origin;
     let smoke =
         game_debug::cosmic_web::smoke_puffs(&debug_app.cosmic.web, layout_seed, layout_origin);
-    let grain =
-        game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
-    let beads =
-        game_debug::cosmic_web::bead_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
     let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
     assert!(!smoke.is_empty(), "smoke must emit puffs");
-    assert!(!grain.is_empty(), "grain must emit points");
-    assert!(!beads.is_empty(), "beads must emit points");
     assert_eq!(
         impostors.len(),
         debug_app.cosmic.web.nodes.len() * 3,
         "three impostors per node"
     );
+    // Splat counts per tier + Low overdraw estimate (CTS-006/008):
+    // stride subsets of the same field, so Low ⊂ Medium ⊂ High.
+    let (splats_low, splats_med, splats_high, overdraw_low) = {
+        use game_debug::cosmic_splat::{SplatTier, overdraw_estimate, splat_records};
+        let web = &debug_app.cosmic.web;
+        let field = &debug_app.cosmic.field;
+        let low = splat_records(field, web, layout_origin, SplatTier::Low);
+        let med = splat_records(field, web, layout_origin, SplatTier::Medium);
+        let high = splat_records(field, web, layout_origin, SplatTier::High);
+        assert!(!high.is_empty(), "splats must emit points");
+        assert!(low.len() < med.len() && med.len() <= high.len());
+        // Inspector framing at 1080p: px_scale / 430 Mpc depth.
+        let px_per_mpc = debug_app.cosmic_inspector.camera.px_scale(1080.0) / 430.0;
+        let overdraw = overdraw_estimate(&low, px_per_mpc, (1920, 1080));
+        (low.len(), med.len(), high.len(), overdraw)
+    };
     println!(
-        "cosmic_layout=smoke{} grain{} beads{} impostors{} ok",
+        "cosmic_layout=smoke{} splatsL{} splatsM{} splatsH{} impostors{} overdrawL{:.1} ok",
         smoke.len(),
-        grain.len(),
-        beads.len(),
-        impostors.len()
+        splats_low,
+        splats_med,
+        splats_high,
+        impostors.len(),
+        overdraw_low
     );
     // Field sidecar self-check (`web-field-export`, ADR-025): the export
     // entry point returns the identical descriptor, the tracer band
@@ -1389,8 +1520,10 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         ui: build_ui_pipeline(&device, &shaders, &render_pass),
         map: build_map_pipeline(&device, &shaders, &render_pass),
         map_glow: build_glow_pipeline(&device, &shaders, &render_pass),
+        splat: build_splat_pipeline(&device, &shaders, &render_pass),
         smoke: build_smoke_pipeline(&device, &shaders, &render_pass),
         glow_scene: build_glow_pipeline(&device, &shaders, &scene_pass),
+        splat_scene: build_splat_pipeline(&device, &shaders, &scene_pass),
         smoke_scene: build_smoke_pipeline(&device, &shaders, &scene_pass),
         bright: build_post_pipeline(
             &device,
@@ -1451,6 +1584,12 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     let extent = [w, h];
     let smoke = upload_cosmic_smoke(&memory_allocator, &debug.cosmic.web, seed, origin);
     let glow = upload_cosmic_glow(&memory_allocator, &debug.cosmic.web, seed, origin);
+    let splats = upload_cosmic_splats(
+        &memory_allocator,
+        &debug.cosmic.field,
+        &debug.cosmic.web,
+        origin,
+    );
     let ship = debug.cosmic.player.position_mpc();
     let player_point = upload_cosmic_player_point(
         &memory_allocator,
@@ -1463,6 +1602,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         eye,
         smoke,
         glow,
+        splats,
         viewport: Viewport {
             offset: [0.0, 0.0],
             extent: [w as f32, h as f32],
@@ -1534,6 +1674,11 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             COSMIC_MAP_BLOOM_INTENSITY,
         )
     };
+    let splat_alpha_k = if is_demo {
+        SPLAT_ALPHA_K_DEMO
+    } else {
+        SPLAT_ALPHA_K_MAP
+    };
     let bloom_enabled = !std::env::var("GAME_DEBUG_COSMIC_BLOOM").is_ok_and(|value| value == "0");
     let readback = Buffer::from_iter(
         memory_allocator.clone(),
@@ -1566,6 +1711,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             redshift,
             BloomParams::spec_defaults().threshold,
             bloom_enabled,
+            splat_alpha_k,
         );
     }
     builder
@@ -1593,6 +1739,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         resolve_exposure,
         bloom_intensity,
         redshift,
+        splat_alpha_k,
         player_point,
     );
     builder
@@ -4088,6 +4235,8 @@ struct ShaderSet {
     map_frag: Arc<ShaderModule>,
     glow_vert: Arc<ShaderModule>,
     glow_frag: Arc<ShaderModule>,
+    splat_vert: Arc<ShaderModule>,
+    splat_frag: Arc<ShaderModule>,
     smoke_vert: Arc<ShaderModule>,
     smoke_frag: Arc<ShaderModule>,
     post_vert: Arc<ShaderModule>,
@@ -4109,6 +4258,8 @@ impl ShaderSet {
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
             glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
             glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
+            splat_vert: compile_shader(device, ShaderKind::Vertex, SPLAT_VERT, "splat vertex"),
+            splat_frag: compile_shader(device, ShaderKind::Fragment, SPLAT_FRAG, "splat fragment"),
             smoke_vert: compile_shader(device, ShaderKind::Vertex, SMOKE_VERT, "smoke vertex"),
             smoke_frag: compile_shader(device, ShaderKind::Fragment, SMOKE_FRAG, "smoke fragment"),
             post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
@@ -4419,6 +4570,66 @@ fn build_glow_pipeline(
         },
     )
     .expect("glow graphics pipeline must create")
+}
+
+/// Cosmic tracer-splat pipeline (`cosmic-tracer-splat`): `PointList`
+/// over [`SplatVertex`] records, premultiplied-additive, no depth
+/// write — a pipeline *variant* of the glow path (same pass, same
+/// blend), not a new pass or draw.
+fn build_splat_pipeline(
+    device: &Arc<Device>,
+    shaders: &ShaderSet,
+    render_pass: &Arc<RenderPass>,
+) -> Arc<GraphicsPipeline> {
+    let vs = shaders
+        .splat_vert
+        .entry_point("main")
+        .expect("vertex entry point");
+    let fs = shaders
+        .splat_frag
+        .entry_point("main")
+        .expect("fragment entry point");
+    let vertex_input_state = SplatVertex::per_vertex()
+        .definition(&vs)
+        .expect("splat vertex layout must match shader");
+    let (layout, stages) = pipeline_layout_for(device, vs, fs);
+    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
+    GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState {
+                topology: PrimitiveTopology::PointList,
+                ..Default::default()
+            }),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState {
+                cull_mode: CullMode::None,
+                ..Default::default()
+            }),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                subpass.num_color_attachments(),
+                ColorBlendAttachmentState {
+                    blend: Some(additive_blend()),
+                    ..Default::default()
+                },
+            )),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(subpass.into()),
+            ..GraphicsPipelineCreateInfo::layout(layout)
+        },
+    )
+    .expect("splat graphics pipeline must create")
 }
 
 /// Cosmic smoke-filament pipeline (smoke display): `TriangleList`
@@ -4823,10 +5034,13 @@ fn upload_cosmic_glow(
     seed: u64,
     origin: glam::DVec3,
 ) -> Subbuffer<[MapVertex]> {
-    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::grain_cloud(web, seed, origin)
+    // `cosmic-tracer-splat` retired the grain + bead clouds: the glow
+    // buffer now holds the dwarf-glow gas veil + node impostors only
+    // (impostors retire in `cosmic-hub-hierarchy`, the veil in
+    // `cosmic-gas-veil-v2`).
+    let _ = seed;
+    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::glow_point_cloud(web, origin)
         .iter()
-        .chain(game_debug::cosmic_web::glow_point_cloud(web, origin).iter())
-        .chain(game_debug::cosmic_web::bead_cloud(web, seed, origin).iter())
         .chain(game_debug::cosmic_web::node_impostors(web, origin).iter())
         .map(|(pos, color, misc)| MapVertex {
             map_pos: *pos,
@@ -4900,6 +5114,52 @@ fn upload_cosmic_smoke(
     .expect("cosmic smoke vertex buffer upload must succeed")
 }
 
+/// Upload the cosmic tracer splats (`cosmic-tracer-splat`): one
+/// 16 B [`SplatVertex`] per tracer at High (all tracers; Low/Medium
+/// stride subsets are the tier constants in `cosmic_splat`, drawn by
+/// device profiles — the windowed viewer has no tier switch). A
+/// degenerate empty set uploads one guard point (vulkano rejects
+/// zero-length vertex buffers).
+fn upload_cosmic_splats(
+    allocator: &Arc<StandardMemoryAllocator>,
+    field: &WebField,
+    web: &WebDescriptor,
+    origin: glam::DVec3,
+) -> Subbuffer<[SplatVertex]> {
+    use game_debug::cosmic_splat::{SplatTier, splat_pack, splat_records};
+    let mut verts: Vec<SplatVertex> = splat_records(field, web, origin, SplatTier::High)
+        .iter()
+        .map(|r| {
+            let tint = r.class_tint >> 1;
+            let b = r.class_tint & 1 == 1;
+            SplatVertex {
+                pos: r.pos,
+                packed: splat_pack(r.overdensity.log2(), tint, b),
+            }
+        })
+        .collect();
+    if verts.is_empty() {
+        verts.push(SplatVertex {
+            pos: [0.0, 0.0, -900.0],
+            packed: game_debug::cosmic_splat::splat_pack(-8.0, 0, false),
+        });
+    }
+    Buffer::from_iter(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        verts,
+    )
+    .expect("cosmic splat vertex buffer upload must succeed")
+}
+
 /// Upload the inspector player point: one origin-relative vertex (near-
 /// white, larger than any node sprite so it reads distinct). Rebuilt per
 /// frame while the Cosmic Web tab shows — the ship moves continuously.
@@ -4944,6 +5204,7 @@ fn record_cosmic_hdr_prepass(
     redshift: f32,
     bloom_threshold: f32,
     bloom_enabled: bool,
+    splat_alpha_k: f32,
 ) {
     // Scene: indigo clear, smoke then glow.
     builder
@@ -5000,6 +5261,30 @@ fn record_cosmic_hdr_prepass(
     // SAFETY: same PointList contract as the galaxy map.
     unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
         .expect("HDR scene glow draw must record");
+    // Tracer splats (`cosmic-tracer-splat`): the field render rides
+    // the same scene pass through its own pipeline variant.
+    builder
+        .bind_pipeline_graphics(pipes.splat_scene.clone())
+        .expect("pipeline must bind")
+        .bind_vertex_buffers(0, frame.splats.clone())
+        .expect("vertex buffer must bind")
+        .push_constants(
+            pipes.splat_scene.layout().clone(),
+            0,
+            SplatPush {
+                mvp: frame.mvp,
+                eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                px_scale: frame.px_scale,
+                exposure: glow_exposure,
+                redshift,
+                h0: SPLAT_H0,
+                alpha_k: splat_alpha_k,
+            },
+        )
+        .expect("splat push constants must upload");
+    // SAFETY: same PointList contract as the glow draw.
+    unsafe { builder.draw(frame.splats.len() as u32, 1, 0, 0) }
+        .expect("HDR scene splat draw must record");
     builder
         .end_render_pass(Default::default())
         .expect("HDR scene pass must end");
@@ -5143,6 +5428,7 @@ fn record_cosmic_view_arm(
     resolve_exposure: f32,
     bloom_intensity: f32,
     redshift: f32,
+    splat_alpha_k: f32,
     player_point: Subbuffer<[MapVertex]>,
 ) {
     if let Some(hdr) = hdr {
@@ -5226,6 +5512,30 @@ fn record_cosmic_view_arm(
             .expect("glow push constants must upload");
         // SAFETY: same PointList contract as the galaxy map.
         unsafe { builder.draw(glow_len as u32, 1, 0, 0) }.expect("cosmic glow draw must record");
+        // Tracer splats (`cosmic-tracer-splat`): same LDR bypass path
+        // through the splat pipeline variant.
+        builder
+            .bind_pipeline_graphics(pipes.splat.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, frame.splats.clone())
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.splat.layout().clone(),
+                0,
+                SplatPush {
+                    mvp: frame.mvp,
+                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                    px_scale: frame.px_scale,
+                    exposure: glow_exposure,
+                    redshift,
+                    h0: SPLAT_H0,
+                    alpha_k: splat_alpha_k,
+                },
+            )
+            .expect("splat push constants must upload");
+        // SAFETY: same PointList contract as the glow draw.
+        unsafe { builder.draw(frame.splats.len() as u32, 1, 0, 0) }
+            .expect("cosmic splat draw must record");
     }
     if !frame.is_demo {
         // Inspector player point: drawn last through the alpha map
@@ -5479,11 +5789,16 @@ struct ViewerApp {
     cosmic_glow: Subbuffer<[MapVertex]>,
     /// Cosmic smoke puffs (instanced billboards, same origin frame).
     cosmic_smoke: Subbuffer<[SmokeVertex]>,
+    /// Cosmic tracer splats (16 B vertices, same origin frame;
+    /// `cosmic-tracer-splat`).
+    cosmic_splats: Subbuffer<[SplatVertex]>,
     /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
     cosmic_tab_glow: Subbuffer<[MapVertex]>,
     /// Inspector smoke puffs (fixed web-center origin).
     cosmic_tab_smoke: Subbuffer<[SmokeVertex]>,
+    /// Inspector tracer splats (fixed web-center origin).
+    cosmic_tab_splats: Subbuffer<[SplatVertex]>,
     /// Inspector player point (one vertex, rebuilt per frame while the
     /// tab shows — the ship moves continuously).
     cosmic_tab_player: Subbuffer<[MapVertex]>,
@@ -5699,6 +6014,12 @@ impl ViewerApp {
             cosmic_seed,
             cosmic_origin,
         );
+        let cosmic_splats = upload_cosmic_splats(
+            &memory_allocator,
+            &debug.cosmic.field,
+            &debug.cosmic.web,
+            cosmic_origin,
+        );
         // Inspector buffers at the fixed web-center origin (WS5).
         let cosmic_tab_glow = upload_cosmic_glow(
             &memory_allocator,
@@ -5710,6 +6031,12 @@ impl ViewerApp {
             &memory_allocator,
             &debug.cosmic.web,
             cosmic_seed,
+            glam::DVec3::ZERO,
+        );
+        let cosmic_tab_splats = upload_cosmic_splats(
+            &memory_allocator,
+            &debug.cosmic.field,
+            &debug.cosmic.web,
             glam::DVec3::ZERO,
         );
         let cosmic_tab_player = upload_cosmic_player_point(&memory_allocator, [0.0, 0.0, 0.0]);
@@ -5754,8 +6081,10 @@ impl ViewerApp {
             system_lines,
             cosmic_glow,
             cosmic_smoke,
+            cosmic_splats,
             cosmic_tab_glow,
             cosmic_tab_smoke,
+            cosmic_tab_splats,
             cosmic_tab_player,
             sky,
             sky_vertices,
@@ -5845,6 +6174,12 @@ impl ViewerApp {
             upload_cosmic_glow(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
         self.cosmic_smoke =
             upload_cosmic_smoke(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        self.cosmic_splats = upload_cosmic_splats(
+            &self.memory_allocator,
+            &self.debug.cosmic.field,
+            &self.debug.cosmic.web,
+            origin,
+        );
         self.cosmic_tab_glow = upload_cosmic_glow(
             &self.memory_allocator,
             &self.debug.cosmic.web,
@@ -5855,6 +6190,12 @@ impl ViewerApp {
             &self.memory_allocator,
             &self.debug.cosmic.web,
             seed,
+            glam::DVec3::ZERO,
+        );
+        self.cosmic_tab_splats = upload_cosmic_splats(
+            &self.memory_allocator,
+            &self.debug.cosmic.field,
+            &self.debug.cosmic.web,
             glam::DVec3::ZERO,
         );
         tracing::info!(
@@ -5899,10 +6240,18 @@ impl ViewerApp {
                 [e.x, e.y, e.z],
             )
         };
-        let (smoke, glow) = if is_demo {
-            (self.cosmic_smoke.clone(), self.cosmic_glow.clone())
+        let (smoke, glow, splats) = if is_demo {
+            (
+                self.cosmic_smoke.clone(),
+                self.cosmic_glow.clone(),
+                self.cosmic_splats.clone(),
+            )
         } else {
-            (self.cosmic_tab_smoke.clone(), self.cosmic_tab_glow.clone())
+            (
+                self.cosmic_tab_smoke.clone(),
+                self.cosmic_tab_glow.clone(),
+                self.cosmic_tab_splats.clone(),
+            )
         };
         if !is_demo {
             let ship = self.debug.cosmic.player.position_mpc();
@@ -5918,6 +6267,7 @@ impl ViewerApp {
             eye,
             smoke,
             glow,
+            splats,
             viewport: Viewport {
                 offset: [vp.x, vp.y],
                 extent: [vp.w, vp.h],
@@ -6184,8 +6534,10 @@ impl ViewerApp {
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
             map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
+            splat: build_splat_pipeline(&self.device, &self.shaders, &render_pass),
             smoke: build_smoke_pipeline(&self.device, &self.shaders, &render_pass),
             glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
+            splat_scene: build_splat_pipeline(&self.device, &self.shaders, &scene_pass),
             smoke_scene: build_smoke_pipeline(&self.device, &self.shaders, &scene_pass),
             bright: build_post_pipeline(
                 &self.device,
@@ -6337,10 +6689,13 @@ struct Pipelines {
     map: Arc<GraphicsPipeline>,
     /// Cosmic glow sprites (additive, update-2026-09-18-2328).
     map_glow: Arc<GraphicsPipeline>,
+    /// Cosmic tracer splats (additive variant, `cosmic-tracer-splat`).
+    splat: Arc<GraphicsPipeline>,
     /// Cosmic smoke filaments (additive instanced billboards).
     smoke: Arc<GraphicsPipeline>,
     /// Scene-pass variants of the cosmic pipelines (HDR mode).
     glow_scene: Arc<GraphicsPipeline>,
+    splat_scene: Arc<GraphicsPipeline>,
     smoke_scene: Arc<GraphicsPipeline>,
     /// Bloom bright extract (post pass).
     bright: Arc<GraphicsPipeline>,
@@ -8088,6 +8443,11 @@ impl ViewerApp {
             } else {
                 (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
             };
+            let splat_alpha_k = if frame.is_demo {
+                SPLAT_ALPHA_K_DEMO
+            } else {
+                SPLAT_ALPHA_K_MAP
+            };
             record_cosmic_hdr_prepass(
                 &mut builder,
                 &ctx.pipelines,
@@ -8098,6 +8458,7 @@ impl ViewerApp {
                 redshift,
                 BloomParams::spec_defaults().threshold,
                 ctx.bloom_enabled,
+                splat_alpha_k,
             );
         }
         builder
@@ -8205,6 +8566,11 @@ impl ViewerApp {
                     } else {
                         (COSMIC_MAP_EXPOSURE, COSMIC_MAP_BLOOM_INTENSITY)
                     };
+                    let splat_alpha_k = if frame.is_demo {
+                        SPLAT_ALPHA_K_DEMO
+                    } else {
+                        SPLAT_ALPHA_K_MAP
+                    };
                     record_cosmic_view_arm(
                         &mut builder,
                         &ctx.pipelines,
@@ -8218,6 +8584,7 @@ impl ViewerApp {
                         resolve_exposure,
                         bloom_intensity,
                         redshift,
+                        splat_alpha_k,
                         self.cosmic_tab_player.clone(),
                     );
                 } else if view == ViewContent::SystemMap {
@@ -8734,6 +9101,8 @@ mod tests {
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
             (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
             (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
+            (ShaderKind::Vertex, SPLAT_VERT, "splat vert"),
+            (ShaderKind::Fragment, SPLAT_FRAG, "splat frag"),
             (ShaderKind::Vertex, SMOKE_VERT, "smoke vert"),
             (ShaderKind::Fragment, SMOKE_FRAG, "smoke frag"),
         ] {
@@ -8751,7 +9120,8 @@ mod tests {
         // compilation cannot catch a mismatch, and there is no
         // GPU-free way to run the real check, so the names are pinned
         // here. `SmokeVertex { pos_size, rgba, misc }`
-        // (per-instance), `MapVertex { map_pos, color, misc }`.
+        // (per-instance), `MapVertex { map_pos, color, misc }`,
+        // `SplatVertex { pos, packed }`.
         for (source, name, what) in [
             (SMOKE_VERT, "in vec4 pos_size;", "smoke pos_size"),
             (SMOKE_VERT, "in vec4 rgba;", "smoke rgba"),
@@ -8759,12 +9129,17 @@ mod tests {
             (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
             (GLOW_VERT, "in vec3 color;", "glow color"),
             (GLOW_VERT, "in vec3 misc;", "glow misc"),
+            (SPLAT_VERT, "in vec3 pos;", "splat pos"),
+            (SPLAT_VERT, "in uint packed;", "splat packed"),
         ] {
             assert!(
                 source.contains(name),
                 "{what} input missing from its vertex shader"
             );
         }
+        // 16 B vertex: the Low buffer budget (300k × 16 B = 4.8 MB)
+        // depends on it.
+        assert_eq!(std::mem::size_of::<SplatVertex>(), 16);
     }
 
     #[test]
@@ -8783,6 +9158,18 @@ mod tests {
             (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
             (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
             (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
+            (
+                SPLAT_FRAG,
+                "1.0 - 4.0 * dot(d, d)",
+                "splat rim-zero falloff",
+            ),
+            (SPLAT_VERT, "max(clip.w, 0.0)", "splat depth clamp"),
+            (SPLAT_VERT, "65535.0 * 16.0 - 8.0", "splat unpack mirror"),
+            (
+                SPLAT_VERT,
+                "smoothstep(h, 2.0 * h, dist)",
+                "splat near-eye fade",
+            ),
             (SMOKE_VERT, "max(clipc.w, 0.0)", "smoke depth clamp"),
             (SMOKE_VERT, "rl > 1e-10", "smoke side guard"),
             (SMOKE_VERT, "min_world", "smoke min-pixel clamp"),
@@ -8796,6 +9183,21 @@ mod tests {
             assert!(
                 source.contains(", 0.5)"),
                 "redshift cap missing from a cosmic vertex shader"
+            );
+        }
+        // Splat fragment: arithmetic-only (mobile fill-rate rule, A-5) —
+        // `exp2`/`log2` live in the vertex stage only.
+        for banned in ["sin(", "cos(", "exp(", "pow(", "log("] {
+            assert!(
+                !SPLAT_FRAG.contains(banned),
+                "splat fragment must stay arithmetic-only: {banned}"
+            );
+        }
+        // Splat density ramp shares the CPU stop table end-to-end.
+        for literal in ["vec3(0.10, 0.08, 0.35)", "vec3(1.00, 0.45, 0.40)"] {
+            assert!(
+                SPLAT_VERT.contains(literal),
+                "splat ramp drifted from DENSITY_RAMP_STOPS: {literal}"
             );
         }
     }
@@ -8827,9 +9229,11 @@ mod tests {
         // Cosmic blocks: glow (MVP + scale + exposure + redshift) and
         // smoke (MVP + eye + scale + exposure + redshift, 92 B) must
         // stay under the 128 B Vulkan 1.1 floor on every tier.
+        // Splat adds the eye + kernel constants (100 B).
         for (bytes, what) in [
             (std::mem::size_of::<GlowPush>(), "GlowPush"),
             (std::mem::size_of::<SmokePush>(), "SmokePush"),
+            (std::mem::size_of::<SplatPush>(), "SplatPush"),
         ] {
             assert!(
                 bytes <= 128,

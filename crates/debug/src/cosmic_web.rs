@@ -9,9 +9,9 @@
 //! This module also owns the CPU-side vertex layout both 3D surfaces
 //! share ([`node_point_cloud`], [`link_segments`], [`glow_point_cloud`]
 //! plus the cinematic enrichment layer ([`strand_records`],
-//! [`grain_cloud`], [`smoke_puffs`], [`bead_cloud`],
-//! [`node_impostors`], over the WS1 [`bifurcation_nodes`] /
-//! [`spine_subsegments`] skeleton)): one source of truth for
+//! [`smoke_puffs`], [`node_impostors`], over the WS1
+//! [`bifurcation_nodes`] / [`spine_subsegments`] skeleton — grain +
+//! beads retired by `cosmic-tracer-splat`): one source of truth for
 //! positions (origin-relative Mpc f32), colors, and sprite sizes. The
 //! binary maps the tuples onto its GPU vertex types at upload.
 //!
@@ -196,7 +196,8 @@ pub fn link_segments(web: &WebDescriptor, origin: DVec3) -> Vec<[f32; 3]> {
 
 // ---------------------------------------------------------------------------
 // Cinematic enrichment layer (update-2026-09-18-2328): braided filaments,
-// particulate grain, emissive node impostors. Render-only derivations of
+// smoke sheaths, emissive node impostors (grain + beads retired by
+// `cosmic-tracer-splat`). Render-only derivations of
 // the descriptor — deterministic per (seed, web, origin), never hashed.
 // ---------------------------------------------------------------------------
 
@@ -207,9 +208,9 @@ pub const BRAID_SUBDIVISIONS: usize = 10;
 pub const BRAID_AMPLITUDE_MPC: f64 = 1.5;
 /// Strands for a zero-density link; a full-density link gets seven
 /// (`3 + floor(4·density)`): hair-like multiplicity — dense filaments
-/// fray into visible sub-threads (Illustris-look WS2). Grain, smoke,
-/// and bead samplers distribute over these strands, so multiplicity
-/// shows through the live point/sprite paths (the ribbon pipeline is
+/// fray into visible sub-threads (Illustris-look WS2). Smoke samplers
+/// distribute over these strands, so multiplicity
+/// shows through the live sprite paths (the ribbon pipeline is
 /// retired — no new pipeline per the notion non-goals).
 pub const BRAID_MIN_STRANDS: u64 = 3;
 /// Strands for a full-density link.
@@ -221,18 +222,9 @@ pub const BRAID_FRAY_LENGTH_MPC: f64 = 20.0;
 /// Links longer than this split their strands across two independent
 /// braid arms (seeded fray variants), so long filaments show diverging
 /// sub-threads instead of one coherent bundle.
-/// Visual grain points emitted per Mpc of link (pre-budget, density
-/// weighted — the same two-pass budget pattern as descriptor glow).
-pub const GRAIN_PER_MPC: f64 = 8.0;
-/// Hard cap on emitted grain points (boot + rebase cost control).
-pub const MAX_GRAIN_POINTS: u32 = 800_000;
-/// Transverse jitter sigma of grain around its strand, Mpc.
-pub const GRAIN_TRANSVERSE_SIGMA_MPC: f64 = 0.8;
-/// Domain-separated stream for braid phases (order-independent from
-/// the grain stream: both consume in canonical link order).
+/// Domain-separated stream for braid phases (consumed in canonical
+/// link order).
 pub const BRAID_STREAM: &str = "cosmic_web/braid";
-/// Domain-separated stream for grain emission.
-pub const GRAIN_STREAM: &str = "cosmic_web/grain";
 /// Exaggerated Hubble redshift strength per Mpc of view depth for the
 /// cosmic glow shaders (spec §9.1 depth cue, artistically boosted: at
 /// 250 Mpc the exaggerated depth is 0.5 — distant filaments redden
@@ -312,8 +304,7 @@ fn braid_point(
 /// One link's full braid shape: lateral basis plus one or two fray
 /// arms. Derived from per-link sub-streams keyed by the canonical
 /// endpoint pair (`seed ^ (a << 32 | b)`, arm variant mixed in), so the
-/// smoke pass ([`smoke_puffs`]), the grain pass ([`grain_cloud`]), and
-/// the bead pass ([`bead_cloud`]) derive identical strands
+/// smoke pass ([`smoke_puffs`]) derives identical strands
 /// independently — no shared stream state, no cross-link coupling,
 /// replay-identical per (seed, link).
 struct BraidShape {
@@ -394,14 +385,12 @@ fn braid_shape(seed: u64, link: &WebLink, pa: [f64; 3], pb: [f64; 3]) -> BraidSh
 
 /// One braid strand's GPU-expansion record
 /// (`update-2026-09-19-1245` P1): everything the ribbon vertex shader
-/// needs to rebuild the strand — same [`braid_shape`] derivation the
-/// grain pass uses, so grain still textures the drawn ribbons.
-/// Compact (~100 B/strand, ~4 MB for the nominal web) vs the retired
-/// baked `braid_segments` (~34 MB of `LineList` vertices per
-/// surface). Origin-relative `a` only; trunk/basis/wander are
-/// translation-invariant. `rgba` is the link-level density color at
-/// mid-strand — the shader applies endpoint warming, redshift, and
-/// the melt profile per vertex.
+/// needs to rebuild the strand. Compact (~100 B/strand, ~4 MB for the
+/// nominal web) vs the retired baked `braid_segments` (~34 MB of
+/// `LineList` vertices per surface). Origin-relative `a` only;
+/// trunk/basis/wander are translation-invariant. `rgba` is the
+/// link-level density color at mid-strand — the shader applies endpoint
+/// warming, redshift, and the melt profile per vertex.
 pub struct StrandRecord {
     /// Strand start = node `a` position, origin-relative Mpc f32.
     pub a: [f32; 3],
@@ -478,7 +467,7 @@ pub fn strand_records(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<Stra
 pub const BIFURCATION_DEGREE: u32 = 3;
 /// Domain-separated stream for spine sub-segment offsets.
 pub const SPINE_STREAM: &str = "cosmic_web/spine";
-/// Target sub-segment length in Mpc for bead placement.
+/// Target sub-segment length in Mpc (kept for the smoke sheath path).
 pub const SPINE_SUBSEGMENT_MPC: f64 = 12.0;
 /// Hard cap of sub-segments per link (CPU + buffer bound).
 pub const MAX_SUBSEGMENTS_PER_LINK: usize = 4;
@@ -486,8 +475,8 @@ pub const MAX_SUBSEGMENTS_PER_LINK: usize = 4;
 pub const SPINE_LATERAL_MPC: f64 = 0.8;
 
 /// Bifurcation nodes: link-graph junctions with degree ≥
-/// [`BIFURCATION_DEGREE`], ascending (deterministic). Smoke and beads
-/// warm toward hub amber near these — the target's golden infusions sit
+/// [`BIFURCATION_DEGREE`], ascending (deterministic). Smoke warms
+/// toward hub amber near these — the target's golden infusions sit
 /// at thread junctions, not only at massive nodes.
 pub fn bifurcation_nodes(web: &WebDescriptor) -> Vec<u32> {
     let mut degree = vec![0_u32; web.nodes.len()];
@@ -504,7 +493,7 @@ pub fn bifurcation_nodes(web: &WebDescriptor) -> Vec<u32> {
 }
 
 /// One spine sub-segment: a param range on a link trunk plus a seeded
-/// lateral midpoint offset. Long links split so beads distribute along
+/// lateral midpoint offset. Long links split so scatter distributes along
 /// the filament instead of bunching at the ends.
 pub struct SpineSubsegment {
     /// Index into `web.links`.
@@ -517,7 +506,7 @@ pub struct SpineSubsegment {
     pub lateral: [f64; 2],
 }
 
-/// Spine sub-segments for bead placement, in canonical link order.
+/// Spine sub-segments, in canonical link order.
 /// Deterministic per (seed, web): per-link sub-stream, count a pure
 /// function of link length.
 pub fn spine_subsegments(web: &WebDescriptor, seed: u64) -> Vec<SpineSubsegment> {
@@ -700,199 +689,6 @@ pub fn smoke_puffs(web: &WebDescriptor, seed: u64, origin: DVec3) -> Vec<SmokePu
 /// arithmetic shaping, no transcendentals in the sampling).
 fn ihalf3(rng: &mut SeededRng) -> f64 {
     rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 1.5
-}
-
-/// Particulate grain along the braid strands as `(position, color,
-/// misc)` tuples — the same shape as [`node_point_cloud`] (`misc =
-/// (pixel size, alpha, kind 0)`), colors up to slightly emissive on
-/// dense links. Deterministic per (seed, web, origin) under the
-/// [`GRAIN_STREAM`] domain; two-pass budget capped at
-/// [`MAX_GRAIN_POINTS`] (the descriptor-glow pattern).
-pub fn grain_cloud(
-    web: &WebDescriptor,
-    seed: u64,
-    origin: DVec3,
-) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-    // Pass 1: raw counts in canonical link order (pure function of
-    // link data — no RNG involved).
-    let mut raw: Vec<f64> = Vec::with_capacity(web.links.len());
-    let mut total_raw = 0.0;
-    for link in &web.links {
-        let pa = web.nodes[link.a as usize].position_mpc;
-        let pb = web.nodes[link.b as usize].position_mpc;
-        let len =
-            ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2) + (pb[2] - pa[2]).powi(2)).sqrt();
-        let count = GRAIN_PER_MPC * len * f64::from(link.density);
-        raw.push(count);
-        total_raw += count;
-    }
-    let scale = if total_raw > 0.0 {
-        (f64::from(MAX_GRAIN_POINTS) / total_raw).min(1.0)
-    } else {
-        0.0
-    };
-    // Pass 2: budgeted emission. Each grain point lands on a strand of
-    // the SAME braid shape the line pass draws (shared `braid_shape`
-    // derivation), plus transverse jitter — the grain textures the
-    // drawn strands instead of floating beside them.
-    let mut rng = SeededRng::stream(seed, GRAIN_STREAM);
-    let mut out: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
-    for (link, count) in web.links.iter().zip(raw.iter()) {
-        let scaled = count * scale;
-        let mut emit = scaled.floor() as u64;
-        let frac = scaled - scaled.floor();
-        if rng.below(1000) < (frac * 1000.0) as u64 {
-            emit += 1;
-        }
-        if emit == 0 {
-            continue;
-        }
-        let pa = web.nodes[link.a as usize].position_mpc;
-        let pb = web.nodes[link.b as usize].position_mpc;
-        let raw_d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-        let shape = braid_shape(seed, link, pa, pb);
-        let sigma = GRAIN_TRANSVERSE_SIGMA_MPC;
-        for _ in 0..emit {
-            let t = rng.unit_f64();
-            let (wander, strand) = shape.pick(&mut rng);
-            let c = braid_point(pa, raw_d, shape.u, shape.v, wander, strand, t);
-            let j1 = ihalf3(&mut rng) * 2.0 * sigma;
-            let j2 = ihalf3(&mut rng) * 2.0 * sigma;
-            let bright = 0.35 + 0.55 * rng.unit_f64();
-            let size = 1.5 + rng.unit_f64();
-            out.push((
-                [
-                    (c[0] + shape.u[0] * j1 + shape.v[0] * j2 - origin.x) as f32,
-                    (c[1] + shape.u[1] * j1 + shape.v[1] * j2 - origin.y) as f32,
-                    (c[2] + shape.u[2] * j1 + shape.v[2] * j2 - origin.z) as f32,
-                ],
-                [
-                    (0.68 * bright) as f32,
-                    (0.62 * bright) as f32,
-                    (1.0 * bright) as f32,
-                ],
-                // Grain textures; it must not light the scene.
-                [size as f32, 0.08, 0.0],
-            ));
-        }
-    }
-    out.truncate(MAX_GRAIN_POINTS as usize);
-    out
-}
-
-/// Gold beads strung along filament spines (Illustris-look WS4):
-/// dwarf-galaxy glitter. The stage-0 peak cut discards sub-threshold
-/// overdensities from the node list; beads render them instead —
-/// thousands of tiny white-gold sprites hugging the spine
-/// sub-segments, gold-graded by endpoint mass like the node impostors.
-/// Same shape as [`node_point_cloud`] (`misc = (pixel size, alpha,
-/// kind 0)`), emissive enough to catch the bloom chain on dense links.
-/// Pick-ignored by construction (`select_at` iterates `web.nodes`
-/// only). Deterministic per (seed, web, origin) under the
-/// [`BEAD_STREAM`] domain; two-pass budget capped at
-/// [`MAX_BEAD_POINTS`] (the descriptor-glow pattern).
-pub const BEAD_PER_MPC: f64 = 0.35;
-/// Hard cap on emitted bead points (Low-tier fill-rate control — cut
-/// beads first on Low per the notion NFR3).
-pub const MAX_BEAD_POINTS: u32 = 60_000;
-/// Domain-separated stream for bead emission.
-pub const BEAD_STREAM: &str = "cosmic_web/bead";
-/// Transverse jitter sigma of beads around their sub-segment, Mpc —
-/// tighter than grain so beads sit visibly *on* the threads.
-pub const BEAD_TRANSVERSE_SIGMA_MPC: f64 = 0.3;
-
-/// Gold bead points along the spine sub-segments as `(position, color,
-/// misc)` tuples. Deterministic per (seed, web, origin); rebase-safe
-/// (translation-invariant except for `pos`).
-pub fn bead_cloud(
-    web: &WebDescriptor,
-    seed: u64,
-    origin: DVec3,
-) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
-    let subsegments = spine_subsegments(web, seed);
-    // Pass 1: raw counts in canonical sub-segment order (pure function
-    // of link data — no RNG involved).
-    let mut raw: Vec<f64> = Vec::with_capacity(subsegments.len());
-    let mut total_raw = 0.0;
-    for sub in &subsegments {
-        let link = &web.links[sub.link];
-        let pa = web.nodes[link.a as usize].position_mpc;
-        let pb = web.nodes[link.b as usize].position_mpc;
-        let len =
-            ((pb[0] - pa[0]).powi(2) + (pb[1] - pa[1]).powi(2) + (pb[2] - pa[2]).powi(2)).sqrt();
-        let count = BEAD_PER_MPC * len * (sub.t1 - sub.t0) * f64::from(link.density);
-        raw.push(count);
-        total_raw += count;
-    }
-    let scale = if total_raw > 0.0 {
-        (f64::from(MAX_BEAD_POINTS) / total_raw).min(1.0)
-    } else {
-        0.0
-    };
-    // Pass 2: budgeted emission on the sub-segment midpoints, bowed by
-    // the lateral offset and textured onto the fray arms.
-    let mut rng = SeededRng::stream(seed, BEAD_STREAM);
-    let mut out: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
-    for (sub, count) in subsegments.iter().zip(raw.iter()) {
-        let scaled = count * scale;
-        let mut emit = scaled.floor() as u64;
-        let frac = scaled - scaled.floor();
-        if rng.below(1000) < (frac * 1000.0) as u64 {
-            emit += 1;
-        }
-        if emit == 0 {
-            continue;
-        }
-        let link = &web.links[sub.link];
-        let pa = web.nodes[link.a as usize].position_mpc;
-        let pb = web.nodes[link.b as usize].position_mpc;
-        let raw_d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-        let shape = braid_shape(seed, link, pa, pb);
-        // Gold grade from the endpoint masses (the impostor ramp):
-        // dwarfs read blue-white, cluster endpoints deep gold.
-        let level = (mass_level(web.nodes[link.a as usize].mass_msun)
-            + mass_level(web.nodes[link.b as usize].mass_msun))
-            * 0.5;
-        let emissive = 1.5 + 1.5 * level;
-        let color = [
-            (0.85 + 0.35 * level) * emissive,
-            (0.72 + 0.15 * level) * emissive,
-            (0.45 + 0.15 * level) * emissive,
-        ];
-        let sigma = BEAD_TRANSVERSE_SIGMA_MPC;
-        for _ in 0..emit {
-            let t = sub.t0 + (sub.t1 - sub.t0) * rng.unit_f64();
-            let (wander, strand) = shape.pick(&mut rng);
-            let c = braid_point(pa, raw_d, shape.u, shape.v, wander, strand, t);
-            // Bow with the sub-segment lateral offset (zero at the
-            // joints, full at mid) plus tight jitter.
-            let span = (sub.t1 - sub.t0).max(f64::MIN_POSITIVE);
-            let bow = ((std::f64::consts::PI * (t - sub.t0) / span).sin()).max(0.0);
-            let j1 = ihalf3(&mut rng) * 2.0 * sigma;
-            let j2 = ihalf3(&mut rng) * 2.0 * sigma;
-            let size = 1.5 + rng.unit_f64();
-            out.push((
-                [
-                    (c[0]
-                        + shape.u[0] * (sub.lateral[0] * bow + j1)
-                        + shape.v[0] * (sub.lateral[1] * bow + j2)
-                        - origin.x) as f32,
-                    (c[1]
-                        + shape.u[1] * (sub.lateral[0] * bow + j1)
-                        + shape.v[1] * (sub.lateral[1] * bow + j2)
-                        - origin.y) as f32,
-                    (c[2]
-                        + shape.u[2] * (sub.lateral[0] * bow + j1)
-                        + shape.v[2] * (sub.lateral[1] * bow + j2)
-                        - origin.z) as f32,
-                ],
-                [color[0], color[1], color[2]],
-                [size as f32, 0.9, 0.0],
-            ));
-        }
-    }
-    out.truncate(MAX_BEAD_POINTS as usize);
-    out
 }
 
 /// Node impostors as `(position, color, misc)` tuples: three sprites
@@ -1135,47 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn grain_replays_identically_and_respects_budget() {
-        let toy = toy_web();
-        assert_eq!(
-            grain_cloud(&toy, 7, DVec3::ZERO),
-            grain_cloud(&toy, 7, DVec3::ZERO)
-        );
-        let nominal = grain_cloud(&web(), 1234, DVec3::ZERO);
-        assert!(!nominal.is_empty(), "nominal web must emit grain");
-        assert!(
-            nominal.len() <= MAX_GRAIN_POINTS as usize,
-            "grain over budget: {}",
-            nominal.len()
-        );
-    }
-
-    #[test]
-    fn grain_stays_near_its_strand() {
-        // Every toy grain point sits within the strand bundle (braid
-        // amplitude + jitter headroom) of some link segment.
-        let grain = grain_cloud(&toy_web(), 7, DVec3::ZERO);
-        assert!(!grain.is_empty());
-        let segs = [
-            ([0.0, 0.0, 0.0], [30.0, 0.0, 0.0]),
-            ([0.0, 0.0, 0.0], [0.0, 40.0, 0.0]),
-        ];
-        for (pos, _, _) in &grain {
-            let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
-            let near = segs.iter().any(|(s, e)| {
-                let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
-                let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                let t = ((p[0] - s[0]) * d[0] + (p[1] - s[1]) * d[1] + (p[2] - s[2]) * d[2]) / l2;
-                let t = t.clamp(0.0, 1.0);
-                let q = [s[0] + d[0] * t, s[1] + d[1] * t, s[2] + d[2] * t];
-                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
-                    <= 8.0
-            });
-            assert!(near, "grain drifted off every strand: {p:?}");
-        }
-    }
-
-    #[test]
     fn impostors_emit_three_layered_sprites_per_node() {
         let web = toy_web();
         let impostors = node_impostors(&web, DVec3::ZERO);
@@ -1239,19 +994,6 @@ mod tests {
                 );
             }
         }
-        let ga = grain_cloud(&web, 7, a);
-        let gb = grain_cloud(&web, 7, b);
-        assert_eq!(ga.len(), gb.len());
-        for ((p, _, _), (q, _, _)) in ga.iter().zip(gb.iter()).take(50) {
-            for axis in 0..3 {
-                let delta = f64::from(p[axis]) - f64::from(q[axis]);
-                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
-                assert!(
-                    (delta - want).abs() < 1e-3,
-                    "axis {axis}: {delta} vs {want}"
-                );
-            }
-        }
         let ia = node_impostors(&web, a);
         let ib = node_impostors(&web, b);
         for (p, q) in ia.iter().zip(ib.iter()) {
@@ -1291,10 +1033,8 @@ mod tests {
                 record.rgba
             );
         }
-        let points = grain_cloud(&web, seed, origin)
+        let points = glow_point_cloud(&web, origin)
             .into_iter()
-            .chain(glow_point_cloud(&web, origin))
-            .chain(bead_cloud(&web, seed, origin))
             .chain(node_impostors(&web, origin))
             .collect::<Vec<_>>();
         assert!(!points.is_empty());
@@ -1474,63 +1214,6 @@ mod tests {
         let empty = WebDescriptor::new(7, Vec::new(), Vec::new(), Vec::new(), 0, 0.0);
         assert!(spine_subsegments(&empty, 7).is_empty());
         assert!(bifurcation_nodes(&empty).is_empty());
-        assert!(bead_cloud(&empty, 7, DVec3::ZERO).is_empty());
-    }
-
-    #[test]
-    fn beads_replay_budget_gold_and_rebase() {
-        let toy = toy_web();
-        let a = DVec3::ZERO;
-        let b = DVec3::new(10.0, -4.0, 2.0);
-        let pa = bead_cloud(&toy, 7, a);
-        let pb = bead_cloud(&toy, 7, a);
-        assert_eq!(pa, pb);
-        assert!(!pa.is_empty(), "toy web must emit beads");
-        assert!(
-            pa.len() <= MAX_BEAD_POINTS as usize,
-            "beads over budget: {}",
-            pa.len()
-        );
-        let nominal = bead_cloud(&web(), 1234, DVec3::ZERO);
-        assert!(nominal.len() <= MAX_BEAD_POINTS as usize);
-        assert!(!nominal.is_empty());
-        // Gold grade: strict r > g > b, emissive red.
-        for (_, color, misc) in &pa {
-            assert!(color[0] > color[1] && color[1] > color[2]);
-            assert!(color[0] > 1.0, "beads must catch bloom: {color:?}");
-            assert_eq!(misc[2], 0.0, "beads must be pixel-sized");
-            assert!((1.0..=3.0).contains(&misc[0]));
-        }
-        // Near-spine + rebase-safe.
-        let segs = [
-            ([0.0, 0.0, 0.0], [30.0, 0.0, 0.0]),
-            ([0.0, 0.0, 0.0], [0.0, 40.0, 0.0]),
-        ];
-        for (pos, _, _) in &pa {
-            let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
-            let near = segs.iter().any(|(s, e)| {
-                let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
-                let l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-                let t = ((p[0] - s[0]) * d[0] + (p[1] - s[1]) * d[1] + (p[2] - s[2]) * d[2]) / l2;
-                let t = t.clamp(0.0, 1.0);
-                let q = [s[0] + d[0] * t, s[1] + d[1] * t, s[2] + d[2] * t];
-                ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt()
-                    <= 8.0
-            });
-            assert!(near, "bead drifted off every spine: {p:?}");
-        }
-        let qb = bead_cloud(&toy, 7, b);
-        assert_eq!(pa.len(), qb.len());
-        for ((p, _, _), (q, _, _)) in pa.iter().zip(qb.iter()).take(50) {
-            for axis in 0..3 {
-                let delta = f64::from(p[axis]) - f64::from(q[axis]);
-                let want = [b.x - a.x, b.y - a.y, b.z - a.z][axis];
-                assert!(
-                    (delta - want).abs() < 1e-3,
-                    "axis {axis}: {delta} vs {want}"
-                );
-            }
-        }
     }
 
     #[test]

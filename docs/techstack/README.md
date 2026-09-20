@@ -1,10 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.40.0 (2026-09-20, v0.3.3 `cosmic-capture-harness`
-  done: `--capture` offscreen PNGs on all four presets (shared
-  frame-recording seam, byte-identical determinism pinned on Intel
-  UHD 620) + windowed `F12`; v0.3.2 baselines under
-  `plans/v0.3.3/cosmic-capture-harness/shots/`; six v0.3.3 features
+- **Version:** 0.41.0 (2026-09-20, v0.3.3 `cosmic-tracer-splat`
+  done: adaptive-kernel tracer splats replace grain + beads (16 B
+  vertices, per-surface energy grade, near-eye fade; Low 255 900 /
+  4.1 MB / overdraw 2.0×; demo wash 1.3 %); five v0.3.3 features
   remain planned)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)

@@ -16,6 +16,7 @@ pub mod cosmic_camera;
 pub mod cosmic_capture;
 pub mod cosmic_demo;
 pub mod cosmic_player;
+pub mod cosmic_splat;
 pub mod cosmic_web;
 pub mod fps;
 pub mod fx;

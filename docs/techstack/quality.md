@@ -14,7 +14,7 @@
 | Post chain per frame (v0.2.0) | +1 fullscreen resolve pass, one transient HDR image (16F preferred, packed-float fallback, content-preserving LDR bypass) | same | same |
 | Cosmic bloom per frame, cosmic views only, debug shell (update-2026-09-18-2328) | +1 bright + 4 blur passes at ½ res on five dedicated targets (A–E), 5 transient HDR images + scene depth (6 total); LDR bypass draws the same layouts direct (no post) | same | same |
 | Cosmic-web cue raymarch (v0.2.0) | 64x64 source grid, ≤16 steps, analytic fallback available | 128x128, ≤32 steps | 256x256, ≤64 steps |
-| Cosmic field render (v0.3.3, ADR-025 — planned; each feature fills its row on `done`) | tracer splats ≤ 300k pts (≤ 5 MB/surface); veil = cell sprites ≤ 200k (no raymarch); bloom 3 levels (`scene + 2·3` HDR images); `WebField` sidecar ≤ 20 MB, boot +≤ 120 ms | splats ≤ 1.0M; veil = quarter-res raymarch 32 steps (one 2 MB R8 3D image + one quarter-res HDR target); bloom 4 levels | splats all tracers (+ optional `refine(2)`); raymarch 48 steps; bloom 5 levels |
+| Cosmic field render (v0.3.3, ADR-025 — planned; each feature fills its row on `done`) | tracer splats ≤ 300k pts (≤ 5 MB/surface — shipped: stride gives 255 900, 4.1 MB, overdraw 2.0×; no new draw/pass); veil = cell sprites ≤ 200k (no raymarch); bloom 3 levels (`scene + 2·3` HDR images); `WebField` sidecar ≤ 20 MB, boot +≤ 120 ms (shipped: 17 MB, +0 ms) | splats ≤ 1.0M; veil = quarter-res raymarch 32 steps (one 2 MB R8 3D image + one quarter-res HDR target); bloom 4 levels | splats all tracers (+ optional `refine(2)`); raymarch 48 steps; bloom 5 levels |
 
 Budgets are enforced by the `tools` renderer smoke + device profiles, not by vibes. Any feature that blows Low tier is cut or tier-gated.
 
