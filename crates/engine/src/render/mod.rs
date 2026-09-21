@@ -70,9 +70,11 @@ pub use exposure::{
 };
 pub use planet::{IndexedMesh, PlanetVertex, SeededPlanet};
 pub use post::{
-    ACES_FIT_GLSL, BLOOM_BLUR_FRAG, BLOOM_BRIGHT_FRAG, BloomBlurPush, BloomBrightPush, BloomParams,
-    BloomResolvePush, HDR_FORMAT_PREFERENCE, HdrSelection, RESOLVE_FRAG_FIXED, RESOLVE_VERT,
-    ResolvePush, gaussian9_weights, resolve_frag_aces, resolve_frag_bloom, select_hdr_format,
+    ACES_FIT_GLSL, BLOOM_BRIGHT_FRAG, BLOOM_DOWN_FRAG, BLOOM_PREFILTER_FRAG, BLOOM_UP_FRAG,
+    BloomBrightPush, BloomDownPush, BloomParams, BloomPrefilterPush, BloomResolvePush, BloomUpPush,
+    HDR_FORMAT_PREFERENCE, HdrSelection, MipBloomParams, RESOLVE_FRAG_FIXED, RESOLVE_VERT,
+    ResolvePush, jimenez13_offsets, resolve_frag_aces, resolve_frag_bloom, select_hdr_format,
+    soft_knee, tent9_weights,
 };
 pub use shaders::{
     PLANET_FRAG, PLANET_VERT, ShaderCompileError, ShaderKind, compile_glsl_to_spirv,

@@ -43,6 +43,9 @@ pub struct WebField {
     pub mean_density: f64,
     /// Box origin in Mpc (`[-half, -half, -half]`).
     pub origin_mpc: [f64; 3],
+    /// Descriptor sphere radius in Mpc (tracers + veil cut to it;
+    /// sphere center is the box center `[0, 0, 0]`).
+    pub sphere_radius_mpc: f64,
 }
 
 /// Tracer budget: full export, or every 2nd tracer on Low (`Half` keeps
@@ -147,6 +150,7 @@ impl WebField {
             cell_size_mpc: self.cell_size_mpc,
             mean_density: self.mean_density,
             origin_mpc: self.origin_mpc,
+            sphere_radius_mpc: self.sphere_radius_mpc,
         }
     }
 }
@@ -383,6 +387,7 @@ pub fn export_field(
         cell_size_mpc: cell,
         mean_density: mean,
         origin_mpc: [-half, -half, -half],
+        sphere_radius_mpc: radius,
     }
 }
 

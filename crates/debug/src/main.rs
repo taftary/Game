@@ -51,11 +51,11 @@ use game_engine::catalog::scheduler::SkyView;
 use game_engine::flight::{ShipMode, mode_of};
 use game_engine::frames::recenter;
 use game_engine::render::{
-    BLOOM_BLUR_FRAG, BLOOM_BRIGHT_FRAG, BloomBlurPush, BloomBrightPush, BloomParams,
-    BloomResolvePush, ExposureParams, FOV_Y, HdrSelection, MAX_PITCH, OrbitCamera, RESOLVE_VERT,
-    ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv, create_instance, device_score,
-    log_physical_device, required_device_extensions, resolve_frag_bloom, select_hdr_format,
-    star_visibility, visible_hemisphere,
+    BLOOM_DOWN_FRAG, BLOOM_PREFILTER_FRAG, BLOOM_UP_FRAG, BloomDownPush, BloomPrefilterPush,
+    BloomResolvePush, BloomUpPush, ExposureParams, FOV_Y, HdrSelection, MAX_PITCH, MipBloomParams,
+    OrbitCamera, QualityTier, RESOLVE_VERT, ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv,
+    create_instance, device_score, log_physical_device, required_device_extensions,
+    resolve_frag_bloom, select_hdr_format, star_visibility, visible_hemisphere,
 };
 use game_engine::universe::{WebDescriptor, WebField};
 use game_engine::waypoints::WaypointId;
@@ -63,8 +63,9 @@ use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageToBufferInfo,
-    PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageInfo,
+    CopyImageToBufferInfo, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
+    SubpassContents,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
@@ -952,11 +953,18 @@ const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
 /// Scene exposure at the ACES resolve.
 const COSMIC_DEMO_EXPOSURE: f32 = 1.15;
 const COSMIC_MAP_EXPOSURE: f32 = 0.85;
-/// Bloom intensity at the resolve (spec default 0.85 lifted: the
-/// half-res 4-pass chain attenuates 1-px lines and small sprites
-/// hard, so the composite needs the push to reach the target glow).
-const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 2.2;
-const COSMIC_MAP_BLOOM_INTENSITY: f32 = 1.2;
+/// Bloom intensities at the resolve, per surface (FR6 — back toward
+/// spec now that the chain delivers the halo: the wide pyramid keeps
+/// ~all of a hub core's over-threshold energy, so the 2.2/1.2
+/// compensations would blow the halos out).
+const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 1.0;
+const COSMIC_MAP_BLOOM_INTENSITY: f32 = 0.85;
+
+/// Mip-bloom pyramid depth (`bloom-mip-chain`): 5 levels (High —
+/// the windowed viewer and the capture path have no tier switch, so
+/// both run the full pyramid and stay pixel-identical). Matches
+/// `MipBloomParams::for_tier(High)`.
+const BLOOM_LEVELS: u8 = 5;
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -1672,21 +1680,29 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         glow_scene: build_glow_pipeline(&device, &shaders, &scene_pass),
         splat_scene: build_splat_pipeline(&device, &shaders, &scene_pass),
         smoke_scene: build_smoke_pipeline(&device, &shaders, &scene_pass),
-        bright: build_post_pipeline(
+        prefilter: build_post_pipeline(
             &device,
-            &shaders.bright_frag,
+            &shaders.prefilter_frag,
             &shaders.post_vert,
             &post_pass,
             None,
-            "bloom bright",
+            "bloom prefilter",
         ),
-        blur: build_post_pipeline(
+        down: build_post_pipeline(
             &device,
-            &shaders.blur_frag,
+            &shaders.down_frag,
             &shaders.post_vert,
             &post_pass,
             None,
-            "bloom blur",
+            "bloom down",
+        ),
+        up: build_post_pipeline(
+            &device,
+            &shaders.up_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "bloom up",
         ),
         resolve: build_post_pipeline(
             &device,
@@ -1878,6 +1894,9 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     )
     .expect("capture command buffer builder must create");
     if let Some(chain) = hdr.as_ref() {
+        // High-tier pyramid on both paths (windowed + capture stay
+        // pixel-identical — the debug binary has no tier switch).
+        let bloom_params = MipBloomParams::for_tier(QualityTier::High);
         record_cosmic_hdr_prepass(
             &mut builder,
             &pipes,
@@ -1886,7 +1905,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             smoke_exposure,
             glow_exposure,
             redshift,
-            BloomParams::spec_defaults().threshold,
+            &bloom_params,
             bloom_enabled,
             splat_alpha_k,
         );
@@ -4486,8 +4505,9 @@ struct ShaderSet {
     smoke_vert: Arc<ShaderModule>,
     smoke_frag: Arc<ShaderModule>,
     post_vert: Arc<ShaderModule>,
-    bright_frag: Arc<ShaderModule>,
-    blur_frag: Arc<ShaderModule>,
+    prefilter_frag: Arc<ShaderModule>,
+    down_frag: Arc<ShaderModule>,
+    up_frag: Arc<ShaderModule>,
     resolve_frag: Arc<ShaderModule>,
 }
 
@@ -4509,17 +4529,23 @@ impl ShaderSet {
             smoke_vert: compile_shader(device, ShaderKind::Vertex, SMOKE_VERT, "smoke vertex"),
             smoke_frag: compile_shader(device, ShaderKind::Fragment, SMOKE_FRAG, "smoke fragment"),
             post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
-            bright_frag: compile_shader(
+            prefilter_frag: compile_shader(
                 device,
                 ShaderKind::Fragment,
-                BLOOM_BRIGHT_FRAG,
-                "bloom bright fragment",
+                BLOOM_PREFILTER_FRAG,
+                "bloom prefilter fragment",
             ),
-            blur_frag: compile_shader(
+            down_frag: compile_shader(
                 device,
                 ShaderKind::Fragment,
-                BLOOM_BLUR_FRAG,
-                "bloom blur fragment",
+                BLOOM_DOWN_FRAG,
+                "bloom down fragment",
+            ),
+            up_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                BLOOM_UP_FRAG,
+                "bloom up fragment",
             ),
             resolve_frag: compile_shader(
                 device,
@@ -5106,35 +5132,75 @@ fn post_image_set(
     .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error}"))
 }
 
+/// Two-image descriptor set (coarse + fine at bindings 0–3 — the
+/// upsample pair): written against the pipeline layout explicitly,
+/// like the bloom-resolve pair below.
+fn post_image_pair_set(
+    allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline: &Arc<GraphicsPipeline>,
+    coarse: &Arc<ImageView>,
+    fine: &Arc<ImageView>,
+    sampler: &Arc<Sampler>,
+    what: &str,
+) -> Arc<DescriptorSet> {
+    let layout = pipeline.layout().set_layouts()[0].clone();
+    DescriptorSet::new(
+        allocator.clone(),
+        layout,
+        [
+            WriteDescriptorSet::image_view(0, coarse.clone()),
+            WriteDescriptorSet::sampler(1, sampler.clone()),
+            WriteDescriptorSet::image_view(2, fine.clone()),
+            WriteDescriptorSet::sampler(3, sampler.clone()),
+        ],
+        [],
+    )
+    .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error}"))
+}
+
 /// Per-window HDR bloom resources (cosmic views only): scene target +
-/// depth, half-res bloom chain targets, and the sampling sets. Each
-/// bloom target is written exactly once per frame and only read
-/// afterwards — never rewritten (an A/B ping-pong reuse pattern
-/// corrupted its images on Intel UHD 620, diagnosed via the
-/// `GAME_DEBUG_COSMIC_BLOOM=0` bisect). One frame executes at a time
-/// behind `previous_frame_end`, so one set of transients is enough.
-/// Rebuilt on swapchain recreate.
+/// depth, mip-bloom pyramid targets, and the sampling sets
+/// (`bloom-mip-chain`). Each bloom target is written exactly once per
+/// frame and only read afterwards — never rewritten (an A/B ping-pong
+/// reuse pattern corrupted its images on Intel UHD 620, diagnosed via
+/// the `GAME_DEBUG_COSMIC_BLOOM=0` bisect). One frame executes at a
+/// time behind `previous_frame_end`, so one set of transients is
+/// enough. Rebuilt on swapchain recreate.
 struct HdrChain {
     format: Format,
     // Views live on through the framebuffers + descriptor sets below;
     // only the framebuffers, sets, and extents are read per frame.
     scene_fb: Arc<Framebuffer>,
-    bloom_a_fb: Arc<Framebuffer>,
-    bloom_b_fb: Arc<Framebuffer>,
-    bloom_c_fb: Arc<Framebuffer>,
-    bloom_d_fb: Arc<Framebuffer>,
-    bloom_e_fb: Arc<Framebuffer>,
-    half_extent: [u32; 2],
-    bright_set: Arc<DescriptorSet>,
-    blur_a_set: Arc<DescriptorSet>,
-    blur_b_set: Arc<DescriptorSet>,
-    blur_c_set: Arc<DescriptorSet>,
-    blur_d_set: Arc<DescriptorSet>,
-    /// Resolve set sampling scene + final bloom (E).
+    /// Full scene extent (prefilter texel source).
+    scene_extent: [u32; 2],
+    /// Pyramid depth (3 Low / 4 Medium / 5 High).
+    levels: u8,
+    /// Down pyramid: `down[0]` at half res … `down[levels-1]`.
+    down: Vec<BloomLevel>,
+    /// Up pyramid, same extents, rebuilt coarse-to-fine.
+    up: Vec<BloomLevel>,
+    /// Prefilter set (samples the scene).
+    prefilter_set: Arc<DescriptorSet>,
+    /// `down_set[k]` samples `down[k]` (the `down[k]→down[k+1]` pass).
+    down_set: Vec<Arc<DescriptorSet>>,
+    /// `up_set[k]` samples the (`up[k+1]`, `down[k]`) pair (the
+    /// `up[k]` pass, `k < levels - 1`).
+    up_set: Vec<Arc<DescriptorSet>>,
+    /// Resolve set sampling scene + `up[0]`.
     resolve_set: Arc<DescriptorSet>,
-    /// Resolve set sampling scene + bright extract (A): the
-    /// `GAME_DEBUG_COSMIC_BLOOM=0` path, where E is never written.
+    /// Resolve set sampling scene + `down[0]`: the
+    /// `GAME_DEBUG_COSMIC_BLOOM=0` path, where the ups are never
+    /// written.
     resolve_nobloom_set: Arc<DescriptorSet>,
+}
+
+/// One mip-bloom pyramid target: image + view + framebuffer + extent.
+/// Every target is written exactly once per frame, then only read.
+struct BloomLevel {
+    image: Arc<Image>,
+    view: Arc<ImageView>,
+    fb: Arc<Framebuffer>,
+    extent: [u32; 2],
 }
 
 fn upload_fill(
@@ -5458,7 +5524,7 @@ fn record_cosmic_hdr_prepass(
     smoke_exposure: f32,
     glow_exposure: f32,
     redshift: f32,
-    bloom_threshold: f32,
+    params: &MipBloomParams,
     bloom_enabled: bool,
     splat_alpha_k: f32,
 ) {
@@ -5553,121 +5619,184 @@ fn record_cosmic_hdr_prepass(
     builder
         .end_render_pass(Default::default())
         .expect("HDR scene pass must end");
-    // Bloom chain at half res: bright extract, then four H/V
-    // separable blur passes through dedicated targets A-E
-    // (write-once, never ping-ponged). Final bloom lands in
-    // E, which the resolve samples.
-    let half_vp = Viewport {
-        offset: [0.0, 0.0],
-        extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],
-        depth_range: 0.0..=1.0,
-    };
+    // Mip-bloom pyramid (`bloom-mip-chain`): prefilter + downs +
+    // alias-free pass-through + ups, recorded from the same pass
+    // description the write-once pin checks.
+    record_bloom_chain(builder, pipes, hdr, params, bloom_enabled);
+}
+
+/// Fullscreen-triangle post-pass opener: black clear + viewport at
+/// the target extent. Shared by every mip-bloom pyramid pass.
+fn begin_post_pass(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    fb: Arc<Framebuffer>,
+    extent: [u32; 2],
+) -> &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
     let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
     builder
         .begin_render_pass(
             RenderPassBeginInfo {
                 clear_values: vec![Some(black)],
-                ..RenderPassBeginInfo::framebuffer(hdr.bloom_a_fb.clone())
+                ..RenderPassBeginInfo::framebuffer(fb)
             },
             SubpassBeginInfo {
                 contents: SubpassContents::Inline,
                 ..Default::default()
             },
         )
-        .expect("bloom bright pass must begin")
-        .set_viewport(0, [half_vp.clone()].into_iter().collect())
+        .expect("bloom pass must begin")
+        .set_viewport(
+            0,
+            [Viewport {
+                offset: [0.0, 0.0],
+                extent: [extent[0] as f32, extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            }]
+            .into_iter()
+            .collect(),
+        )
         .expect("viewport must set")
-        .bind_pipeline_graphics(pipes.bright.clone())
-        .expect("pipeline must bind")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Graphics,
-            pipes.bright.layout().clone(),
-            0,
-            hdr.bright_set.clone(),
-        )
-        .expect("bloom bright set must bind")
-        .push_constants(
-            pipes.bright.layout().clone(),
-            0,
-            BloomBrightPush {
-                threshold: bloom_threshold,
-            },
-        )
-        .expect("bloom bright push must upload");
-    // SAFETY: fullscreen-triangle pipeline, no vertex input
-    // — 3 unbuffered vertices are the whole draw.
-    unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom bright draw must record");
-    builder
-        .end_render_pass(Default::default())
-        .expect("bloom bright pass must end");
-    let hw = hdr.half_extent[0] as f32;
-    let hh = hdr.half_extent[1] as f32;
-    // Dedicated targets per step (see `HdrChain`): bright→A,
-    // H:A→B, V:B→C, wide-H:C→D, wide-V:D→E(final). No target
-    // is ever rewritten. `GAME_DEBUG_COSMIC_BLOOM=0` skips the
-    // chain: the resolve then adds the sharp bright extract.
-    let blur_steps = if bloom_enabled {
-        vec![
-            (
-                hdr.bloom_b_fb.clone(),
-                hdr.blur_a_set.clone(),
-                [1.0 / hw, 0.0],
-            ),
-            (
-                hdr.bloom_c_fb.clone(),
-                hdr.blur_b_set.clone(),
-                [0.0, 1.0 / hh],
-            ),
-            (
-                hdr.bloom_d_fb.clone(),
-                hdr.blur_c_set.clone(),
-                [2.0 / hw, 0.0],
-            ),
-            (
-                hdr.bloom_e_fb.clone(),
-                hdr.blur_d_set.clone(),
-                [0.0, 2.0 / hh],
-            ),
-        ]
-    } else {
-        Vec::new()
+}
+
+/// Execute the mip-bloom pyramid (`bloom-mip-chain` BMC-003/004):
+/// soft-knee prefilter (scene → `down[0]`) + downs + alias-free
+/// pass-through (`down[last]` → `up[last]` exact image copy, never a
+/// filtered blit) + tent ups. The passes follow the same
+/// `describe_bloom_chain` description the write-once pin checks
+/// (debug-asserted — zero cost in release). Every level image is
+/// written once, then only read — never ping-ponged (Intel rule).
+fn record_bloom_chain(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: &HdrChain,
+    params: &MipBloomParams,
+    bloom_enabled: bool,
+) {
+    use game_debug::cosmic_bloom::{
+        BloomPassKind, assert_write_once, bloom_img_down, bloom_img_up, describe_bloom_chain,
+        describe_bloom_chain_bloom_off,
     };
-    for (dst, set, step) in &blur_steps {
-        builder
-            .begin_render_pass(
-                RenderPassBeginInfo {
-                    clear_values: vec![Some(black)],
-                    ..RenderPassBeginInfo::framebuffer(dst.clone())
-                },
-                SubpassBeginInfo {
-                    contents: SubpassContents::Inline,
-                    ..Default::default()
-                },
-            )
-            .expect("bloom blur pass must begin")
-            .set_viewport(0, [half_vp.clone()].into_iter().collect())
-            .expect("viewport must set")
-            .bind_pipeline_graphics(pipes.blur.clone())
-            .expect("pipeline must bind")
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                pipes.blur.layout().clone(),
-                0,
-                set.clone(),
-            )
-            .expect("bloom blur set must bind")
-            .push_constants(
-                pipes.blur.layout().clone(),
-                0,
-                BloomBlurPush { step: *step },
-            )
-            .expect("bloom blur push must upload");
-        // SAFETY: fullscreen-triangle pipeline, no vertex
-        // input — 3 unbuffered vertices are the whole draw.
-        unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom blur draw must record");
-        builder
-            .end_render_pass(Default::default())
-            .expect("bloom blur pass must end");
+    debug_assert_eq!(
+        params.levels, hdr.levels,
+        "bloom params and chain must agree on levels"
+    );
+    let levels = hdr.levels;
+    let descs = if bloom_enabled {
+        describe_bloom_chain(levels)
+    } else {
+        describe_bloom_chain_bloom_off(levels)
+    };
+    debug_assert!(
+        assert_write_once(&descs).is_ok(),
+        "bloom description must be write-once"
+    );
+    for desc in &descs {
+        match desc.kind {
+            BloomPassKind::Prefilter => {
+                let target = &hdr.down[0];
+                begin_post_pass(builder, target.fb.clone(), target.extent)
+                    .bind_pipeline_graphics(pipes.prefilter.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.prefilter.layout().clone(),
+                        0,
+                        hdr.prefilter_set.clone(),
+                    )
+                    .expect("bloom prefilter set must bind")
+                    .push_constants(
+                        pipes.prefilter.layout().clone(),
+                        0,
+                        BloomPrefilterPush {
+                            threshold: params.threshold,
+                            knee: params.knee,
+                            texel: [
+                                1.0 / hdr.scene_extent[0] as f32,
+                                1.0 / hdr.scene_extent[1] as f32,
+                            ],
+                        },
+                    )
+                    .expect("bloom prefilter push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex
+                // input — 3 unbuffered vertices are the whole draw.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom prefilter draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom prefilter pass must end");
+            }
+            BloomPassKind::Down => {
+                let k = (desc.writes - bloom_img_down(0)) as usize;
+                let src = &hdr.down[k - 1];
+                let dst = &hdr.down[k];
+                begin_post_pass(builder, dst.fb.clone(), dst.extent)
+                    .bind_pipeline_graphics(pipes.down.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.down.layout().clone(),
+                        0,
+                        hdr.down_set[k - 1].clone(),
+                    )
+                    .expect("bloom down set must bind")
+                    .push_constants(
+                        pipes.down.layout().clone(),
+                        0,
+                        BloomDownPush {
+                            texel: [1.0 / src.extent[0] as f32, 1.0 / src.extent[1] as f32],
+                        },
+                    )
+                    .expect("bloom down push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex input.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom down draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom down pass must end");
+            }
+            BloomPassKind::PassThrough => {
+                // Alias-free copy: the smallest up level equals the
+                // smallest down level via one exact image copy (a tiny
+                // draw that keeps the "one writer per image" rule
+                // simple — never an alias, never a blit).
+                let last = usize::from(levels) - 1;
+                builder
+                    .copy_image(CopyImageInfo::images(
+                        hdr.down[last].image.clone(),
+                        hdr.up[last].image.clone(),
+                    ))
+                    .expect("bloom pass-through copy must record");
+            }
+            BloomPassKind::Up => {
+                let k = (desc.writes - bloom_img_up(levels, 0)) as usize;
+                let dst = &hdr.up[k];
+                begin_post_pass(builder, dst.fb.clone(), dst.extent)
+                    .bind_pipeline_graphics(pipes.up.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.up.layout().clone(),
+                        0,
+                        hdr.up_set[k].clone(),
+                    )
+                    .expect("bloom up set must bind")
+                    .push_constants(
+                        pipes.up.layout().clone(),
+                        0,
+                        BloomUpPush {
+                            weight: params.level_weights[k + 1],
+                        },
+                    )
+                    .expect("bloom up push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex input.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom up draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom up pass must end");
+            }
+            BloomPassKind::Resolve => {
+                // The composite resolve lives in the view arm (main
+                // pass), never in the pyramid.
+            }
+        }
     }
 }
 
@@ -6876,21 +7005,29 @@ impl ViewerApp {
             glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
             splat_scene: build_splat_pipeline(&self.device, &self.shaders, &scene_pass),
             smoke_scene: build_smoke_pipeline(&self.device, &self.shaders, &scene_pass),
-            bright: build_post_pipeline(
+            prefilter: build_post_pipeline(
                 &self.device,
-                &self.shaders.bright_frag,
+                &self.shaders.prefilter_frag,
                 &self.shaders.post_vert,
                 &post_pass,
                 None,
-                "bloom bright",
+                "bloom prefilter",
             ),
-            blur: build_post_pipeline(
+            down: build_post_pipeline(
                 &self.device,
-                &self.shaders.blur_frag,
+                &self.shaders.down_frag,
                 &self.shaders.post_vert,
                 &post_pass,
                 None,
-                "bloom blur",
+                "bloom down",
+            ),
+            up: build_post_pipeline(
+                &self.device,
+                &self.shaders.up_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "bloom up",
             ),
             resolve: build_post_pipeline(
                 &self.device,
@@ -6932,7 +7069,7 @@ impl ViewerApp {
         post_pass: &Arc<RenderPass>,
         pipes: &Pipelines,
     ) -> HdrChain {
-        let half = [extent[0].max(2) / 2, extent[1].max(2) / 2];
+        let levels = BLOOM_LEVELS;
         let scene_view = create_post_view(memory_allocator, extent, format, "HDR scene");
         let scene_depth = create_depth_view(memory_allocator, extent);
         let scene_fb = Framebuffer::new(
@@ -6943,42 +7080,92 @@ impl ViewerApp {
             },
         )
         .expect("HDR scene framebuffer must create");
-        // Five dedicated bloom targets (A–E): bright→A, blur-H A→B,
-        // blur-V B→C, wide-H C→D, wide-V D→E(final). No target is
-        // ever rewritten — see the `HdrChain` doc.
-        let mut bloom_views = Vec::with_capacity(5);
-        let mut bloom_fbs = Vec::with_capacity(5);
-        for what in ["A", "B", "C", "D", "E"] {
-            let view = create_post_view(memory_allocator, half, format, what);
-            let fb = Framebuffer::new(
-                post_pass.clone(),
-                FramebufferCreateInfo {
-                    attachments: vec![view.clone()],
-                    ..Default::default()
-                },
-            )
-            .unwrap_or_else(|error| panic!("bloom {what} framebuffer must create: {error:?}"));
-            bloom_views.push(view);
-            bloom_fbs.push(fb);
+        // Mip pyramid (`bloom-mip-chain`): `down[k]` at `extent >>
+        // (k+1)` (floored at 1 px), `up[k]` at the same extents. Every
+        // level is its own image — written once, then only read.
+        let level_extent = |k: u8| {
+            [
+                (extent[0] >> (u32::from(k) + 1)).max(1),
+                (extent[1] >> (u32::from(k) + 1)).max(1),
+            ]
+        };
+        let mut down = Vec::with_capacity(usize::from(levels));
+        let mut up = Vec::with_capacity(usize::from(levels));
+        for k in 0..levels {
+            for (pyramid, what) in [(&mut down, "down"), (&mut up, "up")] {
+                let ext = level_extent(k);
+                // TRANSFER_SRC + TRANSFER_DST: the alias-free
+                // pass-through copies `down[last]` → `up[last]` with an
+                // exact image copy (never a filtered blit).
+                let image = Image::new(
+                    memory_allocator.clone(),
+                    ImageCreateInfo {
+                        image_type: ImageType::Dim2d,
+                        format,
+                        extent: [ext[0], ext[1], 1],
+                        usage: ImageUsage::COLOR_ATTACHMENT
+                            | ImageUsage::SAMPLED
+                            | ImageUsage::TRANSFER_SRC
+                            | ImageUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("bloom {what}[{k}] image must create: {error}"));
+                let view = ImageView::new_default(image.clone())
+                    .unwrap_or_else(|error| panic!("bloom {what}[{k}] view must create: {error}"));
+                let fb = Framebuffer::new(
+                    post_pass.clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![view.clone()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("bloom {what}[{k}] framebuffer must create: {error:?}")
+                });
+                pyramid.push(BloomLevel {
+                    image,
+                    view,
+                    fb,
+                    extent: ext,
+                });
+            }
         }
-        let bright_set = post_image_set(
+        let prefilter_set = post_image_set(
             descriptor_set_allocator,
-            &pipes.bright,
+            &pipes.prefilter,
             &scene_view,
             post_sampler,
-            "bloom bright",
+            "bloom prefilter",
         );
-        let mut blur_sets = Vec::with_capacity(4);
-        for (view, tag) in bloom_views.iter().zip(["A", "B", "C", "D"]) {
-            blur_sets.push(post_image_set(
+        let mut down_set = Vec::with_capacity(usize::from(levels));
+        for (k, level) in down.iter().enumerate() {
+            down_set.push(post_image_set(
                 descriptor_set_allocator,
-                &pipes.blur,
-                view,
+                &pipes.down,
+                &level.view,
                 post_sampler,
-                &format!("bloom blur {tag}"),
+                &format!("bloom down[{k}]"),
             ));
         }
-        // Resolve samples two images (scene + final bloom): the second
+        // Up sets sample the (coarse, fine) pair for levels below the
+        // top: `up[k] = tent(up[k+1])·w + down[k]`.
+        let mut up_set = Vec::with_capacity(usize::from(levels).saturating_sub(1));
+        for k in 0..levels.saturating_sub(1) {
+            up_set.push(post_image_pair_set(
+                descriptor_set_allocator,
+                &pipes.up,
+                &up[usize::from(k) + 1].view,
+                &down[usize::from(k)].view,
+                post_sampler,
+                &format!("bloom up[{k}]"),
+            ));
+        }
+        // Resolve samples two images (scene + pyramid top): the second
         // pair is written against the same layout explicitly.
         let resolve_layout = pipes.resolve.layout().set_layouts()[0].clone();
         let resolve_pair = |bloom_view: &Arc<ImageView>, what: &str| {
@@ -6995,24 +7182,18 @@ impl ViewerApp {
             )
             .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error:?}"))
         };
-        let resolve_set = resolve_pair(&bloom_views[4], "bloom resolve");
-        let resolve_nobloom_set = resolve_pair(&bloom_views[0], "bloom resolve nobloom");
-        let mut fbs = bloom_fbs.into_iter();
-        let mut sets = blur_sets.into_iter();
+        let resolve_set = resolve_pair(&up[0].view, "bloom resolve");
+        let resolve_nobloom_set = resolve_pair(&down[0].view, "bloom resolve nobloom");
         HdrChain {
             format,
             scene_fb,
-            bloom_a_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_b_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_c_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_d_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_e_fb: fbs.next().expect("five bloom framebuffers"),
-            half_extent: half,
-            bright_set,
-            blur_a_set: sets.next().expect("four bloom sets"),
-            blur_b_set: sets.next().expect("four bloom sets"),
-            blur_c_set: sets.next().expect("four bloom sets"),
-            blur_d_set: sets.next().expect("four bloom sets"),
+            scene_extent: extent,
+            levels,
+            down,
+            up,
+            prefilter_set,
+            down_set,
+            up_set,
             resolve_set,
             resolve_nobloom_set,
         }
@@ -7034,10 +7215,12 @@ struct Pipelines {
     glow_scene: Arc<GraphicsPipeline>,
     splat_scene: Arc<GraphicsPipeline>,
     smoke_scene: Arc<GraphicsPipeline>,
-    /// Bloom bright extract (post pass).
-    bright: Arc<GraphicsPipeline>,
-    /// Separable blur step (post pass, axis via push).
-    blur: Arc<GraphicsPipeline>,
+    /// Mip-bloom prefilter (scene → down[0], post pass).
+    prefilter: Arc<GraphicsPipeline>,
+    /// Mip-bloom downsample step (post pass).
+    down: Arc<GraphicsPipeline>,
+    /// Mip-bloom upsample step (post pass).
+    up: Arc<GraphicsPipeline>,
     /// Bloom-composite ACES resolve (main pass).
     resolve: Arc<GraphicsPipeline>,
 }
@@ -8920,6 +9103,7 @@ impl ViewerApp {
             } else {
                 SPLAT_ALPHA_K_MAP
             };
+            let bloom_params = MipBloomParams::for_tier(QualityTier::High);
             record_cosmic_hdr_prepass(
                 &mut builder,
                 &ctx.pipelines,
@@ -8928,7 +9112,7 @@ impl ViewerApp {
                 smoke_exposure,
                 glow_exposure,
                 redshift,
-                BloomParams::spec_defaults().threshold,
+                &bloom_params,
                 ctx.bloom_enabled,
                 splat_alpha_k,
             );

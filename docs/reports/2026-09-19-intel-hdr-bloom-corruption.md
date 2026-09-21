@@ -4,7 +4,8 @@
 **GPU:** Intel UHD Graphics 620 (driver 1656914, Vulkan 1.3.215)
 **Severity:** visual-only (no crash, no validation error)
 **Root cause:** image aliasing across render passes — writing then reading then rewriting the same `ImageView` in a single command buffer
-**Fix commit:** `18f98ef` (in-progress, pending commit of the dedicated-target patch)
+**Fix commit:** `18f98ef` (dedicated-target patch) + v0.3.3
+`bloom-mip-chain` (mip pyramid, same rule — now pinned by test, see §8)
 
 ---
 
@@ -143,8 +144,22 @@ flags to isolate stages:
 | Flag | What it skips | What remains |
 |------|---------------|--------------|
 | `GAME_DEBUG_COSMIC_POST=0` | Entire HDR post chain | Scene draws direct to swapchain |
-| `GAME_DEBUG_COSMIC_BLOOM=0` | Blur passes (×4) | Scene → bright → resolve |
+| `GAME_DEBUG_COSMIC_BLOOM=0` | Ups + pass-through (resolve reads `down[0]`) | Scene → prefilter → resolve |
 | Both unset | Nothing | Full bloom chain |
+
+---
+
+## 8. Now pinned by test (v0.3.3 `bloom-mip-chain`, 2026-09-21)
+
+The write-once rule is executable:
+`debug::cosmic_bloom::describe_bloom_chain(levels)` builds the same
+pass list the recorder executes
+(`prefilter → down[k] → pass-through → up[k] → resolve`), and
+`assert_write_once` fails the suite if any image is written twice or
+read by its writing pass — for every tier level count and the
+`BLOOM=0` variant. The `cosmic-gas-veil-v2` march target enters the
+same description, so the pin covers it too. Verified clean on the
+Intel UHD 620 (`slab` + `demo` captures, no coloured squares).
 
 Always verify the `cosmic visual build r2` log tag before trusting a
 run — orphan processes can block the relink and leave a stale binary.

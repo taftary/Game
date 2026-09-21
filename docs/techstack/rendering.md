@@ -313,19 +313,28 @@ non-negative and capped, spec §9.1; unbounded tint decorrelated
 channels into rainbow squares on screen). The shared alpha `map`/`line`
 pipelines and every other surface are untouched. In HDR mode the
 same draws record into an offscreen HDR scene pass (indigo clear),
-then five dedicated bloom targets (A–E) at half-res: bright extract
-→ A, H blur A → B, V blur B → C, wide-H C → D, wide-V D → E (final).
-Every target is written exactly once, then only read — never ping-
-ponged (Intel UHD 620 corruption workaround, see
-`docs/reports/2026-09-19-intel-hdr-bloom-corruption.md`). The
-bloom-composite ACES resolve reads scene + E into the swapchain
+then the mip-bloom pyramid (`bloom-mip-chain`, v0.3.3): soft-knee
+prefilter (scene → `down[0]`) + Jimenez 13-tap downs + alias-free
+pass-through (`down[last]` → `up[last]` exact copy) + 3×3-tent ups
+(`up[k] = tent(up[k+1])·w + down[k]`), 5 levels at High. Every level
+image is written exactly once, then only read — never ping-ponged
+(Intel UHD 620 corruption workaround, see
+`docs/reports/2026-09-19-intel-hdr-bloom-corruption.md` — now pinned
+by the `assert_write_once` test over the pass description). The
+bloom-composite ACES resolve reads scene + `up[0]` into the swapchain
 image; the inspector marker and all UI draw after the resolve. Fullscreen
 passes reuse `RESOLVE_VERT` empty-vertex-input triangles with
 the `post.rs` NDC-top-row UV contract (`v_uv = vec2(pos.x, 1.0 -
-pos.y)`); the bloom GLSL (`BLOOM_BRIGHT_FRAG`, `BLOOM_BLUR_FRAG`,
-`resolve_frag_bloom`) and `BloomParams` live in
+pos.y)`); the bloom GLSL (`BLOOM_PREFILTER_FRAG`, `BLOOM_DOWN_FRAG`,
+`BLOOM_UP_FRAG`, `resolve_frag_bloom`), `MipBloomParams`
+(threshold 1.0, knee 0.5, intensity 0.85, levels 3/4/5 per tier,
+weights `[1.0, 0.9, 0.8, 0.7, 0.6]`), and the CPU mirrors
+(`jimenez13_offsets`, `tent9_weights`, `soft_knee`) live in
 `engine::render::post`, the GPU half follows the `game_tools`
 `ResolvePass` precedent, and transients rebuild with the swapchain.
+Intensities back near spec (demo 1.0, map 0.85 — the pyramid keeps hub
+energy the old 2-scale blur attenuated); `GAME_DEBUG_COSMIC_BLOOM=0`
+resolves scene + `down[0]`.
 
 Smoke filaments (update-2026-09-20-0645, replaces update-2026-09-19-1245
 P1 ribbons): `cosmic_web.rs` emits one compact `SmokePuff` per puff

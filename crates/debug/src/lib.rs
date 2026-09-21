@@ -12,6 +12,7 @@
 pub mod actions;
 pub mod app;
 pub mod console;
+pub mod cosmic_bloom;
 pub mod cosmic_camera;
 pub mod cosmic_capture;
 pub mod cosmic_demo;

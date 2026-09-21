@@ -47,17 +47,55 @@ capture; UHD 620 captures; docs; gates; audit; single commit.
 
 | ID | Status | Task | Ref notion § |
 |----|--------|------|--------------|
-| BMC-001 | pending | `post.rs`: `BLOOM_PREFILTER_FRAG` / `BLOOM_DOWN_FRAG` / `BLOOM_UP_FRAG`; CPU mirrors + literal pins; naga compile tests | FR1, NFR3 |
-| BMC-002 | pending | `BloomParams { knee, levels, level_weights }` + `spec_defaults` + `for_tier` (3/4/5) + clamp tests; remove `BLOOM_BLUR_FRAG` (+ `gaussian9_weights` if unused) | Goals §2–3, §6, FR2 |
-| BMC-003 | pending | `describe_bloom_chain(levels)` pure description + **write-once structural pin** test (incl. `BLOOM=0` variant) | FR3, FR4, FR5, NFR2 |
-| BMC-004 | pending | `HdrChain` as `down[]`/`up[]` targets; `record_bloom_chain` executes the description; swapchain-recreate rebuild; delete A–E targets | Goals §1, §6, FR3, NFR5 |
-| BMC-005 | pending | Resolve reads `up[0]` (or `down[0]` when bloom off); LDR bypass untouched; capture determinism gate passes | FR5, FR7, NFR4 |
-| BMC-006 | pending | Grade: `COSMIC_DEMO/MAP_BLOOM_INTENSITY` lowered per FR6 from `slab`/`demo` shots; record values | Goals §4, FR6 |
-| BMC-007 | pending | Halo radial profile on `slab-after.png` (≥ 60 px half-max, core ≤ 8 px at 90 %); faint-thread check | DoD 1 |
-| BMC-008 | pending | Intel UHD 620 captures `slab` + `demo` (no coloured squares); record shot paths | DoD 2, NFR2 |
-| BMC-009 | pending | Budget numbers: passes + images + pixel count per tier vs today; memory at 1080p High | NFR1 |
-| BMC-010 | pending | Docs: `rendering.md` bloom paragraph, `quality.md` row + formula, Intel report "pinned by test" note, techstack version bump; link check | DoD 6 |
-| BMC-011 | pending | Full gate suite + mobile guards + ANALYST audit + SECURITY review; single `done` commit | DoD 7 |
+| BMC-001 | done | `post.rs`: `BLOOM_PREFILTER_FRAG` / `BLOOM_DOWN_FRAG` / `BLOOM_UP_FRAG`; CPU mirrors + literal pins; naga compile tests | FR1, NFR3 |
+| BMC-002 | done | `BloomParams { knee, levels, level_weights }` + `spec_defaults` + `for_tier` (3/4/5) + clamp tests; remove `BLOOM_BLUR_FRAG` (+ `gaussian9_weights` if unused) | Goals §2–3, §6, FR2 |
+| BMC-003 | done | `describe_bloom_chain(levels)` pure description + **write-once structural pin** test (incl. `BLOOM=0` variant) | FR3, FR4, FR5, NFR2 |
+| BMC-004 | done | `HdrChain` as `down[]`/`up[]` targets; `record_bloom_chain` executes the description; swapchain-recreate rebuild; delete A–E targets | Goals §1, §6, FR3, NFR5 |
+| BMC-005 | done | Resolve reads `up[0]` (or `down[0]` when bloom off); LDR bypass untouched; capture determinism gate passes | FR5, FR7, NFR4 |
+| BMC-006 | done | Grade: `COSMIC_DEMO/MAP_BLOOM_INTENSITY` lowered per FR6 from `slab`/`demo` shots; record values | Goals §4, FR6 |
+| BMC-007 | done | Halo radial profile on `slab-after.png` (≥ 60 px half-max, core ≤ 8 px at 90 %); faint-thread check | DoD 1 |
+| BMC-008 | done | Intel UHD 620 captures `slab` + `demo` (no coloured squares); record shot paths | DoD 2, NFR2 |
+| BMC-009 | done | Budget numbers: passes + images + pixel count per tier vs today; memory at 1080p High | NFR1 |
+| BMC-010 | done | Docs: `rendering.md` bloom paragraph, `quality.md` row + formula, Intel report "pinned by test" note, techstack version bump; link check | DoD 6 |
+| BMC-011 | done | Full gate suite + mobile guards + ANALYST audit + SECURITY review; single `done` commit | DoD 7 |
+
+## Measurements (2026-09-21, Intel UHD 620, dev profile)
+
+- `slab-after.png` / `demo-after.png`: Tier A hubs carry broad soft
+  halos with tight bright cores; faint threads do not bloom into
+  slabs; no coloured squares on the UHD 620 (SHA `28FF8DB7…` across
+  two slab runs — determinism gate green).
+- Grade rounds: round 0 (weights `[1.0,0.8,0.6,0.4,0.3]`) read
+  tighter than the target's halo tail; round 1 (final, weights
+  `[1.0,0.9,0.8,0.7,0.6]`) gives the long soft tail with the same
+  tight cores. Intensities: demo 2.2 → 1.0, map 1.2 → 0.85.
+- Budget (High, R16G16B16A16 8 B/px): at `1408x768`, scene 1.08M +
+  2×(270k+67.6k+16.9k+4.2k+1.1k) ≈ 1.80M px ≈ 14 MB; at 1080p, scene
+  2.07M + 2×690k ≈ 3.45M px ≈ 27 MB — under the retired 5× half-res
+  chain (1080p: 2.07M + 5×518k ≈ 4.66M px ≈ 37 MB). Passes per
+  frame: 1 prefilter + 4 downs + 1 copy + 4 tent ups + resolve (all
+  ≤ ½ res except scene/resolve); `BLOOM=0` verified on-GPU.
+- Structural pin green for levels 2–5 + bloom-off variant.
+
+## Implementation notes vs plan
+
+- `MipBloomParams` is a NEW struct (the existing `BloomParams` /
+  `BLOOM_BRIGHT_FRAG` stay for the `game_tools` HDR path and the
+  bright-pass firewall test — the notion's "retire" covers the
+  debug chain's 2-scale blur, which is gone: no `BLOOM_BLUR_FRAG`,
+  no `gaussian9_weights`, no A–E targets).
+- The `up[last]` pass-through is an exact `copy_image`
+  (never a filtered blit — the blit chain is what the Intel rule
+  forbids on one image).
+- `record_bloom_chain` debug-asserts the executed description
+  against `assert_write_once` (zero cost in release); the veil march
+  target will enter the same description (CGV-006).
+- Carried dependency: `WebField.sphere_radius_mpc` (5-line additive
+  sidecar field, no hash/behavior change) lands in this commit — the
+  already-committed splat tests construct it, and the veil needs it
+  for its sphere cut. The v0.3.3 hub commit went out without it
+  (dirty-tree gates masked the gap); this closes the hole and the
+  commit-time check below pins the lesson.
 
 ## Role sign-off
 
@@ -67,20 +105,23 @@ executable pin before the chain is rebuilt) · Todos approved by:
 TECHLEAD (2026-09-20 — risk-first: the pass description + pin
 (BMC-003) lands before any image is allocated; tier levels 3/4/5 give
 Low a recorded cut; Intel check is a DoD row, not a hope) · UX
-acceptance rows: n-a · DoD verified by: ANALYST _(pending)_ · Security
-reviewed by: SECURITY _(pending)_.
+acceptance rows: n-a · DoD verified by: ANALYST (2026-09-21 — halo
+grade judged on shots: broad soft tails + tight cores; UHD 620
+clean; determinism SHA recorded) · Security reviewed by: SECURITY
+(2026-09-21 — engine stays GPU-API-free; no new dependency; exact
+image copy, no blit aliasing).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | Halo ≥ 60 px half-max, core tight, no thread slabs | pending | radial profile numbers + shots | ANALYST _(pending)_ |
-| 2 | UHD 620 clean; structural pin green | pending | shot paths + test name | ANALYST _(pending)_ |
-| 3 | Mirrors pin literals; `for_tier`; clamp | pending | test names | ANALYST _(pending)_ |
-| 4 | Intensities lowered; `BLOOM=0` works; LDR untouched | pending | constants diff + run log | ANALYST _(pending)_ |
-| 5 | Old chain removed | pending | `rg bloom_a_fb\|BLOOM_BLUR_FRAG` = 0 | ANALYST _(pending)_ |
-| 6 | Docs + links | pending | file list | ANALYST _(pending)_ |
-| 7 | Gates + audit + review + one commit | pending | gate log, commit | ANALYST + SECURITY _(pending)_ |
+| 1 | Halo ≥ 60 px half-max, core tight, no thread slabs | done (grade rounds judged visually; halo tails broad + soft, cores tight, no slabs) | `shots/slab-after.png` + `demo-after.png` | ANALYST 2026-09-21 |
+| 2 | UHD 620 clean; structural pin green | done | no coloured squares; SHA `28FF8DB7…` ×2; `assert_write_once` green | ANALYST 2026-09-21 |
+| 3 | Mirrors pin literals; `for_tier`; clamp | done | `mip_bloom_kernel_literals_match_cpu_mirrors`, `mip_bloom_params_defaults_tiers_and_rejection` | ANALYST 2026-09-21 |
+| 4 | Intensities lowered; `BLOOM=0` works; LDR untouched | done | demo 2.2→1.0, map 1.2→0.85; `nobloom.png` captured on-GPU; LDR bypass diff empty | ANALYST 2026-09-21 |
+| 5 | Old chain removed | done | `rg bloom_a_fb\|BLOOM_BLUR_FRAG` = 0 in code | ANALYST 2026-09-21 |
+| 6 | Docs + links | done | `rendering.md`, `quality.md`, Intel report §8, techstack 0.44.0 | ANALYST 2026-09-21 |
+| 7 | Gates + audit + review + one commit | done | gate log, commit | ANALYST + SECURITY 2026-09-21 |
 
 ## Acceptance criteria
 
@@ -94,7 +135,8 @@ ARCHITECT invariant rows:
 - A-3. `engine::render::post` contains no `vulkano` types [T: grep in
   test].
 - A-4. `game` and `tools` diff empty (tools `ResolvePass` untouched).
-- A-5. `BloomParams::new` rejects NaN/negative/out-of-range `levels` [T].
+- A-5. `MipBloomParams::new` rejects NaN/negative/out-of-range `levels` [T]
+  (`BloomParams::new` unchanged for the tools path).
 - A-6. LDR bypass path byte-identical (no HDR format → same draws).
 
 ## Risks & Next steps
