@@ -20,6 +20,7 @@ pub mod cosmic_hubs;
 pub mod cosmic_player;
 pub mod cosmic_splat;
 pub mod cosmic_veil;
+pub mod cosmic_vista;
 pub mod cosmic_web;
 pub mod cosmic_window;
 pub mod fps;

@@ -2,9 +2,10 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-20; UX consulted; ARCHITECT + TECHLEAD
-breakdown in `plan.md`). Player-facing; the last feature of v0.3.3 —
-it depends on the whole render stack being in place.
+`done` (PO sign-off 2026-09-20; UX consulted; ARCHITECT + TECHLEAD
+breakdown in `plan.md`; ANALYST audit + SECURITY review recorded in
+`plan.md` DoD table; single commit on branch `v0.3.3`, closing the
+version with a merge to `main`)
 
 ## Context
 
@@ -47,14 +48,14 @@ push terms; `cosmic-capture-harness` reserved the `vista` preset;
    centred on the hub's depth; fog off (slab does the windowing).
    Framed width `≈ 400 Mpc` (the target's composition, report §2).
 2. **Hold, then dive.** Hold `2.0 s` (player reads the composition),
-   then `6.0 s` continuous ease (`smoothstep` on `t`) from the vista
+   then `8.0 s` continuous ease (`smoothstep` on `t`) from the vista
    pose to the Chase pose behind the player marker: FOV `25° → 60°`,
    slab widens `40 → off` (half-thickness to `≥ R`), fog `off → L_demo`
    (90 Mpc), eye travels the straight path in Mpc with the look target
-   sliding from the hub to the marker. Total `8 s`, then normal Chase.
+   sliding from the hub to the marker. Total `10 s`, then normal Chase.
 3. **Skip / replay.** Any steering or thrust input, `Esc`, or click
    skips (a `0.6 s` fast ease to Chase, never a cut); `V` replays the
-   vista from the current position (the same 8 s path from the vista
+   vista from the current position (the same 10 s path from the vista
    pose). Reseed (`R`) restarts the vista.
 4. **Marker + HUD.** The player marker (`YOU` dot + heading arrow)
    stays visible throughout via the pinned `world_to_pixels` path (it
@@ -118,7 +119,7 @@ no new pass or pipeline.
 - FR4 (skip/replay): inputs that skip: any `HeldThrust` flag, steer
   drag ≥ 4 px, `Esc`, mouse click, `E`; skip = `0.6 s` ease from the
   current interpolated pose to Chase (`t` remapped, same easing).
-  `V` = replay from the vista pose (Hold `2 s` → Dive `6 s`); `R`
+  `V` = replay from the vista pose (Hold `2 s` → Dive `8 s`); `R`
   (reseed) restarts. While active, `P` (camera cycle) and wheel are
   ignored (no mode fight); after `Done`, all controls as v0.3.2.
 - FR5 (marker + hint): marker via `world_to_pixels` with a `6 px`
@@ -128,7 +129,7 @@ no new pass or pipeline.
 - FR6 (preset): `CapturePreset::VISTA` = the FR2 pose at `t = 0`;
   `demo` preset unchanged (Chase at spawn, i.e. `Done`).
 - FR7 (headless): `game_debug --headless` steps the vista to `Done`
-  (8 s of ticks) and asserts the final pose equals the Chase pose
+  (10 s of ticks) and asserts the final pose equals the Chase pose
   within `1e-6` Mpc / `1e-6` rad (continuity pin).
 
 ## Non-functional requirements
@@ -152,7 +153,7 @@ no new pass or pipeline.
    the version's closest match to `target.jpeg` (report §2 composition:
    outside view, one dominant hub, dark voids, filaments radiating);
    this shot is the version's headline evidence.
-2. Boot: hold `2 s` → dive `6 s` → Chase at spawn; continuity pin
+2. Boot: hold `2 s` → dive `8 s` → Chase at spawn; continuity pin
    (FR7) green; peak angular velocity ≤ 30°/s recorded.
 3. Skip on any listed input (`0.6 s` ease), `V` replays, `R` restarts;
    `P`/wheel ignored while active; selection disabled while active;
@@ -175,7 +176,7 @@ no new pass or pipeline.
   material; the slab/fog terms come from `cosmic-depth-window`; the
   framed hub from `cosmic-hub-hierarchy`). Eighth and last feature on
   branch `v0.3.3`.
-- Durations (`2 s`, `6 s`, `0.6 s`), distance (`180 Mpc`), FOV (`25°`),
+- Durations (`2 s`, `8 s`, `0.6 s`), distance (`180 Mpc`), FOV (`25°`),
   slab (`40 Mpc`) are UX starting values; tuned from shots + a
   hands-on session, recorded as constants.
 - The `press any key` hint is debug-shell text; the release-binary UI

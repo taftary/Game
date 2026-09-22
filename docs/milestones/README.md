@@ -113,14 +113,14 @@ tiered veil (sprites Low / raymarch Medium+High), v0.3.2 closed as-is.
 
 | # | Feature | Status | Crate(s) | Scope |
 |---|---|---|---|---|
-| F0 | [`cosmic-capture-harness`](../../plans/v0.3.3/cosmic-capture-harness/) | planned | debug | `--capture` offscreen PNG + four camera presets (`inspector`, `slab`, `demo`, `vista`) + `F12`; every later DoD's evidence; v0.3.2 baseline shots |
-| F1 | [`web-field-export`](../../plans/v0.3.3/web-field-export/) | planned | engine | `generate_cosmic_web_with_field` → non-hashed `WebField` sidecar (≈1M Zel'dovich tracers + overdensity, 128³ class/density grid); descriptor, hash, saves byte-identical |
-| F2 | [`cosmic-tracer-splat`](../../plans/v0.3.3/cosmic-tracer-splat/) | planned | debug | adaptive-kernel additive splats coloured by one density ramp; classes D/B/C emerge from density + hub proximity; tiers 300k / 1M / all; retires grain + beads |
-| F3 | [`cosmic-depth-window`](../../plans/v0.3.3/cosmic-depth-window/) | planned | debug | visibility fog on every cosmic draw + inspector slab mode (`S`, 10–80 Mpc) + near-ortho 20° inspector FOV; fills the `slab` preset; makes voids dark |
-| F4 | [`cosmic-hub-hierarchy`](../../plans/v0.3.3/cosmic-hub-hierarchy/) | planned | debug | mass-rank tiers A (1 %) / B (10 %) / C; 3-layer cores + member-galaxy scatter for A/B, warm beads for C; retires 3-per-node impostors |
-| F5 | [`bloom-mip-chain`](../../plans/v0.3.3/bloom-mip-chain/) | planned | engine + debug | write-once mip pyramid (13-tap down / tent up, 3–5 levels by tier, soft knee); the Intel rule becomes an executable pin; retires the 5-target blur |
-| F6 | [`cosmic-gas-veil-v2`](../../plans/v0.3.3/cosmic-gas-veil-v2/) | planned | debug | grid-driven gas bodies + walls: cell sprites on Low, quarter-res emission-only raymarch of a 128³ 3D texture on Medium/High; retires smoke + old veil + braid code |
-| F7 | [`cosmic-vista-intro`](../../plans/v0.3.3/cosmic-vista-intro/) | planned | debug | demo boots on the reference composition (outside, 25°, 40 Mpc slab), holds 2 s, dives 6 s to Chase; skippable, `V` replays; fills the `vista` preset; closes the version |
+| F0 | [`cosmic-capture-harness`](../../plans/v0.3.3/cosmic-capture-harness/) | done | debug | `--capture` offscreen PNG + four camera presets (`inspector`, `slab`, `demo`, `vista`) + `F12`; every later DoD's evidence; v0.3.2 baseline shots |
+| F1 | [`web-field-export`](../../plans/v0.3.3/web-field-export/) | done | engine | `generate_cosmic_web_with_field` → non-hashed `WebField` sidecar (≈1M Zel'dovich tracers + overdensity, 128³ class/density grid); descriptor, hash, saves byte-identical |
+| F2 | [`cosmic-tracer-splat`](../../plans/v0.3.3/cosmic-tracer-splat/) | done | debug | adaptive-kernel additive splats coloured by one density ramp; classes D/B/C emerge from density + hub proximity; tiers 300k / 1M / all; retires grain + beads |
+| F3 | [`cosmic-depth-window`](../../plans/v0.3.3/cosmic-depth-window/) | done | debug | visibility fog on every cosmic draw + inspector slab mode (`S`, 10–80 Mpc) + near-ortho 20° inspector FOV; fills the `slab` preset; makes voids dark |
+| F4 | [`cosmic-hub-hierarchy`](../../plans/v0.3.3/cosmic-hub-hierarchy/) | done | debug | mass-rank tiers A (1 %) / B (10 %) / C; 3-layer cores + member-galaxy scatter for A/B, warm beads for C; retires 3-per-node impostors |
+| F5 | [`bloom-mip-chain`](../../plans/v0.3.3/bloom-mip-chain/) | done | engine + debug | write-once mip pyramid (13-tap down / tent up, 3–5 levels by tier, soft knee); the Intel rule becomes an executable pin; retires the 5-target blur |
+| F6 | [`cosmic-gas-veil-v2`](../../plans/v0.3.3/cosmic-gas-veil-v2/) | done | debug | grid-driven gas bodies + walls: cell sprites on Low, quarter-res emission-only raymarch of a 128³ 3D texture on Medium/High; retires smoke + old veil + braid code |
+| F7 | [`cosmic-vista-intro`](../../plans/v0.3.3/cosmic-vista-intro/) | done | debug | demo boots on the reference composition (outside, 25°, 40 Mpc slab), holds 2 s, dives 8 s to Chase; skippable, `V` replays; fills the `vista` preset; closes the version |
 
 Cosmic roadmap items realised here: "volumetric bodies", "quad node
 impostors" (as in-sprite ramps), "sheet-sprite render + density

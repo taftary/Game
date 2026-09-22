@@ -17,7 +17,7 @@ pub enum CaptureView {
     Slab,
     /// Player spawn (Chase boot framing).
     Demo,
-    /// Opening shot; reserved until cosmic-vista-intro lands.
+    /// Opening shot; the t = 0 vista pose (filled by cosmic-vista-intro).
     Vista,
 }
 
@@ -57,7 +57,8 @@ pub const INSPECTOR_PRESET: CapturePreset = CapturePreset {
     height: CAPTURE_DEFAULT_SIZE.1,
 };
 
-/// Target framing; identical to inspector until cosmic-depth-window lands.
+/// Target framing (inspector basis + 30 Mpc slab); the binary narrows
+/// to the 20° slab camera at capture time.
 pub const SLAB_PRESET: CapturePreset = CapturePreset {
     view: CaptureView::Slab,
     surface_is_demo: false,
@@ -81,14 +82,18 @@ pub const DEMO_PRESET: CapturePreset = CapturePreset {
     height: CAPTURE_DEFAULT_SIZE.1,
 };
 
-/// Opening shot; identical to demo until cosmic-vista-intro lands.
+/// Opening shot (`cosmic-vista-intro` CVI-008): the t = 0 vista pose —
+/// 25° FOV, 40 Mpc slab, fog off — computed per seed by
+/// `cosmic_vista::vista_pose` (the binary poses the demo camera from
+/// it; the static offsets below mirror the demo basis framing like
+/// the slab mirrors the inspector).
 pub const VISTA_PRESET: CapturePreset = CapturePreset {
     view: CaptureView::Vista,
     surface_is_demo: true,
     eye_offset_mpc: [38.0, 14.0, -46.0],
     target_offset_mpc: [30.0, 8.0, -38.0],
-    fov_y_deg: 60.0,
-    slab_thickness_mpc: None,
+    fov_y_deg: 25.0,
+    slab_thickness_mpc: Some(40.0),
     width: CAPTURE_DEFAULT_SIZE.0,
     height: CAPTURE_DEFAULT_SIZE.1,
 };
@@ -269,13 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn slab_thickness_only_on_slab_preset() {
+    fn slab_thickness_only_on_slab_and_vista_presets() {
         assert_eq!(preset_for(CaptureView::Slab).slab_thickness_mpc, Some(30.0));
-        for view in [
-            CaptureView::Inspector,
-            CaptureView::Demo,
-            CaptureView::Vista,
-        ] {
+        assert_eq!(
+            preset_for(CaptureView::Vista).slab_thickness_mpc,
+            Some(40.0)
+        );
+        for view in [CaptureView::Inspector, CaptureView::Demo] {
             assert_eq!(preset_for(view).slab_thickness_mpc, None);
         }
     }
@@ -295,11 +300,15 @@ mod tests {
         assert_eq!(slab.eye_offset_mpc, inspector.eye_offset_mpc);
         assert_eq!(slab.target_offset_mpc, inspector.target_offset_mpc);
         assert_eq!(slab.fov_y_deg, inspector.fov_y_deg);
+        // Vista filled (CVI-008): demo-basis offsets, own 25° FOV +
+        // 40 Mpc slab (the t = 0 pose itself is per-seed — the binary
+        // poses from `vista_pose`, pinned by the capture test).
         let demo = preset_for(CaptureView::Demo);
         let vista = preset_for(CaptureView::Vista);
         assert_eq!(vista.eye_offset_mpc, demo.eye_offset_mpc);
         assert_eq!(vista.target_offset_mpc, demo.target_offset_mpc);
-        assert_eq!(vista.fov_y_deg, demo.fov_y_deg);
+        assert_eq!(vista.fov_y_deg, 25.0);
+        assert_eq!(vista.slab_thickness_mpc, Some(40.0));
     }
 
     #[test]

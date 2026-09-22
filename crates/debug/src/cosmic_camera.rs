@@ -98,6 +98,15 @@ pub struct CosmicCamera {
     /// Scene half-extent in Mpc (descriptor radius): drives near/far
     /// only, never framing.
     scene_radius: f32,
+    /// Instance vertical FOV in **radians** (default [`FOV_Y`]): the
+    /// vista intro (`cosmic-vista-intro`) eases this 25° → 60° over the
+    /// dive (vista poses carry degrees — convert at the call site).
+    /// The `cosmic-depth-window` precedent on `MapOrbitCamera`.
+    fov_y: f32,
+    /// External pose override (eye, target) while the vista intro is
+    /// active: eye/target math bypasses the ship anchor; cleared on
+    /// `Done` (camera returns to the tracked ship byte-identically).
+    external_pose: Option<(DVec3, DVec3)>,
 }
 
 impl CosmicCamera {
@@ -113,7 +122,32 @@ impl CosmicCamera {
             yaw: std::f32::consts::FRAC_PI_2,
             pitch: 0.6,
             scene_radius: scene_radius_mpc.max(f32::EPSILON),
+            fov_y: FOV_Y,
+            external_pose: None,
         }
+    }
+
+    /// Instance vertical FOV in degrees.
+    pub fn fov_y(&self) -> f32 {
+        self.fov_y
+    }
+
+    /// Set the instance FOV (the vista dive drives 25° → 60°).
+    pub fn set_fov_y(&mut self, fov_y_deg: f32) {
+        if fov_y_deg.is_finite() && fov_y_deg > 0.0 {
+            self.fov_y = fov_y_deg;
+        }
+    }
+
+    /// External pose override for the vista intro (`None` = track the
+    /// ship as before).
+    pub fn set_external_pose(&mut self, pose: Option<(DVec3, DVec3)>) {
+        self.external_pose = pose;
+    }
+
+    /// Whether an external pose currently drives the camera.
+    pub fn has_external_pose(&self) -> bool {
+        self.external_pose.is_some()
     }
 
     /// Current mode.
@@ -173,7 +207,11 @@ impl CosmicCamera {
     }
 
     /// Eye position in f64 Mpc (world truth; recentered before upload).
+    /// An external pose (vista intro active) bypasses the ship anchor.
     pub fn eye_world(&self) -> DVec3 {
+        if let Some((eye, _)) = self.external_pose {
+            return eye;
+        }
         let forward = self.forward_or_x();
         match self.mode {
             CosmicCameraMode::Chase => {
@@ -191,8 +229,12 @@ impl CosmicCamera {
     }
 
     /// Look target in f64 Mpc: the marker in Chase/Orbit, ahead of the
-    /// nose in FirstPerson.
+    /// nose in FirstPerson — or the external target while the vista
+    /// intro is active.
     fn target_world(&self) -> DVec3 {
+        if let Some((_, target)) = self.external_pose {
+            return target;
+        }
         match self.mode {
             CosmicCameraMode::Chase | CosmicCameraMode::Orbit => self.anchor,
             CosmicCameraMode::FirstPerson => self.anchor + self.forward_or_x(),
@@ -200,8 +242,11 @@ impl CosmicCamera {
     }
 
     /// Eye-to-anchor distance driving the near/far policy (the framing
-    /// scale in every mode).
+    /// scale in every mode; eye-to-target under an external pose).
     fn framing_distance(&self) -> f32 {
+        if let Some((eye, target)) = self.external_pose {
+            return (target - eye).length().max(1e-3) as f32;
+        }
         match self.mode {
             CosmicCameraMode::Chase => self.chase_distance,
             CosmicCameraMode::Orbit => self.orbit_distance,
@@ -221,7 +266,8 @@ impl CosmicCamera {
     /// Perspective projection (un-flipped `directx`, never Vulkan):
     /// near/far derive from framing distance + scene radius (the
     /// MapOrbitCamera policy — only clipping is affected; the web
-    /// pipelines run with no depth state).
+    /// pipelines run with no depth state). Reads the instance FOV
+    /// (default [`FOV_Y`]; the vista dive eases it).
     pub fn projection_matrix(&self, aspect: f32) -> Mat4 {
         let aspect = if aspect.is_finite() && aspect > 0.0 {
             aspect
@@ -231,7 +277,7 @@ impl CosmicCamera {
         let dist = self.framing_distance();
         let near = (dist * 0.01).max(self.scene_radius * 1e-4);
         let far = dist + 4.0 * self.scene_radius;
-        perspective(FOV_Y, aspect, near, far.max(near * 2.0))
+        perspective(self.fov_y, aspect, near, far.max(near * 2.0))
     }
 
     /// Combined matrix the renderer pushes (`projection * view`).
@@ -241,8 +287,9 @@ impl CosmicCamera {
 
     /// Pixels per Mpc at the anchor depth: the point-shader scale for
     /// world-sized sprites (mirrors `MapOrbitCamera::px_scale`).
+    /// Reads the instance FOV so the vista dive scales with it.
     pub fn px_scale(&self, vp_h: f32) -> f32 {
-        vp_h.max(1.0) / (2.0 * (FOV_Y * 0.5).tan())
+        vp_h.max(1.0) / (2.0 * (self.fov_y * 0.5).tan())
     }
 
     /// Current chase distance (post-clamp).
@@ -304,6 +351,58 @@ mod tests {
         // Mirrors WS4 usage: buffers upload at the tracked position.
         cam.set_render_origin(DVec3::new(200.0, -40.0, 80.0));
         cam
+    }
+
+    #[test]
+    fn vista_fov_override_stays_directx_at_25_deg() {
+        // CVI-001/A-1: the vista dive FOV is still un-flipped
+        // `directx::perspective` (RH, Z in [0, 1], no Y-flip).
+        use glam::camera::rh::proj::{directx, vulkan};
+        let mut cam = camera();
+        assert_eq!(cam.fov_y(), FOV_Y);
+        cam.set_fov_y(25.0_f32.to_radians());
+        assert!((cam.fov_y() - 25.0_f32.to_radians()).abs() < 1e-7);
+        let aspect = 16.0 / 9.0;
+        let dist = cam.chase_distance();
+        let near = (dist * 0.01).max(250.0 * 1e-4);
+        let far = dist + 4.0 * 250.0;
+        assert_eq!(
+            cam.projection_matrix(aspect),
+            directx::perspective(25.0_f32.to_radians(), aspect, near, far)
+        );
+        assert_ne!(
+            cam.projection_matrix(aspect),
+            vulkan::perspective(25.0_f32.to_radians(), aspect, near, far)
+        );
+        // px_scale follows the instance FOV (tighter FOV = more px/Mpc).
+        let wide = CosmicCamera::new(250.0).px_scale(768.0);
+        let narrow = cam.px_scale(768.0);
+        assert!(narrow > wide);
+        // Rejections keep the old value.
+        cam.set_fov_y(f32::NAN);
+        cam.set_fov_y(-1.0);
+        cam.set_fov_y(0.0);
+        assert!((cam.fov_y() - 25.0_f32.to_radians()).abs() < 1e-7);
+    }
+
+    #[test]
+    fn external_pose_overrides_and_releases_cleanly() {
+        // CVI-001: while set, eye/target come from the pose; clearing
+        // restores the tracked-ship path byte-identically (existing
+        // tests above cover the default path unchanged).
+        let mut cam = camera();
+        let before = cam.view_proj(800.0 / 600.0);
+        let eye = DVec3::new(0.0, 0.0, 180.0);
+        let target = DVec3::ZERO;
+        cam.set_external_pose(Some((eye, target)));
+        assert!(cam.has_external_pose());
+        assert_eq!(cam.eye_world(), eye);
+        assert_ne!(cam.view_proj(800.0 / 600.0), before);
+        // The anchor still projects off-center under the pose (the
+        // marker-floor test lives on the draw side).
+        cam.set_external_pose(None);
+        assert!(!cam.has_external_pose());
+        assert_eq!(cam.view_proj(800.0 / 600.0), before);
     }
 
     #[test]

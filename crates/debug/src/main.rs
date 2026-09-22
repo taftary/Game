@@ -1174,6 +1174,18 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
     })
 }
 
+/// Pose the demo camera for a `vista` capture (`cosmic-vista-intro`
+/// CVI-008 test seam): external pose + 25° FOV from `vista_pose` at
+/// t = 0 exactly — the same pose the live boot holds.
+fn pose_demo_camera_for_vista_capture(debug: &mut DebugApp) {
+    let pose = game_debug::cosmic_vista::vista_pose(&debug.cosmic.web);
+    debug
+        .cosmic
+        .camera
+        .set_external_pose(Some((pose.eye, pose.target)));
+    debug.cosmic.camera.set_fov_y(pose.fov_y_deg.to_radians());
+}
+
 /// GPU-free viewer check: build the default mesh through the lib, print
 /// stats, run the pick self-test, exit 0. Never touches
 /// `VulkanLibrary` or `EventLoop`. `seed` overrides the universe the
@@ -1191,6 +1203,34 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.camera.render_origin(),
         debug_app.cosmic.player.position_mpc()
     );
+    // Vista continuity pin (`cosmic-vista-intro` FR7): 10 s of ticks
+    // (the shared `tick` path, no input) walk Hold → Dive → Done and
+    // land exactly on the live Chase pose — the dive is one continuous
+    // motion with no cut. Runs first: later self-tests tick with
+    // thrust held (which skips), so they need Done behind them.
+    {
+        use game_debug::cosmic_vista::VistaPhase;
+        assert_eq!(debug_app.cosmic.vista.phase, VistaPhase::Hold);
+        for _ in 0..600 {
+            debug_app.cosmic.tick(1.0 / 60.0);
+        }
+        assert_eq!(debug_app.cosmic.vista.phase, VistaPhase::Done);
+        assert!(!debug_app.cosmic.camera.has_external_pose());
+        let got = debug_app.cosmic.vista.pose();
+        let want = debug_app.cosmic.chase_pose();
+        assert!(
+            (got.eye - want.eye).length() < 1e-6,
+            "vista must end at the Chase eye"
+        );
+        assert!(
+            (got.target - want.target).length() < 1e-6,
+            "vista must end at the Chase target"
+        );
+        assert!((got.fov_y_deg - want.fov_y_deg).abs() < 1e-6);
+        let events = std::mem::take(&mut debug_app.cosmic.vista_events);
+        assert_eq!(events, vec!["hold", "dive", "done"]);
+        println!("vista=done events=hold,dive,done ok");
+    }
     // Field-render layout (`cosmic-gas-veil-v2` CGV-009: smoke retired
     // with the link-graph decoration; splats + hubs + veil sprites
     // derive non-empty from the boot web).
@@ -1757,11 +1797,37 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         debug.cosmic_inspector.camera.set_fov_keep_framing(20.0);
         debug.cosmic_inspector.slab = game_debug::cosmic_window::SlabState::default_on();
     }
+    // Vista intro (`cosmic-vista-intro` CVI-008): the `vista` preset IS
+    // the t = 0 vista pose — external pose + 25° FOV on the demo
+    // camera, driven per seed by `vista_pose` (the same pose the live
+    // boot holds). Optional `GAME_DEBUG_VISTA_T` pre-roll (seconds of
+    // 60 Hz ticks, deterministic per build+seed) serves the timed
+    // marker/hint DoD shots.
+    let vista_pose = if request.view == CaptureView::Vista {
+        pose_demo_camera_for_vista_capture(&mut debug);
+        if let Ok(t) = std::env::var("GAME_DEBUG_VISTA_T")
+            && let Ok(secs) = t.parse::<f64>()
+            && secs > 0.0
+        {
+            for _ in 0..(secs * 60.0) as usize {
+                debug.cosmic.tick(1.0 / 60.0);
+            }
+        }
+        Some(game_debug::cosmic_vista::vista_pose(&debug.cosmic.web))
+    } else {
+        None
+    };
     let (mvp, px_scale, eye, origin, fog_l, slab_center, slab_half) = if is_demo {
         let camera = &debug.cosmic.camera;
         let eye_w = camera.eye_world();
         let origin = debug.cosmic.upload_origin;
-        let fog_l = debug.cosmic.fog_l_mpc;
+        // Vista preset (CVI-008): fog/slab ride the t = 0 pose (fog
+        // off, 40 Mpc slab at the hub depth); the plain demo keeps the
+        // slider fog with the slab off.
+        let (fog_l, slab_center, slab_half) = match vista_pose {
+            Some(pose) => (pose.fog_l_mpc(), pose.slab_center_mpc, pose.slab_half_mpc),
+            None => (debug.cosmic.fog_l_mpc, 0.0, 0.0),
+        };
         (
             camera.view_proj(aspect).to_cols_array_2d(),
             camera.px_scale(h as f32),
@@ -1772,8 +1838,8 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             ],
             origin,
             fog_l,
-            0.0,
-            0.0,
+            slab_center,
+            slab_half,
         )
     } else {
         let inspector = &debug.cosmic_inspector;
@@ -2573,7 +2639,7 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
         items,
         lh,
         rows.next(lh, 6.0),
-        "mouse steer · WASD cruise · click target · E fly-to · Shift+wheel pace · P camera"
+        "mouse steer · WASD cruise · click target · E fly-to · Shift+wheel pace · P camera · V vista (any input skips)"
             .to_owned(),
         C_DIM,
     );
@@ -4104,6 +4170,34 @@ fn compose_overlay_ui(
             )
         {
             draw_target_ring(items, center, TARGET_RING_R, C_WARN);
+        }
+        // Vista intro hint (CVI-005/FR5): `press any key` fades in over
+        // the second hold second (debug-shell text, bottom-center over
+        // the viewport); gone once the dive starts or on skip. Alpha
+        // from `vista_hint_alpha` (pinned in lib tests).
+        {
+            use game_debug::cosmic_vista::vista_hint_alpha;
+            let vista = &cosmic.vista;
+            let alpha = vista_hint_alpha(vista.phase, vista.t);
+            if alpha > 0.0 {
+                let label = "press any key";
+                let w = label.len() as f32 * 8.0 + 24.0;
+                items.solid(
+                    Rect {
+                        x: vp.x + (vp.w - w) * 0.5,
+                        y: vp.y + vp.h - 52.0,
+                        w,
+                        h: 24.0,
+                    },
+                    [0.05, 0.06, 0.10, 0.80 * alpha],
+                );
+                items.text(
+                    label.to_owned(),
+                    vp.x + (vp.w - w) * 0.5 + 12.0,
+                    vp.y + vp.h - 52.0 + 17.0,
+                    [C_TEXT[0], C_TEXT[1], C_TEXT[2], alpha],
+                );
+            }
         }
     }
     // Transition fade + notice banner (UMAP-017): a fullscreen black
@@ -6578,6 +6672,11 @@ impl ViewerApp {
             self.debug.cosmic.rebased();
             self.refresh_cosmic();
         }
+        // Vista intro (CVI-005/FR5): drain transition events into the
+        // Console (`vista: hold/dive/skipped/done`).
+        for event in self.debug.cosmic.vista_events.drain(..) {
+            self.debug.console.push(format!("vista: {event}"));
+        }
     }
 
     /// Rebuild GPU mesh buffers + reframe the camera after Regenerate.
@@ -6710,7 +6809,16 @@ impl ViewerApp {
                 // upload (rebase) origin the demo buffers share.
                 let eye_w = camera.eye_world();
                 let origin = self.debug.cosmic.upload_origin;
-                let fog_l = self.debug.cosmic.fog_l_mpc;
+                // Vista intro (CVI-005): while active, fog/slab ride the
+                // interpolated pose (slab view → immersive values); the
+                // MVP already follows via the camera's external pose.
+                // Done restores the slider fog with the slab off.
+                let (fog_l, slab_center, slab_half) = if self.debug.cosmic.vista_active() {
+                    let pose = self.debug.cosmic.vista.pose();
+                    (pose.fog_l_mpc(), pose.slab_center_mpc, pose.slab_half_mpc)
+                } else {
+                    (self.debug.cosmic.fog_l_mpc, 0.0, 0.0)
+                };
                 (
                     camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
                     camera.px_scale(vp.h),
@@ -6721,8 +6829,8 @@ impl ViewerApp {
                         (eye_w.z - origin.z) as f32,
                     ],
                     fog_l,
-                    0.0,
-                    0.0,
+                    slab_center,
+                    slab_half,
                 )
             } else {
                 let inspector = &self.debug.cosmic_inspector;
@@ -7590,6 +7698,12 @@ impl ViewerApp {
                             // its free-look angles). Checked before player
                             // mode: on this tab there is no walker view,
                             // so an armed walker must not swallow drags.
+                            // Vista intro (CVI-004): a ≥ 4 px drag skips
+                            // to Chase first; the drag then steers as
+                            // usual (controls live immediately after).
+                            if dx.hypot(dy) >= 4.0 {
+                                self.debug.cosmic.skip_vista();
+                            }
                             self.debug.cosmic.steer(dx, dy);
                         } else if content == Some(ViewContent::CosmicWeb) {
                             // Cosmic inspector tab: left-drag orbits the
@@ -7783,12 +7897,16 @@ impl ViewerApp {
                             .select_at(web, glam::DVec3::ZERO, (cx, cy), vp);
                     }
                     // Cosmic demo click: pick the nearest node as the
-                    // fly-to target (a miss clears it).
+                    // fly-to target (a miss clears it). Vista intro
+                    // (CVI-004/NFR2): the click skips to Chase first;
+                    // selection stays gated while the vista owns the
+                    // camera, so a skip-click never also selects.
                     if click
                         && matches!(self.debug.screen, Screen::GameDemo)
                         && in_viewport
                         && let Some((cx, cy)) = cursor
                     {
+                        self.debug.cosmic.skip_vista();
                         let layout = match self.main.as_ref() {
                             Some(ctx) => {
                                 let (w, h) = ctx.size();
@@ -8010,6 +8128,12 @@ impl ViewerApp {
                     };
                     let content = self.debug.screen_content();
                     if matches!(self.debug.screen, Screen::GameDemo) {
+                        // Vista intro (CVI-004): wheel is ignored while
+                        // the vista owns the camera (no pace/zoom fight
+                        // mid-dive).
+                        if self.debug.cosmic.vista_active() {
+                            return;
+                        }
                         if self.shift_held {
                             // Cruise pace: wheel-up (positive scroll)
                             // tightens the pace (faster), wheel-down
@@ -8156,9 +8280,13 @@ impl ViewerApp {
                 }
                 match physical_key {
                     // Esc unwinds UI focus (dropdown → widget); it never
-                    // quits — closing the window exits.
+                    // quits — closing the window exits. On the demo tab
+                    // it also skips the vista intro (CVI-004).
                     PhysicalKey::Code(KeyCode::Escape) => {
                         self.debug.esc_unwind();
+                        if matches!(self.debug.screen, Screen::GameDemo) {
+                            self.debug.cosmic.skip_vista();
+                        }
                     }
                     PhysicalKey::Code(KeyCode::Enter) => {
                         // Enter confirms the focused field: the Settings
@@ -8306,13 +8434,17 @@ impl ViewerApp {
                         // Camera cycle: the cosmic camera on the demo tab,
                         // else the player camera (active player only).
                         // A focused field keeps the keystroke instead.
+                        // Vista intro (CVI-004): P is ignored while the
+                        // vista owns the camera (no mode fight).
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.settings.seed_field.focused
                         {
                             if matches!(self.debug.screen, Screen::GameDemo) {
-                                self.debug.cosmic.camera.cycle();
+                                if !self.debug.cosmic.vista_active() {
+                                    self.debug.cosmic.camera.cycle();
+                                }
                             } else if viewer.player.active {
                                 self.debug.viewer.player.cycle_camera();
                             }
@@ -8398,6 +8530,23 @@ impl ViewerApp {
                             }
                         }
                     }
+                    PhysicalKey::Code(KeyCode::KeyV) => {
+                        // Vista replay (`cosmic-vista-intro` FR4): the
+                        // demo tab restarts Hold → Dive → Done from the
+                        // opening pose. A focused field keeps the
+                        // keystroke instead (no new binding elsewhere).
+                        let viewer = &self.debug.viewer;
+                        if !viewer.subdiv_field.focused
+                            && !viewer.radius_field.focused
+                            && !self.debug.settings.seed_field.focused
+                        {
+                            if matches!(self.debug.screen, Screen::GameDemo) {
+                                self.debug.cosmic.replay_vista();
+                            }
+                        } else if let Some(text) = text {
+                            self.type_into_focused_fields(&text);
+                        }
+                    }
                     PhysicalKey::Code(KeyCode::KeyE) => {
                         // Drill down: armed galaxy star → SystemMap.
                         // Instant faded map navigation (the timed transit
@@ -8410,7 +8559,11 @@ impl ViewerApp {
                         };
                         // Cosmic demo first: E toggles fly-to on the
                         // click-selected node (shared with Controls).
+                        // Vista intro (CVI-004): E skips first (the
+                        // gate in `select_node_at` means there is never
+                        // a mid-vista target to engage).
                         if fields_free && matches!(self.debug.screen, Screen::GameDemo) {
+                            self.debug.cosmic.skip_vista();
                             self.toggle_fly_to();
                         } else if fields_free
                             && self.debug.screen_content() == Some(ViewContent::GalaxyMap)
@@ -8616,9 +8769,19 @@ impl ViewerApp {
             }
             Action::CameraCycle => {
                 if matches!(self.debug.screen, Screen::GameDemo) {
-                    self.debug.cosmic.camera.cycle();
+                    // Vista intro (CVI-004): no mode fight while the
+                    // vista owns the camera (same guard as `P`).
+                    if !self.debug.cosmic.vista_active() {
+                        self.debug.cosmic.camera.cycle();
+                    }
                 } else if self.debug.viewer.player.active {
                     self.debug.viewer.player.cycle_camera();
+                }
+            }
+            Action::VistaReplay => {
+                // Controls-row parity for `V` (demo tab only).
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    self.debug.cosmic.replay_vista();
                 }
             }
             Action::PresetPerspective => {
@@ -9834,6 +9997,26 @@ mod tests {
             let err = parse_args(&argv(&bad)).expect_err("must reject");
             assert!(err.contains("usage:"), "error lacks usage: {err}");
         }
+    }
+
+    #[test]
+    fn vista_capture_pose_matches_t0_pose() {
+        // CVI-008/DoD 5: the `vista` preset IS the t = 0 vista pose —
+        // the capture camera carries `vista_pose()` exactly (eye,
+        // target, 25° FOV), with the pose's fog/slab terms.
+        use game_debug::cosmic_capture::CaptureView;
+        use game_debug::cosmic_vista::{VISTA_FOV_DEG, vista_pose};
+        let mut debug = DebugApp::new();
+        pose_demo_camera_for_vista_capture(&mut debug);
+        let want = vista_pose(&debug.cosmic.web);
+        let eye = debug.cosmic.camera.eye_world();
+        assert!((eye - want.eye).length() < 1e-9);
+        assert!((debug.cosmic.camera.fov_y() - VISTA_FOV_DEG.to_radians()).abs() < 1e-6);
+        assert_eq!(want.fov_y_deg, VISTA_FOV_DEG);
+        assert_eq!(want.slab_half_mpc, 20.0);
+        assert_eq!(want.inv_fog_l, 0.0);
+        // The request routes vista to the demo surface (preset pin).
+        assert!(game_debug::cosmic_capture::preset_for(CaptureView::Vista).surface_is_demo);
     }
 
     #[test]

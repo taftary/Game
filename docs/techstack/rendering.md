@@ -295,7 +295,16 @@ widget with FPS value). Viewer state is preserved across screen switches.
 Camera & screen-space contract, cosmic extension (v0.3.2, ADR-023):
 the space camera (`debug::cosmic_camera`: Chase/Orbit/FirstPerson)
 uses the un-flipped `directx::perspective` with MapOrbitCamera-style
-distance-derived near/far; the cosmic player marker goes through
+distance-derived near/far; since v0.3.3 (`cosmic-vista-intro`) the
+camera carries an instance `fov_y` (default 60°) plus an optional
+external `(eye, target)` pose that bypasses the ship anchor —
+projection, `px_scale`, eye, and target all honour them (pinned at
+25° and 60°; clearing the pose restores ship tracking byte-identically).
+The vista intro boots the demo on the reference composition (nearest
+Tier-A hub, 25° FOV, 40 Mpc slab, fog off; `vista` capture preset),
+holds 2 s, then dives 8 s to the spawn Chase pose (Bézier eye docked
+along the Chase look axis, look target front-loaded hub→marker, fog
+`off → 90 Mpc`, slab widening off; peak 26.5°/s nominal); the cosmic player marker goes through
 `world_to_pixels` + the shared dot/arrow/`YOU` path pin-for-pin with
 the sphere marker (FirstPerson hides it by construction — eye-plane
 `w ≤ 0`); the inspector player point is map content (one-vertex
@@ -470,8 +479,8 @@ and walls as cell sprites on Low and a quarter-res emission-only
 raymarch of a 128³ 3D texture on Medium/High (`cosmic-gas-veil-v2`,
 shipped 2026-09-22, retires smoke + the descriptor-glow veil + braid/spine/strand
 helpers); and a vista intro that boots the demo on the reference
-composition and dives to Chase (`cosmic-vista-intro`, last in the
-version). Reproducible
+composition and dives to Chase (`cosmic-vista-intro`, shipped
+2026-09-22, last of the version). Reproducible
 evidence comes first: `game_debug --capture` with four presets
 (`cosmic-capture-harness`). Invariants carried unchanged: un-flipped
 `directx::perspective`, `ndc = (2u−1, 1−2v)` node-only picking,
@@ -489,8 +498,10 @@ recording, two targets) and writes an 8-bit sRGB PNG, top row first
 (NDC `+1` = top end to end: framebuffer row 0 → ordered readback →
 top-first PNG). Byte-identical per (build, seed, preset, size) on a
 given GPU (pinned: three consecutive `inspector` captures share one
-SHA256 on the Intel UHD 620). `slab`/`vista` presets are reserved
-framings until `cosmic-depth-window` / `cosmic-vista-intro` fill them.
+SHA256 on the Intel UHD 620). The `slab` preset is the 20°
+near-orthographic slice at the home depth (`cosmic-depth-window`);
+the `vista` preset is the t = 0 vista pose (`cosmic-vista-intro`,
+plus `GAME_DEBUG_VISTA_T` pre-roll for timed poses).
 Windowed `F12` (Settings › Controls `Save PNG capture`) writes the
 current cosmic surface to `captures/` for exploration only.
 

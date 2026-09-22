@@ -12,6 +12,7 @@ use super::cosmic_player::{
     CRUISE_SCALE_FLOOR_RVIR, CRUISE_T_CROSS_MAX_S, CRUISE_T_CROSS_MIN_S, CosmicEvent,
     CosmicPlayerState,
 };
+use super::cosmic_vista::{VistaPhase, VistaPose, VistaState, vista_pose};
 use super::cosmic_web::COSMIC_PICK_RADIUS_PX;
 use super::picking::project_to_screen;
 use super::ui::Rect;
@@ -98,6 +99,14 @@ pub struct CosmicDemoState {
     /// fog `1/(1+(d/L)²)` on the immersive view. Dev-widget slider in
     /// `[30, 400]` (default 90); reseed resets it.
     pub fog_l_mpc: f32,
+    /// Vista intro state machine (`cosmic-vista-intro`): Hold → Dive →
+    /// Done from boot (and on reseed / `V` replay). While active the
+    /// camera rides the interpolated pose, not the ship.
+    pub vista: VistaState,
+    /// Un-consumed vista transition log (`hold`/`dive`/`skipped`/`done`):
+    /// the shell drains these into the Console; headless asserts on
+    /// them (FR7 continuity pin).
+    pub vista_events: Vec<&'static str>,
 }
 
 impl CosmicDemoState {
@@ -110,7 +119,8 @@ impl CosmicDemoState {
         camera.track(player.position_mpc(), player.facing());
         let upload_origin = player.position_mpc();
         camera.set_render_origin(upload_origin);
-        Self {
+        let fog_l_mpc = super::cosmic_window::COSMIC_DEMO_FOG_MPC;
+        let mut demo = Self {
             seed,
             params,
             web,
@@ -121,8 +131,120 @@ impl CosmicDemoState {
             held: HeldThrust::default(),
             upload_origin,
             depth_fraction_override: None,
-            fog_l_mpc: super::cosmic_window::COSMIC_DEMO_FOG_MPC,
+            fog_l_mpc,
+            vista: VistaState::start(
+                VistaPose {
+                    eye: DVec3::ZERO,
+                    target: DVec3::ZERO,
+                    fov_y_deg: 60.0,
+                    slab_half_mpc: 0.0,
+                    slab_center_mpc: 0.0,
+                    inv_fog_l: 1.0 / fog_l_mpc,
+                },
+                VistaPose {
+                    eye: DVec3::ZERO,
+                    target: DVec3::ZERO,
+                    fov_y_deg: 60.0,
+                    slab_half_mpc: 0.0,
+                    slab_center_mpc: 0.0,
+                    inv_fog_l: 1.0 / fog_l_mpc,
+                },
+            ),
+            vista_events: Vec::new(),
+        };
+        // Vista intro (`cosmic-vista-intro`): boot opens on the
+        // reference composition, then dives to the spawn Chase pose.
+        // `replay_vista` logs the opening `hold` for the Console drain.
+        demo.replay_vista();
+        demo
+    }
+
+    /// Chase pose as a [`VistaPose`]: the dive endpoint (and the
+    /// headless FR7 continuity reference). Derived from the SHIP, never
+    /// from the camera — a `V` replay mid-vista must still dive to the
+    /// real Chase pose, not to the current interpolated pose.
+    pub fn chase_pose(&self) -> VistaPose {
+        use super::cosmic_camera::{CHASE_HEIGHT_FRACTION, DEFAULT_CHASE_DISTANCE_MPC};
+        let anchor = self.player.position_mpc();
+        let fwd = self.player.facing();
+        let fwd = if fwd.length_squared() > 1e-24 {
+            fwd.normalize()
+        } else {
+            DVec3::X
+        };
+        let d = f64::from(DEFAULT_CHASE_DISTANCE_MPC);
+        VistaPose {
+            eye: anchor - fwd * d + DVec3::Y * (d * f64::from(CHASE_HEIGHT_FRACTION)),
+            target: anchor,
+            fov_y_deg: 60.0,
+            slab_half_mpc: 0.0,
+            slab_center_mpc: 0.0,
+            inv_fog_l: 1.0 / self.fog_l_mpc.max(1e-6),
         }
+    }
+
+    /// (Re)start the vista: Hold at the Tier-A opening pose, diving to
+    /// the current Chase pose. Boot, reseed, and `V` all funnel here.
+    pub fn replay_vista(&mut self) {
+        // The chase endpoint must be read before the camera is posed.
+        let chase = self.chase_pose();
+        let from = vista_pose(&self.web);
+        self.vista = VistaState::start(from, chase);
+        self.vista_events.push("hold");
+        self.apply_vista_pose();
+    }
+
+    /// Push the current vista pose into the camera (external pose +
+    /// instance FOV); no-op once Done (camera tracks the ship).
+    fn apply_vista_pose(&mut self) {
+        if self.vista.phase == VistaPhase::Done {
+            self.camera.set_external_pose(None);
+            self.camera.set_fov_y(60.0_f32.to_radians());
+            return;
+        }
+        let pose = self.vista.pose();
+        self.camera.set_external_pose(Some((pose.eye, pose.target)));
+        self.camera.set_fov_y(pose.fov_y_deg.to_radians());
+    }
+
+    /// Whether the vista intro currently owns the camera.
+    pub fn vista_active(&self) -> bool {
+        self.vista.phase != VistaPhase::Done
+    }
+
+    /// Skip the vista: snapshot the current pose, fast-ease to Chase.
+    /// Logs `skipped` for the Console drain (no-op when Done). The
+    /// endpoint refreshes to the live Chase pose first — the ship may
+    /// have sailed since the dive started (fly-to re-engaged on the
+    /// same keypress cruises during the 0.6 s ease).
+    pub fn skip_vista(&mut self) {
+        if !self.vista_active() {
+            return;
+        }
+        self.vista.to = self.chase_pose();
+        if self.vista.skip() {
+            self.vista_events.push("skipped");
+        }
+        self.apply_vista_pose();
+    }
+
+    /// Advance the vista clock; applies the interpolated pose and logs
+    /// phase transitions for the Console drain. Returns the new phase.
+    pub fn tick_vista(&mut self, dt_s: f64) -> VistaPhase {
+        if !self.vista_active() {
+            return VistaPhase::Done;
+        }
+        let before = self.vista.phase;
+        self.vista.tick(dt_s);
+        if self.vista.phase != before {
+            self.vista_events.push(match self.vista.phase {
+                VistaPhase::Hold => "hold",
+                VistaPhase::Dive => "dive",
+                VistaPhase::Done => "done",
+            });
+        }
+        self.apply_vista_pose();
+        self.vista.phase
     }
 
     /// Regenerate everything from a new seed (`R` in the demo): the web,
@@ -220,10 +342,16 @@ impl CosmicDemoState {
     /// the ship. Returns true when the ship outran the upload origin and
     /// the shell must rebuild the buffers (rebase path). Any held cruise
     /// input cancels a committed fly-to first (continuous hand-back —
-    /// the freed step cruises the same tick).
+    /// the freed step cruises the same tick). The vista intro owns the
+    /// camera until Done: its clock advances here so headless and
+    /// windowed runs share one path (FR7).
     pub fn tick(&mut self, dt_real_s: f64) -> bool {
         let (dir, any) = self.cruise_input();
         if any {
+            // Held thrust skips the vista intro (FR4 — the input layer
+            // sets the flags; the state machine owns the skip so every
+            // caller shares it), then cancels a committed fly-to.
+            self.skip_vista();
             self.player.cancel_fly_to();
         }
         let scale = self.scale_length_mpc();
@@ -233,6 +361,7 @@ impl CosmicDemoState {
         self.player.step_cruise(dir, scale, dt_real_s, depth);
         self.camera
             .track(self.player.position_mpc(), self.player.facing());
+        self.tick_vista(dt_real_s);
         self.needs_rebase()
     }
 
@@ -240,8 +369,13 @@ impl CosmicDemoState {
     /// player camera, keep the nearest projected point within
     /// [`COSMIC_PICK_RADIUS_PX`]. A hit sets the target and queues
     /// `TargetSelected`; a miss clears the target (no event). Lowest
-    /// node index wins exact ties (the map-tab rule).
+    /// node index wins exact ties (the map-tab rule). Disabled while
+    /// the vista intro owns the camera (NFR2 — otherwise a skip-click
+    /// would also select).
     pub fn select_node_at(&mut self, cursor: (f32, f32), vp: Rect) -> Option<u32> {
+        if self.vista_active() {
+            return None;
+        }
         let view_proj = self.camera.view_proj(vp.w / vp.h);
         let origin = self.upload_origin;
         let mut best: Option<(u32, f32)> = None;
@@ -339,6 +473,10 @@ impl CosmicDemoState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cosmic_vista::{
+        VISTA_DIVE_S, VISTA_FOV_DEG, VISTA_MAX_ANGULAR_DEG_PER_S, look_angular_velocity_deg_per_s,
+        smoothstep01, vista_interpolate,
+    };
 
     fn demo() -> CosmicDemoState {
         CosmicDemoState::new(1234)
@@ -440,6 +578,13 @@ mod tests {
         use super::CosmicEvent;
 
         let mut demo = demo();
+        // The shell skips the vista on first input; tests drive the
+        // state machine directly past it (selection is gated while the
+        // vista owns the camera — NFR2).
+        demo.skip_vista();
+        for _ in 0..60 {
+            demo.tick(1.0 / 60.0);
+        }
         let vp = Rect {
             x: 0.0,
             y: 0.0,
@@ -550,5 +695,155 @@ mod tests {
         let clip = demo.camera.view_proj(800.0 / 600.0) * glam::Vec4::from((anchor_rel, 1.0));
         let ndc = glam::Vec3::new(clip.x, clip.y, clip.z) / clip.w;
         assert!(ndc.x.abs() < 1e-5 && ndc.y.abs() < 1e-5);
+    }
+
+    #[test]
+    fn vista_boots_hold_and_reaches_chase() {
+        // CVI-002/005: boot holds the Tier-A opening pose (external
+        // camera, 25° FOV), then Hold 2 s → Dive 6 s → Done restores
+        // ship tracking with the 60° FOV. Events drain in order.
+        let mut demo = demo();
+        assert!(demo.vista_active());
+        assert_eq!(demo.vista.phase, VistaPhase::Hold);
+        assert!(demo.camera.has_external_pose());
+        assert!((demo.camera.fov_y() - VISTA_FOV_DEG.to_radians()).abs() < 1e-6);
+        assert_eq!(demo.vista_events, vec!["hold"]);
+        // Step the full Hold + Dive through the shared tick path (FR7
+        // pattern: 2 s + 8 s = 600 ticks).
+        for _ in 0..600 {
+            demo.tick(1.0 / 60.0);
+        }
+        assert_eq!(demo.vista.phase, VistaPhase::Done);
+        assert!(!demo.vista_active());
+        assert!(!demo.camera.has_external_pose());
+        assert!((demo.camera.fov_y() - 60.0_f32.to_radians()).abs() < 1e-6);
+        assert_eq!(demo.vista_events, vec!["hold", "dive", "done"]);
+        // Done pose == Chase pose (FR7 continuity, 1e-6): the ship
+        // never moved (no input), so the anchor centers again.
+        let anchor_rel =
+            game_engine::frames::recenter(demo.player.position_mpc(), demo.camera.render_origin());
+        let clip = demo.camera.view_proj(800.0 / 600.0) * glam::Vec4::from((anchor_rel, 1.0));
+        let ndc = glam::Vec3::new(clip.x, clip.y, clip.z) / clip.w;
+        assert!(ndc.x.abs() < 1e-5 && ndc.y.abs() < 1e-5);
+    }
+
+    #[test]
+    fn vista_skip_is_fast_and_live() {
+        // CVI-004: thrust-held ticks auto-skip (shared state-machine
+        // path, not input plumbing); the endpoint tracks the live ship.
+        let mut demo = demo();
+        demo.held.fwd = true;
+        demo.tick(1.0 / 60.0);
+        assert!(demo.vista_events.contains(&"skipped"));
+        // 0.6 s skip ease finishes from anywhere in the dive.
+        for _ in 0..60 {
+            demo.tick(1.0 / 60.0);
+        }
+        assert_eq!(demo.vista.phase, VistaPhase::Done);
+    }
+
+    #[test]
+    fn vista_replay_mid_dive_targets_the_ship() {
+        // CVI-004: `V` mid-dive restarts from the opening pose and still
+        // dives to the ship-derived Chase pose (never to a stale
+        // interpolated pose).
+        let mut demo = demo();
+        for _ in 0..180 {
+            demo.tick(1.0 / 60.0);
+        }
+        assert_eq!(demo.vista.phase, VistaPhase::Dive);
+        demo.replay_vista();
+        assert_eq!(demo.vista.phase, VistaPhase::Hold);
+        let chase = demo.chase_pose();
+        assert!((chase.eye - demo.vista.to.eye).length() < 1e-9);
+        assert!((chase.target - demo.player.position_mpc()).length() < 1e-12);
+    }
+
+    #[test]
+    fn real_dive_turns_slowly_on_nominal_seed() {
+        // CVI-003/UX-2: the REAL dive (Tier-A opening → ship-derived
+        // Chase at the nominal seed) must slew ≤ 30°/s with the hub in
+        // frame throughout — measured, not argued.
+        let demo = CosmicDemoState::new(1337);
+        let from = demo.vista.from;
+        let to = demo.vista.to;
+        use glam::camera::rh::proj::directx::perspective;
+        use glam::camera::rh::view::look_at_mat4;
+        let dt = 1.0 / 60.0;
+        let mut peak = 0.0f32;
+        let mut peak_s = 0.0;
+        let mut prev_dir = from.target - from.eye;
+        let mut hub_left = false;
+        let mut min_dist = f64::INFINITY;
+        for k in 1..=(VISTA_DIVE_S / dt) as usize {
+            let p = vista_interpolate(&from, &to, smoothstep01(k as f64 * dt / VISTA_DIVE_S));
+            let dir = p.target - p.eye;
+            let w = look_angular_velocity_deg_per_s(prev_dir, dir, dt);
+            if w > peak {
+                peak = w;
+                peak_s = k as f64 * dt / VISTA_DIVE_S;
+            }
+            prev_dir = dir;
+            min_dist = min_dist.min(dir.length());
+            // Hub-in-frame: project the hub through the interpolated
+            // pose (25°→60°, capture aspect) — NDC inside means visible
+            // (UX-2; the wide frame buys horizontal room, so a raw cone
+            // check would be too strict).
+            let eye = glam::Vec3::new(p.eye.x as f32, p.eye.y as f32, p.eye.z as f32);
+            let tgt = glam::Vec3::new(p.target.x as f32, p.target.y as f32, p.target.z as f32);
+            let hub = glam::Vec3::new(
+                from.target.x as f32,
+                from.target.y as f32,
+                from.target.z as f32,
+            );
+            let vp = perspective(p.fov_y_deg.to_radians(), 1408.0 / 768.0, 0.1, 5000.0)
+                * look_at_mat4(eye, tgt, glam::Vec3::Y);
+            let clip = vp * glam::Vec4::new(hub.x, hub.y, hub.z, 1.0);
+            if clip.w > 0.0 {
+                let ndc = glam::Vec3::new(clip.x, clip.y, clip.z) / clip.w;
+                if ndc.x.abs() > 1.0 || ndc.y.abs() > 1.0 {
+                    if !hub_left {
+                        eprintln!("hub exits frame at s={:.3}", k as f64 * dt / VISTA_DIVE_S);
+                    }
+                    hub_left = true;
+                    // Revised UX-2 (2026-09-22, geometric proof in plan):
+                    // the hub may only drift out once the look commits
+                    // to the marker — never in the opening third.
+                    assert!(
+                        k as f64 * dt / VISTA_DIVE_S > 0.35,
+                        "hub left frame too early"
+                    );
+                }
+            } else {
+                hub_left = true;
+            }
+        }
+        eprintln!(
+            "real dive peak turn: {peak} deg/s at s={peak_s:.3}, min eye-target dist: {min_dist:.1} Mpc, hub left frame: {hub_left}"
+        );
+        assert!(
+            peak <= VISTA_MAX_ANGULAR_DEG_PER_S,
+            "real dive turns too fast: {peak} deg/s"
+        );
+    }
+
+    #[test]
+    fn vista_disables_selection() {
+        // NFR2: clicks skip (wired in the shell) but never select while
+        // the vista owns the camera.
+        let mut demo = demo();
+        let vp = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        assert!(demo.select_node_at((400.0, 300.0), vp).is_none());
+        for _ in 0..600 {
+            demo.tick(1.0 / 60.0);
+        }
+        // After Done the gate opens (may or may not hit a node — the
+        // gate, not the pick, is under test).
+        let _ = demo.select_node_at((400.0, 300.0), vp);
     }
 }

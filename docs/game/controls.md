@@ -56,7 +56,14 @@ Unified action map (`engine::input`), not per-device logic in gameplay:
   FirstPerson (marker hidden); wheel zooms the Chase/Orbit camera;
   click a node to target it (amber ring marker, also on the Cosmic Web
   tab's clicked node), `E` engages/cancels the eased fly-to (any
-  cruise input also cancels); `R` re-seeds the web. The shipping HUD
+   cruise input also cancels); `R` re-seeds the web. The demo boots on
+   a vista intro (v0.3.3 `cosmic-vista-intro`): the reference
+   composition (outside view of the nearest Tier-A hub, 25° FOV, 40 Mpc
+   slab) holds 2 s with a `press any key` hint, then dives 8 s to the
+   spawn Chase pose. Any steering/thrust input, `Esc`, click, or `E`
+   skips (0.6 s fast ease, never a cut); `V` replays; `R` restarts;
+   `P`/wheel are ignored while the vista owns the camera; node
+   selection is disabled while active. The shipping HUD
   shows frame (cosmological/Mpc), time (real-time or compressed ratio),
   live cruise speed (Mpc/s), and the fly-to target with distance + ETA;
   SOI stays `—` (no handoffs at this scale). `E` is context-dependent

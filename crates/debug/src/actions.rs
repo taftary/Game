@@ -105,6 +105,7 @@ pub enum Action {
     WalkEast,
     PlayerToggle,
     CameraCycle,
+    VistaReplay,
     PresetPerspective,
     PresetTop,
     PresetBottom,
@@ -152,6 +153,7 @@ impl Action {
             Action::WalkEast => "D / Right",
             Action::PlayerToggle => "U",
             Action::CameraCycle => "P",
+            Action::VistaReplay => "V",
             Action::PresetPerspective => "G",
             Action::PresetTop => "T",
             Action::PresetBottom => "B",
@@ -193,6 +195,7 @@ impl Action {
             Action::WalkEast => "Walk east",
             Action::PlayerToggle => "Toggle player mode",
             Action::CameraCycle => "Cycle camera",
+            Action::VistaReplay => "Replay vista intro",
             Action::PresetPerspective => "Camera preset: perspective",
             Action::PresetTop => "Camera preset: top",
             Action::PresetBottom => "Camera preset: bottom",
@@ -234,6 +237,7 @@ impl Action {
             | Action::WalkEast
             | Action::PlayerToggle
             | Action::CameraCycle
+            | Action::VistaReplay
             | Action::PresetPerspective
             | Action::PresetTop
             | Action::PresetBottom
@@ -278,7 +282,7 @@ impl Action {
 
     /// Every static (non-parameterized) action, for the Controls list
     /// and the parity test.
-    pub const ALL_STATIC: [Action; 34] = [
+    pub const ALL_STATIC: [Action; 35] = [
         Action::ToggleLeftDock,
         Action::ToggleRightDock,
         Action::ToggleDevWidget,
@@ -296,6 +300,7 @@ impl Action {
         Action::WalkEast,
         Action::PlayerToggle,
         Action::CameraCycle,
+        Action::VistaReplay,
         Action::PresetPerspective,
         Action::PresetTop,
         Action::PresetBottom,
@@ -364,7 +369,21 @@ mod tests {
 
     #[test]
     fn registry_size_is_pinned() {
-        // 34 static + 10 dimensions + 6 shader modes.
-        assert_eq!(all_actions().len(), 50);
+        // 35 static + 10 dimensions + 6 shader modes.
+        assert_eq!(all_actions().len(), 51);
+    }
+
+    #[test]
+    fn vista_key_is_never_rebound() {
+        // NFR5 (`cosmic-vista-intro` CVI-006): adding `V` must not
+        // steal or duplicate any existing binding. (The registry has
+        // one pre-existing context-dependent duplicate, `R` =
+        // PresetRight on planet content / RerollSeed elsewhere — keys
+        // are context-scoped, so uniqueness is pinned per-key here.)
+        let v_count = Action::ALL_STATIC
+            .iter()
+            .filter(|a| a.key_label() == "V")
+            .count();
+        assert_eq!(v_count, 1, "`V` must label exactly one action");
     }
 }
