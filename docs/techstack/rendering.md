@@ -272,13 +272,13 @@ with the shared `OrbitCamera`, a wireframe overlay and a pentagon
 highlight, plus an inputs panel with subdivisions 0–8 and live
 10·4^N+2 cost hint, validated radius, explicit Regenerate, read-only
 stats); the Cosmic Web tab (v0.3.2, ADR-023; cinematic refresh in
-update-2026-09-18-2328, smoke in update-2026-09-20-0645 replacing the
-update-2026-09-19-1245 ribbons) mounts the
-absorbed cosmic-web inspector (instanced smoke-billboard filaments
-through the additive smoke `TriangleList` pipeline, grain + gas veil +
-3-layer node impostors through the additive glow `PointList`
-pipeline, own orbit/pan/zoom camera, live player point). The Game Demo tab renders the same web as the
-player-immersive scene (one glow draw + one smoke draw per surface,
+update-2026-09-18-2328, field render in v0.3.3) mounts the
+absorbed cosmic-web inspector (tracer splats + hub impostors +
+member scatter + grid cell-sprite veil through the additive glow
+`PointList` pipeline, quarter-res raymarch composite on Medium/High,
+own orbit/pan/zoom camera, live player point). The Game Demo tab renders the same web as the
+player-immersive scene (one glow draw + one splat draw per surface +
+the veil march composite on Medium/High,
 buffers relative to an upload origin, camera recentered on the same
 origin with a 50 Mpc rebase). Both cosmic views render through an
 HDR scene target with a real bloom chain (bright extract + 2-scale
@@ -302,12 +302,14 @@ the sphere marker (FirstPerson hides it by construction — eye-plane
 point draw), never the UI marker. Points/lines carry no faces, so no
 front-face/cull state is involved on either cosmic surface.
 
-Cinematic refresh (update-2026-09-18-2328): the cosmic draws use two
-new additive (`One`, `One`, premultiplied in-shader) pipelines —
+Cinematic refresh (update-2026-09-18-2328; braid lines retired by
+v0.3.3 `cosmic-gas-veil-v2`): the cosmic draws use additive (`One`,
+`One`, premultiplied in-shader) pipelines —
 glow points (rim-zero quadratic-falloff sprite mask, per-sprite
 alpha, emissive colors above 1.0 on cluster cores; halos are
-world-sized `kind`-1 sprites, cores/grain/glow fixed-pixel `kind` 0)
-and braid lines (per-vertex rgba) — both carrying a bounded
+world-sized `kind`-1 sprites, hub cores `kind` 2, veil cell sprites
+`kind` 1, else fixed-pixel `kind` 0) and tracer splats (same blend,
+own vertex format — `cosmic-tracer-splat`), both carrying a bounded
 exaggerated Hubble redshift tint from view depth (`clip.w` clamped
 non-negative and capped, spec §9.1; unbounded tint decorrelated
 channels into rainbow squares on screen). The shared alpha `map`/`line`
@@ -463,12 +465,13 @@ hub tiers A/B/C with in-sprite radial core ramps and a member-galaxy
 scatter (`cosmic-hub-hierarchy`, retires the 3-per-node impostors); a
 write-once mip bloom pyramid whose pass list is asserted by a test —
 every image written once, never read by its writer
-(`bloom-mip-chain`, retires the 5-target blur); grid-driven gas bodies
+(`bloom-mip-chain`, shipped 2026-09-21, retires the 5-target blur); grid-driven gas bodies
 and walls as cell sprites on Low and a quarter-res emission-only
 raymarch of a 128³ 3D texture on Medium/High (`cosmic-gas-veil-v2`,
-retires smoke + the descriptor-glow veil + braid/spine/strand
+shipped 2026-09-22, retires smoke + the descriptor-glow veil + braid/spine/strand
 helpers); and a vista intro that boots the demo on the reference
-composition and dives to Chase (`cosmic-vista-intro`). Reproducible
+composition and dives to Chase (`cosmic-vista-intro`, last in the
+version). Reproducible
 evidence comes first: `game_debug --capture` with four presets
 (`cosmic-capture-harness`). Invariants carried unchanged: un-flipped
 `directx::perspective`, `ndc = (2u−1, 1−2v)` node-only picking,
@@ -505,19 +508,22 @@ tint from the packed vertex word (`pos[3] + u32`: 16 B, Low 300k =
 4.8 MB), `smoothstep(h, 2h, dist)` near-eye fade, bounded Hubble
 tint. Fragment: rim-zero `(1−4d²)²` + warm core, arithmetic-only.
 Grain + bead clouds, constants, streams, and tests are gone
-(`rg grain_cloud|bead_cloud` = 0); braid helpers stay for the smoke
-path until `cosmic-gas-veil-v2`. Nominal headless:
-`smoke51953 splatsL255900 splatsM511800 splatsH1023599
+(`rg grain_cloud|bead_cloud` = 0); smoke, braid, spine, strand, and
+fray helpers followed in `cosmic-gas-veil-v2`
+(`rg smoke_puffs|glow_point_cloud|braid_point|spine_subsegments` = 0
+in code). Nominal headless:
+`splatsL255900 splatsM511800 splatsH1023599
 impostors18000 overdrawL2.0`.
 
 Depth window (`cosmic-depth-window`, shipped 2026-09-20): one shared
 GLSL term (`cosmic_window_vis`: fog `1/(1+(d/L)²)` × slab window
 with a 5 Mpc smoothstep edge, hub floor 0.25 on `kind ≥ 1`) pasted
-into the glow/smoke/splat vertex shaders (single authority:
+into the glow/splat vertex shaders and the veil march fragment
+shader (single authority:
 `debug::cosmic_window::COSMIC_WINDOW_GLSL`, pinned byte-identical)
 and pushed per surface (`fog_l`, `slab_center`, `slab_half` extend
-`GlowPush`/`SmokePush`/`SplatPush` to 88/104/112 B — still under the
-128 B floor). Demo runs fog `L = 90` Mpc (dev-slider `[30, 400]` in
+`GlowPush`/`SplatPush` to 88/112 B, march carries its own 128 B
+`MarchPush` — still within the 128 B floor). Demo runs fog `L = 90` Mpc (dev-slider `[30, 400]` in
 the widget Inspector tab, Console-logged); the inspector shows full
 depth until `S` opens the slab (30 Mpc default at the orbit target's
 depth, 20° near-ortho with framing kept, `Shift+wheel` scrolls,
@@ -541,6 +547,38 @@ Tier A/B impostors take the 0.25 fog floor. The 3-per-node
 `node_point_cloud`) are retired. Nominal headless: 6720 impostors +
 20 512 members; spawn goal Tier C (pinned — highlight ring carries
 it, vista frames Tier A).
+
+Gas veil (`cosmic-gas-veil-v2`, shipped 2026-09-22): the filament
+bodies are the `WebField` 128³ grid itself — filament/sheet/node
+cells with `1+δ ≥ 0.5` (≈ 335k nominal), not link-graph decoration.
+Low draws one world-sized additive sprite per cell into the glow
+`PointList` (`kind 1`, deterministic stride-2 subset ≈ 168k ≤ 200k,
+≈ 6.0 MB; diameter by class: sheet 2.0 / filament 1.4 / node 1.2 ×
+cell; alpha `min(0.006·√(1+δ), 0.05)`; hash jitter ≤ 0.25 cell, no
+RNG). Medium/High march the grid instead: one `R8_UNORM` 128³ upload
+per seed (2 MB), one quarter-res fullscreen pass (`MARCH_FRAG`:
+ray–sphere clip, 32/48 steps, ordered dither, fog + slab applied
+in-march, 2-cell near-eye ramp, emission `a = 0.002·max(0, δ−0.5)`
+accumulated as a vis-weighted MEAN — grade round 2: a column integral
+graded at the slab washed full-depth views, the mean keeps one grade
+correct on every view),
+written once to a dedicated HDR target and composited at the resolve
+(`scene + bloom·i + march·e`, resolve gain 30 = the 30 Mpc reference
+window) — the march row lives in the
+`bloom-mip-chain` pass description, so `assert_write_once` covers it.
+One density ramp across splats, sprites, and march (single
+authority: `debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL`, pinned
+byte-identical in `SPLAT_VERT` + `MARCH_FRAG`; sprites take
+CPU-computed colors from the same stops). `VeilMode::for_tier`
+(Sprites / March 32 / March 48) + `GAME_DEBUG_COSMIC_VEIL`
+override (`sprites|march|march:<8..=64>`); headless
+`cosmic_layout=` prints `veilspritesN` / `veilmarchS`. Smoke,
+descriptor-glow veil, and braid/spine/strand helpers are retired
+(`rg smoke_puffs|glow_point_cloud|braid_point|spine_subsegments` = 0
+in code). Measured: UHD 620 `slab`/`demo` captures clean both modes
+(byte-deterministic per build+seed); Low ≈ 168k sprites ≈ 6.0 MB;
+march ≈ 4.1M (Medium) / 6.2M (High) texture fetches per 1080p frame
++ ≈ 1 MB quarter-res HDR target.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,

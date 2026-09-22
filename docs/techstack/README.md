@@ -1,9 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.44.0 (2026-09-21, v0.3.3 `bloom-mip-chain`
-  done: mip pyramid replaces the 5-target blur (write-once pin green,
-  UHD 620 clean, halo grade round 1, intensities back near spec);
-  two v0.3.3 features remain planned)
+- **Version:** 0.45.0 (2026-09-22, v0.3.3 `cosmic-gas-veil-v2`
+  done: grid-driven gas bodies — cell sprites on Low, quarter-res
+  raymarch on Medium/High, smoke + link-graph decoration retired,
+  UHD 620 clean; one v0.3.3 feature remains planned)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

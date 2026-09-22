@@ -68,7 +68,9 @@ crates/game/     # `game` binary: clean release entry — game states, camera
 crates/debug/    # `game_debug` lib (unified shell: actions/app/ui/
                    # console/fps/inspector modules + galaxy/system maps +
                    # planet_viewer/picking + cosmic player/camera/demo/
-                   # web-inspector modules + live fly-to event feed) +
+                   # web-inspector modules + field-render modules
+                   # (splat/hub/veil/vista, v0.3.3 ADR-025) + live fly-to
+                   # event feed) +
                    # binary (non-default member): single window (Game Demo
                    # tab with the cosmic player scene + shipping HUD +
                    # Dimensions dropdown mounting the absorbed Galaxy Map

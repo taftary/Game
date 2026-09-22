@@ -20,6 +20,10 @@ pub fn bloom_img_up(levels: u8, k: u8) -> u32 {
     1 + u32::from(levels) + u32::from(k)
 }
 
+/// Gas-veil march target image id: above every pyramid slot
+/// (`down` 1..=5, `up` 6..=10 at 5 levels), so it never collides.
+pub const BLOOM_IMG_MARCH: u32 = 11;
+
 /// What a bloom pass does (shader + target pairing, Vulkan-agnostic).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BloomPassKind {
@@ -31,6 +35,9 @@ pub enum BloomPassKind {
     PassThrough,
     /// Tent upsample: `tent(up[k+1])·w + down[k]` → `up[k]`.
     Up,
+    /// Gas-veil raymarch: 3D grid → `BLOOM_IMG_MARCH`
+    /// (`cosmic-gas-veil-v2`).
+    March,
     /// Composite resolve into the swapchain sink (`u32::MAX`).
     Resolve,
 }
@@ -102,6 +109,36 @@ pub fn describe_bloom_chain_bloom_off(levels: u8) -> Vec<BloomPassDesc> {
             kind: BloomPassKind::Resolve,
         },
     ]
+}
+
+/// Full chain with the gas-veil march target (`cosmic-gas-veil-v2`
+/// CGV-006): the bloom chain plus a `March` pass writing
+/// `BLOOM_IMG_MARCH`, and the resolve additionally reading it. The
+/// write-once pin covers the march target like every bloom target.
+pub fn describe_veil_chain(levels: u8, march: bool, bloom_on: bool) -> Vec<BloomPassDesc> {
+    let mut passes = if bloom_on {
+        describe_bloom_chain(levels)
+    } else {
+        describe_bloom_chain_bloom_off(levels)
+    };
+    if !march {
+        return passes;
+    }
+    let resolve = passes.pop().expect("chain ends with resolve");
+    debug_assert_eq!(resolve.kind, BloomPassKind::Resolve);
+    passes.push(BloomPassDesc {
+        writes: BLOOM_IMG_MARCH,
+        reads: vec![BLOOM_IMG_SCENE],
+        kind: BloomPassKind::March,
+    });
+    let mut reads = resolve.reads;
+    reads.push(BLOOM_IMG_MARCH);
+    passes.push(BloomPassDesc {
+        writes: resolve.writes,
+        reads,
+        kind: BloomPassKind::Resolve,
+    });
+    passes
 }
 
 /// Write-once pin: every written image except the swapchain sink is
@@ -205,5 +242,39 @@ mod tests {
             kind: BloomPassKind::Down,
         }];
         assert!(assert_write_once(&self_read).is_err());
+    }
+
+    #[test]
+    fn veil_chain_covers_the_march_target() {
+        // March on: one March pass writing BLOOM_IMG_MARCH, resolve
+        // reads scene + top + march; pin green for every tier.
+        for levels in [2, 3, 4, 5] {
+            for bloom_on in [true, false] {
+                let chain = describe_veil_chain(levels, true, bloom_on);
+                let march: Vec<_> = chain
+                    .iter()
+                    .filter(|p| p.kind == BloomPassKind::March)
+                    .collect();
+                assert_eq!(march.len(), 1, "one march pass at {levels}");
+                assert_eq!(march[0].writes, BLOOM_IMG_MARCH);
+                let resolve = chain.last().expect("chain ends with resolve");
+                assert!(resolve.reads.contains(&BLOOM_IMG_MARCH));
+                assert_eq!(resolve.reads.len(), 3, "scene + bloom + march");
+                assert_write_once(&chain).expect("veil chain must be write-once");
+            }
+        }
+        // March off: identical to the plain bloom chains.
+        assert_eq!(describe_veil_chain(4, false, true), describe_bloom_chain(4));
+        assert_eq!(
+            describe_veil_chain(4, false, false),
+            describe_bloom_chain_bloom_off(4)
+        );
+        // March id never collides with pyramid slots (levels ≤ 5).
+        for levels in [2, 3, 4, 5] {
+            for k in 0..levels {
+                assert_ne!(bloom_img_down(k), BLOOM_IMG_MARCH);
+                assert_ne!(bloom_img_up(levels, k), BLOOM_IMG_MARCH);
+            }
+        }
     }
 }

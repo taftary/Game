@@ -257,6 +257,30 @@ pub fn resolve_frag_bloom() -> String {
     )
 }
 
+/// Resolve fragment shader, veil-march composite variant
+/// (`cosmic-gas-veil-v2` FR4): `scene + bloom·i + march·e` through
+/// the ACES fit. Composed from [`resolve_frag_bloom`] (same pattern):
+/// the march sampler rides bindings 4–5, the bloom source is never
+/// hand-duplicated.
+pub fn resolve_frag_bloom_march() -> String {
+    let bloom = resolve_frag_bloom();
+    let with_march_tex = bloom.replacen(
+        "layout(set = 0, binding = 3) uniform sampler bloom_sampler;",
+        "layout(set = 0, binding = 3) uniform sampler bloom_sampler;\nlayout(set = 0, binding = 4) uniform texture2D march_tex;\nlayout(set = 0, binding = 5) uniform sampler march_sampler;",
+        1,
+    );
+    let with_march_push = with_march_tex.replacen(
+        "float intensity;",
+        "float intensity;\n    float march_gain;",
+        1,
+    );
+    with_march_push.replacen(
+        "aces_fit(hdr * pc.exposure + bloom * pc.intensity)",
+        "aces_fit(hdr * pc.exposure + bloom * pc.intensity + texture(sampler2D(march_tex, march_sampler), v_uv).rgb * pc.march_gain)",
+        1,
+    )
+}
+
 /// Bright-pass push-constant block: HDR threshold (4 B).
 ///
 /// ```
@@ -287,6 +311,26 @@ pub struct BloomResolvePush {
     pub exposure: f32,
     /// Bloom weight added before tone mapping.
     pub intensity: f32,
+}
+
+/// Veil-march resolve push-constant block: exposure + bloom weight +
+/// march gain (12 B).
+///
+/// ```
+/// use game_engine::render::post::BloomMarchResolvePush;
+/// use std::mem::size_of;
+///
+/// assert_eq!(size_of::<BloomMarchResolvePush>(), 12);
+/// ```
+#[derive(BufferContents, Clone, Copy)]
+#[repr(C)]
+pub struct BloomMarchResolvePush {
+    /// Linear exposure multiplier applied to the HDR scene sample.
+    pub exposure: f32,
+    /// Bloom weight added before tone mapping.
+    pub intensity: f32,
+    /// March target gain added before tone mapping.
+    pub march_gain: f32,
 }
 
 /// Mip-prefilter push-constant block: soft-knee threshold + knee +
@@ -697,6 +741,29 @@ mod tests {
         assert!(
             !bloom.contains("hdr * pc.exposure, 1.0"),
             "no unmapped linear output may survive"
+        );
+    }
+
+    #[test]
+    fn march_resolve_composition_shares_the_bloom_source() {
+        let march = resolve_frag_bloom_march();
+        // Bloom anchors survive; march pair + gain ride along.
+        for anchor in [
+            "uniform texture2D bloom_tex;",
+            "uniform sampler bloom_sampler;",
+            "uniform texture2D march_tex;",
+            "uniform sampler march_sampler;",
+            "float march_gain;",
+            "f_color = vec4(",
+        ] {
+            assert!(march.contains(anchor), "composition dropped {anchor:?}");
+        }
+        assert_eq!(
+            march
+                .matches("aces_fit(hdr * pc.exposure + bloom * pc.intensity + texture(sampler2D(march_tex, march_sampler), v_uv).rgb * pc.march_gain)")
+                .count(),
+            1,
+            "fit must wrap scene + bloom + march once"
         );
     }
 

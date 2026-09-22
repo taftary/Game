@@ -2,8 +2,9 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-20; UX consulted; ARCHITECT + TECHLEAD
-breakdown in `plan.md`)
+`done` (PO sign-off 2026-09-20; UX consulted; ARCHITECT + TECHLEAD
+breakdown in `plan.md`; ANALYST audit + SECURITY review recorded in
+`plan.md` DoD table; single commit on branch `v0.3.3`)
 
 ## Context
 
@@ -44,7 +45,10 @@ Medium/High; Low must read as the same web with less body.
 
 1. **Low — cell sprites.** One world-sized additive sprite per
    `SHEET`/`FILAMENT`/`NODE` cell with `1+δ ≥ 0.5` inside the sphere
-   (nominal ≈ 120–180k), diameter `cell_size · (1.2 … 2.0)` by class,
+   (measured nominal seed 1234: 335 387 — the 120–180k notion estimate
+   was low; Low draws a deterministic stride-2 subset ≈ 168k ≤ 200k
+   at upload, the `cosmic-tracer-splat` stride precedent), diameter
+   `cell_size · (1.2 … 2.0)` by class,
    alpha `0.006 · (1+δ)^0.5` clamped `≤ 0.05`, colour from the same
    density ramp as the splats but shifted cool (sheets indigo,
    filaments violet-lavender, node cells pale) — rides the glow
@@ -111,12 +115,13 @@ across three shader families.
 
 - FR1 (sprites): `veil_sprites(&WebField, origin) -> Vec<(pos, color,
   misc)>` — one record per qualifying cell at the cell centre + a
-  deterministic sub-cell offset (hash of the cell index, no RNG stream)
-  to break the lattice; diameter by class (sheet 2.0, filament 1.4,
-  node 1.2 × cell); alpha `min(0.006·sqrt(1+δ), 0.05)`; colour
-  `ramp(log2(1+δ)) · class_tint` (sheet ×`[0.8,0.8,1.0]`, filament ×1,
-  node ×`[1.0,0.95,0.9]`). Pure function; count band at nominal
-  `[100k, 200k]`.
+   deterministic sub-cell offset (hash of the cell index, no RNG stream)
+   to break the lattice; diameter by class (sheet 2.0, filament 1.4,
+   node 1.2 × cell); alpha `min(0.006·sqrt(1+δ), 0.05)`; colour
+   `ramp(log2(1+δ)) · class_tint` (sheet ×`[0.8,0.8,1.0]`, filament ×1,
+   node ×`[1.0,0.95,0.9]`). Pure function; count band at nominal
+   seed 1234 `[300k, 370k]` (measured 335 387; Low draws a stride-2
+   subset ≈ 168k ≤ 200k at upload).
 - FR2 (texture): `R8_UNORM` 3D image `128³`, value = the grid's 6-bit
   log-density (class dropped — the march colours by density only),
   uploaded once per (seed); sampler linear, clamp-to-edge; origin
