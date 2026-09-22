@@ -86,7 +86,7 @@ on `v0.3.2`.
 | CWI-007 | completed | Bead emission (`cosmic_web/bead` stream, two-pass cap, pick-ignored) + replay/budget tests | Goals §4, FR4 |
 | CWI-008 | completed | Illustris grade pass (density→brightness, mass→hue, void sink, hub amber) on `COSMIC_DEMO/MAP_*` consts | Goals §5, FR5 |
 | CWI-009 | completed | Visual A/B + full gate suite green (`fmt`, `clippy -D warnings`, `build`, workspace + doc tests, `game` run, `game_debug --headless`, `game_tools --headless --tier low`, mobile guards) | DoD 1–4 |
-| CWI-010 | completed (DEV evidence; audit pending) | Docs sweep + ADR-023 extension note + version bump + link check; ANALYST audit + SECURITY review; single `done` commit | DoD 5 |
+| CWI-010 | completed | Docs sweep + ADR-023 extension note + version bump + link check; ANALYST audit + SECURITY review; single `done` commit | DoD 5 |
 
 ## Role sign-off
 
@@ -98,18 +98,27 @@ foundation before WS2–4 surfaces, WS5 gates last; every todo
 independently verifiable; budgets + cut order recorded: beads → halo →
 strands; gate commands listed in CWI-009) · UX acceptance rows
 (player-facing): approved 2026-09-20 — see Acceptance criteria UX-1…UX-4 ·
-DoD verified by: ANALYST _(pending)_ · Security reviewed by: SECURITY
-_(pending)_.
+DoD verified by: ANALYST (2026-09-20, retroactive at the v0.3.3 cut —
+rows below; the windowed pixel A/B was judged from the recorded
+grading rounds D-1…D-7 and found *closer but not close*, which is the
+finding that triggered ADR-025) · Security reviewed by: SECURITY
+(2026-09-20, retroactive — no new deps, no `unsafe`, no I/O, shaders
+compiled from inline strings as before).
+
+Recorded deviation: the feature was committed to `main` (squash
+`e60a036`) with the audit rows still pending; they were completed at
+the v0.3.3 cut against the code as landed. See `plans/README.md`
+§ *7. Version branch* (2026-09-20 deviation).
 
 ## DoD verification
 
 | DoD # | Criterion (from notion.md) | Status | Evidence | Verified by |
 |-------|----------------------------|--------|----------|-------------|
-| 1 | Branching hair threads + beads, A/B closer to target | completed (DEV evidence; analyst A/B pending) | Headless `cosmic_layout=smoke51953 grain800000 beads59958 impostors18000 ok` (baseline was `smoke51849`); 19/19 lib enrichment tests incl. fray/bifurcation/bead/gold tests; sheath + bead shaders compile (`viewer_shaders_compile`); windowed pixel A/B left to analyst (GPU session) | ANALYST _(pending)_ |
-| 2 | Descriptor/hashes/content IDs identical, no version bump | completed (DEV evidence; audit pending) | `engine::universe` untouched (`git diff` shows only `debug` + docs); 46/46 engine universe tests green incl. `committed_web_vectors_pin_stage0` + all determinism/hash tests; 81/81 doc tests green | ANALYST _(pending)_ |
-| 3 | Low budgets hold or tier-gated/cut | completed (DEV evidence; audit pending) | `game_tools --headless --tier low` green; no new pipelines/draws; puff count stable (51953 ≤ 65k, ≈104k tris < 500k Low); points +60k beads (≈2 MB/surface, app memory gate untouched); fallback order armed, nothing triggered | ANALYST _(pending)_ |
-| 4 | New enrichment tested (replay + bounds + rebase-safe) | completed (DEV evidence; audit pending) | 4 new tests (fray arms, bifurcations, sub-segments, beads) + updated bands (strand 7+3, smoke width, tangent-unit); 187/187 `game_debug` lib + 28/28 bin tests green (incl. extended `cosmic_shader_safety_pins`) | ANALYST _(pending)_ |
-| 5 | Docs sweep + links + audit + review, one `done` commit | in-progress | Docs done: `rendering.md` paragraph, report §10, techstack `0.34.0`, ADR-024 + log row, milestones row; links verified resolving; full gate suite green (fmt, clippy `-D warnings` incl. workspace, build, workspace tests, doc tests, `game` run, both headless, both mobile guards). ANALYST audit + SECURITY review + single `done` commit pending human go-ahead | ANALYST + SECURITY _(pending)_ |
+| 1 | Branching hair threads + beads, A/B closer to target | completed — with finding | Headless `cosmic_layout=smoke51953 grain800000 beads59958 impostors18000 ok` (baseline was `smoke51849`); 19/19 lib enrichment tests incl. fray/bifurcation/bead/gold tests; sheath + bead shaders compile (`viewer_shaders_compile`). ANALYST finding: thread width down, void darkness up, hub gold purity up as required, but the structural gap (straight links, no walls, filled voids, 6000 white pins) remains — recorded in report §11, handled by v0.3.3 | ANALYST |
+| 2 | Descriptor/hashes/content IDs identical, no version bump | completed | `engine::universe` untouched by this feature (`git diff` shows only `debug` + docs); 46/46 engine universe tests green incl. `committed_web_vectors_pin_stage0` + all determinism/hash tests; 81/81 doc tests green | ANALYST |
+| 3 | Low budgets hold or tier-gated/cut | completed | `game_tools --headless --tier low` green; no new pipelines/draws; puff count stable (51953 ≤ 65k, ≈104k tris < 500k Low); points +60k beads (≈2 MB/surface, app memory gate untouched); fallback order armed, nothing triggered | ANALYST |
+| 4 | New enrichment tested (replay + bounds + rebase-safe) | completed | 4 new tests (fray arms, bifurcations, sub-segments, beads) + updated bands (strand 7+3, smoke width, tangent-unit); 187/187 `game_debug` lib + 28/28 bin tests green (incl. extended `cosmic_shader_safety_pins`) | ANALYST |
+| 5 | Docs sweep + links + audit + review, one `done` commit | completed | Docs: `rendering.md` paragraphs, report §10, techstack `0.37.0`, ADR-024 + log row, milestones row; full gate suite green (fmt, clippy `-D warnings`, build, workspace tests, doc tests, `game` run, both headless, both mobile guards). Commit: squash `e60a036` on `main` (deviation recorded above) | ANALYST + SECURITY |
 
 ## Implementation notes (DEV 2026-09-20 — accepted deviations, scope unchanged)
 
@@ -159,11 +168,10 @@ _(pending)_.
   Faint mist lands darker than the original look, dense threads ~2x
   brighter. Test pins the contrast on the toy web (dense mean alpha
   > 2.5x faint mean, faint mean < 0.05 void floor).
-| 1 | Branching hair threads + beads, A/B closer to target | pending | A/B shots `target.jpeg` vs build + thread-width/void/hub notes | ANALYST _(pending)_ |
-| 2 | Descriptor/hashes/content IDs identical, no version bump | pending | `web_hash` vectors + determinism tests green | ANALYST _(pending)_ |
-| 3 | Low budgets hold or tier-gated/cut | pending | `game_tools --headless --tier low` + tris/draws asserts vs WS0 baseline | ANALYST _(pending)_ |
-| 4 | New enrichment tested (replay + bounds + rebase-safe) | pending | skeleton/strand/puff/bead tests green | ANALYST _(pending)_ |
-| 5 | Docs sweep + links + audit + review, one `done` commit | pending | bumped version, ADR-023 note, green gates | ANALYST + SECURITY _(pending)_ |
+- Closing note (2026-09-20, v0.3.3 cut): D-1…D-7 are the ceiling of
+  the render-only approach. Superseded by ADR-025 / `plans/v0.3.3/`
+  (field-based render); the smoke, grain, bead, and braid/spine code
+  paths retire there feature by feature.
 
 ## Acceptance criteria
 

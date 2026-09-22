@@ -57,6 +57,13 @@ pub struct MapOrbitCamera {
     scene_radius: f32,
     /// Remembered (yaw, pitch) for the top-down toggle.
     saved_tilt: (f32, f32),
+    /// Per-instance vertical FOV, radians (`cosmic-depth-window`:
+    /// slab mode narrows the inspector to 20° for the near-
+    /// orthographic target framing). Defaults to [`FOV_Y`]; every
+    /// derived quantity (`projection_matrix`, `px_scale`,
+    /// `world_per_pixel`, `project_to_screen`) reads it, so picking
+    /// and drawing always share one matrix.
+    fov_y: f32,
 }
 
 impl MapOrbitCamera {
@@ -81,6 +88,7 @@ impl MapOrbitCamera {
             max_distance,
             scene_radius: scene_radius.max(f32::EPSILON),
             saved_tilt: (yaw, pitch),
+            fov_y: FOV_Y,
         };
         camera.distance = camera
             .distance
@@ -175,7 +183,7 @@ impl MapOrbitCamera {
         };
         let near = (self.distance * 0.01).max(self.scene_radius * 1e-4);
         let far = self.distance + 4.0 * self.scene_radius;
-        perspective(FOV_Y, aspect, near, far.max(near * 2.0))
+        perspective(self.fov_y, aspect, near, far.max(near * 2.0))
     }
 
     /// Combined matrix the renderer pushes (`projection * view`).
@@ -185,14 +193,34 @@ impl MapOrbitCamera {
 
     /// Map units per screen pixel at the target depth (pan scale).
     pub fn world_per_pixel(&self, vp_h: f32) -> f32 {
-        2.0 * self.distance * (FOV_Y * 0.5).tan() / vp_h.max(1.0)
+        2.0 * self.distance * (self.fov_y * 0.5).tan() / vp_h.max(1.0)
     }
 
     /// Pixels per map unit at the target depth: the point-shader
     /// scale for world-sized sprites (`px = world_size * px_scale /
     /// clip.w`).
     pub fn px_scale(&self, vp_h: f32) -> f32 {
-        vp_h.max(1.0) / (2.0 * (FOV_Y * 0.5).tan())
+        vp_h.max(1.0) / (2.0 * (self.fov_y * 0.5).tan())
+    }
+
+    /// Instance vertical FOV, radians (default [`FOV_Y`]).
+    pub fn fov_y(&self) -> f32 {
+        self.fov_y
+    }
+
+    /// Narrow (or widen) the FOV to `fov_deg` while keeping the framed
+    /// width constant: distance rescales by `tan(old/2)/tan(new/2)`
+    /// (clamped to the zoom band). Toggling back restores both.
+    pub fn set_fov_keep_framing(&mut self, fov_deg: f32) {
+        if !fov_deg.is_finite() {
+            return;
+        }
+        let new_fov = (fov_deg.to_radians()).clamp(1.0_f32.to_radians(), 89.0_f32.to_radians());
+        let scale = (self.fov_y * 0.5).tan() / (new_fov * 0.5).tan();
+        if scale.is_finite() && scale > 0.0 {
+            self.fov_y = new_fov;
+            self.distance = (self.distance * scale).clamp(self.min_distance, self.max_distance);
+        }
     }
 
     /// Current target.
@@ -424,5 +452,50 @@ mod tests {
         let target = Vec3::new(1.0, 2.0, 3.0);
         let cam = MapOrbitCamera::new(target, 100.0, 0.3, 0.2, 10.0, 200.0, 120.0);
         assert!((cam.eye() - target).length() - 100.0 < 1e-4);
+    }
+
+    #[test]
+    fn fov_defaults_to_shared_value() {
+        assert_eq!(camera().fov_y(), FOV_Y);
+    }
+
+    #[test]
+    fn set_fov_keep_framing_preserves_width() {
+        // Generous zoom band so the ×3.27 distance rescale never clamps.
+        let mut cam = MapOrbitCamera::new(Vec3::ZERO, 100.0, 0.3, 0.2, 10.0, 2000.0, 120.0);
+        let width = |cam: &MapOrbitCamera| 2.0 * cam.distance() * (cam.fov_y() * 0.5).tan();
+        let before = width(&cam);
+        cam.set_fov_keep_framing(20.0);
+        assert!((cam.fov_y() - 20.0_f32.to_radians()).abs() < 1e-6);
+        assert!(
+            (width(&cam) - before).abs() / before < 0.01,
+            "framed width drifted: {} vs {before}",
+            width(&cam)
+        );
+        // Toggling back restores both.
+        cam.set_fov_keep_framing(60.0);
+        assert!((cam.fov_y() - FOV_Y).abs() < 1e-6);
+        assert!((width(&cam) - before).abs() / before < 0.01);
+        assert!((cam.distance() - 100.0).abs() / 100.0 < 0.01);
+        // Degenerate input is a no-op.
+        cam.set_fov_keep_framing(f32::NAN);
+        assert!((cam.fov_y() - FOV_Y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn projection_stays_unflipped_at_any_fov() {
+        use glam::camera::rh::proj::directx;
+        let mut cam = camera();
+        for fov in [60.0, 20.0, 25.0] {
+            cam.set_fov_keep_framing(fov);
+            let aspect = 16.0 / 9.0;
+            let near = (cam.distance() * 0.01).max(120.0 * 1e-4);
+            let far = cam.distance() + 4.0 * 120.0;
+            assert_eq!(
+                cam.projection_matrix(aspect),
+                directx::perspective(cam.fov_y(), aspect, near, far),
+                "projection must stay directx at {fov}°"
+            );
+        }
     }
 }

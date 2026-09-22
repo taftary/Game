@@ -92,8 +92,42 @@ commit when it reaches `done` (workflow rule:
 |---|---|---|
 | [`cosmic-scale-player`](../../plans/v0.3.2/cosmic-scale-player/) | done | §1 W1 + §2 + dev tooling (ADR-023 extends ADR-022) |
 | [`settings-seed-loader`](../../plans/v0.3.2/settings-seed-loader/) | done | dev tooling (single Settings seed editor + staged load progress) |
-| [`cosmic-web-mass-rank-fix`](../../plans/v0.3.2/cosmic-web-mass-rank-fix/) | in-progress | bugfix: densest peak now gets rarest mass (UNIVERSE_VERSION 2→3) |
-| [`cosmic-web-illustris-look`](../../plans/v0.3.2/cosmic-web-illustris-look/) | in-review | render-only enrichment: branching hair threads + smoke-v2 sheath + gold beads toward the Illustris target (no descriptor/hash change) |
+| [`cosmic-web-mass-rank-fix`](../../plans/v0.3.2/cosmic-web-mass-rank-fix/) | done | bugfix: densest peak now gets rarest mass (UNIVERSE_VERSION 2→3); closed at the v0.3.3 cut (deviation recorded in `plans/README.md` § 7) |
+| [`cosmic-web-illustris-look`](../../plans/v0.3.2/cosmic-web-illustris-look/) | done | render-only enrichment: branching hair threads + smoke-v2 sheath + gold beads toward the Illustris target (no descriptor/hash change); closed at the v0.3.3 cut — reached the render-only ceiling, superseded by ADR-025 |
+
+## v0.3.3 — Cosmic-web field render (ADR-025)
+
+Work happens on branch `v0.3.3` (cut from `main` at `e4cb6fe`); each
+feature lands as exactly one commit when it reaches `done` (workflow
+rule: [`plans/README.md`](../../plans/README.md) § *7. Version
+branch*). Goal: the cosmic surfaces read like the Illustris reference
+([`../reports/images/target.jpeg`](../reports/images/target.jpeg),
+described in
+[`../reports/2026-09-20-cosmic-web-visual-description.md`](../reports/2026-09-20-cosmic-web-visual-description.md))
+by rendering the **field** the generator already computes instead of
+decorating the link graph (diagnosis:
+[`../reports/2026-09-19-cosmic-web-visual-architecture.md`](../reports/2026-09-19-cosmic-web-visual-architecture.md)
+§ 11). Features are listed in dependency order; PO decisions
+(2026-09-20): engine export accepted, both surfaces with a vista intro,
+tiered veil (sprites Low / raymarch Medium+High), v0.3.2 closed as-is.
+
+| # | Feature | Status | Crate(s) | Scope |
+|---|---|---|---|---|
+| F0 | [`cosmic-capture-harness`](../../plans/v0.3.3/cosmic-capture-harness/) | done | debug | `--capture` offscreen PNG + four camera presets (`inspector`, `slab`, `demo`, `vista`) + `F12`; every later DoD's evidence; v0.3.2 baseline shots |
+| F1 | [`web-field-export`](../../plans/v0.3.3/web-field-export/) | done | engine | `generate_cosmic_web_with_field` → non-hashed `WebField` sidecar (≈1M Zel'dovich tracers + overdensity, 128³ class/density grid); descriptor, hash, saves byte-identical |
+| F2 | [`cosmic-tracer-splat`](../../plans/v0.3.3/cosmic-tracer-splat/) | done | debug | adaptive-kernel additive splats coloured by one density ramp; classes D/B/C emerge from density + hub proximity; tiers 300k / 1M / all; retires grain + beads |
+| F3 | [`cosmic-depth-window`](../../plans/v0.3.3/cosmic-depth-window/) | done | debug | visibility fog on every cosmic draw + inspector slab mode (`S`, 10–80 Mpc) + near-ortho 20° inspector FOV; fills the `slab` preset; makes voids dark |
+| F4 | [`cosmic-hub-hierarchy`](../../plans/v0.3.3/cosmic-hub-hierarchy/) | done | debug | mass-rank tiers A (1 %) / B (10 %) / C; 3-layer cores + member-galaxy scatter for A/B, warm beads for C; retires 3-per-node impostors |
+| F5 | [`bloom-mip-chain`](../../plans/v0.3.3/bloom-mip-chain/) | done | engine + debug | write-once mip pyramid (13-tap down / tent up, 3–5 levels by tier, soft knee); the Intel rule becomes an executable pin; retires the 5-target blur |
+| F6 | [`cosmic-gas-veil-v2`](../../plans/v0.3.3/cosmic-gas-veil-v2/) | done | debug | grid-driven gas bodies + walls: cell sprites on Low, quarter-res emission-only raymarch of a 128³ 3D texture on Medium/High; retires smoke + old veil + braid code |
+| F7 | [`cosmic-vista-intro`](../../plans/v0.3.3/cosmic-vista-intro/) | done | debug | demo boots on the reference composition (outside, 25°, 40 Mpc slab), holds 2 s, dives 8 s to Chase; skippable, `V` replays; fills the `vista` preset; closes the version |
+
+Cosmic roadmap items realised here: "volumetric bodies", "quad node
+impostors" (as in-sprite ramps), "sheet-sprite render + density
+export" (without the `UNIVERSE_VERSION` bump that roadmap assumed —
+nothing hashed changes). Still deferred: LOD/culling hardening
+(measured costs land in F2/F3/F6 DoDs), 2LPT / nested grids, SDSS
+overlay.
 
 ## Post-v0.3 (unscheduled)
 
@@ -110,14 +144,14 @@ commit when it reaches `done` (workflow rule:
   the player-traversable cosmic web as the demo's starting dimension;
   region streaming, sheet rendering, and frame handoff stay follow-ups
   per ADR-023.)
-- **Cosmic web roadmap** (decisions 2026-09-19): stability-first ordering.
-  Immediate: perf measurement + tier budgets → LOD/culling → cheap wins
-  (redshift rescale, braid strip, marker caching) → filament ribbons.
-  One batched descriptor change (UNIVERSE_VERSION bump): dominant long
-  filaments + sheet/density export + sheet sprite render. Volumetric
-  raymarching deferred to discrete-GPU tiers only. Compute-grain dropped
-  (build-time cost, not per-frame). SDSS overlay deferred (data-ingest
-  project). 2LPT deferred until nested grids exist.
+- **Cosmic web roadmap** (decisions 2026-09-19, revised 2026-09-20 by
+  ADR-025): the "filament ribbons" and "batched descriptor change"
+  steps are replaced by v0.3.3's field render (`WebField` export is
+  non-hashed, so no `UNIVERSE_VERSION` bump); volumetric raymarching
+  lands tiered (Medium/High) in `cosmic-gas-veil-v2` instead of
+  discrete-GPU-only. Still deferred: LOD/culling hardening (after
+  v0.3.3 costs are measured), compute-grain (dropped), SDSS overlay
+  (data-ingest project), 2LPT until nested grids exist.
 
 ## Open product items (spec §10 — must not be silently dropped)
 

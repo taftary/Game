@@ -51,29 +51,33 @@ use game_engine::catalog::scheduler::SkyView;
 use game_engine::flight::{ShipMode, mode_of};
 use game_engine::frames::recenter;
 use game_engine::render::{
-    BLOOM_BLUR_FRAG, BLOOM_BRIGHT_FRAG, BloomBlurPush, BloomBrightPush, BloomParams,
-    BloomResolvePush, ExposureParams, FOV_Y, HdrSelection, MAX_PITCH, OrbitCamera, RESOLVE_VERT,
-    ShaderKind, WORLD_TO_EQUATORIAL, compile_glsl_to_spirv, create_instance, device_score,
-    log_physical_device, required_device_extensions, resolve_frag_bloom, select_hdr_format,
-    star_visibility, visible_hemisphere,
+    BLOOM_DOWN_FRAG, BLOOM_PREFILTER_FRAG, BLOOM_UP_FRAG, BloomDownPush, BloomMarchResolvePush,
+    BloomPrefilterPush, BloomUpPush, ExposureParams, FOV_Y, HdrSelection, MAX_PITCH,
+    MipBloomParams, OrbitCamera, QualityTier, RESOLVE_VERT, ShaderKind, WORLD_TO_EQUATORIAL,
+    compile_glsl_to_spirv, create_instance, device_score, log_physical_device,
+    required_device_extensions, resolve_frag_bloom_march, select_hdr_format, star_visibility,
+    visible_hemisphere,
 };
-use game_engine::universe::WebDescriptor;
+use game_engine::universe::{WebDescriptor, WebField};
 use game_engine::waypoints::WaypointId;
 use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, RenderPassBeginInfo,
-    SubpassBeginInfo, SubpassContents,
+    AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo, CopyImageInfo,
+    CopyImageToBufferInfo, PrimaryAutoCommandBuffer, RenderPassBeginInfo, SubpassBeginInfo,
+    SubpassContents,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
-use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags};
+use vulkano::device::{
+    Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+};
 use vulkano::format::{ClearValue, Format, FormatFeatures};
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
-use vulkano::instance::Instance;
+use vulkano::instance::{Instance, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
@@ -374,6 +378,17 @@ void main() {
 // Hubble redshift tint from view depth (`clip.w`, spec §9.1: distant
 // filaments redden and dim). Cosmic views only — the shared map
 // shaders above stay byte-identical for galaxy/system/planet/sky.
+/// Shared depth-window GLSL (`cosmic-depth-window`): the authority is
+/// `game_debug::cosmic_window::COSMIC_WINDOW_GLSL` — pasted verbatim
+/// into `GLOW_VERT`, `SPLAT_VERT`, and `MARCH_FRAG` below (pinned
+/// byte-identical by `cosmic_window_snippet_shared` +
+/// `march_loop_stays_narrow`; `concat!` cannot
+/// take consts, so paste + pin instead of composition).
+/// Visibility fog `1/(1+(d/L)²)` × slab window, arithmetic-only
+/// (`smoothstep`, `/`, `*`) — no `exp`, no depth-buffer read (points
+/// write none). `kind >= 1` (hub impostor halos + cores) gets the
+/// 0.25 fog floor so the navigation goal stays visible at any
+/// distance.
 const GLOW_VERT: &str = r"#version 450
 layout(location = 0) in vec3 map_pos;
 layout(location = 1) in vec3 color;
@@ -383,15 +398,30 @@ layout(push_constant) uniform PushConstants {
     float px_scale;
     float exposure;
     float redshift;
+    float fog_l;
+    float slab_center;
+    float slab_half;
 } pc;
+
+float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
+    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
+    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
+    float vis = fog * slab;
+    vis = (kind >= 1) ? max(vis, 0.25) : vis;
+    return vis;
+}
+
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
+layout(location = 2) out float v_kind;
 void main() {
     vec4 clip = pc.mvp * vec4(map_pos, 1.0);
     gl_Position = clip;
     // `kind` 1 = world-unit size (halo impostors), scaled by
     // `px_scale` over the perspective divide — the shared map-shader
-    // convention; `kind` 0 = fixed pixel size (cores, grain, glow).
+    // convention; `kind` 0 = fixed pixel size (cores, grain, glow);
+    // `kind` 2 = hub core with an in-sprite radial ramp
+    // (`cosmic-hub-hierarchy`).
     float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
     gl_PointSize = clamp(px, 1.0, 256.0);
     // Bounded redshift depth: negative view depth clamps to 0 and the
@@ -406,12 +436,17 @@ void main() {
     vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
     v_color = color * tint * dim;
-    v_alpha = misc.y * pc.exposure;
+    // Depth window (`cosmic-depth-window`): fog × slab, hub floor on
+    // `kind >= 1` so the navigation goal never fades out.
+    float vis = cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, int(misc.z + 0.5));
+    v_alpha = misc.y * pc.exposure * vis;
+    v_kind = misc.z;
 }";
 
 const GLOW_FRAG: &str = r"#version 450
 layout(location = 0) in vec3 v_color;
 layout(location = 1) in float v_alpha;
+layout(location = 2) in float v_kind;
 layout(location = 0) out vec4 f_color;
 void main() {
     vec2 d = gl_PointCoord - vec2(0.5);
@@ -419,128 +454,261 @@ void main() {
     // faint square corners on screen — the visual-issue fix).
     float t = max(0.0, 1.0 - 4.0 * dot(d, d));
     float fall = t * t;
-    f_color = vec4(v_color * v_alpha * fall, 1.0);
+    vec3 col = v_color;
+    // Hub core (`cosmic-hub-hierarchy`, `kind` 2): white-hot center →
+    // pale yellow → orange rim inside the sprite (arithmetic-only).
+    float r = length(d) * 2.0;
+    vec3 core = mix(vec3(1.0, 0.97, 0.85), vec3(1.0, 0.55, 0.25), smoothstep(0.2, 0.5, r));
+    col = (v_kind > 1.5) ? core : col;
+    f_color = vec4(col * v_alpha * fall, 1.0);
 }";
 
-// Cosmic smoke filaments (smoke v2 display, Illustris-look WS3):
-// tangent-aligned stretched impostor records expanded in-shader into
-// filament-hugging quads (TriangleList, 6 verts per puff — two
-// triangles, no index buffer). The quad stretches 4× along the link
-// tangent (`misc.yzw`) and stays thin across, so sheaths read as
-// threads. No trig in the vertex shader (crosses + normalizes for the
-// frame); dust variation is a cheap 8x8 hash in the fragment shader.
-// Same bounded redshift treatment as the glow sprites, premultiplied
-// additive output.
-const SMOKE_VERT: &str = r"#version 450
-layout(location = 0) in vec4 pos_size; // puff center xyz, across-width Mpc
-layout(location = 1) in vec4 rgba;     // link rgb (hub-warmed), alpha
-layout(location = 2) in vec4 misc;     // noise seed, tangent xyz
+// Cosmic tracer splats (`cosmic-tracer-splat`, ADR-025): one additive
+// point sprite per Zel'dovich tracer, kernel size + color from local
+// density (the Illustris particle-splat look). The vertex stage may use
+// `exp2`/`log2` (per-vertex, not per-pixel); the fragment stays
+// arithmetic-only (mobile fill-rate rule). Density ramp stops match
+// `cosmic_splat::DENSITY_RAMP_STOPS` (pinned by
+// `cosmic_shader_safety_pins`); the vertex unpack mirrors
+// `cosmic_splat::splat_pack` bit-for-bit.
+const SPLAT_VERT: &str = r"#version 450
+layout(location = 0) in vec3 pos;
+layout(location = 1) in uint packed;
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 eye;
     float px_scale;
     float exposure;
     float redshift;
+    float h0;
+    float alpha_k;
+    float fog_l;
+    float slab_center;
+    float slab_half;
 } pc;
-layout(location = 0) out vec4 v_rgba;
-layout(location = 1) out vec2 v_uv;
-layout(location = 2) out float v_seed;
+layout(location = 0) out vec3 v_color;
+layout(location = 1) out float v_alpha;
+layout(location = 2) out float v_b;
+// Shared density ramp (`cosmic-gas-veil-v2` CGV-001): the authority is
+// `game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL` — pasted verbatim
+// (pinned byte-identical by `cosmic_density_ramp_shared`; `concat!`
+// cannot take consts, so paste + pin instead of composition).
+vec3 cosmic_density_ramp(float log2od) {
+    vec3 c0 = vec3(0.10, 0.08, 0.35);
+    vec3 c1 = vec3(0.35, 0.32, 0.80);
+    vec3 c2 = vec3(0.85, 0.85, 1.00);
+    vec3 c3 = vec3(1.00, 0.92, 0.60);
+    vec3 c4 = vec3(1.00, 0.45, 0.40);
+    vec3 col = c0;
+    col = mix(col, c1, clamp((log2od - (-2.0)) / (0.0 - (-2.0)), 0.0, 1.0));
+    col = mix(col, c2, clamp((log2od - 0.0) / (1.5 - 0.0), 0.0, 1.0));
+    col = mix(col, c3, clamp((log2od - 1.5) / (3.0 - 1.5), 0.0, 1.0));
+    col = mix(col, c4, clamp((log2od - 3.0) / (4.5 - 3.0), 0.0, 1.0));
+    return col;
+}
+
+float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
+    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
+    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
+    float vis = fog * slab;
+    vis = (kind >= 1) ? max(vis, 0.25) : vis;
+    return vis;
+}
+
 void main() {
-    int vi = int(gl_VertexIndex);
-    // Two triangles: (-,-),(+,-),(+,-)/(-,-),(+,-),(-,+) pattern over
-    // 6 verts without an index buffer. x runs ALONG the filament,
-    // y runs ACROSS it.
-    vec2 corner = vec2((vi == 1 || vi == 2 || vi == 4) ? 1.0 : -1.0,
-                       (vi == 2 || vi == 4 || vi == 5) ? 1.0 : -1.0);
-    vec3 center = pos_size.xyz;
-    vec4 clipc0 = pc.mvp * vec4(center, 1.0);
-    // Minimum-pixel clamp on the ACROSS width (the retired ribbon's
-    // 1.5-px rule): without it, distant sheaths in the zoomed-out
-    // inspector shrink subpixel and vanish while near ones stay huge.
-    // The halo tier is allowed to vanish (overdraw relief); the core
-    // tier always passes a clamped width from the CPU.
-    float min_world = 2.0 * max(clipc0.w, 1e-6) / max(pc.px_scale, 1e-6);
-    float width = max(max(pos_size.w, 1e-6), min_world);
-    float len = width * 4.0;
-    vec3 view_dir = center - pc.eye.xyz;
-    float vd = length(view_dir);
-    view_dir = (vd > 1e-6) ? view_dir / vd : vec3(0.0, 0.0, 1.0);
-    vec3 axis = misc.yzw;
-    if (dot(axis, axis) < 1e-6) {
-        // Degenerate tangent (empty-set guard puff): fall back to a
-        // camera-facing square; its zero alpha rasterizes nothing.
-        vec3 up_ref = (abs(view_dir.y) > 0.9) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
-        vec3 right0 = cross(view_dir, up_ref);
-        right0 = (length(right0) > 1e-10) ? normalize(right0) : vec3(1.0, 0.0, 0.0);
-        axis = normalize(cross(right0, view_dir));
-    } else {
-        axis = normalize(axis);
-    }
-    vec3 side = cross(view_dir, axis);
-    float rl = length(side);
-    side = (rl > 1e-10) ? side / rl : vec3(1.0, 0.0, 0.0);
-    vec3 world = center + axis * (corner.x * 0.5 * len) + side * (corner.y * 0.5 * width);
-    vec4 clipc = clipc0;
-    gl_Position = pc.mvp * vec4(world, 1.0);
-    v_uv = corner;
-    v_seed = misc.x;
-    // Same bounded redshift depth as the glow sprites (never divides
-    // by zero, never flips a channel sign).
-    float z = min(pc.redshift * max(clipc.w, 0.0), 0.5);
-    vec3 tint = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
+    uint q = packed & 65535u;
+    float log2od = float(q) / 65535.0 * 16.0 - 8.0;
+    uint tint = (packed >> 16u) & 3u;
+    uint b = (packed >> 18u) & 1u;
+    float od = exp2(log2od);
+    // Adaptive kernel h = h0 * (1+d)^(-1/3), clamped [0.5, 4] Mpc.
+    float h = clamp(pc.h0 * exp2(-log2(max(od, 1e-3)) / 3.0), 0.5, 4.0);
+    vec4 clip = pc.mvp * vec4(pos, 1.0);
+    gl_Position = clip;
+    float px = clamp(h * pc.px_scale / max(clip.w, 1e-6), 1.5, 64.0);
+    gl_PointSize = px;
+    // Constant energy per splat: dense clumps are bright because they
+    // hold many particles, not because each is bigger.
+    float alpha = pc.alpha_k / max(px * px, 1.0) * pc.exposure;
+    // Depth window (`cosmic-depth-window`): splats never take the hub
+    // floor (kind 0) — fully fogged or out-of-slab vertices add zero.
+    alpha *= cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, 0);
+    // Near-eye fade (the v0.3.2 white-flash lesson): kernels closer
+    // than 2h dissolve instead of filling the screen.
+    float dist = length(pos - pc.eye.xyz);
+    alpha *= smoothstep(h, 2.0 * h, dist);
+    // Bounded redshift depth (the glow-shader treatment, same clamps).
+    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
+    vec3 hubble = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
-    // Size-relative near fade: the player flies through filaments,
-    // so a puff viewed from closer than ~its own length would fill
-    // the screen as a hard slab. Dissolve it before its quad edges
-    // resolve — distant puffs still paint the filament, and beads,
-    // grain, and node impostors keep nearby structure legible.
-    float fade_start = max(1.0, len * 0.35);
-    float fade_end = max(6.0, len * 1.25);
-    float efade = smoothstep(fade_start, fade_end, vd);
-    v_rgba = vec4(rgba.rgb * tint * dim, rgba.a * pc.exposure * efade);
+    // Density ramp + emissive (dense cores cross the bloom threshold)
+    // + class-C hub tint toward pink-red.
+    vec3 ramp = cosmic_density_ramp(log2od);
+    float emissive = 1.0 + 0.5 * max(0.0, log2od - 1.5);
+    vec3 tinted = mix(ramp, vec3(1.0, 0.5, 0.55), float(tint) / 3.0 * 0.6);
+    v_color = tinted * emissive * hubble * dim;
+    v_alpha = alpha;
+    v_b = float(b);
 }";
 
-const SMOKE_FRAG: &str = r"#version 450
-layout(location = 0) in vec4 v_rgba;
-layout(location = 1) in vec2 v_uv;
-layout(location = 2) in float v_seed;
+const SPLAT_FRAG: &str = r"#version 450
+layout(location = 0) in vec3 v_color;
+layout(location = 1) in float v_alpha;
+layout(location = 2) in float v_b;
 layout(location = 0) out vec4 f_color;
-// Fract-only cell hash (no sin/exp per pixel — mobile fill-rate rule).
-float smoke_hash(vec2 c) {
-    return fract(v_seed * 0.173 + dot(c, vec2(12.9898, 78.233)));
+void main() {
+    vec2 d = gl_PointCoord - vec2(0.5);
+    // Rim-zero kernel (the glow-shader falloff, same literal).
+    float t = max(0.0, 1.0 - 4.0 * dot(d, d));
+    float fall = t * t;
+    vec3 col = v_color;
+    // Class-B galaxy core: warm 2 px lobe on top of the kernel.
+    float core = max(0.0, 1.0 - dot(d, d) * 16.0);
+    col = mix(col, vec3(1.0, 0.85, 0.55) * 2.0, core * v_b);
+    f_color = vec4(col * v_alpha * fall, 1.0);
+}";
+
+/// World-space kernel scale: `h = h0 * (1+d)^(-1/3)` Mpc.
+const SPLAT_H0: f32 = 2.0;
+/// Constant-energy numerator: `alpha = k / max(px^2, 1)`. Per-surface
+/// grade (round 1, 2026-09-20): the zoomed-out inspector stacks the
+/// full 500 Mpc depth column (~7× the demo's per-px energy), so the
+/// map runs 0.2 while the immersive demo keeps 1.0. `cosmic-depth-
+/// window` fog replaces this knob with a real depth term.
+const SPLAT_ALPHA_K_DEMO: f32 = 1.0;
+/// See [`SPLAT_ALPHA_K_DEMO`].
+const SPLAT_ALPHA_K_MAP: f32 = 0.2;
+
+// Cosmic gas-veil raymarch (`cosmic-gas-veil-v2`, Medium/High):
+// quarter-res fullscreen emission-only march of the 128³ density
+// grid (uploaded once as R8). One `exp2` per step converts the packed
+// log-density back to overdensity — the single scoped exception to
+// the arithmetic-only fragment rule (recorded in CGV-005: the march
+// never runs on Low; sprite fragments stay arithmetic-only). Ray–sphere
+// clip, ordered-dither offset, fog + slab in-march, near-eye ramp.
+// Reconstructed from the SAME view-projection as the draws (inverse
+// of the pushed matrix, NDC top row — pinned by CGV-007).
+const MARCH_FRAG: &str = r"#version 450
+layout(set = 0, binding = 0) uniform texture3D grid_tex;
+layout(set = 0, binding = 1) uniform sampler grid_sampler;
+layout(push_constant) uniform PushConstants {
+    mat4 inv_vp;
+    vec4 eye_radius;
+    vec4 center_cell;
+    vec4 origin_steps;
+    vec4 window_gain;
+} pc;
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 f_color;
+// Shared density ramp (`cosmic-gas-veil-v2` CGV-001): the authority is
+// `game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL` — pasted verbatim
+// (pinned byte-identical by `cosmic_density_ramp_shared`).
+vec3 cosmic_density_ramp(float log2od) {
+    vec3 c0 = vec3(0.10, 0.08, 0.35);
+    vec3 c1 = vec3(0.35, 0.32, 0.80);
+    vec3 c2 = vec3(0.85, 0.85, 1.00);
+    vec3 c3 = vec3(1.00, 0.92, 0.60);
+    vec3 c4 = vec3(1.00, 0.45, 0.40);
+    vec3 col = c0;
+    col = mix(col, c1, clamp((log2od - (-2.0)) / (0.0 - (-2.0)), 0.0, 1.0));
+    col = mix(col, c2, clamp((log2od - 0.0) / (1.5 - 0.0), 0.0, 1.0));
+    col = mix(col, c3, clamp((log2od - 1.5) / (3.0 - 1.5), 0.0, 1.0));
+    col = mix(col, c4, clamp((log2od - 3.0) / (4.5 - 3.0), 0.0, 1.0));
+    return col;
+}
+float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
+    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
+    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
+    float vis = fog * slab;
+    vis = (kind >= 1) ? max(vis, 0.25) : vis;
+    return vis;
 }
 void main() {
-    // Soft volumetric falloff: v_uv.x runs ALONG the filament,
-    // v_uv.y runs ACROSS it. Both axes dissolve fully at the quad rim
-    // (tips hit exactly zero — no cut edges up close) with zero slope
-    // at the core (no tent-ridge blade when magnified). Peak stays at
-    // 1.0: a distant puff's pixels only ever sample the core, so any
-    // renormalization above 1.0 would brighten the whole far field —
-    // the far-field grade lives in the CPU alpha + exposure knobs.
-    float r2 = dot(v_uv, v_uv);
-    if (r2 > 1.0) { discard; }
-    float ax = 1.0 - v_uv.x * v_uv.x;
-    float radial = max(0.0, 1.0 - r2);
-    float fall = ax * ax * radial * radial;
-    if (fall <= 0.0) { discard; }
-    // Smooth value-noise dust: bilinear-smoothed 8x8 hash, so near
-    // puffs read as gas texture instead of block edges (still
-    // fract-only, no sin/exp per pixel).
-    vec2 g = (v_uv * 0.5 + 0.5) * 8.0;
-    vec2 id = floor(g);
-    vec2 f = fract(g);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    float h = mix(mix(smoke_hash(id), smoke_hash(id + vec2(1.0, 0.0)), u.x),
-                  mix(smoke_hash(id + vec2(0.0, 1.0)), smoke_hash(id + vec2(1.0, 1.0)), u.x), u.y);
-    float n = 0.72 + 0.28 * h;
-    // White hot-center: desaturate toward the puff's own luminance at
-    // the quad core so dense sheaths read white-hot with blue edges.
-    // Pure arithmetic on v_rgba (no sin/exp — mobile fill-rate rule).
-    float core = radial * radial * radial;
-    float luma = dot(v_rgba.rgb, vec3(0.299, 0.587, 0.114));
-    vec3 col = mix(v_rgba.rgb, vec3(luma), core * 0.45);
-    f_color = vec4(col * v_rgba.a * fall * n, 1.0);
+    // NDC from the resolve UV contract (v_uv = (pos.x, 1 - pos.y)).
+    vec2 ndc = vec2(v_uv.x * 2.0 - 1.0, (1.0 - v_uv.y) * 2.0 - 1.0);
+    vec4 near4 = pc.inv_vp * vec4(ndc, 0.0, 1.0);
+    vec4 far4 = pc.inv_vp * vec4(ndc, 1.0, 1.0);
+    vec3 near = near4.xyz / max(near4.w, 1e-6);
+    vec3 far = far4.xyz / max(far4.w, 1e-6);
+    vec3 dir = far - near;
+    float dl = length(dir);
+    dir = (dl > 1e-6) ? dir / dl : vec3(0.0, 0.0, 1.0);
+    vec3 eye = pc.eye_radius.xyz;
+    float radius = pc.eye_radius.w;
+    vec3 center = pc.center_cell.xyz;
+    float cell = max(pc.center_cell.w, 1e-6);
+    // Ray–sphere intersect (unit-dir quadratic, CPU-mirrored).
+    vec3 oc = eye - center;
+    float b = dot(oc, dir);
+    float c = dot(oc, oc) - radius * radius;
+    float h = b * b - c;
+    if (h <= 0.0) { f_color = vec4(0.0); return; }
+    float sq = sqrt(h);
+    float t0 = max(-b - sq, 0.0);
+    float t1 = -b + sq;
+    if (t1 <= t0) { f_color = vec4(0.0); return; }
+    float steps = max(pc.origin_steps.w, 1.0);
+    float dt = (t1 - t0) / steps;
+    // Ordered dither hides banding at 32–48 steps (fract only).
+    float dither = fract(dot(gl_FragCoord.xy, vec2(0.7548776662, 0.5698402909)));
+    float fog_l = pc.window_gain.x;
+    float slab_center = pc.window_gain.y;
+    float slab_half = pc.window_gain.z;
+    float gain = pc.window_gain.w;
+    // Grid box: cubic, centered — size from the (negative) origin.
+    vec3 origin = pc.origin_steps.xyz;
+    vec3 span = max(-2.0 * origin, vec3(1e-6));
+    vec3 acc = vec3(0.0);
+    // Grade round 2 (2026-09-22): the march is a vis-weighted MEAN, not
+    // a column. A column grows with chord length, so the emission `k`
+    // graded at the 30 Mpc slab framing washed full-depth views
+    // (demo/inspector chords are 100–500 Mpc). Dividing by the
+    // integrated weight keeps one grade correct on every view — and
+    // softens the sphere-limb edge (short limb chords divide by less).
+    float wsum = 0.0;
+    for (float i = 0.0; i < 64.0; i += 1.0) {
+        if (i >= steps) { break; }
+        float t = t0 + (i + dither) * dt;
+        vec3 p = eye + dir * t;
+        // Outside the grid box: no contribution (clamp edge would smear).
+        vec3 guv = (p - origin) / span;
+        if (any(lessThan(guv, vec3(0.0))) || any(greaterThan(guv, vec3(1.0)))) {
+            continue;
+        }
+        float q = texture(sampler3D(grid_tex, grid_sampler), guv).r;
+        float log2od = q * 10.0 - 4.0;
+        float od = exp2(log2od);
+        float a = 0.002 * max(0.0, od - 0.5);
+        float vis = cosmic_window_vis(t, fog_l, slab_center, slab_half, 0);
+        // Near-eye ramp (same rule as splats): never an opaque wash.
+        float near_w = smoothstep(0.0, 2.0 * cell, t);
+        float w = vis * near_w * dt;
+        acc += cosmic_density_ramp(log2od) * (a * w);
+        wsum += w;
+    }
+    vec3 mean = acc / max(wsum, 1e-6);
+    f_color = vec4(mean * gain, 1.0);
 }";
+
+/// March emission constant: `a = k·max(0, od − 0.5)` (grade round 1,
+/// 2026-09-21 — matches the Low sprite body at the slab framing).
+/// Baked into `MARCH_FRAG` as the `0.002` literal (GLSL has no Rust
+/// consts; the value is pinned by `march_emission_matches_grade`).
+/// Test-only anchor in non-test builds.
+#[allow(dead_code)]
+const VEIL_MARCH_K: f32 = 0.002;
+/// March target gain in the march push (`window_gain.w`): passthrough.
+/// The march target holds the vis-weighted MEAN density response; the
+/// grade lives at the resolve (`VEIL_MARCH_RESOLVE_GAIN`), so the two
+/// knobs never compound — grade-round-2 lesson (2026-09-22): one const
+/// fed both sides and blew the composite out 900×.
+const VEIL_MARCH_GAIN: f32 = 1.0;
+/// March composite gain at the resolve (`scene + bloom·i + march·e`,
+/// FR4): `30.0` carries the 30 Mpc reference window back in — the mean
+/// over a slab sightline (`wsum ≈ 30`) lands exactly where grade
+/// round 1 put the column, while full-depth views divide by their own
+/// weight instead of washing.
+const VEIL_MARCH_RESOLVE_GAIN: f32 = 30.0;
 
 // ---------------------------------------------------------------------------
 // GPU types (bin-local, mirroring the `game_tools` `MvpData` pattern).
@@ -651,7 +819,8 @@ struct MapPush {
 
 /// Cosmic glow push constants: MVP + pixel size scale + exposure +
 /// exaggerated Hubble redshift strength per Mpc of view depth
-/// (update-2026-09-18-2328; 76 B < 128 B Vulkan 1.1 floor).
+/// (update-2026-09-18-2328) + depth-window terms (`cosmic-depth-
+/// window`, 88 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 struct GlowPush {
@@ -659,49 +828,111 @@ struct GlowPush {
     px_scale: f32,
     exposure: f32,
     redshift: f32,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
 }
 
-/// Cosmic smoke push constants: MVP, camera eye (buffer frame),
-/// sprite scale (reserved), per-surface alpha exposure, redshift
-/// strength. 92 B total, under the 128 B Vulkan 1.1 floor.
+/// Cosmic tracer-splat vertex (`cosmic-tracer-splat`): origin-relative
+/// Mpc position + packed density/class word (see
+/// `cosmic_splat::splat_pack`). 16 B — Low holds 300k in 4.8 MB.
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+struct SplatVertex {
+    #[format(R32G32B32_SFLOAT)]
+    pos: [f32; 3],
+    #[format(R32_UINT)]
+    packed: u32,
+}
+
+/// Cosmic splat push constants: MVP + buffer-frame eye (near-eye
+/// fade) + pixel scale + exposure + redshift + kernel scale +
+/// constant-energy numerator + depth-window terms
+/// (`cosmic-depth-window`, 112 B < 128 B Vulkan 1.1 floor).
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct SmokePush {
+struct SplatPush {
     mvp: [[f32; 4]; 4],
     eye: [f32; 4],
     px_scale: f32,
     exposure: f32,
     redshift: f32,
+    h0: f32,
+    alpha_k: f32,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
 }
 
-/// Cosmic smoke puff: per-instance vertex layout for the smoke
-/// pipeline — three `vec4` attributes at instance rate, 48 B,
-/// mirroring [`game_debug::cosmic_web::SmokePuff`]: center + across
-/// width, color + alpha, noise seed + tangent xyz (~1.9 MB for the
-/// nominal 40k-puff web per surface).
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+/// Cosmic veil-march push constants (`cosmic-gas-veil-v2`): inverse
+/// view-projection (ray reconstruction from the same matrix as the
+/// draws) + eye/sphere + grid frame + window terms. Exactly 128 B —
+/// the Vulkan 1.1 floor (pinned by `march_push_fits_vulkan_floor`).
+#[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
-struct SmokeVertex {
-    #[format(R32G32B32A32_SFLOAT)]
-    pos_size: [f32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    rgba: [f32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    misc: [f32; 4],
+struct MarchPush {
+    inv_vp: [[f32; 4]; 4],
+    eye_radius: [f32; 4],
+    center_cell: [f32; 4],
+    origin_steps: [f32; 4],
+    window_gain: [f32; 4],
 }
 
 /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328) —
 /// see `ViewerApp::cosmic_frame`. `eye` is the camera position in the
-/// surface's buffer frame (the smoke shader builds camera-facing
-/// billboards from it).
+/// surface's buffer frame. Depth-window terms (`cosmic-depth-window`):
+/// `fog_l` (Mpc, ≤ 0 = off), `slab_center`/`slab_half` (Mpc view
+/// depth, `slab_half` ≤ 0 = off). `march` carries the veil raymarch
+/// push (`cosmic-gas-veil-v2`; stale in sprites mode — the pass is
+/// skipped there).
 struct CosmicFrame {
     mvp: [[f32; 4]; 4],
     px_scale: f32,
     is_demo: bool,
     eye: [f32; 3],
-    smoke: Subbuffer<[SmokeVertex]>,
     glow: Subbuffer<[MapVertex]>,
+    splats: Subbuffer<[SplatVertex]>,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
+    march: MarchPush,
     viewport: Viewport,
+}
+
+/// Assemble the veil-march push for a frame (CGV-005): inverse of the
+/// pushed view-projection (ray reconstruction from the SAME matrix as
+/// the draws), buffer-frame eye/sphere/grid, window terms, steps from
+/// the veil mode.
+#[allow(clippy::too_many_arguments)] // one push per frame; explicit fields are the pin
+fn march_push_for(
+    mvp: [[f32; 4]; 4],
+    eye: [f32; 3],
+    origin: glam::DVec3,
+    field: &WebField,
+    radius_mpc: f32,
+    fog_l: f32,
+    slab_center: f32,
+    slab_half: f32,
+    steps: u32,
+) -> MarchPush {
+    let inv_vp = Mat4::from_cols_array_2d(&mvp).inverse().to_cols_array_2d();
+    MarchPush {
+        inv_vp,
+        eye_radius: [eye[0], eye[1], eye[2], radius_mpc],
+        center_cell: [
+            -origin.x as f32,
+            -origin.y as f32,
+            -origin.z as f32,
+            field.cell_size_mpc as f32,
+        ],
+        origin_steps: [
+            (field.origin_mpc[0] - origin.x) as f32,
+            (field.origin_mpc[1] - origin.y) as f32,
+            (field.origin_mpc[2] - origin.z) as f32,
+            steps as f32,
+        ],
+        window_gain: [fog_l, slab_center, slab_half, VEIL_MARCH_GAIN],
+    }
 }
 
 /// Additive blend for the cosmic glow paths: source added at full
@@ -725,33 +956,28 @@ fn additive_blend() -> AttachmentBlend {
 const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
 
 /// Cosmic grade knobs (update-2026-09-19-1933), split per surface:
-/// the immersive Game Demo stacks a few puffs per pixel while the
+/// the immersive Game Demo stacks a few sprites per pixel while the
 /// zoomed-out inspector stacks dozens, so one grade cannot serve both.
 /// Engine `BloomParams::spec_defaults()` (threshold 1.0, blur σ)
 /// stays the shared spec; only these bin-local values tune the look.
-/// Smoke alpha exposure (multiplies puff alpha in the vertex shader).
-/// A billboard puff spreads its energy over ~6–50 px where the retired
-/// 1-px lines/1.5-Mpc tubes concentrated it, so the zoomed-out
-/// inspector needs ~6x the old ribbon MAP grade to read at all; the
-/// immersive demo stacks a few puffs/px and keeps the lower grade to
-/// protect mobile fill-rate. Trimmed 2026-09-20 with the density-
-/// contrast pass (CPU faint floor now below the old grade, so the
-/// exposure no longer needs to carry faint-link visibility): DEMO
-/// 0.65 / MAP 0.85 — faint mist lands darker than the original grade,
-/// dense threads ~2x brighter (see `smoke_puffs` contrast note).
-const COSMIC_DEMO_SMOKE_EXPOSURE: f32 = 0.65;
-const COSMIC_MAP_SMOKE_EXPOSURE: f32 = 0.85;
-/// Sprite alpha exposure (grain, dwarf glow, node cores + halos).
+/// Sprite alpha exposure (hub members + impostors + veil sprites).
 const COSMIC_DEMO_GLOW_EXPOSURE: f32 = 1.0;
 const COSMIC_MAP_GLOW_EXPOSURE: f32 = 0.3;
 /// Scene exposure at the ACES resolve.
 const COSMIC_DEMO_EXPOSURE: f32 = 1.15;
 const COSMIC_MAP_EXPOSURE: f32 = 0.85;
-/// Bloom intensity at the resolve (spec default 0.85 lifted: the
-/// half-res 4-pass chain attenuates 1-px lines and small sprites
-/// hard, so the composite needs the push to reach the target glow).
-const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 2.2;
-const COSMIC_MAP_BLOOM_INTENSITY: f32 = 1.2;
+/// Bloom intensities at the resolve, per surface (FR6 — back toward
+/// spec now that the chain delivers the halo: the wide pyramid keeps
+/// ~all of a hub core's over-threshold energy, so the 2.2/1.2
+/// compensations would blow the halos out).
+const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 1.0;
+const COSMIC_MAP_BLOOM_INTENSITY: f32 = 0.85;
+
+/// Mip-bloom pyramid depth (`bloom-mip-chain`): 5 levels (High —
+/// the windowed viewer and the capture path have no tier switch, so
+/// both run the full pyramid and stay pixel-identical). Matches
+/// `MipBloomParams::for_tier(High)`.
+const BLOOM_LEVELS: u8 = 5;
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -836,20 +1062,41 @@ const STREAM_SYNC_MS: u64 = 100;
 // ---------------------------------------------------------------------------
 
 fn usage() -> &'static str {
-    "usage: game_debug [--headless] [--seed N]"
+    "usage: game_debug [--headless] [--seed N] [--capture OUT.png --view inspector|slab|demo|vista --size WxH]"
+}
+
+/// Offscreen capture request (`--capture`, `cosmic-capture-harness`):
+/// renders one frame of a cosmic surface without a window and writes
+/// an 8-bit sRGB PNG. GPU-gated (never in CI).
+#[derive(Debug)]
+struct CaptureRequest {
+    /// Output PNG path.
+    path: String,
+    /// Camera preset (surface + pose).
+    view: game_debug::cosmic_capture::CaptureView,
+    /// Output size, px.
+    width: u32,
+    /// Output size, px.
+    height: u32,
 }
 
 /// Parsed CLI: `--headless` runs the GPU-free checks; `--seed N`
-/// opens the viewer (and seeds the headless map checks) on universe N.
+/// opens the viewer (and seeds the headless map checks) on universe N;
+/// `--capture` renders one offscreen frame (GPU required).
 #[derive(Debug)]
 struct CliArgs {
     headless: bool,
     seed: Option<u64>,
+    capture: Option<CaptureRequest>,
 }
 
 fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
+    use game_debug::cosmic_capture::{CAPTURE_DEFAULT_SIZE, parse_size, parse_view};
     let mut headless = false;
     let mut seed = None;
+    let mut capture_path: Option<String> = None;
+    let mut capture_view = None;
+    let mut capture_size = CAPTURE_DEFAULT_SIZE;
     let mut rest = argv.iter().skip(1);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -869,6 +1116,37 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
                     return Err(format!("--seed needs a value\n{usage}", usage = usage()));
                 }
             },
+            "--capture" => match rest.next() {
+                Some(value) => capture_path = Some(value.clone()),
+                None => {
+                    return Err(format!("--capture needs a path\n{usage}", usage = usage()));
+                }
+            },
+            "--view" => match rest.next() {
+                Some(value) => match parse_view(value) {
+                    Ok(view) => capture_view = Some(view),
+                    Err(error) => {
+                        return Err(format!("{error}\n{usage}", usage = usage()));
+                    }
+                },
+                None => {
+                    return Err(format!("--view needs a preset\n{usage}", usage = usage()));
+                }
+            },
+            "--size" => match rest.next() {
+                Some(value) => match parse_size(value) {
+                    Ok(size) => capture_size = size,
+                    Err(error) => {
+                        return Err(format!("{error}\n{usage}", usage = usage()));
+                    }
+                },
+                None => {
+                    return Err(format!(
+                        "--size needs a WxH value\n{usage}",
+                        usage = usage()
+                    ));
+                }
+            },
             other => {
                 return Err(format!(
                     "unknown argument {other:?}\n{usage}",
@@ -877,7 +1155,35 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
             }
         }
     }
-    Ok(CliArgs { headless, seed })
+    let capture = capture_path.map(|path| CaptureRequest {
+        path,
+        view: capture_view.unwrap_or(game_debug::cosmic_capture::CaptureView::Inspector),
+        width: capture_size.0,
+        height: capture_size.1,
+    });
+    if capture.is_some() && headless {
+        return Err(format!(
+            "--capture needs a GPU; --headless is GPU-free\n{usage}",
+            usage = usage()
+        ));
+    }
+    Ok(CliArgs {
+        headless,
+        seed,
+        capture,
+    })
+}
+
+/// Pose the demo camera for a `vista` capture (`cosmic-vista-intro`
+/// CVI-008 test seam): external pose + 25° FOV from `vista_pose` at
+/// t = 0 exactly — the same pose the live boot holds.
+fn pose_demo_camera_for_vista_capture(debug: &mut DebugApp) {
+    let pose = game_debug::cosmic_vista::vista_pose(&debug.cosmic.web);
+    debug
+        .cosmic
+        .camera
+        .set_external_pose(Some((pose.eye, pose.target)));
+    debug.cosmic.camera.set_fov_y(pose.fov_y_deg.to_radians());
 }
 
 /// GPU-free viewer check: build the default mesh through the lib, print
@@ -897,36 +1203,176 @@ fn run_headless(seed: Option<u64>) -> i32 {
         debug_app.cosmic.camera.render_origin(),
         debug_app.cosmic.player.position_mpc()
     );
-    // Cinematic layout smoke (update 2026-09-18-2328, smoke
-    // billboards replace ribbons; Illustris-look WS1–WS4: stretched
-    // sheath quads, frayed strands, gold beads over the bifurcation /
-    // spine skeleton): the enrichment layer derives non-empty
-    // smoke/grain/bead/impostor clouds from the boot web.
+    // Vista continuity pin (`cosmic-vista-intro` FR7): 10 s of ticks
+    // (the shared `tick` path, no input) walk Hold → Dive → Done and
+    // land exactly on the live Chase pose — the dive is one continuous
+    // motion with no cut. Runs first: later self-tests tick with
+    // thrust held (which skips), so they need Done behind them.
+    {
+        use game_debug::cosmic_vista::VistaPhase;
+        assert_eq!(debug_app.cosmic.vista.phase, VistaPhase::Hold);
+        for _ in 0..600 {
+            debug_app.cosmic.tick(1.0 / 60.0);
+        }
+        assert_eq!(debug_app.cosmic.vista.phase, VistaPhase::Done);
+        assert!(!debug_app.cosmic.camera.has_external_pose());
+        let got = debug_app.cosmic.vista.pose();
+        let want = debug_app.cosmic.chase_pose();
+        assert!(
+            (got.eye - want.eye).length() < 1e-6,
+            "vista must end at the Chase eye"
+        );
+        assert!(
+            (got.target - want.target).length() < 1e-6,
+            "vista must end at the Chase target"
+        );
+        assert!((got.fov_y_deg - want.fov_y_deg).abs() < 1e-6);
+        let events = std::mem::take(&mut debug_app.cosmic.vista_events);
+        assert_eq!(events, vec!["hold", "dive", "done"]);
+        println!("vista=done events=hold,dive,done ok");
+    }
+    // Field-render layout (`cosmic-gas-veil-v2` CGV-009: smoke retired
+    // with the link-graph decoration; splats + hubs + veil sprites
+    // derive non-empty from the boot web).
     // GPU-free — upload happens only in the windowed shell.
     let layout_seed = debug_app.cosmic.seed;
     let layout_origin = debug_app.cosmic.upload_origin;
-    let smoke =
-        game_debug::cosmic_web::smoke_puffs(&debug_app.cosmic.web, layout_seed, layout_origin);
-    let grain =
-        game_debug::cosmic_web::grain_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
-    let beads =
-        game_debug::cosmic_web::bead_cloud(&debug_app.cosmic.web, layout_seed, layout_origin);
-    let impostors = game_debug::cosmic_web::node_impostors(&debug_app.cosmic.web, layout_origin);
-    assert!(!smoke.is_empty(), "smoke must emit puffs");
-    assert!(!grain.is_empty(), "grain must emit points");
-    assert!(!beads.is_empty(), "beads must emit points");
-    assert_eq!(
-        impostors.len(),
-        debug_app.cosmic.web.nodes.len() * 3,
-        "three impostors per node"
-    );
+    // Hub tiers + members (CHH-005): sprite totals + the goal-tier
+    // check (FR6 — the spawn's first fly-to goal reads Tier A/B, or
+    // the highlight ring carries it per the recorded UX-1 fallback).
+    let (hub_impostors, hub_members, goal_tier) = {
+        use game_debug::cosmic_hubs::{HubTier, hub_impostors, hub_members};
+        let web = &debug_app.cosmic.web;
+        let impostors = hub_impostors(web, layout_origin);
+        let members = hub_members(web, layout_seed, layout_origin);
+        assert!(!impostors.is_empty(), "hubs must emit impostors");
+        assert!(!members.is_empty(), "hubs must emit members");
+        let goal = web
+            .strongest_link_from(web.home_node)
+            .map(|link| {
+                let far = if link.a == web.home_node {
+                    link.b
+                } else {
+                    link.a
+                };
+                far as usize
+            })
+            .unwrap_or(web.home_node as usize);
+        let tier = HubTier::of(goal, web.nodes.len());
+        (impostors.len(), members.len(), tier)
+    };
     println!(
-        "cosmic_layout=smoke{} grain{} beads{} impostors{} ok",
-        smoke.len(),
-        grain.len(),
-        beads.len(),
-        impostors.len()
+        "cosmic_hubs=impostors{} members{} goal_tier{:?} ok",
+        hub_impostors, hub_members, goal_tier
     );
+    // Splat counts per tier + Low overdraw estimate (CTS-006/008):
+    // stride subsets of the same field, so Low ⊂ Medium ⊂ High.
+    // Veil mode line (CGV-006/008): sprites count or march steps.
+    let (splats_low, splats_med, splats_high, overdraw_low, veil_info) = {
+        use game_debug::cosmic_splat::{SplatTier, overdraw_estimate, splat_records};
+        use game_debug::cosmic_veil::{VeilMode, veil_sprites};
+        let web = &debug_app.cosmic.web;
+        let field = &debug_app.cosmic.field;
+        let low = splat_records(field, web, layout_origin, SplatTier::Low);
+        let med = splat_records(field, web, layout_origin, SplatTier::Medium);
+        let high = splat_records(field, web, layout_origin, SplatTier::High);
+        assert!(!high.is_empty(), "splats must emit points");
+        assert!(low.len() < med.len() && med.len() <= high.len());
+        // Inspector framing at 1080p: px_scale / 430 Mpc depth.
+        let px_per_mpc = debug_app.cosmic_inspector.camera.px_scale(1080.0) / 430.0;
+        let overdraw = overdraw_estimate(&low, px_per_mpc, (1920, 1080));
+        let veil = match veil_mode() {
+            VeilMode::Sprites => {
+                let sprites = veil_sprites(field, layout_origin);
+                assert!(!sprites.is_empty(), "veil must emit sprites");
+                format!("sprites{}", sprites.len())
+            }
+            VeilMode::March { steps } => {
+                let bytes = game_debug::cosmic_veil::veil_volume_bytes(field);
+                assert_eq!(bytes.len(), 128 * 128 * 128, "volume must be 128³");
+                format!("march{steps}")
+            }
+        };
+        (low.len(), med.len(), high.len(), overdraw, veil)
+    };
+    println!(
+        "cosmic_layout=splatsL{} splatsM{} splatsH{} hubs{} members{} veil{} overdrawL{:.1} ok",
+        splats_low, splats_med, splats_high, hub_impostors, hub_members, veil_info, overdraw_low
+    );
+    // Slab relief (`cosmic-depth-window` NFR5): fraction of Low splats
+    // inside the nominal slab window (30 Mpc at the home depth under
+    // the 20° slab camera) — the draws that survive; the rest add ~0
+    // through the window term. Separate line so the CTS layout pin
+    // above stays byte-stable.
+    {
+        use game_debug::cosmic_splat::{SplatTier, splat_records};
+        use game_debug::cosmic_window::SlabState;
+        let web = &debug_app.cosmic.web;
+        let field = &debug_app.cosmic.field;
+        let low = splat_records(field, web, glam::DVec3::ZERO, SplatTier::Low);
+        let mut cam = debug_app.cosmic_inspector.camera.clone();
+        cam.set_fov_keep_framing(20.0);
+        let eye = cam.eye();
+        let fwd = (cam.target() - eye).normalize_or_zero();
+        let home = web.home().position_mpc;
+        let home_depth = ((home[0] as f32 - eye.x) * fwd.x
+            + (home[1] as f32 - eye.y) * fwd.y
+            + (home[2] as f32 - eye.z) * fwd.z)
+            .max(0.0);
+        let slab = SlabState::default_on();
+        let half = slab.thickness_mpc * 0.5 + 5.0;
+        let mut keep = 0usize;
+        for r in &low {
+            let depth = ((r.pos[0] - eye.x) * fwd.x
+                + (r.pos[1] - eye.y) * fwd.y
+                + (r.pos[2] - eye.z) * fwd.z)
+                .max(0.0);
+            if (depth - home_depth).abs() <= half {
+                keep += 1;
+            }
+        }
+        println!(
+            "slab_relief=keep{} total{} frac{:.2} ok",
+            keep,
+            low.len(),
+            keep as f64 / low.len().max(1) as f64
+        );
+    }
+    // Field sidecar self-check (`web-field-export`, ADR-025): the export
+    // entry point returns the identical descriptor, the tracer band
+    // holds, and the sidecar fits its memory budget. Timings print for
+    // the plan.md record (the +120 ms NFR3 budget is a release-desktop
+    // number; dev-profile absolutes are recorded, not gated).
+    {
+        use game_engine::universe::{
+            CosmicWebParams, WebFieldBudget, generate_cosmic_web, generate_cosmic_web_with_field,
+        };
+        let params = CosmicWebParams::nominal();
+        let t0 = Instant::now();
+        let plain = generate_cosmic_web(1337, &params);
+        let plain_ms = t0.elapsed();
+        let t1 = Instant::now();
+        let (via_field, field) =
+            generate_cosmic_web_with_field(1337, &params, WebFieldBudget::Full);
+        let field_ms = t1.elapsed();
+        assert_eq!(plain, via_field, "export must not move the descriptor");
+        assert!(
+            (900_000..=1_200_000).contains(&field.tracers.len()),
+            "nominal tracer band broken: {}",
+            field.tracers.len()
+        );
+        let bytes =
+            field.tracers.len() * size_of::<game_engine::universe::WebTracer>() + field.grid.len();
+        assert!(bytes <= 20 * 1024 * 1024, "sidecar over budget: {bytes} B");
+        println!(
+            "web_field=tracers{} plain_ms{} field_ms{} delta_ms{} mb{} ok",
+            field.tracers.len(),
+            plain_ms.as_millis(),
+            field_ms.as_millis(),
+            field_ms.as_millis().saturating_sub(plain_ms.as_millis()),
+            bytes / (1024 * 1024)
+        );
+    }
     // Cruise smoke (update 2026-09-18-2027): five seconds of W must move
     // the ship Mpc-scale — the old thrust law could not move it at all.
     let cruise_p0 = debug_app.cosmic.player.position_mpc();
@@ -1124,9 +1570,595 @@ fn run_headless(seed: Option<u64>) -> i32 {
     0
 }
 
+/// Offscreen capture format (R-1): no surface exists, so the windowed
+/// swapchain format is unavailable — `B8G8R8A8_SRGB` is the near-
+/// universal swapchain pick, and the capture builds its own render
+/// passes + pipelines against it (never reusing windowed pipelines
+/// against a foreign format).
+const CAPTURE_FORMAT: Format = Format::B8G8R8A8_SRGB;
+
+/// Default capture seed (the DoD gate examples use `--seed 1337`).
+const CAPTURE_DEFAULT_SEED: u64 = 1337;
+
+/// Offscreen cosmic capture (`cosmic-capture-harness` FR1): headless
+/// Vulkan boot (no surface, no swapchain, no window), same HDR chain /
+/// pipelines / buffers as the windowed viewer, one frame recorded
+/// through the shared CAP-001 seam (`record_cosmic_hdr_prepass` +
+/// `record_cosmic_view_arm` — the only recording path), read back to
+/// host, BGRA→RGBA swizzled, PNG-encoded top-row-first, written to
+/// `request.path`. Deterministic per (build, seed, preset, size) on a
+/// given GPU: fixed sim time `t = 0` (no ticks), no animation, all
+/// randomness from the seed. Exit codes (FR5): 2 = no Vulkan device,
+/// 3 = output unwritable.
+///
+/// This function intentionally duplicates the small CPU-side frame
+/// assembly (`cosmic_frame` stays windowed-only): the GPU command
+/// recording is shared, the CPU pose math is not.
+fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
+    use game_debug::cosmic_capture::{CaptureView, encode_png_rgba8, preset_for};
+    let seed = seed.unwrap_or(CAPTURE_DEFAULT_SEED);
+    let preset = preset_for(request.view);
+    let (w, h) = (request.width, request.height);
+    // FR5: unwritable path → exit 3 before touching Vulkan.
+    if let Some(parent) = std::path::Path::new(&request.path).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "capture: cannot create output dir {}: {error}",
+            parent.display()
+        );
+        return 3;
+    }
+    // Headless Vulkan boot: instance without surface extensions, a
+    // graphics queue without presentation support, no swapchain
+    // extension on the device.
+    let library = match VulkanLibrary::new() {
+        Ok(library) => library,
+        Err(error) => {
+            eprintln!("capture: no Vulkan loader: {error}");
+            return 2;
+        }
+    };
+    let instance = match create_instance(library, InstanceExtensions::empty(), false) {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("capture: instance failed: {error:?}");
+            return 2;
+        }
+    };
+    let (physical_device, queue_family_index) = match instance
+        .enumerate_physical_devices()
+        .map_err(|error| format!("{error:?}"))
+        .and_then(|devices| {
+            devices
+                .filter_map(|p| {
+                    p.queue_family_properties()
+                        .iter()
+                        .enumerate()
+                        .position(|(_, q)| q.queue_flags.intersects(QueueFlags::GRAPHICS))
+                        .map(|i| (p, i as u32))
+                })
+                .min_by_key(|(p, _)| device_score(p.properties().device_type))
+                .ok_or_else(|| "no graphics queue found".to_owned())
+        }) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("capture: no suitable Vulkan device: {error}");
+            return 2;
+        }
+    };
+    log_physical_device(&physical_device);
+    let (device, mut queues) = match Device::new(
+        physical_device.clone(),
+        DeviceCreateInfo {
+            enabled_extensions: DeviceExtensions::empty(),
+            queue_create_infos: vec![QueueCreateInfo {
+                queue_family_index,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    ) {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("capture: logical device failed: {error:?}");
+            return 2;
+        }
+    };
+    let queue = queues.next().expect("one queue requested");
+    let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+    let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+        device.clone(),
+        Default::default(),
+    ));
+    let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+        device.clone(),
+        Default::default(),
+    ));
+    let post_sampler = Sampler::new(
+        device.clone(),
+        SamplerCreateInfo {
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::ClampToEdge; 3],
+            ..Default::default()
+        },
+    )
+    .expect("capture post sampler must create");
+    let shaders = ShaderSet::compile(&device);
+    // Offscreen render passes: main (capture format + depth, the
+    // windowed main-pass shape) plus the shared scene/post builders.
+    let render_pass = vulkano::single_pass_renderpass!(
+        device.clone(),
+        attachments: {
+            color: {
+                format: CAPTURE_FORMAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+            depth: {
+                format: DEPTH_FORMAT,
+                samples: 1,
+                load_op: Clear,
+                store_op: DontCare,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {depth},
+        },
+    )
+    .expect("capture render pass must create");
+    // HDR select over the same support predicate as windowed (FR5:
+    // missing HDR → LDR bypass + log, still exit 0).
+    let hdr_format = match select_hdr_format(|format| hdr_support(&physical_device, format)) {
+        HdrSelection::Hdr(format) => Some(format),
+        HdrSelection::LdrBypass => None,
+    };
+    if hdr_format.is_none() {
+        eprintln!("capture: no HDR format — LDR bypass");
+    }
+    let scene_format = hdr_format.unwrap_or(CAPTURE_FORMAT);
+    let scene_pass = build_scene_pass(&device, scene_format);
+    let post_pass = build_post_pass(&device, scene_format);
+    // Cosmic-only pipeline subset (the capture records no other view).
+    let pipes = Pipelines {
+        fill: build_fill_pipeline(&device, &shaders, &render_pass),
+        line: build_line_pipeline(&device, &shaders, &render_pass),
+        ui: build_ui_pipeline(&device, &shaders, &render_pass),
+        map: build_map_pipeline(&device, &shaders, &render_pass),
+        map_glow: build_glow_pipeline(&device, &shaders, &render_pass),
+        splat: build_splat_pipeline(&device, &shaders, &render_pass),
+        glow_scene: build_glow_pipeline(&device, &shaders, &scene_pass),
+        splat_scene: build_splat_pipeline(&device, &shaders, &scene_pass),
+        prefilter: build_post_pipeline(
+            &device,
+            &shaders.prefilter_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "bloom prefilter",
+        ),
+        down: build_post_pipeline(
+            &device,
+            &shaders.down_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "bloom down",
+        ),
+        up: build_post_pipeline(
+            &device,
+            &shaders.up_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "bloom up",
+        ),
+        march: build_post_pipeline(
+            &device,
+            &shaders.march_frag,
+            &shaders.post_vert,
+            &post_pass,
+            None,
+            "veil march",
+        ),
+        resolve: build_post_pipeline(
+            &device,
+            &shaders.resolve_frag,
+            &shaders.post_vert,
+            &render_pass,
+            Some(DepthStencilState::default()),
+            "bloom resolve",
+        ),
+    };
+    // Deterministic app state at t = 0 (no ticks, no animation).
+    let mut debug = DebugApp::new();
+    if seed != DEFAULT_GALAXY_SEED {
+        debug.cosmic.reseed(seed);
+    }
+    // Gas-veil density volume (per seed; the march samples it).
+    let veil_volume = upload_veil_volume(
+        &memory_allocator,
+        &command_buffer_allocator,
+        &queue,
+        &device,
+        &debug.cosmic.field,
+    );
+    let is_demo = preset.surface_is_demo;
+    let aspect = w as f32 / h as f32;
+    // Depth window (`cosmic-depth-window` CDW-007): the `slab` preset
+    // narrows to 20° (framing kept by the distance rescale) and windows
+    // a 30 Mpc slice at the home node's view depth — the target's
+    // composition. `inspector` stays full-depth 60°.
+    if request.view == CaptureView::Slab {
+        debug.cosmic_inspector.camera.set_fov_keep_framing(20.0);
+        debug.cosmic_inspector.slab = game_debug::cosmic_window::SlabState::default_on();
+    }
+    // Vista intro (`cosmic-vista-intro` CVI-008): the `vista` preset IS
+    // the t = 0 vista pose — external pose + 25° FOV on the demo
+    // camera, driven per seed by `vista_pose` (the same pose the live
+    // boot holds). Optional `GAME_DEBUG_VISTA_T` pre-roll (seconds of
+    // 60 Hz ticks, deterministic per build+seed) serves the timed
+    // marker/hint DoD shots.
+    let vista_pose = if request.view == CaptureView::Vista {
+        pose_demo_camera_for_vista_capture(&mut debug);
+        if let Ok(t) = std::env::var("GAME_DEBUG_VISTA_T")
+            && let Ok(secs) = t.parse::<f64>()
+            && secs > 0.0
+        {
+            for _ in 0..(secs * 60.0) as usize {
+                debug.cosmic.tick(1.0 / 60.0);
+            }
+        }
+        Some(game_debug::cosmic_vista::vista_pose(&debug.cosmic.web))
+    } else {
+        None
+    };
+    let (mvp, px_scale, eye, origin, fog_l, slab_center, slab_half) = if is_demo {
+        let camera = &debug.cosmic.camera;
+        let eye_w = camera.eye_world();
+        let origin = debug.cosmic.upload_origin;
+        // Vista preset (CVI-008): fog/slab ride the t = 0 pose (fog
+        // off, 40 Mpc slab at the hub depth); the plain demo keeps the
+        // slider fog with the slab off.
+        let (fog_l, slab_center, slab_half) = match vista_pose {
+            Some(pose) => (pose.fog_l_mpc(), pose.slab_center_mpc, pose.slab_half_mpc),
+            None => (debug.cosmic.fog_l_mpc, 0.0, 0.0),
+        };
+        (
+            camera.view_proj(aspect).to_cols_array_2d(),
+            camera.px_scale(h as f32),
+            [
+                (eye_w.x - origin.x) as f32,
+                (eye_w.y - origin.y) as f32,
+                (eye_w.z - origin.z) as f32,
+            ],
+            origin,
+            fog_l,
+            slab_center,
+            slab_half,
+        )
+    } else {
+        let inspector = &debug.cosmic_inspector;
+        let e = inspector.camera.eye();
+        // Slab center: home-node view depth under the preset camera.
+        let (slab_center, slab_half) = if inspector.slab.on {
+            let home = debug.cosmic.web.home().position_mpc;
+            let fwd = (inspector.camera.target() - e).normalize_or_zero();
+            let depth = ((home[0] as f32 - e.x) * fwd.x
+                + (home[1] as f32 - e.y) * fwd.y
+                + (home[2] as f32 - e.z) * fwd.z)
+                .max(0.0);
+            (depth, inspector.slab.thickness_mpc * 0.5)
+        } else {
+            (0.0, 0.0)
+        };
+        (
+            inspector.view_proj(aspect).to_cols_array_2d(),
+            inspector.camera.px_scale(h as f32),
+            [e.x, e.y, e.z],
+            DVec3::ZERO,
+            0.0,
+            slab_center,
+            slab_half,
+        )
+    };
+    let extent = [w, h];
+    // Veil mode first (the glow upload branches on it).
+    let veil_mode = veil_mode();
+    let glow = upload_cosmic_glow(
+        &memory_allocator,
+        &debug.cosmic.web,
+        &debug.cosmic.field,
+        seed,
+        origin,
+        veil_mode,
+    );
+    let splats = upload_cosmic_splats(
+        &memory_allocator,
+        &debug.cosmic.field,
+        &debug.cosmic.web,
+        origin,
+    );
+    let ship = debug.cosmic.player.position_mpc();
+    let player_point = upload_cosmic_player_point(
+        &memory_allocator,
+        [ship.x as f32, ship.y as f32, ship.z as f32],
+    );
+    // Veil march push (CGV-005): steps from the mode above; skipped
+    // at record time in sprites mode.
+    let march_steps = match veil_mode {
+        game_debug::cosmic_veil::VeilMode::Sprites => 0,
+        game_debug::cosmic_veil::VeilMode::March { steps } => steps,
+    };
+    let march = march_push_for(
+        mvp,
+        eye,
+        origin,
+        &debug.cosmic.field,
+        debug.cosmic.params.descriptor_radius_mpc as f32,
+        fog_l,
+        slab_center,
+        slab_half,
+        march_steps,
+    );
+    let frame = CosmicFrame {
+        mvp,
+        px_scale,
+        is_demo,
+        eye,
+        glow,
+        splats,
+        fog_l,
+        slab_center,
+        slab_half,
+        march,
+        viewport: Viewport {
+            offset: [0.0, 0.0],
+            extent: [w as f32, h as f32],
+            depth_range: 0.0..=1.0,
+        },
+    };
+    let extent_arr = [w, h];
+    let veil_view = veil_volume.as_ref().map(|(_, view)| view.clone());
+    let hdr = hdr_format.map(|format| {
+        ViewerApp::build_hdr_chain(
+            &memory_allocator,
+            &descriptor_set_allocator,
+            &post_sampler,
+            format,
+            extent_arr,
+            &scene_pass,
+            &post_pass,
+            &pipes,
+            veil_view.as_ref().expect("veil volume must upload"),
+        )
+    });
+    // Offscreen target: capture-format color (+TRANSFER_SRC for the
+    // readback) with depth, under the offscreen main pass.
+    let target_image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: CAPTURE_FORMAT,
+            extent: [w, h, 1],
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("capture: target image failed: {error}");
+        std::process::exit(2);
+    });
+    let target_view = ImageView::new_default(target_image.clone()).unwrap_or_else(|error| {
+        eprintln!("capture: target view failed: {error}");
+        std::process::exit(2);
+    });
+    let target_depth = create_depth_view(&memory_allocator, extent);
+    let target_fb = Framebuffer::new(
+        render_pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![target_view, target_depth],
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("capture: target framebuffer failed: {error:?}");
+        std::process::exit(2);
+    });
+    let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
+    let (glow_exposure, resolve_exposure, bloom_intensity) = if is_demo {
+        (
+            COSMIC_DEMO_GLOW_EXPOSURE,
+            COSMIC_DEMO_EXPOSURE,
+            COSMIC_DEMO_BLOOM_INTENSITY,
+        )
+    } else {
+        (
+            COSMIC_MAP_GLOW_EXPOSURE,
+            COSMIC_MAP_EXPOSURE,
+            COSMIC_MAP_BLOOM_INTENSITY,
+        )
+    };
+    let splat_alpha_k = if is_demo {
+        SPLAT_ALPHA_K_DEMO
+    } else {
+        SPLAT_ALPHA_K_MAP
+    };
+    let bloom_enabled = !std::env::var("GAME_DEBUG_COSMIC_BLOOM").is_ok_and(|value| value == "0");
+    let readback = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                | MemoryTypeFilter::PREFER_HOST,
+            ..Default::default()
+        },
+        (0..w as usize * h as usize * 4).map(|_| 0u8),
+    )
+    .expect("capture readback buffer must create");
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator.clone(),
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .expect("capture command buffer builder must create");
+    if let Some(chain) = hdr.as_ref() {
+        // High-tier pyramid on both paths (windowed + capture stay
+        // pixel-identical — the debug binary has no tier switch).
+        let bloom_params = MipBloomParams::for_tier(QualityTier::High);
+        record_cosmic_hdr_prepass(
+            &mut builder,
+            &pipes,
+            chain,
+            &frame,
+            glow_exposure,
+            redshift,
+            &bloom_params,
+            bloom_enabled,
+            splat_alpha_k,
+        );
+        // Gas-veil march (CGV-005/006): pyramid → march → resolve.
+        // Skipped in sprites mode (cleared target adds ~0).
+        if matches!(veil_mode, game_debug::cosmic_veil::VeilMode::March { .. }) {
+            record_veil_march(&mut builder, &pipes, chain, &frame.march);
+        }
+    }
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(COSMIC_BACKDROP.into()), Some(ClearValue::Depth(1.0))],
+                ..RenderPassBeginInfo::framebuffer(target_fb)
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )
+        .expect("capture pass must begin");
+    record_cosmic_view_arm(
+        &mut builder,
+        &pipes,
+        hdr.as_ref(),
+        bloom_enabled,
+        &frame,
+        frame.viewport.clone(),
+        [w as f32, h as f32],
+        glow_exposure,
+        resolve_exposure,
+        bloom_intensity,
+        redshift,
+        splat_alpha_k,
+        VEIL_MARCH_RESOLVE_GAIN,
+        player_point,
+    );
+    builder
+        .end_render_pass(Default::default())
+        .expect("capture pass must end");
+    builder
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            target_image,
+            readback.clone(),
+        ))
+        .expect("capture readback copy must record");
+    let command_buffer = builder.build().expect("capture command buffer must build");
+    if let Err(error) = sync::now(device.clone())
+        .then_execute(queue.clone(), command_buffer)
+        .expect("capture submit must succeed")
+        .then_signal_fence_and_flush()
+        .expect("capture fence must flush")
+        .wait(None)
+    {
+        eprintln!("capture: GPU execution failed: {error}");
+        return 2;
+    }
+    // BGRA (swapchain order) → RGBA swizzle, row 0 = top (NDC +1 =
+    // top invariant, NFR5) straight into the PNG encoder.
+    let pixels = {
+        let guard = readback.read().expect("capture readback must map");
+        let mut rgba = guard.to_vec();
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        rgba
+    };
+    debug_assert_eq!(pixels.len(), w as usize * h as usize * 4);
+    let png = match encode_png_rgba8(w, h, &pixels) {
+        Ok(png) => png,
+        Err(error) => {
+            eprintln!("capture: PNG encode failed: {error}");
+            return 3;
+        }
+    };
+    if let Err(error) = std::fs::write(&request.path, &png) {
+        eprintln!("capture: cannot write {}: {error}", request.path);
+        return 3;
+    }
+    let view_name = match request.view {
+        CaptureView::Inspector => "inspector",
+        CaptureView::Slab => "slab",
+        CaptureView::Demo => "demo",
+        CaptureView::Vista => "vista",
+    };
+    println!(
+        "capture saved: {} (view {view_name}, seed {seed}, {w}x{h})",
+        request.path
+    );
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Pure UI builders (unit-tested below; the frame loop only converts).
 // ---------------------------------------------------------------------------
+
+/// Windowed-capture timestamp (`captures/<surface>-<seed>-<ts>.png`):
+/// UTC `yyyymmdd-hhmmss` from UNIX seconds, dependency-free (Hinnant's
+/// days-from-civil algorithm over u64). Exploration filenames only —
+/// DoD evidence always comes from `--capture` presets.
+fn capture_timestamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    // Days → civil date (Hinnant): all exact u64 math, valid for any
+    // non-negative day count.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    y += u64::from(m <= 2);
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        y,
+        m,
+        d,
+        tod / 3_600,
+        (tod % 3_600) / 60,
+        tod % 60
+    )
+}
+
+/// Current UTC timestamp for windowed captures; `unknown-time` when
+/// the clock is unavailable (never a panic on a dev tool path).
+fn capture_now_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| capture_timestamp(d.as_secs()))
+        .unwrap_or_else(|_| "unknown-time".to_owned())
+}
 
 /// Thousands separator for stats (`40962` → `"40,962"`).
 fn fmt_int(mut n: usize) -> String {
@@ -1607,7 +2639,7 @@ fn build_demo_ui(items: &mut UiItems, lh: f32, app: &mut DebugApp, area: Rect) {
         items,
         lh,
         rows.next(lh, 6.0),
-        "mouse steer · WASD cruise · click target · E fly-to · Shift+wheel pace · P camera"
+        "mouse steer · WASD cruise · click target · E fly-to · Shift+wheel pace · P camera · V vista (any input skips)"
             .to_owned(),
         C_DIM,
     );
@@ -1680,9 +2712,27 @@ fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -
             "right-drag: pan",
             "click: select node",
             "Home: top-down",
+            "S: slab mode",
+            "Shift+wheel: slab depth",
+            "[/]: slab thickness",
         ] {
             text_row(&mut items, lh, rows.next(lh, 6.0), hint.to_owned(), C_DIM);
         }
+        // Depth-window readout (`cosmic-depth-window` FR3).
+        text_row(
+            &mut items,
+            lh,
+            rows.next(lh, 6.0),
+            if inspector.slab.on {
+                format!(
+                    "slab {} Mpc @ {:.0} Mpc · 20°",
+                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                )
+            } else {
+                "slab off".to_owned()
+            },
+            C_DIM,
+        );
     }
 
     // ---- Right dock: SELECTION ----
@@ -1699,7 +2749,18 @@ fn build_cosmic_web_ui(atlas: &mut GlyphAtlas, app: &DebugApp, layout: Layout) -
                     &mut items,
                     lh,
                     rows.next(lh, 6.0),
-                    format!("node {}", node.node_index),
+                    format!(
+                        "node {} · tier {}",
+                        node.node_index,
+                        match game_debug::cosmic_hubs::HubTier::of(
+                            node.node_index as usize,
+                            cosmic.web.nodes.len()
+                        ) {
+                            game_debug::cosmic_hubs::HubTier::A => "A",
+                            game_debug::cosmic_hubs::HubTier::B => "B",
+                            game_debug::cosmic_hubs::HubTier::C => "C",
+                        }
+                    ),
                     C_TEXT,
                 );
                 text_row(
@@ -3110,6 +4171,34 @@ fn compose_overlay_ui(
         {
             draw_target_ring(items, center, TARGET_RING_R, C_WARN);
         }
+        // Vista intro hint (CVI-005/FR5): `press any key` fades in over
+        // the second hold second (debug-shell text, bottom-center over
+        // the viewport); gone once the dive starts or on skip. Alpha
+        // from `vista_hint_alpha` (pinned in lib tests).
+        {
+            use game_debug::cosmic_vista::vista_hint_alpha;
+            let vista = &cosmic.vista;
+            let alpha = vista_hint_alpha(vista.phase, vista.t);
+            if alpha > 0.0 {
+                let label = "press any key";
+                let w = label.len() as f32 * 8.0 + 24.0;
+                items.solid(
+                    Rect {
+                        x: vp.x + (vp.w - w) * 0.5,
+                        y: vp.y + vp.h - 52.0,
+                        w,
+                        h: 24.0,
+                    },
+                    [0.05, 0.06, 0.10, 0.80 * alpha],
+                );
+                items.text(
+                    label.to_owned(),
+                    vp.x + (vp.w - w) * 0.5 + 12.0,
+                    vp.y + vp.h - 52.0 + 17.0,
+                    [C_TEXT[0], C_TEXT[1], C_TEXT[2], alpha],
+                );
+            }
+        }
     }
     // Transition fade + notice banner (UMAP-017): a fullscreen black
     // ramp over the fresh layer, then a banner pill top-center of
@@ -3279,16 +4368,34 @@ fn build_widget(items: &mut UiItems, lh: f32, app: &DebugApp, win_w: f32, win_h:
             C_TEXT,
         );
     }
-    let body = Rect {
-        x: widget.x + ui::DOCK_PAD,
-        y: widget.y + ui::WIDGET_TAB_H + 4.0,
-        w: (widget.w - 2.0 * ui::DOCK_PAD).max(0.0),
-        h: (widget.h - ui::WIDGET_TAB_H - 12.0).max(0.0),
-    };
+    let body = widget_body_rect(widget);
     match app.widget_tab {
         WidgetTab::Fps => build_widget_fps(items, lh, app, body),
         WidgetTab::Console => build_widget_console(items, lh, app, body),
         WidgetTab::Inspector => build_widget_inspector(items, lh, app, body),
+    }
+}
+
+/// Widget body rect from the widget rect (shared by the draw and the
+/// fog-slider hit-test — one formula, two callers).
+fn widget_body_rect(widget: Rect) -> Rect {
+    Rect {
+        x: widget.x + ui::DOCK_PAD,
+        y: widget.y + ui::WIDGET_TAB_H + 4.0,
+        w: (widget.w - 2.0 * ui::DOCK_PAD).max(0.0),
+        h: (widget.h - ui::WIDGET_TAB_H - 12.0).max(0.0),
+    }
+}
+
+/// Demo-fog slider track (`cosmic-depth-window` FR5, debug-only):
+/// after the 4 inspector text rows + label row (all `lh + 4`), a
+/// 20 px track. Shared by the widget draw and the mouse hit-test.
+fn fog_slider_track(body: Rect, lh: f32) -> Rect {
+    Rect {
+        x: body.x,
+        y: body.y + 5.0 * (lh + 4.0),
+        w: body.w,
+        h: 20.0,
     }
 }
 
@@ -3352,6 +4459,28 @@ fn build_widget_inspector(items: &mut UiItems, lh: f32, app: &DebugApp, body: Re
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
     }
+    // Demo-fog slider (`cosmic-depth-window` FR5, debug-only): the
+    // track rect is shared with the mouse hit-test
+    // (`fog_slider_track`).
+    text_row(
+        items,
+        lh,
+        rows.next(lh, 4.0),
+        format!("demo fog:   {:.0} Mpc", app.cosmic.fog_l_mpc),
+        C_TEXT,
+    );
+    let track = fog_slider_track(body, lh);
+    items.solid(track, C_TRACK);
+    let knob_value = ui::Slider::new(30, 400, app.cosmic.fog_l_mpc as u32);
+    items.solid(
+        Rect {
+            x: knob_value.knob_x(track) - 5.0,
+            y: track.y + 1.0,
+            w: 10.0,
+            h: track.h - 2.0,
+        },
+        C_KNOB,
+    );
 }
 
 /// Widget FPS body: live numbers + a sparkline of the newest
@@ -3523,11 +4652,13 @@ struct ShaderSet {
     map_frag: Arc<ShaderModule>,
     glow_vert: Arc<ShaderModule>,
     glow_frag: Arc<ShaderModule>,
-    smoke_vert: Arc<ShaderModule>,
-    smoke_frag: Arc<ShaderModule>,
+    splat_vert: Arc<ShaderModule>,
+    splat_frag: Arc<ShaderModule>,
     post_vert: Arc<ShaderModule>,
-    bright_frag: Arc<ShaderModule>,
-    blur_frag: Arc<ShaderModule>,
+    prefilter_frag: Arc<ShaderModule>,
+    down_frag: Arc<ShaderModule>,
+    up_frag: Arc<ShaderModule>,
+    march_frag: Arc<ShaderModule>,
     resolve_frag: Arc<ShaderModule>,
 }
 
@@ -3544,25 +4675,37 @@ impl ShaderSet {
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
             glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
             glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
-            smoke_vert: compile_shader(device, ShaderKind::Vertex, SMOKE_VERT, "smoke vertex"),
-            smoke_frag: compile_shader(device, ShaderKind::Fragment, SMOKE_FRAG, "smoke fragment"),
+            splat_vert: compile_shader(device, ShaderKind::Vertex, SPLAT_VERT, "splat vertex"),
+            splat_frag: compile_shader(device, ShaderKind::Fragment, SPLAT_FRAG, "splat fragment"),
             post_vert: compile_shader(device, ShaderKind::Vertex, RESOLVE_VERT, "post vertex"),
-            bright_frag: compile_shader(
+            prefilter_frag: compile_shader(
                 device,
                 ShaderKind::Fragment,
-                BLOOM_BRIGHT_FRAG,
-                "bloom bright fragment",
+                BLOOM_PREFILTER_FRAG,
+                "bloom prefilter fragment",
             ),
-            blur_frag: compile_shader(
+            down_frag: compile_shader(
                 device,
                 ShaderKind::Fragment,
-                BLOOM_BLUR_FRAG,
-                "bloom blur fragment",
+                BLOOM_DOWN_FRAG,
+                "bloom down fragment",
+            ),
+            up_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                BLOOM_UP_FRAG,
+                "bloom up fragment",
+            ),
+            march_frag: compile_shader(
+                device,
+                ShaderKind::Fragment,
+                MARCH_FRAG,
+                "veil march fragment",
             ),
             resolve_frag: compile_shader(
                 device,
                 ShaderKind::Fragment,
-                &resolve_frag_bloom(),
+                &resolve_frag_bloom_march(),
                 "bloom resolve fragment",
             ),
         }
@@ -3856,27 +4999,26 @@ fn build_glow_pipeline(
     .expect("glow graphics pipeline must create")
 }
 
-/// Cosmic smoke-filament pipeline (smoke display): `TriangleList`
-/// over per-instance [`SmokeVertex`] records (the vertex shader
-/// expands `gl_VertexIndex` into camera-facing billboard quads),
-/// premultiplied-additive, no depth write (puffs accumulate like the
-/// glow sprites).
-fn build_smoke_pipeline(
+/// Cosmic tracer-splat pipeline (`cosmic-tracer-splat`): `PointList`
+/// over [`SplatVertex`] records, premultiplied-additive, no depth
+/// write — a pipeline *variant* of the glow path (same pass, same
+/// blend), not a new pass or draw.
+fn build_splat_pipeline(
     device: &Arc<Device>,
     shaders: &ShaderSet,
     render_pass: &Arc<RenderPass>,
 ) -> Arc<GraphicsPipeline> {
     let vs = shaders
-        .smoke_vert
+        .splat_vert
         .entry_point("main")
         .expect("vertex entry point");
     let fs = shaders
-        .smoke_frag
+        .splat_frag
         .entry_point("main")
         .expect("fragment entry point");
-    let vertex_input_state = SmokeVertex::per_instance()
+    let vertex_input_state = SplatVertex::per_vertex()
         .definition(&vs)
-        .expect("smoke vertex layout must match shader");
+        .expect("splat vertex layout must match shader");
     let (layout, stages) = pipeline_layout_for(device, vs, fs);
     let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
     GraphicsPipeline::new(
@@ -3886,7 +5028,7 @@ fn build_smoke_pipeline(
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
             input_assembly_state: Some(InputAssemblyState {
-                topology: PrimitiveTopology::TriangleList,
+                topology: PrimitiveTopology::PointList,
                 ..Default::default()
             }),
             viewport_state: Some(ViewportState::default()),
@@ -3914,7 +5056,7 @@ fn build_smoke_pipeline(
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .expect("smoke graphics pipeline must create")
+    .expect("splat graphics pipeline must create")
 }
 
 // ---------------------------------------------------------------------------
@@ -4084,35 +5226,83 @@ fn post_image_set(
     .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error}"))
 }
 
+/// Two-image descriptor set (coarse + fine at bindings 0–3 — the
+/// upsample pair): written against the pipeline layout explicitly,
+/// like the bloom-resolve pair below.
+fn post_image_pair_set(
+    allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline: &Arc<GraphicsPipeline>,
+    coarse: &Arc<ImageView>,
+    fine: &Arc<ImageView>,
+    sampler: &Arc<Sampler>,
+    what: &str,
+) -> Arc<DescriptorSet> {
+    let layout = pipeline.layout().set_layouts()[0].clone();
+    DescriptorSet::new(
+        allocator.clone(),
+        layout,
+        [
+            WriteDescriptorSet::image_view(0, coarse.clone()),
+            WriteDescriptorSet::sampler(1, sampler.clone()),
+            WriteDescriptorSet::image_view(2, fine.clone()),
+            WriteDescriptorSet::sampler(3, sampler.clone()),
+        ],
+        [],
+    )
+    .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error}"))
+}
+
 /// Per-window HDR bloom resources (cosmic views only): scene target +
-/// depth, half-res bloom chain targets, and the sampling sets. Each
-/// bloom target is written exactly once per frame and only read
-/// afterwards — never rewritten (an A/B ping-pong reuse pattern
-/// corrupted its images on Intel UHD 620, diagnosed via the
-/// `GAME_DEBUG_COSMIC_BLOOM=0` bisect). One frame executes at a time
-/// behind `previous_frame_end`, so one set of transients is enough.
-/// Rebuilt on swapchain recreate.
+/// depth, mip-bloom pyramid targets, and the sampling sets
+/// (`bloom-mip-chain`). Each bloom target is written exactly once per
+/// frame and only read afterwards — never rewritten (an A/B ping-pong
+/// reuse pattern corrupted its images on Intel UHD 620, diagnosed via
+/// the `GAME_DEBUG_COSMIC_BLOOM=0` bisect). One frame executes at a
+/// time behind `previous_frame_end`, so one set of transients is
+/// enough. Rebuilt on swapchain recreate.
 struct HdrChain {
     format: Format,
     // Views live on through the framebuffers + descriptor sets below;
     // only the framebuffers, sets, and extents are read per frame.
     scene_fb: Arc<Framebuffer>,
-    bloom_a_fb: Arc<Framebuffer>,
-    bloom_b_fb: Arc<Framebuffer>,
-    bloom_c_fb: Arc<Framebuffer>,
-    bloom_d_fb: Arc<Framebuffer>,
-    bloom_e_fb: Arc<Framebuffer>,
-    half_extent: [u32; 2],
-    bright_set: Arc<DescriptorSet>,
-    blur_a_set: Arc<DescriptorSet>,
-    blur_b_set: Arc<DescriptorSet>,
-    blur_c_set: Arc<DescriptorSet>,
-    blur_d_set: Arc<DescriptorSet>,
-    /// Resolve set sampling scene + final bloom (E).
+    /// Full scene extent (prefilter texel source).
+    scene_extent: [u32; 2],
+    /// Pyramid depth (3 Low / 4 Medium / 5 High).
+    levels: u8,
+    /// Down pyramid: `down[0]` at half res … `down[levels-1]`.
+    down: Vec<BloomLevel>,
+    /// Up pyramid, same extents, rebuilt coarse-to-fine.
+    up: Vec<BloomLevel>,
+    /// Prefilter set (samples the scene).
+    prefilter_set: Arc<DescriptorSet>,
+    /// `down_set[k]` samples `down[k]` (the `down[k]→down[k+1]` pass).
+    down_set: Vec<Arc<DescriptorSet>>,
+    /// `up_set[k]` samples the (`up[k+1]`, `down[k]`) pair (the
+    /// `up[k]` pass, `k < levels - 1`).
+    up_set: Vec<Arc<DescriptorSet>>,
+    /// March target (quarter-res HDR, `cosmic-gas-veil-v2`): written
+    /// once by the march pass, read only at the resolve. In sprites
+    /// mode the pass is skipped and the cleared target adds ~0.
+    march_fb: Arc<Framebuffer>,
+    /// March target extent (quarter of the scene extent).
+    march_extent: [u32; 2],
+    /// March set (samples the 3D density volume).
+    march_set: Arc<DescriptorSet>,
+    /// Resolve set sampling scene + `up[0]` + march.
     resolve_set: Arc<DescriptorSet>,
-    /// Resolve set sampling scene + bright extract (A): the
-    /// `GAME_DEBUG_COSMIC_BLOOM=0` path, where E is never written.
+    /// Resolve set sampling scene + `down[0]` + march: the
+    /// `GAME_DEBUG_COSMIC_BLOOM=0` path, where the ups are never
+    /// written.
     resolve_nobloom_set: Arc<DescriptorSet>,
+}
+
+/// One mip-bloom pyramid target: image + view + framebuffer + extent.
+/// Every target is written exactly once per frame, then only read.
+struct BloomLevel {
+    image: Arc<Image>,
+    view: Arc<ImageView>,
+    fb: Arc<Framebuffer>,
+    extent: [u32; 2],
 }
 
 fn upload_fill(
@@ -4255,20 +5445,38 @@ fn upload_map(
 fn upload_cosmic_glow(
     allocator: &Arc<StandardMemoryAllocator>,
     web: &WebDescriptor,
+    field: &WebField,
     seed: u64,
     origin: glam::DVec3,
+    veil_mode: game_debug::cosmic_veil::VeilMode,
 ) -> Subbuffer<[MapVertex]> {
-    let mut verts: Vec<MapVertex> = game_debug::cosmic_web::grain_cloud(web, seed, origin)
-        .iter()
-        .chain(game_debug::cosmic_web::glow_point_cloud(web, origin).iter())
-        .chain(game_debug::cosmic_web::bead_cloud(web, seed, origin).iter())
-        .chain(game_debug::cosmic_web::node_impostors(web, origin).iter())
-        .map(|(pos, color, misc)| MapVertex {
-            map_pos: *pos,
-            color: *color,
-            misc: *misc,
-        })
-        .collect();
+    // `cosmic-gas-veil-v2`: the glow buffer holds hub member galaxies
+    // + tiered hub impostors, plus — in sprites mode only — the grid
+    // cell-sprite veil (deterministic stride-2 subset, ~168k ≤ 200k
+    // Low budget; one body, never both). The old descriptor-glow veil
+    // is retired. Upload order is draw order for
+    // the alpha-blended point draw — veil, then members, then
+    // impostors so cores top the scatter.
+    use game_debug::cosmic_veil::{VeilMode, veil_sprites};
+    let to_vertex = |(pos, color, misc): &([f32; 3], [f32; 3], [f32; 3])| MapVertex {
+        map_pos: *pos,
+        color: *color,
+        misc: *misc,
+    };
+    let mut verts: Vec<MapVertex> = Vec::new();
+    if matches!(veil_mode, VeilMode::Sprites) {
+        verts.extend(veil_sprites(field, origin).iter().step_by(2).map(to_vertex));
+    }
+    verts.extend(
+        game_debug::cosmic_hubs::hub_members(web, seed, origin)
+            .iter()
+            .map(to_vertex),
+    );
+    verts.extend(
+        game_debug::cosmic_hubs::hub_impostors(web, origin)
+            .iter()
+            .map(to_vertex),
+    );
     if verts.is_empty() {
         // Degenerate params guard (vulkano rejects zero-length vertex
         // buffers): one transparent point, mirroring upload_sky_points.
@@ -4294,29 +5502,34 @@ fn upload_cosmic_glow(
     .expect("cosmic glow vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic smoke puffs as per-instance vertices (same
-/// origin frame as [`upload_cosmic_glow`], layout from
-/// [`cosmic_web`]). A degenerate empty set uploads one zero-alpha
-/// puff (rasterizes nothing — the radial falloff discards it).
-fn upload_cosmic_smoke(
+/// Upload the cosmic tracer splats (`cosmic-tracer-splat`): one
+/// 16 B [`SplatVertex`] per tracer at High (all tracers; Low/Medium
+/// stride subsets are the tier constants in `cosmic_splat`, drawn by
+/// device profiles — the windowed viewer has no tier switch). A
+/// degenerate empty set uploads one guard point (vulkano rejects
+/// zero-length vertex buffers).
+fn upload_cosmic_splats(
     allocator: &Arc<StandardMemoryAllocator>,
+    field: &WebField,
     web: &WebDescriptor,
-    seed: u64,
     origin: glam::DVec3,
-) -> Subbuffer<[SmokeVertex]> {
-    let mut verts: Vec<SmokeVertex> = game_debug::cosmic_web::smoke_puffs(web, seed, origin)
+) -> Subbuffer<[SplatVertex]> {
+    use game_debug::cosmic_splat::{SplatTier, splat_pack, splat_records};
+    let mut verts: Vec<SplatVertex> = splat_records(field, web, origin, SplatTier::High)
         .iter()
-        .map(|p| SmokeVertex {
-            pos_size: [p.pos[0], p.pos[1], p.pos[2], p.size_mpc],
-            rgba: p.rgba,
-            misc: [p.seed, p.tangent[0], p.tangent[1], p.tangent[2]],
+        .map(|r| {
+            let tint = r.class_tint >> 1;
+            let b = r.class_tint & 1 == 1;
+            SplatVertex {
+                pos: r.pos,
+                packed: splat_pack(r.overdensity.log2(), tint, b),
+            }
         })
         .collect();
     if verts.is_empty() {
-        verts.push(SmokeVertex {
-            pos_size: [0.0, 0.0, 0.0, 1.0],
-            rgba: [0.0, 0.0, 0.0, 0.0],
-            misc: [0.0, 0.0, 0.0, 0.0],
+        verts.push(SplatVertex {
+            pos: [0.0, 0.0, -900.0],
+            packed: game_debug::cosmic_splat::splat_pack(-8.0, 0, false),
         });
     }
     Buffer::from_iter(
@@ -4332,7 +5545,7 @@ fn upload_cosmic_smoke(
         },
         verts,
     )
-    .expect("cosmic smoke vertex buffer upload must succeed")
+    .expect("cosmic splat vertex buffer upload must succeed")
 }
 
 /// Upload the inspector player point: one origin-relative vertex (near-
@@ -4360,6 +5573,539 @@ fn upload_cosmic_player_point(
         }],
     )
     .expect("cosmic player point upload must succeed")
+}
+
+/// Upload the gas-veil density volume (`cosmic-gas-veil-v2` CGV-004):
+/// R8 3D texture from the field grid, one staging copy + fence wait
+/// (the atlas-upload shape). Returns image + view; the sampler is the
+/// shared linear post sampler.
+fn upload_veil_volume(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue: &Arc<Queue>,
+    device: &Arc<Device>,
+    field: &WebField,
+) -> Option<(Arc<Image>, Arc<ImageView>)> {
+    use game_debug::cosmic_veil::veil_volume_bytes;
+    let bytes = veil_volume_bytes(field);
+    let n = field.grid_cells;
+    if bytes.is_empty() || n == 0 {
+        return None;
+    }
+    let image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim3d,
+            format: Format::R8_UNORM,
+            extent: [n, n, n],
+            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .expect("veil volume image must create");
+    let staging = Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        bytes,
+    )
+    .expect("veil staging buffer must create");
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_buffer_allocator.clone(),
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .expect("veil command buffer builder must create");
+    builder
+        .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(staging, image.clone()))
+        .expect("veil copy must record");
+    let command_buffer = builder.build().expect("veil command buffer must build");
+    sync::now(device.clone())
+        .then_execute(queue.clone(), command_buffer)
+        .expect("veil upload must submit")
+        .then_signal_fence_and_flush()
+        .expect("veil fence must flush")
+        .wait(None)
+        .expect("veil upload must complete");
+    let view = ImageView::new_default(image.clone()).expect("veil volume view must create");
+    Some((image, view))
+}
+
+/// Veil body mode for this run: `GAME_DEBUG_COSMIC_VEIL` override, or
+/// High-tier march (the debug binary has no tier switch — windowed
+/// and capture both run the full march and stay pixel-identical, the
+/// splat-tier precedent).
+fn veil_mode() -> game_debug::cosmic_veil::VeilMode {
+    use game_debug::cosmic_veil::VeilMode;
+    match std::env::var("GAME_DEBUG_COSMIC_VEIL") {
+        Ok(value) => VeilMode::parse_override(&value).unwrap_or_else(|error| {
+            eprintln!("bad GAME_DEBUG_COSMIC_VEIL={value:?}: {error}; using march");
+            VeilMode::for_tier_high()
+        }),
+        Err(_) => VeilMode::for_tier_high(),
+    }
+}
+
+/// Shared cosmic HDR pre-pass recording (`cosmic-capture-harness`
+/// CAP-001 seam): indigo scene (glow then splats) + mip-bloom pyramid
+/// through the write-once targets. Called by the windowed
+/// frame loop AND the offscreen `--capture` path — one recording
+/// function, two targets (NFR1). Everything target-independent arrives
+/// as params; the transients ride `hdr`, the draws ride `frame`.
+#[allow(clippy::too_many_arguments)] // seam fn: explicit params are the no-drift guarantee
+fn record_cosmic_hdr_prepass(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: &HdrChain,
+    frame: &CosmicFrame,
+    glow_exposure: f32,
+    redshift: f32,
+    params: &MipBloomParams,
+    bloom_enabled: bool,
+    splat_alpha_k: f32,
+) {
+    // Scene: indigo clear, glow then splats (smoke retired CGV-009).
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(COSMIC_BACKDROP.into()), Some(ClearValue::Depth(1.0))],
+                ..RenderPassBeginInfo::framebuffer(hdr.scene_fb.clone())
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )
+        .expect("HDR scene pass must begin")
+        .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
+        .expect("viewport must set")
+        .bind_pipeline_graphics(pipes.glow_scene.clone())
+        .expect("pipeline must bind")
+        .bind_vertex_buffers(0, frame.glow.clone())
+        .expect("vertex buffer must bind")
+        .push_constants(
+            pipes.glow_scene.layout().clone(),
+            0,
+            GlowPush {
+                mvp: frame.mvp,
+                px_scale: frame.px_scale,
+                exposure: glow_exposure,
+                redshift,
+                fog_l: frame.fog_l,
+                slab_center: frame.slab_center,
+                slab_half: frame.slab_half,
+            },
+        )
+        .expect("glow push constants must upload");
+    // SAFETY: same PointList contract as the galaxy map.
+    unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
+        .expect("HDR scene glow draw must record");
+    // Tracer splats (`cosmic-tracer-splat`): the field render rides
+    // the same scene pass through its own pipeline variant.
+    builder
+        .bind_pipeline_graphics(pipes.splat_scene.clone())
+        .expect("pipeline must bind")
+        .bind_vertex_buffers(0, frame.splats.clone())
+        .expect("vertex buffer must bind")
+        .push_constants(
+            pipes.splat_scene.layout().clone(),
+            0,
+            SplatPush {
+                mvp: frame.mvp,
+                eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                px_scale: frame.px_scale,
+                exposure: glow_exposure,
+                redshift,
+                h0: SPLAT_H0,
+                alpha_k: splat_alpha_k,
+                fog_l: frame.fog_l,
+                slab_center: frame.slab_center,
+                slab_half: frame.slab_half,
+            },
+        )
+        .expect("splat push constants must upload");
+    // SAFETY: same PointList contract as the glow draw.
+    unsafe { builder.draw(frame.splats.len() as u32, 1, 0, 0) }
+        .expect("HDR scene splat draw must record");
+    builder
+        .end_render_pass(Default::default())
+        .expect("HDR scene pass must end");
+    // Mip-bloom pyramid (`bloom-mip-chain`): prefilter + downs +
+    // alias-free pass-through + ups, recorded from the same pass
+    // description the write-once pin checks.
+    record_bloom_chain(builder, pipes, hdr, params, bloom_enabled);
+}
+
+/// Fullscreen-triangle post-pass opener: black clear + viewport at
+/// the target extent. Shared by every mip-bloom pyramid pass.
+fn begin_post_pass(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    fb: Arc<Framebuffer>,
+    extent: [u32; 2],
+) -> &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer> {
+    let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
+    builder
+        .begin_render_pass(
+            RenderPassBeginInfo {
+                clear_values: vec![Some(black)],
+                ..RenderPassBeginInfo::framebuffer(fb)
+            },
+            SubpassBeginInfo {
+                contents: SubpassContents::Inline,
+                ..Default::default()
+            },
+        )
+        .expect("bloom pass must begin")
+        .set_viewport(
+            0,
+            [Viewport {
+                offset: [0.0, 0.0],
+                extent: [extent[0] as f32, extent[1] as f32],
+                depth_range: 0.0..=1.0,
+            }]
+            .into_iter()
+            .collect(),
+        )
+        .expect("viewport must set")
+}
+
+/// Execute the mip-bloom pyramid (`bloom-mip-chain` BMC-003/004):
+/// soft-knee prefilter (scene → `down[0]`) + downs + alias-free
+/// pass-through (`down[last]` → `up[last]` exact image copy, never a
+/// filtered blit) + tent ups. The passes follow the same
+/// `describe_bloom_chain` description the write-once pin checks
+/// (debug-asserted — zero cost in release). Every level image is
+/// written once, then only read — never ping-ponged (Intel rule).
+fn record_bloom_chain(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: &HdrChain,
+    params: &MipBloomParams,
+    bloom_enabled: bool,
+) {
+    use game_debug::cosmic_bloom::{
+        BloomPassKind, assert_write_once, bloom_img_down, bloom_img_up, describe_bloom_chain,
+        describe_bloom_chain_bloom_off, describe_veil_chain,
+    };
+    debug_assert_eq!(
+        params.levels, hdr.levels,
+        "bloom params and chain must agree on levels"
+    );
+    let levels = hdr.levels;
+    let descs = if bloom_enabled {
+        describe_bloom_chain(levels)
+    } else {
+        describe_bloom_chain_bloom_off(levels)
+    };
+    debug_assert!(
+        assert_write_once(&descs).is_ok(),
+        "bloom description must be write-once"
+    );
+    // The veil march extends the same description (CGV-006); assert
+    // the covered form too — zero cost in release.
+    debug_assert!(
+        assert_write_once(&describe_veil_chain(levels, true, bloom_enabled)).is_ok(),
+        "veil chain must be write-once"
+    );
+    for desc in &descs {
+        match desc.kind {
+            BloomPassKind::Prefilter => {
+                let target = &hdr.down[0];
+                begin_post_pass(builder, target.fb.clone(), target.extent)
+                    .bind_pipeline_graphics(pipes.prefilter.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.prefilter.layout().clone(),
+                        0,
+                        hdr.prefilter_set.clone(),
+                    )
+                    .expect("bloom prefilter set must bind")
+                    .push_constants(
+                        pipes.prefilter.layout().clone(),
+                        0,
+                        BloomPrefilterPush {
+                            threshold: params.threshold,
+                            knee: params.knee,
+                            texel: [
+                                1.0 / hdr.scene_extent[0] as f32,
+                                1.0 / hdr.scene_extent[1] as f32,
+                            ],
+                        },
+                    )
+                    .expect("bloom prefilter push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex
+                // input — 3 unbuffered vertices are the whole draw.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom prefilter draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom prefilter pass must end");
+            }
+            BloomPassKind::Down => {
+                let k = (desc.writes - bloom_img_down(0)) as usize;
+                let src = &hdr.down[k - 1];
+                let dst = &hdr.down[k];
+                begin_post_pass(builder, dst.fb.clone(), dst.extent)
+                    .bind_pipeline_graphics(pipes.down.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.down.layout().clone(),
+                        0,
+                        hdr.down_set[k - 1].clone(),
+                    )
+                    .expect("bloom down set must bind")
+                    .push_constants(
+                        pipes.down.layout().clone(),
+                        0,
+                        BloomDownPush {
+                            texel: [1.0 / src.extent[0] as f32, 1.0 / src.extent[1] as f32],
+                        },
+                    )
+                    .expect("bloom down push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex input.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom down draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom down pass must end");
+            }
+            BloomPassKind::PassThrough => {
+                // Alias-free copy: the smallest up level equals the
+                // smallest down level via one exact image copy (a tiny
+                // draw that keeps the "one writer per image" rule
+                // simple — never an alias, never a blit).
+                let last = usize::from(levels) - 1;
+                builder
+                    .copy_image(CopyImageInfo::images(
+                        hdr.down[last].image.clone(),
+                        hdr.up[last].image.clone(),
+                    ))
+                    .expect("bloom pass-through copy must record");
+            }
+            BloomPassKind::Up => {
+                let k = (desc.writes - bloom_img_up(levels, 0)) as usize;
+                let dst = &hdr.up[k];
+                begin_post_pass(builder, dst.fb.clone(), dst.extent)
+                    .bind_pipeline_graphics(pipes.up.clone())
+                    .expect("pipeline must bind")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipes.up.layout().clone(),
+                        0,
+                        hdr.up_set[k].clone(),
+                    )
+                    .expect("bloom up set must bind")
+                    .push_constants(
+                        pipes.up.layout().clone(),
+                        0,
+                        BloomUpPush {
+                            weight: params.level_weights[k + 1],
+                        },
+                    )
+                    .expect("bloom up push must upload");
+                // SAFETY: fullscreen-triangle pipeline, no vertex input.
+                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom up draw must record");
+                builder
+                    .end_render_pass(Default::default())
+                    .expect("bloom up pass must end");
+            }
+            BloomPassKind::Resolve => {
+                // The composite resolve lives in the view arm (main
+                // pass), never in the pyramid.
+            }
+            BloomPassKind::March => {
+                // The veil march records separately
+                // (`record_veil_march`, after the pyramid) — never
+                // inside the bloom chain.
+            }
+        }
+    }
+}
+
+/// Execute the gas-veil march (`cosmic-gas-veil-v2` CGV-005/006):
+/// one fullscreen pass into the quarter-res march target (the
+/// `March` row of the veil pass description — write-once pinned).
+/// Call between the bloom pyramid and the view arm; skipped in
+/// sprites mode (the cleared target then adds ~0 at the resolve).
+fn record_veil_march(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: &HdrChain,
+    march: &MarchPush,
+) {
+    begin_post_pass(builder, hdr.march_fb.clone(), hdr.march_extent)
+        .bind_pipeline_graphics(pipes.march.clone())
+        .expect("pipeline must bind")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            pipes.march.layout().clone(),
+            0,
+            hdr.march_set.clone(),
+        )
+        .expect("veil march set must bind")
+        .push_constants(pipes.march.layout().clone(), 0, *march)
+        .expect("veil march push must upload");
+    // SAFETY: fullscreen-triangle pipeline, no vertex input.
+    unsafe { builder.draw(3, 1, 0, 0) }.expect("veil march draw must record");
+    builder
+        .end_render_pass(Default::default())
+        .expect("veil march pass must end");
+}
+
+/// Shared cosmic view-arm recording (CAP-001 seam, second half): the
+/// `ViewContent::CosmicWeb` arm of the main pass — HDR mode resolves
+/// the pre-recorded scene + bloom + march over the target, LDR bypass
+/// draws glow + splats direct, then the inspector player point.
+/// Called by the windowed frame loop (inside the swapchain pass,
+/// among the other views + UI) AND the offscreen `--capture` path
+/// (alone in its own pass) — one recording function, two targets.
+/// `viewport` is the per-view rect; `full_extent` sizes the HDR
+/// resolve triangle.
+#[allow(clippy::too_many_arguments)]
+fn record_cosmic_view_arm(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: Option<&HdrChain>,
+    bloom_enabled: bool,
+    frame: &CosmicFrame,
+    viewport: Viewport,
+    full_extent: [f32; 2],
+    glow_exposure: f32,
+    resolve_exposure: f32,
+    bloom_intensity: f32,
+    redshift: f32,
+    splat_alpha_k: f32,
+    march_gain: f32,
+    player_point: Subbuffer<[MapVertex]>,
+) {
+    if let Some(hdr) = hdr {
+        let full_vp = Viewport {
+            offset: [0.0, 0.0],
+            extent: full_extent,
+            depth_range: 0.0..=1.0,
+        };
+        // Full bloom chain: scene + final bloom (E).
+        // `GAME_DEBUG_COSMIC_BLOOM=0`: scene + bright
+        // extract (A) — E is never written there.
+        let resolve_set = if bloom_enabled {
+            hdr.resolve_set.clone()
+        } else {
+            hdr.resolve_nobloom_set.clone()
+        };
+        builder
+            .set_viewport(0, [full_vp.clone()].into_iter().collect())
+            .expect("viewport must set")
+            .bind_pipeline_graphics(pipes.resolve.clone())
+            .expect("pipeline must bind")
+            .bind_descriptor_sets(
+                PipelineBindPoint::Graphics,
+                pipes.resolve.layout().clone(),
+                0,
+                resolve_set,
+            )
+            .expect("bloom resolve set must bind")
+            .push_constants(
+                pipes.resolve.layout().clone(),
+                0,
+                BloomMarchResolvePush {
+                    exposure: resolve_exposure,
+                    intensity: bloom_intensity,
+                    march_gain,
+                },
+            )
+            .expect("bloom resolve push must upload");
+        // SAFETY: fullscreen-triangle pipeline, no vertex
+        // input — 3 unbuffered vertices are the whole draw.
+        unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom resolve draw must record");
+    } else {
+        let glow_len = frame.glow.len();
+        builder
+            .set_viewport(0, [viewport].into_iter().collect())
+            .expect("viewport must set")
+            .bind_pipeline_graphics(pipes.map_glow.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, frame.glow.clone())
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.map_glow.layout().clone(),
+                0,
+                GlowPush {
+                    mvp: frame.mvp,
+                    px_scale: frame.px_scale,
+                    exposure: glow_exposure,
+                    redshift,
+                    fog_l: frame.fog_l,
+                    slab_center: frame.slab_center,
+                    slab_half: frame.slab_half,
+                },
+            )
+            .expect("glow push constants must upload");
+        // SAFETY: same PointList contract as the galaxy map.
+        unsafe { builder.draw(glow_len as u32, 1, 0, 0) }.expect("cosmic glow draw must record");
+        // Tracer splats (`cosmic-tracer-splat`): same LDR bypass path
+        // through the splat pipeline variant.
+        builder
+            .bind_pipeline_graphics(pipes.splat.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, frame.splats.clone())
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.splat.layout().clone(),
+                0,
+                SplatPush {
+                    mvp: frame.mvp,
+                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
+                    px_scale: frame.px_scale,
+                    exposure: glow_exposure,
+                    redshift,
+                    h0: SPLAT_H0,
+                    alpha_k: splat_alpha_k,
+                    fog_l: frame.fog_l,
+                    slab_center: frame.slab_center,
+                    slab_half: frame.slab_half,
+                },
+            )
+            .expect("splat push constants must upload");
+        // SAFETY: same PointList contract as the glow draw.
+        unsafe { builder.draw(frame.splats.len() as u32, 1, 0, 0) }
+            .expect("cosmic splat draw must record");
+    }
+    if !frame.is_demo {
+        // Inspector player point: drawn last through the alpha map
+        // pipeline — after the resolve in HDR mode, so
+        // the marker stays legible over the glow. The
+        // pipeline bind is explicit: the previously
+        // bound pipeline here is `resolve` (HDR) or
+        // `map_glow` (LDR), whose push layouts are
+        // incompatible with `MapPush` (VUID-06425).
+        builder
+            .bind_pipeline_graphics(pipes.map.clone())
+            .expect("pipeline must bind")
+            .bind_vertex_buffers(0, player_point)
+            .expect("vertex buffer must bind")
+            .push_constants(
+                pipes.map.layout().clone(),
+                0,
+                MapPush {
+                    mvp: frame.mvp,
+                    px_scale: frame.px_scale,
+                    exposure: 1.0,
+                },
+            )
+            .expect("map push constants must upload");
+        // SAFETY: single-vertex PointList, no index buffer.
+        unsafe { builder.draw(1, 1, 0, 0) }.expect("cosmic player point draw must record");
+    }
 }
 
 /// Upload catalog-sky points as Backdrop sprites (`misc` = pixel size,
@@ -4580,17 +6326,26 @@ struct ViewerApp {
     map_vertices: Subbuffer<[MapVertex]>,
     system_points: Subbuffer<[MapVertex]>,
     system_lines: Subbuffer<[LineVertex]>,
-    /// Cosmic glow point buffer (grain + dwarf glow + node impostors,
-    /// update-2026-09-18-2328): uploaded relative to the demo upload
-    /// origin, rebuilt on reseed + rebase.
+    /// Cosmic glow point buffer (veil sprites in sprites mode, hub
+    /// members + impostors always; `cosmic-gas-veil-v2`): uploaded
+    /// relative to the demo upload origin, rebuilt on reseed + rebase.
     cosmic_glow: Subbuffer<[MapVertex]>,
-    /// Cosmic smoke puffs (instanced billboards, same origin frame).
-    cosmic_smoke: Subbuffer<[SmokeVertex]>,
+    /// Cosmic tracer splats (16 B vertices, same origin frame;
+    /// `cosmic-tracer-splat`).
+    cosmic_splats: Subbuffer<[SplatVertex]>,
     /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
     cosmic_tab_glow: Subbuffer<[MapVertex]>,
-    /// Inspector smoke puffs (fixed web-center origin).
-    cosmic_tab_smoke: Subbuffer<[SmokeVertex]>,
+    /// Inspector tracer splats (fixed web-center origin).
+    cosmic_tab_splats: Subbuffer<[SplatVertex]>,
+    /// Gas-veil density volume (`cosmic-gas-veil-v2`): R8 3D texture
+    /// uploaded once per seed from the field grid + view. Rebuilt on
+    /// reseed (never on rebase — rebase rides the march push origin).
+    /// `None` until the first upload (LDR bypass never needs it).
+    veil_volume: Option<(Arc<Image>, Arc<ImageView>)>,
+    /// Veil body mode (sprites on Low-tier override, march default):
+    /// read once at boot from `GAME_DEBUG_COSMIC_VEIL`.
+    veil_mode: game_debug::cosmic_veil::VeilMode,
     /// Inspector player point (one vertex, rebuilt per frame while the
     /// tab shows — the ship moves continuously).
     cosmic_tab_player: Subbuffer<[MapVertex]>,
@@ -4602,6 +6357,14 @@ struct ViewerApp {
     /// Astronomical): keys the sky-luminance input of the star
     /// fade-in (exposure-tone-mapping DoD-2 captures).
     twilight_stage: u8,
+    /// Fog-slider drag in the widget Inspector tab
+    /// (`cosmic-depth-window` FR5, debug-only).
+    dragging_fog: bool,
+    /// Windowed screenshot request (`F12`, `cosmic-capture-harness`):
+    /// the next frame copies its swapchain image to a host buffer and
+    /// writes `captures/<surface>-<seed>-<ts>.png`. Exploration only —
+    /// DoD evidence always comes from `--capture` presets.
+    pending_capture: bool,
     /// Partial sim-step accumulator for the transit countdown
     /// (fixed-step consumption of the frame dt).
     transit_acc: f32,
@@ -4651,6 +6414,8 @@ enum WalkDir {
 struct WindowContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
+    /// Swapchain images (F12 readback indexes the acquired one).
+    swapchain_images: Vec<Arc<Image>>,
     render_pass: Arc<RenderPass>,
     pipelines: Pipelines,
     framebuffers: Vec<Arc<Framebuffer>>,
@@ -4787,33 +6552,45 @@ impl ViewerApp {
         // Cosmic web for the demo tab (same master seed as the maps).
         let cosmic_origin = debug.cosmic.upload_origin;
         let cosmic_seed = debug.cosmic.seed;
+        let veil_mode = veil_mode();
         let cosmic_glow = upload_cosmic_glow(
             &memory_allocator,
             &debug.cosmic.web,
+            &debug.cosmic.field,
             cosmic_seed,
             cosmic_origin,
+            veil_mode,
         );
-        let cosmic_smoke = upload_cosmic_smoke(
+        let cosmic_splats = upload_cosmic_splats(
             &memory_allocator,
+            &debug.cosmic.field,
             &debug.cosmic.web,
-            cosmic_seed,
             cosmic_origin,
         );
         // Inspector buffers at the fixed web-center origin (WS5).
         let cosmic_tab_glow = upload_cosmic_glow(
             &memory_allocator,
             &debug.cosmic.web,
+            &debug.cosmic.field,
             cosmic_seed,
             glam::DVec3::ZERO,
+            veil_mode,
         );
-        let cosmic_tab_smoke = upload_cosmic_smoke(
+        let cosmic_tab_splats = upload_cosmic_splats(
             &memory_allocator,
+            &debug.cosmic.field,
             &debug.cosmic.web,
-            cosmic_seed,
             glam::DVec3::ZERO,
         );
         let cosmic_tab_player = upload_cosmic_player_point(&memory_allocator, [0.0, 0.0, 0.0]);
-        // Catalog sky over the cooker layout (`assets/catalog`); missing
+        // Gas-veil density volume (per seed; the march samples it).
+        let veil_volume = upload_veil_volume(
+            &memory_allocator,
+            &command_buffer_allocator,
+            &queue,
+            &device,
+            &debug.cosmic.field,
+        );
         // manifest ⇒ procedural fallback sky (model-only, logged). The
         // sky shares the universe seed so fallback content is stable
         // per seed.
@@ -4853,13 +6630,17 @@ impl ViewerApp {
             system_points,
             system_lines,
             cosmic_glow,
-            cosmic_smoke,
+            cosmic_splats,
             cosmic_tab_glow,
-            cosmic_tab_smoke,
+            cosmic_tab_splats,
             cosmic_tab_player,
+            veil_volume,
+            veil_mode,
             sky,
             sky_vertices,
             twilight_stage: 0,
+            dragging_fog: false,
+            pending_capture: false,
             transit_acc: 0.0,
             atlas_image: None,
             dragging_orbit: false,
@@ -4890,6 +6671,11 @@ impl ViewerApp {
         if self.debug.cosmic.tick(dt.max(1e-6) as f64) {
             self.debug.cosmic.rebased();
             self.refresh_cosmic();
+        }
+        // Vista intro (CVI-005/FR5): drain transition events into the
+        // Console (`vista: hold/dive/skipped/done`).
+        for event in self.debug.cosmic.vista_events.drain(..) {
+            self.debug.console.push(format!("vista: {event}"));
         }
     }
 
@@ -4940,20 +6726,62 @@ impl ViewerApp {
     fn refresh_cosmic(&mut self) {
         let origin = self.debug.cosmic.upload_origin;
         let seed = self.debug.cosmic.seed;
-        self.cosmic_glow =
-            upload_cosmic_glow(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
-        self.cosmic_smoke =
-            upload_cosmic_smoke(&self.memory_allocator, &self.debug.cosmic.web, seed, origin);
+        let veil_mode = self.veil_mode;
+        // Veil volume follows the seed (rebase rides the march push);
+        // the chain's march set samples it, so the chain rebuilds too
+        // (same path as swapchain recreate).
+        self.veil_volume = upload_veil_volume(
+            &self.memory_allocator,
+            &self.command_buffer_allocator,
+            &self.queue,
+            &self.device,
+            &self.debug.cosmic.field,
+        );
+        if let Some(ctx) = self.main.as_mut() {
+            ctx.hdr = ctx.hdr_format.map(|format| {
+                Self::build_hdr_chain(
+                    &self.memory_allocator,
+                    &self.descriptor_set_allocator,
+                    &self.post_sampler,
+                    format,
+                    ctx.swapchain.image_extent(),
+                    &ctx.scene_pass,
+                    &ctx.post_pass,
+                    &ctx.pipelines,
+                    &self
+                        .veil_volume
+                        .as_ref()
+                        .expect("veil volume must upload with the field")
+                        .1,
+                )
+            });
+        }
+        self.cosmic_glow = upload_cosmic_glow(
+            &self.memory_allocator,
+            &self.debug.cosmic.web,
+            &self.debug.cosmic.field,
+            seed,
+            origin,
+            veil_mode,
+        );
+        self.cosmic_splats = upload_cosmic_splats(
+            &self.memory_allocator,
+            &self.debug.cosmic.field,
+            &self.debug.cosmic.web,
+            origin,
+        );
         self.cosmic_tab_glow = upload_cosmic_glow(
             &self.memory_allocator,
             &self.debug.cosmic.web,
+            &self.debug.cosmic.field,
             seed,
             glam::DVec3::ZERO,
+            veil_mode,
         );
-        self.cosmic_tab_smoke = upload_cosmic_smoke(
+        self.cosmic_tab_splats = upload_cosmic_splats(
             &self.memory_allocator,
+            &self.debug.cosmic.field,
             &self.debug.cosmic.web,
-            seed,
             glam::DVec3::ZERO,
         );
         tracing::info!(
@@ -4970,38 +6798,67 @@ impl ViewerApp {
     /// record identical draws. Also rebuilds the inspector player
     /// point (the ship moves continuously).
     fn cosmic_frame(&mut self, vp: Rect) -> CosmicFrame {
-        let (mvp, px_scale, is_demo, eye) = if self.debug.screen == Screen::GameDemo {
-            let camera = &self.debug.cosmic.camera;
-            // Eye in the demo buffer frame: world truth minus the
-            // upload (rebase) origin the demo buffers share.
-            let eye_w = camera.eye_world();
-            let origin = self.debug.cosmic.upload_origin;
-            (
-                camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
-                camera.px_scale(vp.h),
-                true,
-                [
-                    (eye_w.x - origin.x) as f32,
-                    (eye_w.y - origin.y) as f32,
-                    (eye_w.z - origin.z) as f32,
-                ],
-            )
+        // Depth window (`cosmic-depth-window`): the demo fades past
+        // ~2 fog lengths into the backdrop (length on the dev-widget
+        // slider, default 90 Mpc); the inspector shows the
+        // full depth unless slab mode windows it.
+        let (mvp, px_scale, is_demo, eye, fog_l, slab_center, slab_half) =
+            if self.debug.screen == Screen::GameDemo {
+                let camera = &self.debug.cosmic.camera;
+                // Eye in the demo buffer frame: world truth minus the
+                // upload (rebase) origin the demo buffers share.
+                let eye_w = camera.eye_world();
+                let origin = self.debug.cosmic.upload_origin;
+                // Vista intro (CVI-005): while active, fog/slab ride the
+                // interpolated pose (slab view → immersive values); the
+                // MVP already follows via the camera's external pose.
+                // Done restores the slider fog with the slab off.
+                let (fog_l, slab_center, slab_half) = if self.debug.cosmic.vista_active() {
+                    let pose = self.debug.cosmic.vista.pose();
+                    (pose.fog_l_mpc(), pose.slab_center_mpc, pose.slab_half_mpc)
+                } else {
+                    (self.debug.cosmic.fog_l_mpc, 0.0, 0.0)
+                };
+                (
+                    camera.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                    camera.px_scale(vp.h),
+                    true,
+                    [
+                        (eye_w.x - origin.x) as f32,
+                        (eye_w.y - origin.y) as f32,
+                        (eye_w.z - origin.z) as f32,
+                    ],
+                    fog_l,
+                    slab_center,
+                    slab_half,
+                )
+            } else {
+                let inspector = &self.debug.cosmic_inspector;
+                // Inspector buffers use the web-center (zero) origin, the
+                // same frame the inspector camera's eye is already in.
+                let e = inspector.camera.eye();
+                let (slab_center, slab_half) = if inspector.slab.on {
+                    (
+                        inspector.slab.center_mpc,
+                        inspector.slab.thickness_mpc * 0.5,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                (
+                    inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
+                    inspector.camera.px_scale(vp.h),
+                    false,
+                    [e.x, e.y, e.z],
+                    0.0,
+                    slab_center,
+                    slab_half,
+                )
+            };
+        let (glow, splats) = if is_demo {
+            (self.cosmic_glow.clone(), self.cosmic_splats.clone())
         } else {
-            let inspector = &self.debug.cosmic_inspector;
-            // Inspector buffers use the web-center (zero) origin, the
-            // same frame the inspector camera's eye is already in.
-            let e = inspector.camera.eye();
-            (
-                inspector.view_proj(vp.w / vp.h).to_cols_array_2d(),
-                inspector.camera.px_scale(vp.h),
-                false,
-                [e.x, e.y, e.z],
-            )
-        };
-        let (smoke, glow) = if is_demo {
-            (self.cosmic_smoke.clone(), self.cosmic_glow.clone())
-        } else {
-            (self.cosmic_tab_smoke.clone(), self.cosmic_tab_glow.clone())
+            (self.cosmic_tab_glow.clone(), self.cosmic_tab_splats.clone())
         };
         if !is_demo {
             let ship = self.debug.cosmic.player.position_mpc();
@@ -5010,19 +6867,82 @@ impl ViewerApp {
                 [ship.x as f32, ship.y as f32, ship.z as f32],
             );
         }
+        // Veil march push (CGV-005): origin + sphere + grid ride the
+        // buffer frame of the active surface (demo origin vs web
+        // center); steps from this run's veil mode.
+        let march_origin = if is_demo {
+            self.debug.cosmic.upload_origin
+        } else {
+            glam::DVec3::ZERO
+        };
+        let march_steps = match self.veil_mode {
+            game_debug::cosmic_veil::VeilMode::Sprites => 0,
+            game_debug::cosmic_veil::VeilMode::March { steps } => steps,
+        };
+        let march = march_push_for(
+            mvp,
+            eye,
+            march_origin,
+            &self.debug.cosmic.field,
+            self.debug.cosmic.params.descriptor_radius_mpc as f32,
+            fog_l,
+            slab_center,
+            slab_half,
+            march_steps,
+        );
         CosmicFrame {
             mvp,
             px_scale,
             is_demo,
             eye,
-            smoke,
             glow,
+            splats,
+            fog_l,
+            slab_center,
+            slab_half,
+            march,
             viewport: Viewport {
                 offset: [vp.x, vp.y],
                 extent: [vp.w, vp.h],
                 depth_range: 0.0..=1.0,
             },
         }
+    }
+
+    /// Toggle the inspector slab (`S` on the Cosmic Web tab,
+    /// `cosmic-depth-window` FR3): slab mode narrows to 20°
+    /// near-orthographic (framing kept by the distance rescale) around
+    /// a 30 Mpc slice at the orbit target's view depth; toggling back
+    /// restores 60° and the previous framing. Scroll roams the full
+    /// sphere depth (clamp ±2600 Mpc — the `SlabState::scroll` radius
+    /// is absolute view depth here, not target-relative).
+    fn toggle_cosmic_slab(&mut self) {
+        use game_debug::cosmic_window::SlabState;
+        let inspector = &mut self.debug.cosmic_inspector;
+        if inspector.slab.on {
+            inspector.slab = SlabState::off();
+            inspector.camera.set_fov_keep_framing(60.0);
+            self.debug.fx.notify("slab off".to_owned());
+        } else {
+            let eye = inspector.camera.eye();
+            let fwd = (inspector.camera.target() - eye).normalize_or_zero();
+            let t = inspector.camera.target();
+            let depth =
+                ((t.x - eye.x) * fwd.x + (t.y - eye.y) * fwd.y + (t.z - eye.z) * fwd.z).max(0.0);
+            let mut slab = SlabState::default_on();
+            slab.center_mpc = depth;
+            inspector.slab = slab;
+            inspector.camera.set_fov_keep_framing(20.0);
+            self.debug.fx.notify(format!(
+                "slab {} Mpc @ {:.0} Mpc",
+                inspector.slab.thickness_mpc, depth
+            ));
+        }
+        tracing::info!(
+            on = self.debug.cosmic_inspector.slab.on,
+            fov = self.debug.cosmic_inspector.camera.fov_y(),
+            "cosmic slab toggled"
+        );
     }
 
     /// Reseed the cosmic demo (web + player + camera + HUD) and rebuild
@@ -5283,24 +7203,40 @@ impl ViewerApp {
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
             map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
-            smoke: build_smoke_pipeline(&self.device, &self.shaders, &render_pass),
+            splat: build_splat_pipeline(&self.device, &self.shaders, &render_pass),
             glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
-            smoke_scene: build_smoke_pipeline(&self.device, &self.shaders, &scene_pass),
-            bright: build_post_pipeline(
+            splat_scene: build_splat_pipeline(&self.device, &self.shaders, &scene_pass),
+            prefilter: build_post_pipeline(
                 &self.device,
-                &self.shaders.bright_frag,
+                &self.shaders.prefilter_frag,
                 &self.shaders.post_vert,
                 &post_pass,
                 None,
-                "bloom bright",
+                "bloom prefilter",
             ),
-            blur: build_post_pipeline(
+            down: build_post_pipeline(
                 &self.device,
-                &self.shaders.blur_frag,
+                &self.shaders.down_frag,
                 &self.shaders.post_vert,
                 &post_pass,
                 None,
-                "bloom blur",
+                "bloom down",
+            ),
+            up: build_post_pipeline(
+                &self.device,
+                &self.shaders.up_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "bloom up",
+            ),
+            march: build_post_pipeline(
+                &self.device,
+                &self.shaders.march_frag,
+                &self.shaders.post_vert,
+                &post_pass,
+                None,
+                "veil march",
             ),
             resolve: build_post_pipeline(
                 &self.device,
@@ -5331,99 +7267,173 @@ impl ViewerApp {
     /// bypass (no transients — the cosmic draws go direct). Associated
     /// function (not a method) so the recreate path can pass disjoint
     /// `self` fields alongside the `&mut` window context.
+    #[allow(clippy::too_many_arguments)] // builder fn: explicit resources, two call sites + capture
     fn build_hdr_chain(
         memory_allocator: &Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         post_sampler: &Arc<Sampler>,
-        ctx: &WindowContext,
-    ) -> Option<HdrChain> {
-        let format = ctx.hdr_format?;
-        let extent = ctx.swapchain.image_extent();
-        let half = [extent[0].max(2) / 2, extent[1].max(2) / 2];
+        format: Format,
+        extent: [u32; 2],
+        scene_pass: &Arc<RenderPass>,
+        post_pass: &Arc<RenderPass>,
+        pipes: &Pipelines,
+        march_volume: &Arc<ImageView>,
+    ) -> HdrChain {
+        let levels = BLOOM_LEVELS;
         let scene_view = create_post_view(memory_allocator, extent, format, "HDR scene");
         let scene_depth = create_depth_view(memory_allocator, extent);
         let scene_fb = Framebuffer::new(
-            ctx.scene_pass.clone(),
+            scene_pass.clone(),
             FramebufferCreateInfo {
                 attachments: vec![scene_view.clone(), scene_depth.clone()],
                 ..Default::default()
             },
         )
         .expect("HDR scene framebuffer must create");
-        // Five dedicated bloom targets (A–E): bright→A, blur-H A→B,
-        // blur-V B→C, wide-H C→D, wide-V D→E(final). No target is
-        // ever rewritten — see the `HdrChain` doc.
-        let mut bloom_views = Vec::with_capacity(5);
-        let mut bloom_fbs = Vec::with_capacity(5);
-        for what in ["A", "B", "C", "D", "E"] {
-            let view = create_post_view(memory_allocator, half, format, what);
-            let fb = Framebuffer::new(
-                ctx.post_pass.clone(),
-                FramebufferCreateInfo {
-                    attachments: vec![view.clone()],
-                    ..Default::default()
-                },
-            )
-            .unwrap_or_else(|error| panic!("bloom {what} framebuffer must create: {error:?}"));
-            bloom_views.push(view);
-            bloom_fbs.push(fb);
+        // Mip pyramid (`bloom-mip-chain`): `down[k]` at `extent >>
+        // (k+1)` (floored at 1 px), `up[k]` at the same extents. Every
+        // level is its own image — written once, then only read.
+        let level_extent = |k: u8| {
+            [
+                (extent[0] >> (u32::from(k) + 1)).max(1),
+                (extent[1] >> (u32::from(k) + 1)).max(1),
+            ]
+        };
+        let mut down = Vec::with_capacity(usize::from(levels));
+        let mut up = Vec::with_capacity(usize::from(levels));
+        for k in 0..levels {
+            for (pyramid, what) in [(&mut down, "down"), (&mut up, "up")] {
+                let ext = level_extent(k);
+                // TRANSFER_SRC + TRANSFER_DST: the alias-free
+                // pass-through copies `down[last]` → `up[last]` with an
+                // exact image copy (never a filtered blit).
+                let image = Image::new(
+                    memory_allocator.clone(),
+                    ImageCreateInfo {
+                        image_type: ImageType::Dim2d,
+                        format,
+                        extent: [ext[0], ext[1], 1],
+                        usage: ImageUsage::COLOR_ATTACHMENT
+                            | ImageUsage::SAMPLED
+                            | ImageUsage::TRANSFER_SRC
+                            | ImageUsage::TRANSFER_DST,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("bloom {what}[{k}] image must create: {error}"));
+                let view = ImageView::new_default(image.clone())
+                    .unwrap_or_else(|error| panic!("bloom {what}[{k}] view must create: {error}"));
+                let fb = Framebuffer::new(
+                    post_pass.clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![view.clone()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!("bloom {what}[{k}] framebuffer must create: {error:?}")
+                });
+                pyramid.push(BloomLevel {
+                    image,
+                    view,
+                    fb,
+                    extent: ext,
+                });
+            }
         }
-        let pipes = &ctx.pipelines;
-        let bright_set = post_image_set(
+        let prefilter_set = post_image_set(
             descriptor_set_allocator,
-            &pipes.bright,
+            &pipes.prefilter,
             &scene_view,
             post_sampler,
-            "bloom bright",
+            "bloom prefilter",
         );
-        let mut blur_sets = Vec::with_capacity(4);
-        for (view, tag) in bloom_views.iter().zip(["A", "B", "C", "D"]) {
-            blur_sets.push(post_image_set(
+        let mut down_set = Vec::with_capacity(usize::from(levels));
+        for (k, level) in down.iter().enumerate() {
+            down_set.push(post_image_set(
                 descriptor_set_allocator,
-                &pipes.blur,
-                view,
+                &pipes.down,
+                &level.view,
                 post_sampler,
-                &format!("bloom blur {tag}"),
+                &format!("bloom down[{k}]"),
             ));
         }
-        // Resolve samples two images (scene + final bloom): the second
-        // pair is written against the same layout explicitly.
+        // Up sets sample the (coarse, fine) pair for levels below the
+        // top: `up[k] = tent(up[k+1])·w + down[k]`.
+        let mut up_set = Vec::with_capacity(usize::from(levels).saturating_sub(1));
+        for k in 0..levels.saturating_sub(1) {
+            up_set.push(post_image_pair_set(
+                descriptor_set_allocator,
+                &pipes.up,
+                &up[usize::from(k) + 1].view,
+                &down[usize::from(k)].view,
+                post_sampler,
+                &format!("bloom up[{k}]"),
+            ));
+        }
+        // Resolve samples scene + pyramid top + march target: the
+        // third pair is written against the same layout explicitly.
         let resolve_layout = pipes.resolve.layout().set_layouts()[0].clone();
-        let resolve_pair = |bloom_view: &Arc<ImageView>, what: &str| {
-            DescriptorSet::new(
-                descriptor_set_allocator.clone(),
-                resolve_layout.clone(),
-                [
-                    WriteDescriptorSet::image_view(0, scene_view.clone()),
-                    WriteDescriptorSet::sampler(1, post_sampler.clone()),
-                    WriteDescriptorSet::image_view(2, bloom_view.clone()),
-                    WriteDescriptorSet::sampler(3, post_sampler.clone()),
-                ],
-                [],
-            )
-            .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error:?}"))
-        };
-        let resolve_set = resolve_pair(&bloom_views[4], "bloom resolve");
-        let resolve_nobloom_set = resolve_pair(&bloom_views[0], "bloom resolve nobloom");
-        let mut fbs = bloom_fbs.into_iter();
-        let mut sets = blur_sets.into_iter();
-        Some(HdrChain {
+        let resolve_pair =
+            |bloom_view: &Arc<ImageView>, march_view: &Arc<ImageView>, what: &str| {
+                DescriptorSet::new(
+                    descriptor_set_allocator.clone(),
+                    resolve_layout.clone(),
+                    [
+                        WriteDescriptorSet::image_view(0, scene_view.clone()),
+                        WriteDescriptorSet::sampler(1, post_sampler.clone()),
+                        WriteDescriptorSet::image_view(2, bloom_view.clone()),
+                        WriteDescriptorSet::sampler(3, post_sampler.clone()),
+                        WriteDescriptorSet::image_view(4, march_view.clone()),
+                        WriteDescriptorSet::sampler(5, post_sampler.clone()),
+                    ],
+                    [],
+                )
+                .unwrap_or_else(|error| panic!("{what} descriptor set must create: {error:?}"))
+            };
+        // March target (`cosmic-gas-veil-v2`): quarter-res HDR, own
+        // framebuffer under the post pass — written once by the march
+        // pass, read only at the resolve. In sprites mode the pass is
+        // skipped and the cleared target adds ~0.
+        let march_extent = [(extent[0] / 4).max(1), (extent[1] / 4).max(1)];
+        let march_view = create_post_view(memory_allocator, march_extent, format, "veil march");
+        let march_fb = Framebuffer::new(
+            post_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![march_view.clone()],
+                ..Default::default()
+            },
+        )
+        .expect("veil march framebuffer must create");
+        let march_set = post_image_set(
+            descriptor_set_allocator,
+            &pipes.march,
+            march_volume,
+            post_sampler,
+            "veil march volume",
+        );
+        let resolve_set = resolve_pair(&up[0].view, &march_view, "bloom resolve");
+        let resolve_nobloom_set = resolve_pair(&down[0].view, &march_view, "bloom resolve nobloom");
+        HdrChain {
             format,
             scene_fb,
-            bloom_a_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_b_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_c_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_d_fb: fbs.next().expect("five bloom framebuffers"),
-            bloom_e_fb: fbs.next().expect("five bloom framebuffers"),
-            half_extent: half,
-            bright_set,
-            blur_a_set: sets.next().expect("four bloom sets"),
-            blur_b_set: sets.next().expect("four bloom sets"),
-            blur_c_set: sets.next().expect("four bloom sets"),
-            blur_d_set: sets.next().expect("four bloom sets"),
+            scene_extent: extent,
+            levels,
+            down,
+            up,
+            prefilter_set,
+            down_set,
+            up_set,
+            march_fb,
+            march_extent,
+            march_set,
             resolve_set,
             resolve_nobloom_set,
-        })
+        }
     }
 }
 
@@ -5434,15 +7444,19 @@ struct Pipelines {
     map: Arc<GraphicsPipeline>,
     /// Cosmic glow sprites (additive, update-2026-09-18-2328).
     map_glow: Arc<GraphicsPipeline>,
-    /// Cosmic smoke filaments (additive instanced billboards).
-    smoke: Arc<GraphicsPipeline>,
+    /// Cosmic tracer splats (additive variant, `cosmic-tracer-splat`).
+    splat: Arc<GraphicsPipeline>,
     /// Scene-pass variants of the cosmic pipelines (HDR mode).
     glow_scene: Arc<GraphicsPipeline>,
-    smoke_scene: Arc<GraphicsPipeline>,
-    /// Bloom bright extract (post pass).
-    bright: Arc<GraphicsPipeline>,
-    /// Separable blur step (post pass, axis via push).
-    blur: Arc<GraphicsPipeline>,
+    splat_scene: Arc<GraphicsPipeline>,
+    /// Mip-bloom prefilter (scene → down[0], post pass).
+    prefilter: Arc<GraphicsPipeline>,
+    /// Mip-bloom downsample step (post pass).
+    down: Arc<GraphicsPipeline>,
+    /// Mip-bloom upsample step (post pass).
+    up: Arc<GraphicsPipeline>,
+    /// Gas-veil raymarch (quarter-res target, post pass).
+    march: Arc<GraphicsPipeline>,
     /// Bloom-composite ACES resolve (main pass).
     resolve: Arc<GraphicsPipeline>,
 }
@@ -5496,7 +7510,7 @@ impl ViewerApp {
                     min_image_count: capabilities.min_image_count.max(2),
                     image_format,
                     image_extent: window_size.into(),
-                    image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
                     composite_alpha: capabilities
                         .supported_composite_alpha
                         .into_iter()
@@ -5514,6 +7528,7 @@ impl ViewerApp {
         let mut ctx = WindowContext {
             window,
             swapchain,
+            swapchain_images: images.clone(),
             render_pass,
             pipelines,
             framebuffers,
@@ -5529,12 +7544,23 @@ impl ViewerApp {
             post_pass,
             hdr: None,
         };
-        ctx.hdr = Self::build_hdr_chain(
-            &self.memory_allocator,
-            &self.descriptor_set_allocator,
-            &self.post_sampler,
-            &ctx,
-        );
+        ctx.hdr = ctx.hdr_format.map(|format| {
+            Self::build_hdr_chain(
+                &self.memory_allocator,
+                &self.descriptor_set_allocator,
+                &self.post_sampler,
+                format,
+                ctx.swapchain.image_extent(),
+                &ctx.scene_pass,
+                &ctx.post_pass,
+                &ctx.pipelines,
+                &self
+                    .veil_volume
+                    .as_ref()
+                    .expect("veil volume must upload at boot")
+                    .1,
+            )
+        });
         if let Some(chain) = ctx.hdr.as_ref() {
             tracing::info!(format = ?chain.format, "HDR cosmic post chain active");
         } else {
@@ -5605,7 +7631,18 @@ impl ViewerApp {
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x as f32, position.y as f32);
                 let content = self.debug.screen_content();
-                if self.dragging_slider {
+                if self.dragging_fog {
+                    // Demo-fog slider drag (`cosmic-depth-window` FR5).
+                    if let Some(ctx) = self.main.as_ref() {
+                        let (w, h) = ctx.size();
+                        let lh = self.atlas.line_height();
+                        let track = fog_slider_track(widget_body_rect(ui::widget_rect(w, h)), lh);
+                        let mut slider =
+                            ui::Slider::new(30, 400, self.debug.cosmic.fog_l_mpc as u32);
+                        slider.drag_to(track, cursor.0);
+                        self.debug.cosmic.fog_l_mpc = slider.value as f32;
+                    }
+                } else if self.dragging_slider {
                     if let Some(ctx) = self.main.as_ref() {
                         let (w, h) = ctx.size();
                         let viewer = &mut self.debug.viewer;
@@ -5661,6 +7698,12 @@ impl ViewerApp {
                             // its free-look angles). Checked before player
                             // mode: on this tab there is no walker view,
                             // so an armed walker must not swallow drags.
+                            // Vista intro (CVI-004): a ≥ 4 px drag skips
+                            // to Chase first; the drag then steers as
+                            // usual (controls live immediately after).
+                            if dx.hypot(dy) >= 4.0 {
+                                self.debug.cosmic.skip_vista();
+                            }
                             self.debug.cosmic.steer(dx, dy);
                         } else if content == Some(ViewContent::CosmicWeb) {
                             // Cosmic inspector tab: left-drag orbits the
@@ -5773,6 +7816,14 @@ impl ViewerApp {
                     self.dragging_orbit = false;
                     self.dragging_slider = false;
                     self.dragging_density = false;
+                    // Demo-fog slider release (`cosmic-depth-window`
+                    // FR5): Console logs the settled value.
+                    if self.dragging_fog {
+                        self.dragging_fog = false;
+                        let line = format!("demo fog {:.0} Mpc", self.debug.cosmic.fog_l_mpc);
+                        tracing::info!("{line}");
+                        self.debug.console.push(line);
+                    }
                     self.press_cursor = None;
                     if click
                         && content == Some(ViewContent::PlanetView)
@@ -5846,12 +7897,16 @@ impl ViewerApp {
                             .select_at(web, glam::DVec3::ZERO, (cx, cy), vp);
                     }
                     // Cosmic demo click: pick the nearest node as the
-                    // fly-to target (a miss clears it).
+                    // fly-to target (a miss clears it). Vista intro
+                    // (CVI-004/NFR2): the click skips to Chase first;
+                    // selection stays gated while the vista owns the
+                    // camera, so a skip-click never also selects.
                     if click
                         && matches!(self.debug.screen, Screen::GameDemo)
                         && in_viewport
                         && let Some((cx, cy)) = cursor
                     {
+                        self.debug.cosmic.skip_vista();
                         let layout = match self.main.as_ref() {
                             Some(ctx) => {
                                 let (w, h) = ctx.size();
@@ -5934,6 +7989,20 @@ impl ViewerApp {
                         for (i, tab) in WidgetTab::ALL.iter().enumerate() {
                             if ui::widget_tab_button(widget, i).contains(cx, cy) {
                                 self.debug.select_widget_tab(*tab);
+                            }
+                        }
+                        // Demo-fog slider (`cosmic-depth-window` FR5):
+                        // Inspector tab body only.
+                        if self.debug.widget_tab == WidgetTab::Inspector {
+                            let body = widget_body_rect(widget);
+                            let track = fog_slider_track(body, self.atlas.line_height());
+                            if track.contains(cx, cy) {
+                                self.dragging_fog = true;
+                                let mut slider =
+                                    ui::Slider::new(30, 400, self.debug.cosmic.fog_l_mpc as u32);
+                                slider.drag_to(track, cx);
+                                self.debug.cosmic.fog_l_mpc = slider.value as f32;
+                                return;
                             }
                         }
                         return;
@@ -6059,6 +8128,12 @@ impl ViewerApp {
                     };
                     let content = self.debug.screen_content();
                     if matches!(self.debug.screen, Screen::GameDemo) {
+                        // Vista intro (CVI-004): wheel is ignored while
+                        // the vista owns the camera (no pace/zoom fight
+                        // mid-dive).
+                        if self.debug.cosmic.vista_active() {
+                            return;
+                        }
                         if self.shift_held {
                             // Cruise pace: wheel-up (positive scroll)
                             // tightens the pace (faster), wheel-down
@@ -6089,9 +8164,29 @@ impl ViewerApp {
                         let factor = (1.0 - 0.12 * scroll).max(0.05);
                         self.debug.system.camera.zoom_by(factor);
                     } else if content == Some(ViewContent::CosmicWeb) {
-                        // Inspector log-zoom (demo zoom handled above).
-                        let factor = (1.0 - 0.12 * scroll).max(0.05);
-                        self.debug.cosmic_inspector.camera.zoom_by(factor);
+                        if self.shift_held {
+                            // Slab scroll (`cosmic-depth-window` FR3):
+                            // Shift+wheel steps the slice depth by T/4
+                            // per notch when slab mode is on; plain
+                            // wheel keeps the orbit zoom below.
+                            let inspector = &mut self.debug.cosmic_inspector;
+                            if inspector.slab.on {
+                                let notches = if scroll > 0.0 { 1 } else { -1 };
+                                inspector.slab.scroll(notches, 2600.0);
+                                self.debug.fx.notify(format!(
+                                    "slab {} Mpc @ {:.0} Mpc",
+                                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                                ));
+                            } else {
+                                // Inspector log-zoom (demo zoom handled above).
+                                let factor = (1.0 - 0.12 * scroll).max(0.05);
+                                self.debug.cosmic_inspector.camera.zoom_by(factor);
+                            }
+                        } else {
+                            // Inspector log-zoom (demo zoom handled above).
+                            let factor = (1.0 - 0.12 * scroll).max(0.05);
+                            self.debug.cosmic_inspector.camera.zoom_by(factor);
+                        }
                     } else if self.debug.viewer.player.active {
                         self.debug.viewer.player.zoom_camera(scroll);
                     } else {
@@ -6185,9 +8280,13 @@ impl ViewerApp {
                 }
                 match physical_key {
                     // Esc unwinds UI focus (dropdown → widget); it never
-                    // quits — closing the window exits.
+                    // quits — closing the window exits. On the demo tab
+                    // it also skips the vista intro (CVI-004).
                     PhysicalKey::Code(KeyCode::Escape) => {
                         self.debug.esc_unwind();
+                        if matches!(self.debug.screen, Screen::GameDemo) {
+                            self.debug.cosmic.skip_vista();
+                        }
                     }
                     PhysicalKey::Code(KeyCode::Enter) => {
                         // Enter confirms the focused field: the Settings
@@ -6249,6 +8348,19 @@ impl ViewerApp {
                         self.twilight_stage = (self.twilight_stage + 1) % 4;
                         let (_, name) = twilight_key(self.twilight_stage);
                         self.debug.fx.notify(format!("Twilight {name}"));
+                    }
+                    PhysicalKey::Code(KeyCode::F12) => {
+                        // Windowed PNG capture
+                        // (`cosmic-capture-harness`, exploration only —
+                        // DoD evidence comes from `--capture` presets).
+                        if self.debug.screen_content() == Some(ViewContent::CosmicWeb) {
+                            self.pending_capture = true;
+                        } else {
+                            self.debug.fx.notify(
+                                "F12 captures a cosmic view — switch to Game Demo or Cosmic Web"
+                                    .to_owned(),
+                            );
+                        }
                     }
                     PhysicalKey::Code(
                         KeyCode::Digit0
@@ -6322,13 +8434,17 @@ impl ViewerApp {
                         // Camera cycle: the cosmic camera on the demo tab,
                         // else the player camera (active player only).
                         // A focused field keeps the keystroke instead.
+                        // Vista intro (CVI-004): P is ignored while the
+                        // vista owns the camera (no mode fight).
                         let viewer = &self.debug.viewer;
                         if !viewer.subdiv_field.focused
                             && !viewer.radius_field.focused
                             && !self.debug.settings.seed_field.focused
                         {
                             if matches!(self.debug.screen, Screen::GameDemo) {
-                                self.debug.cosmic.camera.cycle();
+                                if !self.debug.cosmic.vista_active() {
+                                    self.debug.cosmic.camera.cycle();
+                                }
                             } else if viewer.player.active {
                                 self.debug.viewer.player.cycle_camera();
                             }
@@ -6362,6 +8478,75 @@ impl ViewerApp {
                             self.type_into_focused_fields(&text);
                         }
                     }
+                    PhysicalKey::Code(KeyCode::KeyS) => {
+                        // Inspector slab toggle (`cosmic-depth-window`
+                        // FR3): Cosmic Web tab only, fields keep the
+                        // keystroke. (GameDemo S is thrust — handled
+                        // above and returned early.)
+                        let viewer = &self.debug.viewer;
+                        if !viewer.subdiv_field.focused
+                            && !viewer.radius_field.focused
+                            && !self.debug.settings.seed_field.focused
+                            && self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                            && !matches!(self.debug.screen, Screen::GameDemo)
+                        {
+                            self.toggle_cosmic_slab();
+                        } else if let Some(text) = text {
+                            self.type_into_focused_fields(&text);
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::BracketLeft) => {
+                        // Slab thinner (`cosmic-depth-window` FR3):
+                        // Cosmic Web tab, slab on.
+                        if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                            && !matches!(self.debug.screen, Screen::GameDemo)
+                        {
+                            let inspector = &mut self.debug.cosmic_inspector;
+                            if inspector.slab.on {
+                                inspector
+                                    .slab
+                                    .set_thickness(inspector.slab.thickness_mpc - 10.0);
+                                self.debug.fx.notify(format!(
+                                    "slab {} Mpc @ {:.0} Mpc",
+                                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                                ));
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::BracketRight) => {
+                        // Slab thicker (`cosmic-depth-window` FR3).
+                        if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                            && !matches!(self.debug.screen, Screen::GameDemo)
+                        {
+                            let inspector = &mut self.debug.cosmic_inspector;
+                            if inspector.slab.on {
+                                inspector
+                                    .slab
+                                    .set_thickness(inspector.slab.thickness_mpc + 10.0);
+                                self.debug.fx.notify(format!(
+                                    "slab {} Mpc @ {:.0} Mpc",
+                                    inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                                ));
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::KeyV) => {
+                        // Vista replay (`cosmic-vista-intro` FR4): the
+                        // demo tab restarts Hold → Dive → Done from the
+                        // opening pose. A focused field keeps the
+                        // keystroke instead (no new binding elsewhere).
+                        let viewer = &self.debug.viewer;
+                        if !viewer.subdiv_field.focused
+                            && !viewer.radius_field.focused
+                            && !self.debug.settings.seed_field.focused
+                        {
+                            if matches!(self.debug.screen, Screen::GameDemo) {
+                                self.debug.cosmic.replay_vista();
+                            }
+                        } else if let Some(text) = text {
+                            self.type_into_focused_fields(&text);
+                        }
+                    }
                     PhysicalKey::Code(KeyCode::KeyE) => {
                         // Drill down: armed galaxy star → SystemMap.
                         // Instant faded map navigation (the timed transit
@@ -6374,7 +8559,11 @@ impl ViewerApp {
                         };
                         // Cosmic demo first: E toggles fly-to on the
                         // click-selected node (shared with Controls).
+                        // Vista intro (CVI-004): E skips first (the
+                        // gate in `select_node_at` means there is never
+                        // a mid-vista target to engage).
                         if fields_free && matches!(self.debug.screen, Screen::GameDemo) {
+                            self.debug.cosmic.skip_vista();
                             self.toggle_fly_to();
                         } else if fields_free
                             && self.debug.screen_content() == Some(ViewContent::GalaxyMap)
@@ -6552,6 +8741,16 @@ impl ViewerApp {
             Action::UnwindUi => {
                 self.debug.esc_unwind();
             }
+            Action::CaptureScreenshot => {
+                // Settings Controls parity for F12 (same gate as the key).
+                if self.debug.screen_content() == Some(ViewContent::CosmicWeb) {
+                    self.pending_capture = true;
+                } else {
+                    self.debug.fx.notify(
+                        "F12 captures a cosmic view — switch to Game Demo or Cosmic Web".to_owned(),
+                    );
+                }
+            }
             Action::NavGameDemo => self.debug.select_screen(Screen::GameDemo),
             Action::NavDimensions => self.debug.toggle_dropdown(),
             Action::NavSettings => self.debug.select_screen(Screen::Settings),
@@ -6570,9 +8769,19 @@ impl ViewerApp {
             }
             Action::CameraCycle => {
                 if matches!(self.debug.screen, Screen::GameDemo) {
-                    self.debug.cosmic.camera.cycle();
+                    // Vista intro (CVI-004): no mode fight while the
+                    // vista owns the camera (same guard as `P`).
+                    if !self.debug.cosmic.vista_active() {
+                        self.debug.cosmic.camera.cycle();
+                    }
                 } else if self.debug.viewer.player.active {
                     self.debug.viewer.player.cycle_camera();
+                }
+            }
+            Action::VistaReplay => {
+                // Controls-row parity for `V` (demo tab only).
+                if matches!(self.debug.screen, Screen::GameDemo) {
+                    self.debug.cosmic.replay_vista();
                 }
             }
             Action::PresetPerspective => {
@@ -6603,6 +8812,36 @@ impl ViewerApp {
             }
             Action::TwilightCycle => {
                 self.twilight_stage = (self.twilight_stage + 1) % 4;
+            }
+            Action::SlabToggle => {
+                // Settings Controls parity for S (same tab gate).
+                if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                    && !matches!(self.debug.screen, Screen::GameDemo)
+                {
+                    self.toggle_cosmic_slab();
+                }
+            }
+            Action::SlabThinner | Action::SlabThicker => {
+                // Settings Controls parity for [/] (same tab gate).
+                if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
+                    && !matches!(self.debug.screen, Screen::GameDemo)
+                {
+                    let inspector = &mut self.debug.cosmic_inspector;
+                    if inspector.slab.on {
+                        let delta = if matches!(action, Action::SlabThinner) {
+                            -10.0
+                        } else {
+                            10.0
+                        };
+                        inspector
+                            .slab
+                            .set_thickness(inspector.slab.thickness_mpc + delta);
+                        self.debug.fx.notify(format!(
+                            "slab {} Mpc @ {:.0} Mpc",
+                            inspector.slab.thickness_mpc, inspector.slab.center_mpc
+                        ));
+                    }
+                }
             }
             Action::ShaderMode(i) => {
                 if let Some(&mode) = DebugMode::ALL.get(i) {
@@ -6919,18 +9158,31 @@ impl ViewerApp {
                     })
                     .expect("swapchain recreation must succeed");
                 ctx.swapchain = new_swapchain;
+                ctx.swapchain_images = new_images.clone();
                 ctx.depth_view =
                     create_depth_view(&self.memory_allocator, ctx.swapchain.image_extent());
                 ctx.framebuffers =
                     window_size_dependent_setup(&new_images, &ctx.render_pass, &ctx.depth_view);
                 // HDR transients track the swapchain extent (the passes
-                // and pipelines persist — only images/sets rebuild).
-                ctx.hdr = Self::build_hdr_chain(
-                    &self.memory_allocator,
-                    &self.descriptor_set_allocator,
-                    &self.post_sampler,
-                    ctx,
-                );
+                // and pipelines persist — only images/sets rebuild; the
+                // volume texture persists across recreates).
+                ctx.hdr = ctx.hdr_format.map(|format| {
+                    Self::build_hdr_chain(
+                        &self.memory_allocator,
+                        &self.descriptor_set_allocator,
+                        &self.post_sampler,
+                        format,
+                        ctx.swapchain.image_extent(),
+                        &ctx.scene_pass,
+                        &ctx.post_pass,
+                        &ctx.pipelines,
+                        &self
+                            .veil_volume
+                            .as_ref()
+                            .expect("veil volume must upload at boot")
+                            .1,
+                    )
+                });
                 ctx.recreate_swapchain = false;
             }
         }
@@ -7077,6 +9329,39 @@ impl ViewerApp {
             CommandBufferUsage::OneTimeSubmit,
         )
         .expect("command buffer builder must create");
+        // Windowed capture (F12), first half: copy the acquired
+        // swapchain image to a host buffer BEFORE the render pass
+        // overwrites it. Encode + write happen after the flush below
+        // (one-frame deferred — the loop never blocks more than one
+        // frame for a capture).
+        let capture_readback = if self.pending_capture {
+            let extent = ctx.swapchain.image_extent();
+            let buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_DST,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                        | MemoryTypeFilter::PREFER_HOST,
+                    ..Default::default()
+                },
+                (0..extent[0] as usize * extent[1] as usize * 4).map(|_| 0u8),
+            )
+            .expect("capture readback buffer must create");
+            let image = ctx
+                .swapchain_images
+                .get(image_index as usize)
+                .expect("acquired swapchain image must exist")
+                .clone();
+            builder
+                .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(image, buffer.clone()))
+                .expect("capture readback copy must record");
+            Some((buffer, extent))
+        } else {
+            None
+        };
         // Orbit backdrop (UMAP-020): the arrival target's atmosphere
         // color, scaled to a near-black space read; the default tint
         // otherwise. Cosmic views clear to deep indigo instead
@@ -7100,198 +9385,44 @@ impl ViewerApp {
         // bloom chain run offscreen before the main pass begins; the
         // views loop below only resolves into the swapchain image. LDR
         // bypass skips this block and draws direct-to-swapchain in the
-        // loop instead.
+        // loop instead. Recording lives in `record_cosmic_hdr_prepass`
+        // (CAP-001 seam: the offscreen `--capture` path calls it too).
         if let Some(frame) = cosmic_frame.as_ref()
             && let Some(hdr) = ctx.hdr.as_ref()
         {
-            let pipes = &ctx.pipelines;
             let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
-            let bloom = BloomParams::spec_defaults();
             // Per-surface grade (update-2026-09-19-1933): the
-            // inspector's zoomed-out view stacks dozens of puffs/px
+            // inspector's zoomed-out view stacks dozens of sprites/px
             // where the immersive demo stacks a few — one exposure
             // can't serve both.
-            let (smoke_exposure, glow_exposure) = if frame.is_demo {
-                (COSMIC_DEMO_SMOKE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+            let glow_exposure = if frame.is_demo {
+                COSMIC_DEMO_GLOW_EXPOSURE
             } else {
-                (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+                COSMIC_MAP_GLOW_EXPOSURE
             };
-            // Scene: indigo clear, smoke then glow.
-            builder
-                .begin_render_pass(
-                    RenderPassBeginInfo {
-                        clear_values: vec![
-                            Some(COSMIC_BACKDROP.into()),
-                            Some(ClearValue::Depth(1.0)),
-                        ],
-                        ..RenderPassBeginInfo::framebuffer(hdr.scene_fb.clone())
-                    },
-                    SubpassBeginInfo {
-                        contents: SubpassContents::Inline,
-                        ..Default::default()
-                    },
-                )
-                .expect("HDR scene pass must begin")
-                .set_viewport(0, [frame.viewport.clone()].into_iter().collect())
-                .expect("viewport must set")
-                .bind_pipeline_graphics(pipes.smoke_scene.clone())
-                .expect("pipeline must bind")
-                .bind_vertex_buffers(0, frame.smoke.clone())
-                .expect("vertex buffer must bind")
-                .push_constants(
-                    pipes.smoke_scene.layout().clone(),
-                    0,
-                    SmokePush {
-                        mvp: frame.mvp,
-                        eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
-                        px_scale: frame.px_scale,
-                        exposure: smoke_exposure,
-                        redshift,
-                    },
-                )
-                .expect("smoke push constants must upload");
-            // SAFETY: per-instance puff records, 6 verts per billboard
-            // (two triangles); instance count is the puff count, no
-            // index buffer bound.
-            unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
-                .expect("HDR scene smoke draw must record");
-            builder
-                .bind_pipeline_graphics(pipes.glow_scene.clone())
-                .expect("pipeline must bind")
-                .bind_vertex_buffers(0, frame.glow.clone())
-                .expect("vertex buffer must bind")
-                .push_constants(
-                    pipes.glow_scene.layout().clone(),
-                    0,
-                    GlowPush {
-                        mvp: frame.mvp,
-                        px_scale: frame.px_scale,
-                        exposure: glow_exposure,
-                        redshift,
-                    },
-                )
-                .expect("glow push constants must upload");
-            // SAFETY: same PointList contract as the galaxy map.
-            unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
-                .expect("HDR scene glow draw must record");
-            builder
-                .end_render_pass(Default::default())
-                .expect("HDR scene pass must end");
-            // Bloom chain at half res: bright extract, then four H/V
-            // separable blur passes through dedicated targets A-E
-            // (write-once, never ping-ponged). Final bloom lands in
-            // E, which the resolve samples.
-            let half_vp = Viewport {
-                offset: [0.0, 0.0],
-                extent: [hdr.half_extent[0] as f32, hdr.half_extent[1] as f32],
-                depth_range: 0.0..=1.0,
-            };
-            let black: ClearValue = [0.0, 0.0, 0.0, 1.0].into();
-            builder
-                .begin_render_pass(
-                    RenderPassBeginInfo {
-                        clear_values: vec![Some(black)],
-                        ..RenderPassBeginInfo::framebuffer(hdr.bloom_a_fb.clone())
-                    },
-                    SubpassBeginInfo {
-                        contents: SubpassContents::Inline,
-                        ..Default::default()
-                    },
-                )
-                .expect("bloom bright pass must begin")
-                .set_viewport(0, [half_vp.clone()].into_iter().collect())
-                .expect("viewport must set")
-                .bind_pipeline_graphics(pipes.bright.clone())
-                .expect("pipeline must bind")
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipes.bright.layout().clone(),
-                    0,
-                    hdr.bright_set.clone(),
-                )
-                .expect("bloom bright set must bind")
-                .push_constants(
-                    pipes.bright.layout().clone(),
-                    0,
-                    BloomBrightPush {
-                        threshold: bloom.threshold,
-                    },
-                )
-                .expect("bloom bright push must upload");
-            // SAFETY: fullscreen-triangle pipeline, no vertex input
-            // — 3 unbuffered vertices are the whole draw.
-            unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom bright draw must record");
-            builder
-                .end_render_pass(Default::default())
-                .expect("bloom bright pass must end");
-            let hw = hdr.half_extent[0] as f32;
-            let hh = hdr.half_extent[1] as f32;
-            // Dedicated targets per step (see `HdrChain`): bright→A,
-            // H:A→B, V:B→C, wide-H:C→D, wide-V:D→E(final). No target
-            // is ever rewritten. `GAME_DEBUG_COSMIC_BLOOM=0` skips the
-            // chain: the resolve then adds the sharp bright extract.
-            let blur_steps = if ctx.bloom_enabled {
-                vec![
-                    (
-                        hdr.bloom_b_fb.clone(),
-                        hdr.blur_a_set.clone(),
-                        [1.0 / hw, 0.0],
-                    ),
-                    (
-                        hdr.bloom_c_fb.clone(),
-                        hdr.blur_b_set.clone(),
-                        [0.0, 1.0 / hh],
-                    ),
-                    (
-                        hdr.bloom_d_fb.clone(),
-                        hdr.blur_c_set.clone(),
-                        [2.0 / hw, 0.0],
-                    ),
-                    (
-                        hdr.bloom_e_fb.clone(),
-                        hdr.blur_d_set.clone(),
-                        [0.0, 2.0 / hh],
-                    ),
-                ]
+            let splat_alpha_k = if frame.is_demo {
+                SPLAT_ALPHA_K_DEMO
             } else {
-                Vec::new()
+                SPLAT_ALPHA_K_MAP
             };
-            for (dst, set, step) in &blur_steps {
-                builder
-                    .begin_render_pass(
-                        RenderPassBeginInfo {
-                            clear_values: vec![Some(black)],
-                            ..RenderPassBeginInfo::framebuffer(dst.clone())
-                        },
-                        SubpassBeginInfo {
-                            contents: SubpassContents::Inline,
-                            ..Default::default()
-                        },
-                    )
-                    .expect("bloom blur pass must begin")
-                    .set_viewport(0, [half_vp.clone()].into_iter().collect())
-                    .expect("viewport must set")
-                    .bind_pipeline_graphics(pipes.blur.clone())
-                    .expect("pipeline must bind")
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipes.blur.layout().clone(),
-                        0,
-                        set.clone(),
-                    )
-                    .expect("bloom blur set must bind")
-                    .push_constants(
-                        pipes.blur.layout().clone(),
-                        0,
-                        BloomBlurPush { step: *step },
-                    )
-                    .expect("bloom blur push must upload");
-                // SAFETY: fullscreen-triangle pipeline, no vertex
-                // input — 3 unbuffered vertices are the whole draw.
-                unsafe { builder.draw(3, 1, 0, 0) }.expect("bloom blur draw must record");
-                builder
-                    .end_render_pass(Default::default())
-                    .expect("bloom blur pass must end");
+            let bloom_params = MipBloomParams::for_tier(QualityTier::High);
+            record_cosmic_hdr_prepass(
+                &mut builder,
+                &ctx.pipelines,
+                hdr,
+                frame,
+                glow_exposure,
+                redshift,
+                &bloom_params,
+                ctx.bloom_enabled,
+                splat_alpha_k,
+            );
+            // Gas-veil march (CGV-005/006): skipped in sprites mode.
+            if matches!(
+                self.veil_mode,
+                game_debug::cosmic_veil::VeilMode::March { .. }
+            ) {
+                record_veil_march(&mut builder, &ctx.pipelines, hdr, &frame.march);
             }
         }
         builder
@@ -7377,139 +9508,49 @@ impl ViewerApp {
                 } else if view == ViewContent::CosmicWeb {
                     // Cosmic player scene (update-2026-09-18-2328): HDR
                     // mode resolves the pre-recorded scene + bloom over
-                    // the full window; LDR bypass draws smoke + glow
+                    // the full window; LDR bypass draws glow + splats
                     // direct-to-swapchain. Both arms share the
                     // precomputed frame, so the draws are identical.
                     // The demo tab renders the player-immersive view;
                     // the Cosmic Web tab renders through the inspector
                     // camera (fixed-center buffers + live player point).
+                    // Recording lives in `record_cosmic_view_arm`
+                    // (CAP-001 seam: the offscreen path calls it too).
                     let frame = cosmic_frame
                         .as_ref()
                         .expect("cosmic view must precompute its frame");
                     let redshift = game_debug::cosmic_web::COSMIC_REDSHIFT_PER_MPC;
-                    let (smoke_exposure, glow_exposure) = if frame.is_demo {
-                        (COSMIC_DEMO_SMOKE_EXPOSURE, COSMIC_DEMO_GLOW_EXPOSURE)
+                    let glow_exposure = if frame.is_demo {
+                        COSMIC_DEMO_GLOW_EXPOSURE
                     } else {
-                        (COSMIC_MAP_SMOKE_EXPOSURE, COSMIC_MAP_GLOW_EXPOSURE)
+                        COSMIC_MAP_GLOW_EXPOSURE
                     };
                     let (resolve_exposure, bloom_intensity) = if frame.is_demo {
                         (COSMIC_DEMO_EXPOSURE, COSMIC_DEMO_BLOOM_INTENSITY)
                     } else {
                         (COSMIC_MAP_EXPOSURE, COSMIC_MAP_BLOOM_INTENSITY)
                     };
-                    if let Some(hdr) = ctx.hdr.as_ref() {
-                        let full_vp = Viewport {
-                            offset: [0.0, 0.0],
-                            extent: [win_w, win_h],
-                            depth_range: 0.0..=1.0,
-                        };
-                        // Full bloom chain: scene + final bloom (E).
-                        // `GAME_DEBUG_COSMIC_BLOOM=0`: scene + bright
-                        // extract (A) — E is never written there.
-                        let resolve_set = if ctx.bloom_enabled {
-                            hdr.resolve_set.clone()
-                        } else {
-                            hdr.resolve_nobloom_set.clone()
-                        };
-                        builder
-                            .set_viewport(0, [full_vp.clone()].into_iter().collect())
-                            .expect("viewport must set")
-                            .bind_pipeline_graphics(ctx.pipelines.resolve.clone())
-                            .expect("pipeline must bind")
-                            .bind_descriptor_sets(
-                                PipelineBindPoint::Graphics,
-                                ctx.pipelines.resolve.layout().clone(),
-                                0,
-                                resolve_set,
-                            )
-                            .expect("bloom resolve set must bind")
-                            .push_constants(
-                                ctx.pipelines.resolve.layout().clone(),
-                                0,
-                                BloomResolvePush {
-                                    exposure: resolve_exposure,
-                                    intensity: bloom_intensity,
-                                },
-                            )
-                            .expect("bloom resolve push must upload");
-                        // SAFETY: fullscreen-triangle pipeline, no vertex
-                        // input — 3 unbuffered vertices are the whole
-                        // draw.
-                        unsafe { builder.draw(3, 1, 0, 0) }
-                            .expect("bloom resolve draw must record");
+                    let splat_alpha_k = if frame.is_demo {
+                        SPLAT_ALPHA_K_DEMO
                     } else {
-                        let glow_len = frame.glow.len();
-                        builder
-                            .set_viewport(0, [viewport].into_iter().collect())
-                            .expect("viewport must set")
-                            .bind_pipeline_graphics(ctx.pipelines.smoke.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, frame.smoke.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.smoke.layout().clone(),
-                                0,
-                                SmokePush {
-                                    mvp: frame.mvp,
-                                    eye: [frame.eye[0], frame.eye[1], frame.eye[2], 0.0],
-                                    px_scale: frame.px_scale,
-                                    exposure: smoke_exposure,
-                                    redshift,
-                                },
-                            )
-                            .expect("smoke push constants must upload");
-                        // SAFETY: per-instance puff records, 6 verts
-                        // per billboard; no index buffer bound.
-                        unsafe { builder.draw(6, frame.smoke.len() as u32, 0, 0) }
-                            .expect("cosmic smoke draw must record");
-                        builder
-                            .bind_pipeline_graphics(ctx.pipelines.map_glow.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, frame.glow.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.map_glow.layout().clone(),
-                                0,
-                                GlowPush {
-                                    mvp: frame.mvp,
-                                    px_scale: frame.px_scale,
-                                    exposure: glow_exposure,
-                                    redshift,
-                                },
-                            )
-                            .expect("glow push constants must upload");
-                        // SAFETY: same PointList contract as the galaxy map.
-                        unsafe { builder.draw(glow_len as u32, 1, 0, 0) }
-                            .expect("cosmic glow draw must record");
-                    }
-                    if !frame.is_demo {
-                        // Inspector player point (precomputed in the
-                        // frame): drawn last through the alpha map
-                        // pipeline — after the resolve in HDR mode, so
-                        // the marker stays legible over the glow. The
-                        // pipeline bind is explicit: the previously
-                        // bound pipeline here is `resolve` (HDR) or
-                        // `map_glow` (LDR), whose push layouts are
-                        // incompatible with `MapPush` (VUID-06425).
-                        builder
-                            .bind_pipeline_graphics(ctx.pipelines.map.clone())
-                            .expect("pipeline must bind")
-                            .bind_vertex_buffers(0, self.cosmic_tab_player.clone())
-                            .expect("vertex buffer must bind")
-                            .push_constants(
-                                ctx.pipelines.map.layout().clone(),
-                                0,
-                                MapPush {
-                                    mvp: frame.mvp,
-                                    px_scale: frame.px_scale,
-                                    exposure: 1.0,
-                                },
-                            )
-                            .expect("map push constants must upload");
-                        // SAFETY: single-vertex PointList, no index buffer.
-                        unsafe { builder.draw(1, 1, 0, 0) }
-                            .expect("cosmic player point draw must record");
-                    }
+                        SPLAT_ALPHA_K_MAP
+                    };
+                    record_cosmic_view_arm(
+                        &mut builder,
+                        &ctx.pipelines,
+                        ctx.hdr.as_ref(),
+                        ctx.bloom_enabled,
+                        frame,
+                        viewport.clone(),
+                        [win_w, win_h],
+                        glow_exposure,
+                        resolve_exposure,
+                        bloom_intensity,
+                        redshift,
+                        splat_alpha_k,
+                        VEIL_MARCH_RESOLVE_GAIN,
+                        self.cosmic_tab_player.clone(),
+                    );
                 } else if view == ViewContent::SystemMap {
                     // System map: orbit rings through the line pipeline,
                     // star + planets through the map point pipeline — both
@@ -7789,12 +9830,78 @@ impl ViewerApp {
             )
             .then_signal_fence_and_flush();
         match future.map_err(Validated::unwrap) {
-            Ok(future) => ctx.previous_frame_end = Some(future.boxed()),
+            Ok(future) => {
+                if let Some((buffer, extent)) = capture_readback {
+                    // Windowed capture (F12), second half: this frame's
+                    // GPU work is ≤1 frame by construction — wait for
+                    // it, then map + encode + write on the CPU.
+                    self.pending_capture = false;
+                    match future.wait(None) {
+                        Ok(()) => {
+                            ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                            self.write_windowed_capture(&buffer, extent);
+                        }
+                        Err(error) => {
+                            ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                            self.debug
+                                .fx
+                                .notify(format!("F12 capture failed on the GPU: {error:?}"));
+                        }
+                    }
+                } else {
+                    ctx.previous_frame_end = Some(future.boxed());
+                }
+            }
             Err(VulkanError::OutOfDate) => {
+                if capture_readback.is_some() {
+                    self.pending_capture = false;
+                    self.debug.fx.notify(
+                        "F12 capture lost (swapchain out of date) — press F12 again".to_owned(),
+                    );
+                }
                 ctx.recreate_swapchain = true;
                 ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
             Err(error) => panic!("frame flush failed: {error}"),
+        }
+    }
+
+    /// Windowed capture (F12), CPU half: BGRA→RGBA swizzle + PNG write
+    /// + Console/notice log. Failures notify, never panic.
+    fn write_windowed_capture(&mut self, buffer: &Subbuffer<[u8]>, extent: [u32; 2]) {
+        use game_debug::cosmic_capture::{encode_png_rgba8, windowed_capture_filename};
+        let surface = match self.debug.screen {
+            Screen::GameDemo => "demo",
+            Screen::Dimensions(_) => "inspector",
+            Screen::Settings => "settings",
+        };
+        let path =
+            windowed_capture_filename(surface, self.debug.cosmic.seed, &capture_now_timestamp());
+        let result = (|| -> Result<String, String> {
+            if let Some(parent) = std::path::Path::new(&path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
+            }
+            let guard = buffer.read().map_err(|e| format!("{e:?}"))?;
+            let mut rgba = guard.to_vec();
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let png = encode_png_rgba8(extent[0], extent[1], &rgba).map_err(|e| e.to_string())?;
+            std::fs::write(&path, &png).map_err(|e| format!("{e}"))?;
+            Ok(path.clone())
+        })();
+        match result {
+            Ok(path) => {
+                let line = format!("capture saved: {path}");
+                tracing::info!("{line}");
+                self.debug.console.push(line.clone());
+                self.debug.fx.notify(line);
+            }
+            Err(error) => {
+                self.debug.fx.notify(format!("F12 capture failed: {error}"));
+            }
         }
     }
 }
@@ -7819,6 +9926,9 @@ fn run() -> i32 {
     };
     if args.headless {
         return run_headless(args.seed);
+    }
+    if let Some(request) = args.capture {
+        return run_capture(request, args.seed);
     }
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
@@ -7849,6 +9959,21 @@ mod tests {
     }
 
     #[test]
+    fn capture_timestamp_formats_utc() {
+        // 2026-09-20 20:00:00 UTC — month/day/hour boundaries pinned.
+        assert_eq!(capture_timestamp(1_789_934_400), "20260920-200000");
+        assert_eq!(capture_timestamp(0), "19700101-000000");
+        assert_eq!(capture_timestamp(86_399), "19700101-235959");
+        assert_eq!(capture_timestamp(86_400), "19700102-000000");
+        // Leap day 2024-02-29 12:00:00 UTC.
+        assert_eq!(capture_timestamp(1_709_208_000), "20240229-120000");
+        // Shape: 15 chars, dash at 8.
+        let ts = capture_now_timestamp();
+        assert_eq!(ts.len(), 15, "bad timestamp shape: {ts}");
+        assert_eq!(&ts[8..9], "-");
+    }
+
+    #[test]
     fn cli_seed_parsing() {
         let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // Bare + headless.
@@ -7868,6 +9993,70 @@ mod tests {
             vec!["game_debug", "--seed", "abc"],
             vec!["game_debug", "--seed", "-1"],
             vec!["game_debug", "--nope"],
+        ] {
+            let err = parse_args(&argv(&bad)).expect_err("must reject");
+            assert!(err.contains("usage:"), "error lacks usage: {err}");
+        }
+    }
+
+    #[test]
+    fn vista_capture_pose_matches_t0_pose() {
+        // CVI-008/DoD 5: the `vista` preset IS the t = 0 vista pose —
+        // the capture camera carries `vista_pose()` exactly (eye,
+        // target, 25° FOV), with the pose's fog/slab terms.
+        use game_debug::cosmic_capture::CaptureView;
+        use game_debug::cosmic_vista::{VISTA_FOV_DEG, vista_pose};
+        let mut debug = DebugApp::new();
+        pose_demo_camera_for_vista_capture(&mut debug);
+        let want = vista_pose(&debug.cosmic.web);
+        let eye = debug.cosmic.camera.eye_world();
+        assert!((eye - want.eye).length() < 1e-9);
+        assert!((debug.cosmic.camera.fov_y() - VISTA_FOV_DEG.to_radians()).abs() < 1e-6);
+        assert_eq!(want.fov_y_deg, VISTA_FOV_DEG);
+        assert_eq!(want.slab_half_mpc, 20.0);
+        assert_eq!(want.inv_fog_l, 0.0);
+        // The request routes vista to the demo surface (preset pin).
+        assert!(game_debug::cosmic_capture::preset_for(CaptureView::Vista).surface_is_demo);
+    }
+
+    #[test]
+    fn cli_capture_parsing() {
+        use game_debug::cosmic_capture::CaptureView;
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Full form.
+        let args = parse_args(&argv(&[
+            "game_debug",
+            "--capture",
+            "shots/a.png",
+            "--seed",
+            "1337",
+            "--view",
+            "slab",
+            "--size",
+            "800x600",
+        ]))
+        .expect("capture must parse");
+        let req = args.capture.expect("capture request must exist");
+        assert_eq!(req.path, "shots/a.png");
+        assert_eq!(req.view, CaptureView::Slab);
+        assert_eq!((req.width, req.height), (800, 600));
+        assert_eq!(args.seed, Some(1337));
+        // Defaults: inspector preset, target aspect.
+        let args = parse_args(&argv(&["game_debug", "--capture", "b.png"])).expect("defaults");
+        let req = args.capture.expect("capture request must exist");
+        assert_eq!(req.view, CaptureView::Inspector);
+        assert_eq!(
+            (req.width, req.height),
+            game_debug::cosmic_capture::CAPTURE_DEFAULT_SIZE
+        );
+        // Failures carry usage.
+        for bad in [
+            vec!["game_debug", "--capture"],
+            vec!["game_debug", "--capture", "a.png", "--view", "orbit"],
+            vec!["game_debug", "--capture", "a.png", "--size", "abc"],
+            vec!["game_debug", "--capture", "a.png", "--size", "0x10"],
+            vec!["game_debug", "--capture", "a.png", "--headless"],
+            vec!["game_debug", "--headless", "--capture", "a.png"],
         ] {
             let err = parse_args(&argv(&bad)).expect_err("must reject");
             assert!(err.contains("usage:"), "error lacks usage: {err}");
@@ -7896,8 +10085,9 @@ mod tests {
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
             (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
             (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
-            (ShaderKind::Vertex, SMOKE_VERT, "smoke vert"),
-            (ShaderKind::Fragment, SMOKE_FRAG, "smoke frag"),
+            (ShaderKind::Vertex, SPLAT_VERT, "splat vert"),
+            (ShaderKind::Fragment, SPLAT_FRAG, "splat frag"),
+            (ShaderKind::Fragment, MARCH_FRAG, "march frag"),
         ] {
             if let Err(error) = compile_glsl_to_spirv(kind, source) {
                 panic!("{what} must compile: {error}");
@@ -7912,21 +10102,23 @@ mod tests {
         // vertex-struct fields BY NAME at pipeline creation — naga
         // compilation cannot catch a mismatch, and there is no
         // GPU-free way to run the real check, so the names are pinned
-        // here. `SmokeVertex { pos_size, rgba, misc }`
-        // (per-instance), `MapVertex { map_pos, color, misc }`.
+        // here. `MapVertex { map_pos, color, misc }`,
+        // `SplatVertex { pos, packed }`.
         for (source, name, what) in [
-            (SMOKE_VERT, "in vec4 pos_size;", "smoke pos_size"),
-            (SMOKE_VERT, "in vec4 rgba;", "smoke rgba"),
-            (SMOKE_VERT, "in vec4 misc;", "smoke misc"),
             (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
             (GLOW_VERT, "in vec3 color;", "glow color"),
             (GLOW_VERT, "in vec3 misc;", "glow misc"),
+            (SPLAT_VERT, "in vec3 pos;", "splat pos"),
+            (SPLAT_VERT, "in uint packed;", "splat packed"),
         ] {
             assert!(
                 source.contains(name),
                 "{what} input missing from its vertex shader"
             );
         }
+        // 16 B vertex: the Low buffer budget (300k × 16 B = 4.8 MB)
+        // depends on it.
+        assert_eq!(std::mem::size_of::<SplatVertex>(), 16);
     }
 
     #[test]
@@ -7936,28 +10128,157 @@ mod tests {
         // exactly zero at the rim (else full quads), and the redshift
         // depth term must be clamped non-negative and capped (else
         // Inf/NaN/negative channels decorrelate into rainbow squares).
-        // The smoke shader must pin the same redshift clamp, must
-        // guard the billboard normalization, and must hit zero radial
-        // falloff at the puff rims (else full quads). String pins,
-        // because neither naga nor any GPU-free test can evaluate the
-        // shaders.
+        // String pins, because neither naga nor any GPU-free test can
+        // evaluate the shaders. (Smoke pins retired with the smoke
+        // path, `cosmic-gas-veil-v2` CGV-009.)
         for (source, literal, what) in [
             (GLOW_FRAG, "1.0 - 4.0 * dot(d, d)", "rim-zero falloff"),
             (GLOW_VERT, "max(clip.w, 0.0)", "glow depth clamp"),
             (GLOW_VERT, "misc.z < 0.5", "glow kind branch"),
-            (SMOKE_VERT, "max(clipc.w, 0.0)", "smoke depth clamp"),
-            (SMOKE_VERT, "rl > 1e-10", "smoke side guard"),
-            (SMOKE_VERT, "min_world", "smoke min-pixel clamp"),
-            (SMOKE_FRAG, "1.0 - r2", "smoke rim-zero falloff"),
-            (SMOKE_FRAG, "1.0 - v_uv.x * v_uv.x", "smoke tip dissolve"),
-            (SMOKE_FRAG, "vec3(luma)", "smoke white hot-center"),
+            (GLOW_FRAG, "smoothstep(0.2, 0.5, r)", "hub kind-2 core ramp"),
+            (
+                SPLAT_FRAG,
+                "1.0 - 4.0 * dot(d, d)",
+                "splat rim-zero falloff",
+            ),
+            (SPLAT_VERT, "max(clip.w, 0.0)", "splat depth clamp"),
+            (SPLAT_VERT, "65535.0 * 16.0 - 8.0", "splat unpack mirror"),
+            (
+                SPLAT_VERT,
+                "smoothstep(h, 2.0 * h, dist)",
+                "splat near-eye fade",
+            ),
         ] {
             assert!(source.contains(literal), "{what} missing from its shader");
         }
-        for source in [GLOW_VERT, SMOKE_VERT] {
+        for source in [GLOW_VERT, SPLAT_VERT] {
             assert!(
                 source.contains(", 0.5)"),
                 "redshift cap missing from a cosmic vertex shader"
+            );
+        }
+        // Splat fragment: arithmetic-only (mobile fill-rate rule, A-5) —
+        // `exp2`/`log2` live in the vertex stage only.
+        for banned in ["sin(", "cos(", "exp(", "pow(", "log("] {
+            assert!(
+                !SPLAT_FRAG.contains(banned),
+                "splat fragment must stay arithmetic-only: {banned}"
+            );
+        }
+        // Splat density ramp shares the CPU stop table end-to-end.
+        for literal in ["vec3(0.10, 0.08, 0.35)", "vec3(1.00, 0.45, 0.40)"] {
+            assert!(
+                SPLAT_VERT.contains(literal),
+                "splat ramp drifted from DENSITY_RAMP_STOPS: {literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn cosmic_window_snippet_shared() {
+        // CDW-002/A-4: one `COSMIC_WINDOW_GLSL` source of truth,
+        // byte-identical in every cosmic vertex shader (the lib const
+        // is the authority — the binary pastes it verbatim).
+        use game_debug::cosmic_window::COSMIC_WINDOW_GLSL;
+        for (source, what) in [(GLOW_VERT, "glow"), (SPLAT_VERT, "splat")] {
+            assert!(
+                source.contains(COSMIC_WINDOW_GLSL),
+                "{what} shader drifted from the shared window snippet"
+            );
+        }
+    }
+
+    #[test]
+    fn cosmic_density_ramp_shared() {
+        // CGV-001/A-4: one `COSMIC_DENSITY_RAMP_GLSL` source of truth,
+        // byte-identical in the splat vertex shader and the veil march
+        // fragment shader (the lib const is the authority — the binary
+        // pastes it verbatim). Veil sprites ride the glow pipeline with
+        // CPU-computed colors (`veil_ramp_cpu`, pinned against
+        // `VEIL_RAMP_STOPS` in `cosmic_veil` tests).
+        use game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL;
+        for (source, what) in [(SPLAT_VERT, "splat"), (MARCH_FRAG, "march")] {
+            assert!(
+                source.contains(COSMIC_DENSITY_RAMP_GLSL),
+                "{what} shader drifted from the shared density-ramp snippet"
+            );
+        }
+    }
+
+    #[test]
+    fn march_gains_stay_decoupled() {
+        // Grade-round-2 lesson (CGV-015): the march push gain and the
+        // resolve composite gain are DIFFERENT knobs fed from different
+        // consts. One const fed both sides once and blew the composite
+        // out 30×30. The push stays a passthrough; the grade lives at
+        // the resolve.
+        assert_eq!(VEIL_MARCH_GAIN, 1.0, "march push must stay a passthrough");
+        assert_eq!(
+            VEIL_MARCH_RESOLVE_GAIN, 30.0,
+            "resolve grade carries the 30 Mpc reference window"
+        );
+    }
+
+    #[test]
+    fn march_push_fits_vulkan_floor() {
+        // CGV-005/A: the march push is exactly the 128 B Vulkan 1.1
+        // floor (inverse VP + eye/sphere + grid frame + window terms).
+        assert_eq!(std::mem::size_of::<MarchPush>(), 128);
+    }
+
+    #[test]
+    fn march_emission_matches_grade() {
+        // CGV grade knob: the GLSL emission literal tracks
+        // `VEIL_MARCH_K` (`a = k·max(0, od − 0.5)`).
+        assert!(
+            MARCH_FRAG.contains(&format!("{VEIL_MARCH_K} * max(0.0, od - 0.5)")),
+            "march emission drifted from VEIL_MARCH_K"
+        );
+    }
+
+    #[test]
+    fn march_loop_stays_narrow() {
+        // CGV-005/A-3: the march loop is texture fetch + mix/FMA with
+        // one scoped `exp2` (log-density → overdensity; the march never
+        // runs on Low). Everything else transcendental stays out.
+        for banned in ["pow(", "log(", "sin(", "cos(", "tan("] {
+            assert!(
+                !MARCH_FRAG.contains(banned),
+                "march loop must stay narrow: {banned}"
+            );
+        }
+        assert_eq!(
+            MARCH_FRAG.matches("exp2(").count(),
+            1,
+            "exactly one scoped exp2 in the march loop"
+        );
+        // Ray setup mirrors `cosmic_veil::march_ray` (CGV-007): same
+        // quadratic tokens on both sides.
+        for token in ["dot(oc, dir)", "dot(oc, oc) - radius * radius", "b * b - c"] {
+            assert!(
+                MARCH_FRAG.contains(token),
+                "march ray formula drifted from the CPU mirror: {token}"
+            );
+        }
+        // Shared ramp + window snippets (CGV-001/A-4): the march uses
+        // the same density ramp and window term as the sprites.
+        for literal in ["vec3(0.10, 0.08, 0.35)", "vec3(1.00, 0.45, 0.40)"] {
+            assert!(
+                MARCH_FRAG.contains(literal),
+                "march ramp drifted from DENSITY_RAMP_STOPS: {literal}"
+            );
+        }
+        use game_debug::cosmic_window::COSMIC_WINDOW_GLSL;
+        assert!(
+            MARCH_FRAG.contains(COSMIC_WINDOW_GLSL),
+            "march drifted from the shared window snippet"
+        );
+        // Grade round 2 (CGV-015): vis-weighted MEAN, not a column —
+        // full-depth views must divide by their own weight.
+        for token in ["float wsum = 0.0;", "wsum += w;", "acc / max(wsum, 1e-6)"] {
+            assert!(
+                MARCH_FRAG.contains(token),
+                "march mean-normalization regressed: {token}"
             );
         }
     }
@@ -7986,12 +10307,12 @@ mod tests {
 
     #[test]
     fn cosmic_push_constants_fit_vulkan_floor() {
-        // Cosmic blocks: glow (MVP + scale + exposure + redshift) and
-        // smoke (MVP + eye + scale + exposure + redshift, 92 B) must
-        // stay under the 128 B Vulkan 1.1 floor on every tier.
+        // Cosmic blocks: glow (88 B with the depth-window terms) and
+        // splat (112 B) must stay under the 128 B Vulkan 1.1 floor on
+        // every tier (march has its own 128 B-exact pin above).
         for (bytes, what) in [
             (std::mem::size_of::<GlowPush>(), "GlowPush"),
-            (std::mem::size_of::<SmokePush>(), "SmokePush"),
+            (std::mem::size_of::<SplatPush>(), "SplatPush"),
         ] {
             assert!(
                 bytes <= 128,

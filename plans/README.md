@@ -37,6 +37,9 @@ Current version folders (contents + per-version scope:
 - `v0.3.0/` — Player-facing layer (spec §10 + debug screens)
 - `v0.3.1/` — Debug shell unification (ADR-022: `unified-debug-view`)
 - `v0.3.2/` — Cosmic-scale player (main game notion: `cosmic-scale-player`)
+- `v0.3.3/` — Cosmic-web field render (ADR-025: eight features, capture
+  harness first, then field export → splats → depth window → hubs →
+  bloom → veil → vista intro)
 
 ## Role gates
 
@@ -105,6 +108,16 @@ Single vocabulary everywhere (feature `notion.md`, update `notion.md`, issue `sp
   3. `plan.md` (from `issue-plan.md`) — added after investigation, fix tasks with IDs `ISS-YYYYMMDD-001`, … Only then implement.
 - Never rewrites parent feature/update files — cross-links only. Issue `done` requires `report.md` + `plan.md` present and all fix todos checked.
 
+### 6b. Evidence shots (v0.3.3 `cosmic-capture-harness` convention)
+
+- A feature folder may hold `shots/` with PNG files only, each
+  ≤ 4 MB, named `<preset>-<before|after>[-<tag>].png` where `<preset>`
+  is one of `inspector|slab|demo|vista` (the capture-harness presets).
+  Shots are committed with the feature's single `done` commit and
+  captioned in the plan's DoD table. (PO decision 2026-09-20: full
+  `1408x768` PNGs, no downscale — measured ~2–3 MB each on the
+  reference GPU, so the pre-cut ≤ 1 MB budget was raised to 4 MB.)
+
 ### 7. Version branch
 
 Each version folder `vX.Y.Z` gets a same-named git branch, cut from
@@ -127,3 +140,13 @@ directly on `main` — the `v0.2.0` branch holds only a duplicate of the
 log-depth commit (`b842bb7` ≈ `d72a545`) and is dropped; every other
 rule here (one commit per `done` feature, docs-only commits separate)
 still applies. The branch rule resumes for the next version.
+
+Recorded deviation (PO decision 2026-09-20, v0.3.3 cut): the last two
+v0.3.2 features (`cosmic-web-mass-rank-fix`, `cosmic-web-illustris-look`)
+reached `main` inside squash commit `e60a036` with their ANALYST /
+SECURITY rows still pending. Both were closed `done` at the cut with
+the rows filled retroactively against the code as landed (evidence in
+each `plan.md`); branch `v0.3.2` is left as-is (already merged). Branch
+`v0.3.3` is cut from `main` at `e4cb6fe` and follows every rule above
+from the first feature (one `done` commit per feature, docs-only
+commits separate).
