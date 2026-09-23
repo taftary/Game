@@ -26,7 +26,9 @@ pub mod params;
 
 pub use classify::{FILAMENT, NODE, SHEET, VOID};
 pub use descriptor::{WebDescriptor, WebLink, WebNode};
-pub use field_export::{WebField, WebFieldBudget, WebTracer, export_field};
+pub use field_export::{
+    WebField, WebFieldBudget, WebTracer, cell_list, displace_sample, export_field,
+};
 pub use params::CosmicWebParams;
 
 use classify::classify;
@@ -72,6 +74,7 @@ pub fn generate_cosmic_web(seed: u64, params: &CosmicWebParams) -> WebDescriptor
 /// assert_eq!(desc, generate_cosmic_web(1234, &params));
 /// assert!(!field.tracers.is_empty());
 /// assert_eq!(field.grid.len(), 32 * 32 * 32);
+/// assert_eq!(field.displacement.len(), 32 * 32 * 32);
 /// ```
 pub fn generate_cosmic_web_with_field(
     seed: u64,

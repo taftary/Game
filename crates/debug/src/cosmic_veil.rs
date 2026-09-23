@@ -257,6 +257,7 @@ mod tests {
         }
         WebField {
             tracers: Vec::new(),
+            displacement: Vec::new(),
             grid,
             grid_cells: n,
             cell_size_mpc: 4.0,
@@ -460,6 +461,7 @@ mod tests {
     fn empty_field_emits_nothing() {
         let field = WebField {
             tracers: Vec::new(),
+            displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
             cell_size_mpc: 4.0,
@@ -488,6 +490,7 @@ mod tests {
         // Degenerate fields build no texture.
         let empty = WebField {
             tracers: Vec::new(),
+            displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
             cell_size_mpc: 4.0,

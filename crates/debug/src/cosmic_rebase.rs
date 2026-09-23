@@ -210,6 +210,7 @@ mod tests {
         grid[0] = (2 << 6) | 63;
         let field = WebField {
             tracers,
+            displacement: Vec::new(),
             grid,
             grid_cells: 2,
             cell_size_mpc: 4.0,

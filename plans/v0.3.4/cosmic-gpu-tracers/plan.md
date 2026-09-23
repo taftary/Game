@@ -49,9 +49,9 @@ their tests; `rg` pin; docs; gates; audit; single commit.
 
 | ID | Status | Task | Ref notion § |
 |----|--------|------|--------------|
-| CGT-001 | pending | `WebField.displacement: Vec<[i16;3]>` (SNORM ± 8 cells) from the stage-B `∇Ψ` stencil; `sphere_radius_mpc` kept; doc-test updated; entry-point equality pin green | FR1, Goals §1 |
-| CGT-002 | pending | `displace_sample(field, q)` CPU mirror (quantize → trilinear → wrap); test vs the old tracer loop on the 32³ doc-test box (≤ 1 quantum) | FR7, Goals §6 |
-| CGT-003 | pending | `cell_list(field) -> Vec<u32>` (inside `R + cell`, sorted); tests: determinism, count band nominal seed, all listed cells' displaced centres inside `R + cell` | FR4, Goals §3 |
+| CGT-001 | done | `WebField.displacement: Vec<[i16;3]>` (SNORM ± 8 cells) from the stage-B `∇Ψ` stencil; `sphere_radius_mpc` kept; doc-test updated; entry-point equality pin green | FR1, Goals §1 |
+| CGT-002 | done | `displace_sample(field, q)` CPU mirror (quantize → trilinear → wrap); test vs the old tracer loop on the 32³ doc-test box (≤ 1 quantum) | FR7, Goals §6 |
+| CGT-003 | done | `cell_list(field) -> Vec<u32>` (inside `R + cell`, sorted); tests: determinism, count band nominal seed, all listed cells' displaced centres inside `R + cell` | FR4, Goals §3 |
 | CGT-004 | pending | Displacement 3D image `R16G16B16A16_SNORM` + linear clamp sampler + cell-list storage buffer on the seed path (never on rebase); R8 density volume bound to the vertex stage | FR2 |
 | CGT-005 | pending | `SPLAT_VERT` v2: `gl_VertexIndex → (slot, sub)`; offset table per `k`; jitter ≤ ¼ sub-cell (`fract`-hash); displacement fetch; sphere + slab tests; push origin; density fetch; shared ramp; pipeline without vertex input; draw by `cells × k` | FR3, Goals §2 |
 | CGT-006 | pending | `SplatK::for_tier` (1/2/8) + `GAME_DEBUG_COSMIC_K` (strict `1..=8`) + `cosmic_layout=` `cells/k/verts`; parse + mapping tests | FR5 |
@@ -82,8 +82,8 @@ SECURITY _(pending)_.
 |-------|----------------------------|--------|----------|-------------|
 | 1 | ≥ 5 continuous beaded filaments at `slab` (ridge scan) | pending | | |
 | 2 | Low/High parity overlay | pending | | |
-| 3 | Retirement pin = 0; `WebField` shape; equality pin | pending | | |
-| 4 | FR7 tests + cell-list band + env parse | pending | | |
+| 3 | Retirement pin = 0; `WebField` shape; equality pin | partial | `WebField` gains `displacement` (tracers kept until CGT-010); equality pin `with_field_matches_plain_entry_point` green 2026-09-23 | DEV |
+| 4 | FR7 tests + cell-list band + env parse | partial | CPU half green 2026-09-23: `displacement_quantagrees_within_one_quantum_on_small_box` (max err ≤ 1 quantum = 8/32767 cells; nominal max \|D₊·∇Ψ\| = 5.2214 cells, no SNORM clamp), `cell_list_sorted_inside_and_deterministic_on_small_box`, `cell_list_nominal_count_band` (seed 1234: 1 072 958 cells ∈ [900k, 1.3M]; sidecar 18 971 896 B ≈ 18.1 MB ≤ 24 MB). GPU readback (A-3) + `GAME_DEBUG_COSMIC_K` parse (CGT-006) pending | DEV |
 | 5 | Costs recorded per tier; cut order applied if needed | pending | | |
 | 6 | Docs + links | pending | | |
 | 7 | Gates + audit + review + one commit | pending | | |

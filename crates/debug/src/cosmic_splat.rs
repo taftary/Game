@@ -242,6 +242,7 @@ mod tests {
             .collect();
         WebField {
             tracers,
+            displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
             cell_size_mpc: 1.0,
@@ -312,6 +313,7 @@ mod tests {
                     overdensity: 10.0,
                 },
             ],
+            displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
             cell_size_mpc: 1.0,
@@ -403,6 +405,7 @@ mod tests {
                     overdensity: 1.0,
                 }, // hub 2: tinted
             ],
+            displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
             cell_size_mpc: 1.0,
