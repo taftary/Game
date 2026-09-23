@@ -2,8 +2,14 @@
 
 ## Status
 
-`in-progress` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
-threading precedent, ADR-026 §3; DEV implementation started 2026-09-23)
+`done` (PO sign-off 2026-09-23; UX consulted — UX-1 judged off the
+traverse + telemetry pins + capture stability, limitation L-2 in
+`plan.md` (no interactive session drivable; re-verify hands-on at
+`cosmic-vista-reframe`); ARCHITECT consulted — threading precedent,
+ADR-026 §3; DEV CRA-001..011 done 2026-09-23; ANALYST audit + SECURITY
+review recorded in `plan.md` DoD table; completion commit on branch
+`v0.3.4`, deviation recorded: progress commit `529819e` + CGT-010
+changes preceded it)
 
 ## Context
 

@@ -1,12 +1,14 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.51.0 (2026-09-23, v0.3.4 `cosmic-void-contrast`
-  in-progress: shared transfer snippet + CPU mirror across proc
-  splats / march / sprite colours, `emissive_scale` retired, HDR
-  clear deep indigo, MAP splat gain 0.2 → 0.25, UHD 620 slab /
-  inspector / demo captures + CPU scan tests green, full gates
-  green; ANALYST audit + SECURITY review pending; `cosmic-rebase-async`
-  reference-HW upload measure + UX hands-on still pending)
+- **Version:** 0.52.0 (2026-09-23, v0.3.4 `cosmic-rebase-async`
+  done: rebase never blocks the frame — split seed/rebase rebuilds,
+  glow-only off-thread worker (CGT-010 follow-through) with latest-wins
+  + join on drop; UHD 620 swap upload 22 194 pts / 0.8 MB in 1.50–2.11 ms
+  (no two-frame split), headless traverse 507 Mpc / 10 rebases / max tick
+  0.47 ms; ANALYST audit + SECURITY review recorded in `plan.md`;
+  completion commit on branch `v0.3.4`, deviation recorded: progress
+  commit `529819e` + CGT-010 changes preceded it; prior `cosmic-void-contrast`
+  done per its plan, commit `19558c4`)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
