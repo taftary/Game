@@ -13,16 +13,47 @@ pub const HUB_TIER_A_FRACTION: f64 = 0.01;
 /// Fraction of nodes promoted to Tier B (secondary hubs).
 pub const HUB_TIER_B_FRACTION: f64 = 0.10;
 /// Hard cap on member points (two-pass budget, deterministic).
-pub const MAX_MEMBER_POINTS: usize = 40_000;
+pub const MAX_MEMBER_POINTS: usize = 100_000;
+
+/// Pixel cap for the Tier A white-hot pin (`cosmic-hub-compact-cores`
+/// FR1/Goal 1: pin reads as a point, never a disc).
+pub const HUB_PIN_PX: f32 = 4.0;
+/// Pixel cap for Tier A cores (FR1/Goal 1).
+pub const HUB_CORE_A_PX: f32 = 10.0;
+/// Pixel cap for Tier B cores (FR1/Goal 1).
+pub const HUB_CORE_B_PX: f32 = 6.0;
+
+/// Glow `kind` for the Tier A pin (fixed 2.0 precedent, capped to
+/// [`HUB_PIN_PX`] in `GLOW_VERT`).
+pub const HUB_KIND_PIN: f32 = 2.0;
+/// Glow `kind` for Tier A cores (new in this feature, capped to
+/// [`HUB_CORE_A_PX`]).
+pub const HUB_KIND_CORE_A: f32 = 3.0;
+/// Glow `kind` for Tier B cores (new in this feature, capped to
+/// [`HUB_CORE_B_PX`]).
+pub const HUB_KIND_CORE_B: f32 = 4.0;
+
+/// Suffusion emission threshold in px (`cosmic-hub-compact-cores`
+/// FR3/Goal 4: the `1.0·r_vir` low-alpha world sprite emits only where
+/// it projects to at least this size, so it never becomes a disc from
+/// afar).
+pub const SUFFUSION_PX_THRESHOLD: f32 = 12.0;
+/// Suffusion alpha (very low, below the veil max 0.05 — starting value,
+/// recorded in the plan).
+pub const SUFFUSION_ALPHA: f32 = 0.04;
+/// Nominal `px_scale` for the suffusion projection estimate: 768 px
+/// viewport at 60° FOV (`768 / (2·tan 30°) ≈ 665.1`). Pure CPU estimate,
+/// deterministic — the shader never sees it.
+pub const SUFFUSION_PX_SCALE_NOMINAL: f32 = 665.1;
 
 /// Visual tier of a hub node, by mass rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HubTier {
-    /// Top 1 %: pin + core + halo, plus a member scatter.
+    /// Top 1 %: pin + core + conditional suffusion, plus a member scatter.
     A,
-    /// Next 10 %: core + halo, plus a small member scatter.
+    /// Next 10 %: core + conditional suffusion, plus a small member scatter.
     B,
-    /// The rest: a single warm bead, no halo, no members.
+    /// The rest: a single warm bead, no suffusion, no members.
     C,
 }
 
@@ -80,33 +111,53 @@ fn rel_pos(position_mpc: [f64; 3], origin: DVec3) -> [f32; 3] {
     ]
 }
 
-/// Impostor sprites as `(pos, color, misc=(size, alpha, kind))`: pin and
-/// core/bead sizes are px, halo sizes are world-Mpc diameters (kind 1).
+/// Impostor sprites as `(pos, color, misc=(size, alpha, kind))`:
+/// pin (`kind` 2) and cores (`kind` 3 = A, `kind` 4 = B) carry world-Mpc
+/// diameters capped to px maxima in `GLOW_VERT` ([`HUB_PIN_PX`],
+/// [`HUB_CORE_A_PX`], [`HUB_CORE_B_PX`]); beads (`kind` 0) are fixed
+/// 2 px; suffusion (`kind` 1) is an optional `1.0·r_vir` world sprite
+/// emitted only where [`should_emit_suffusion`] holds. The world-sized
+/// `kind`-1 halos of `cosmic-hub-hierarchy` are retired (this feature).
 pub fn hub_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
     let n = web.nodes.len();
     let mut out = Vec::new();
     for (rank, node) in web.nodes.iter().enumerate() {
         let pos = rel_pos(node.position_mpc, origin);
         let l = level_for(rank, n);
+        // Origin-relative distance for the suffusion estimate (ship to
+        // hub at build time — deterministic, pure).
+        let dist_mpc = (pos[0] as f64 * pos[0] as f64
+            + pos[1] as f64 * pos[1] as f64
+            + pos[2] as f64 * pos[2] as f64)
+            .sqrt();
         match HubTier::of(rank, n) {
             HubTier::A => {
-                // White-hot pin + pale core + world-sized warm halo.
-                out.push((pos, [3.2, 3.0, 2.8], [5.0, 1.0, 2.0]));
-                out.push((pos, [3.0, 2.4, 1.6], [12.0 + 8.0 * l, 1.0, 2.0]));
-                out.push((
-                    pos,
-                    [0.9, 0.55, 0.35],
-                    [(2.0 * node.virial_radius_mpc) as f32, 0.12, 1.0],
-                ));
+                // White-hot pin + pale core (both px-capped in-shader),
+                // plus conditional suffusion (no unconditional halo).
+                out.push((pos, [3.2, 3.0, 2.8], [5.0, 1.0, HUB_KIND_PIN]));
+                out.push((pos, [3.0, 2.4, 1.6], [12.0 + 8.0 * l, 1.0, HUB_KIND_CORE_A]));
+                if should_emit_suffusion(node.virial_radius_mpc, dist_mpc) {
+                    out.push((
+                        pos,
+                        [0.9, 0.55, 0.35],
+                        [node.virial_radius_mpc as f32, SUFFUSION_ALPHA, 1.0],
+                    ));
+                }
             }
             HubTier::B => {
-                // Warm gold core + small halo.
-                out.push((pos, [1.5, 1.15, 0.75], [4.0 + 4.0 * l, 1.0, 2.0]));
+                // Warm gold core (px-capped) + conditional suffusion.
                 out.push((
                     pos,
-                    [0.8, 0.5, 0.3],
-                    [node.virial_radius_mpc as f32, 0.10, 1.0],
+                    [1.5, 1.15, 0.75],
+                    [4.0 + 4.0 * l, 1.0, HUB_KIND_CORE_B],
                 ));
+                if should_emit_suffusion(node.virial_radius_mpc, dist_mpc) {
+                    out.push((
+                        pos,
+                        [0.8, 0.5, 0.3],
+                        [node.virial_radius_mpc as f32, SUFFUSION_ALPHA, 1.0],
+                    ));
+                }
             }
             HubTier::C => {
                 // Single warm bead, below the bloom threshold.
@@ -117,6 +168,48 @@ pub fn hub_impostors(web: &WebDescriptor, origin: DVec3) -> Vec<([f32; 3], [f32;
     out
 }
 
+/// Pixel cap for a glow `kind` (`cosmic-hub-compact-cores` CHC-001 CPU
+/// mirror of `GLOW_VERT`): pin → 4 px, Tier A core → 10 px, Tier B
+/// core → 6 px; all other kinds (fixed beads/members, world veil /
+/// suffusion) have no cap.
+pub fn hub_px_cap(kind: f32) -> Option<f32> {
+    if (kind - HUB_KIND_PIN).abs() < 1e-6 {
+        Some(HUB_PIN_PX)
+    } else if (kind - HUB_KIND_CORE_A).abs() < 1e-6 {
+        Some(HUB_CORE_A_PX)
+    } else if (kind - HUB_KIND_CORE_B).abs() < 1e-6 {
+        Some(HUB_CORE_B_PX)
+    } else {
+        None
+    }
+}
+
+/// CPU mirror of the `GLOW_VERT` clamp: perspective-scaled `world_px`
+/// (or fixed `px` for `kind` 0) reduced to the per-kind cap. Pure
+/// arithmetic for tests.
+pub fn clamp_hub_px(kind: f32, px: f32) -> f32 {
+    match hub_px_cap(kind) {
+        Some(cap) => px.min(cap),
+        None => px,
+    }
+}
+
+/// Estimated projected size of `r_vir` in px at `dist_mpc` under the
+/// nominal demo framing ([`SUFFUSION_PX_SCALE_NOMINAL`]). At zero
+/// distance the hub is at the eye — treat as infinitely large (emit).
+pub fn suffusion_px_estimate(r_vir_mpc: f64, dist_mpc: f64) -> f32 {
+    if dist_mpc <= 1e-9 {
+        return f32::INFINITY;
+    }
+    (r_vir_mpc as f32 * SUFFUSION_PX_SCALE_NOMINAL / dist_mpc.max(1e-6) as f32).max(0.0)
+}
+
+/// Suffusion emission rule (FR3, pure): emit the `1.0·r_vir` sprite
+/// only where it projects to at least [`SUFFUSION_PX_THRESHOLD`] px.
+pub fn should_emit_suffusion(r_vir_mpc: f64, dist_mpc: f64) -> bool {
+    suffusion_px_estimate(r_vir_mpc, dist_mpc) >= SUFFUSION_PX_THRESHOLD
+}
+
 /// Irwin-Hall-3: sum of 3 uniforms, centered (pure arithmetic).
 fn ihalf3(rng: &mut SeededRng) -> f64 {
     rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 1.5
@@ -125,8 +218,8 @@ fn ihalf3(rng: &mut SeededRng) -> f64 {
 /// Nominal member count for one node (before the budget cap).
 fn nominal_members(tier: HubTier, l: f32) -> usize {
     match tier {
-        HubTier::A => (40.0 + 200.0 * f64::from(l)).round() as usize,
-        HubTier::B => (10.0 + 20.0 * f64::from(l)).round() as usize,
+        HubTier::A => (150.0 + 250.0 * f64::from(l)).round() as usize,
+        HubTier::B => (30.0 + 40.0 * f64::from(l)).round() as usize,
         HubTier::C => 0,
     }
 }
@@ -161,8 +254,8 @@ pub fn hub_members(
     let mut out = Vec::new();
     for ((rank, node), count) in web.nodes.iter().enumerate().zip(budgeted.iter()) {
         let l = level_for(rank, n);
-        let glow = 1.5 + 1.5 * f64::from(l);
-        let size = 1.5 + 1.5 * l;
+        let glow = 2.0 + 2.0 * f64::from(l);
+        let size = 1.5 + 1.0 * l;
         let r_vir = node.virial_radius_mpc;
         for _ in 0..*count {
             let u = rng.unit_f64();
@@ -197,7 +290,7 @@ pub fn hub_members(
             out.push((
                 pos,
                 [base[0] * e, base[1] * e, base[2] * e],
-                [size, 0.9, 0.0],
+                [size, 0.95, 0.0],
             ));
         }
     }
@@ -277,36 +370,159 @@ mod tests {
 
     #[test]
     fn bloom_bands_per_tier() {
-        // n=100: rank 0 is A, ranks 1..=10 are B, rest C.
+        // n=100: rank 0 is A, ranks 1..=10 are B, rest C. Far origin
+        // (1e6 Mpc) omits all suffusion (px < 12), so A owns exactly
+        // pin + core, B exactly core.
         let web = synth_web(100, 50);
-        let sprites = hub_impostors(&web, DVec3::ZERO);
-        let (a_pin, a_core, a_halo) = (sprites[0], sprites[1], sprites[2]);
+        let far = DVec3::new(1.0e6, 0.0, 0.0);
+        let sprites = hub_impostors(&web, far);
+        let (a_pin, a_core) = (sprites[0], sprites[1]);
         assert!(peak(a_pin.1) >= 3.0);
         assert!(peak(a_core.1) >= 3.0);
-        assert_eq!(a_pin.2[2], 2.0);
-        assert_eq!(a_core.2[2], 2.0);
-        assert_eq!(a_halo.2[2], 1.0);
-        let b_core = sprites[3];
+        assert_eq!(a_pin.2[2], HUB_KIND_PIN);
+        assert_eq!(a_core.2[2], HUB_KIND_CORE_A);
+        let b_core = sprites[2];
         assert!((peak(b_core.1) - 1.5).abs() <= 0.3);
-        assert_eq!(b_core.2[2], 2.0);
+        assert_eq!(b_core.2[2], HUB_KIND_CORE_B);
         let c_bead = sprites[sprites.len() - 1];
         assert!(peak(c_bead.1) <= 0.9);
         assert_eq!(c_bead.2[2], 0.0);
+        // Halo retirement pin (CHC-003): no `2.0·r_vir` world halo
+        // remains — the old literal sizes (4.0 for A with r_vir 2.0,
+        // 2.0/1.0 for B) never appear as kind-1 sprites.
+        for (_, _, misc) in &sprites {
+            if misc[2] == 1.0 {
+                // Suffusion only (omitted here by the far origin), never
+                // the retired halo: assert no kind-1 at all in this
+                // configuration.
+                panic!("no kind-1 sprite expected at the far origin: {misc:?}");
+            }
+        }
     }
 
     #[test]
     fn impostor_sprite_totals() {
-        // n=200: A=2, B=20, C=178 -> 6 + 40 + 178 = 224.
+        // n=200: A=2, B=20, C=178. Far origin omits suffusion: 2·2 +
+        // 20·1 + 178 = 202.
         let web = synth_web(200, 100);
-        let sprites = hub_impostors(&web, DVec3::ZERO);
-        assert_eq!(sprites.len(), 2 * 3 + 20 * 2 + 178);
-        // Per-node stride: A nodes own 3 each, B 2, C 1.
+        let far = DVec3::new(1.0e6, 0.0, 0.0);
+        let sprites = hub_impostors(&web, far);
+        assert_eq!(sprites.len(), 2 * 2 + 20 + 178);
+        // Per-node stride without suffusion: A 2 each, B 1, C 1.
         assert_eq!(sprites[0].2[0], 5.0); // A pin size
-        let b_start = 2 * 3;
-        assert_eq!(sprites[b_start + 1].2[2], 1.0); // B halo kind
-        let c_start = b_start + 20 * 2;
+        assert_eq!(sprites[0].2[2], HUB_KIND_PIN);
+        assert_eq!(sprites[1].2[2], HUB_KIND_CORE_A);
+        let b_start = 2 * 2;
+        assert_eq!(sprites[b_start].2[2], HUB_KIND_CORE_B);
+        let c_start = b_start + 20;
         assert_eq!(sprites[c_start].2, [2.0, 1.0, 0.0]); // C bead misc
         assert_eq!(sprites.len() - c_start, 178);
+    }
+
+    #[test]
+    fn px_cap_mirror_matches_plan_consts() {
+        // CHC-001 CPU mirror: per-kind caps after the perspective scale.
+        assert_eq!(HUB_PIN_PX, 4.0);
+        assert_eq!(HUB_CORE_A_PX, 10.0);
+        assert_eq!(HUB_CORE_B_PX, 6.0);
+        assert_eq!(hub_px_cap(HUB_KIND_PIN), Some(4.0));
+        assert_eq!(hub_px_cap(HUB_KIND_CORE_A), Some(10.0));
+        assert_eq!(hub_px_cap(HUB_KIND_CORE_B), Some(6.0));
+        assert_eq!(hub_px_cap(0.0), None);
+        assert_eq!(hub_px_cap(1.0), None);
+        // Clamp: world-scaled sizes above the cap reduce to the cap;
+        // below the cap pass through (distant hubs are naturally small).
+        assert_eq!(clamp_hub_px(HUB_KIND_PIN, 27.0), 4.0);
+        assert_eq!(clamp_hub_px(HUB_KIND_CORE_A, 109.0), 10.0);
+        assert_eq!(clamp_hub_px(HUB_KIND_CORE_B, 21.0), 6.0);
+        assert_eq!(clamp_hub_px(HUB_KIND_CORE_A, 7.5), 7.5);
+        assert_eq!(clamp_hub_px(0.0, 2.5), 2.5);
+        assert_eq!(clamp_hub_px(1.0, 21.8), 21.8);
+    }
+
+    #[test]
+    fn suffusion_rule_emits_close_omits_far() {
+        // CHC-003/FR3: 2 Mpc r_vir at 10 Mpc projects ≈133 px (emit);
+        // at the 427 Mpc slab distance ≈3 px (omit). Threshold 12 px.
+        assert_eq!(SUFFUSION_PX_THRESHOLD, 12.0);
+        assert!(should_emit_suffusion(2.0, 10.0));
+        assert!(!should_emit_suffusion(2.0, 427.0));
+        assert!(!should_emit_suffusion(1.0, 427.0));
+        // At the eye (dist 0) the hub fills the view — emit.
+        assert!(should_emit_suffusion(1.0, 0.0));
+        // Estimate sanity: 2 Mpc at 10 Mpc under the nominal 665.1
+        // scale ≈133 px.
+        let px = suffusion_px_estimate(2.0, 10.0);
+        assert!((px - 133.0).abs() < 2.0, "suffusion estimate off: {px}");
+        // Deterministic + pure: same inputs, same outputs.
+        assert_eq!(
+            suffusion_px_estimate(2.0, 10.0),
+            suffusion_px_estimate(2.0, 10.0)
+        );
+    }
+
+    #[test]
+    fn halo_retired_suffusion_replaces_it() {
+        // CHC-003: close origin emits suffusion (kind 1, 1.0·r_vir,
+        // low alpha); far origin omits it. Old halo literals
+        // (2.0·r_vir with alpha 0.12, 1.0·r_vir with 0.10) never appear.
+        let web = synth_web(10, 5);
+        let close = hub_impostors(&web, DVec3::ZERO);
+        let far = hub_impostors(&web, DVec3::new(1.0e6, 0.0, 0.0));
+        assert!(close.len() > far.len(), "close must add suffusion");
+        for (_, _, misc) in &close {
+            // No retired halo: kind-1 sprites carry the suffusion
+            // alpha, never 2·r_vir / 0.12 / 0.10.
+            if misc[2] == 1.0 {
+                assert!(
+                    (misc[1] - SUFFUSION_ALPHA).abs() < 1e-6,
+                    "kind-1 must be suffusion alpha: {misc:?}"
+                );
+            }
+            assert_ne!(misc[1], 0.12, "retired A halo alpha: {misc:?}");
+            assert_ne!(misc[1], 0.10, "retired B halo alpha: {misc:?}");
+        }
+        // Suffusion size is exactly 1.0·r_vir: every kind-1 size must
+        // match some node's r_vir (2.0 for A nodes, 1.0 for the rest in
+        // the synth web). Walk per-node (A owns 3 sprites close, B 2,
+        // C 1) instead of zipping sprites to nodes.
+        let mut saw_a_suffusion = false;
+        let mut cursor = 0_usize;
+        for (rank, node) in web.nodes.iter().enumerate() {
+            let tier = HubTier::of(rank, web.nodes.len());
+            let stride = match tier {
+                HubTier::A => 3,
+                HubTier::B => 2,
+                HubTier::C => 1,
+            };
+            // Far origin omits suffusion, so close may own one more
+            // sprite per A/B node; locate the kind-1 within the stride
+            // when present.
+            let mut found_kind1: Option<[f32; 3]> = None;
+            for k in 0..stride {
+                // Close origin emits for every node in this small web
+                // (all within ~90 Mpc), so the stride holds.
+                if cursor + k < close.len() {
+                    let misc = close[cursor + k].2;
+                    if misc[2] == 1.0 {
+                        found_kind1 = Some(misc);
+                    }
+                }
+            }
+            if let Some(misc) = found_kind1 {
+                assert!(
+                    (misc[0] - node.virial_radius_mpc as f32).abs() < 1e-6,
+                    "suffusion must be 1.0·r_vir: {misc:?} vs node {rank}"
+                );
+                if node.virial_radius_mpc == 2.0 {
+                    saw_a_suffusion = true;
+                }
+            }
+            // Advance by the close stride (all emit here); the far
+            // stride is shorter, which the length assertion covers.
+            cursor += stride;
+        }
+        assert!(saw_a_suffusion, "close origin must emit A suffusion");
     }
 
     /// Expected nominal counts for the `synth_web(200)` layout.
@@ -322,15 +538,64 @@ mod tests {
     fn member_counts_match_tiers() {
         let web = synth_web(200, 100);
         let expected = expected_counts_200();
-        // A head emits 40+200*1 = 240, second A 40+200*0.5 = 140.
-        assert_eq!(expected[0], 240);
-        assert_eq!(expected[1], 140);
-        // B head emits 10+20*1 = 30; C nodes emit none.
-        assert_eq!(expected[2], 30);
+        // A head emits 150+250*1 = 400, second A 150+250*0.5 = 275.
+        assert_eq!(expected[0], 400);
+        assert_eq!(expected[1], 275);
+        // B head emits 30+40*1 = 70; C nodes emit none.
+        assert_eq!(expected[2], 70);
         assert!(expected[22..].iter().all(|c| *c == 0));
         let members = hub_members(&web, 7, DVec3::ZERO);
         assert_eq!(members.len(), expected.iter().sum::<usize>());
         assert!(members.len() <= MAX_MEMBER_POINTS);
+    }
+
+    #[test]
+    fn member_budget_cap_is_100k() {
+        // CHC-002/FR2: the two-pass cap holds 100k; nominal ≈46.5k
+        // (60·275 + 600·50) sits under it, so no scaling at nominal.
+        assert_eq!(MAX_MEMBER_POINTS, 100_000);
+        // Nominal headless shape (FR5): 60 A × ~275 + 600 B × ~50.
+        let a_avg = 150.0_f64 + 250.0_f64 * 0.5;
+        let b_avg = 30.0_f64 + 40.0_f64 * 0.5;
+        let nominal = 60.0_f64 * a_avg + 600.0_f64 * b_avg;
+        assert!(
+            (nominal - 46_500.0_f64).abs() < 1.0,
+            "nominal members must be ≈46 500, got {nominal}"
+        );
+        // Over-budget scales deterministically below the cap.
+        let web = synth_web(6000, 3000);
+        let members = hub_members(&web, 7, DVec3::ZERO);
+        assert!(
+            members.len() <= MAX_MEMBER_POINTS,
+            "members over budget: {}",
+            members.len()
+        );
+    }
+
+    #[test]
+    fn member_emissive_and_alpha_match_fr2() {
+        // CHC-002/FR2: emissive 2.0+2.0·l, alpha 0.95, sizes 1.5–2.5.
+        // Head (l=1): e=4.0; tail (l→0): e→2.0. Peak channel equals e
+        // (red base 1.0), so members read individually against the F4
+        // grading by construction.
+        let web = synth_web(200, 100);
+        let members = hub_members(&web, 7, DVec3::ZERO);
+        assert!(!members.is_empty());
+        for (_, color, misc) in &members {
+            let e = peak(*color);
+            assert!(
+                (2.0 - 1e-6..=4.0 + 1e-6).contains(&e),
+                "member emissive out of [2,4]: {e}"
+            );
+            assert_eq!(misc[1], 0.95);
+            assert!((1.5 - 1e-6..=2.5 + 1e-6).contains(&misc[0]));
+        }
+        // CHC-004/FR4 note: with FR2 emissive the members sit at 2–4
+        // (above the 1.0 bloom threshold), so they bloom individually
+        // where bright — the FR4 "members ≤ 0.9 (bloom only where they
+        // stack)" line cannot hold together with FR2 and is recorded
+        // as an accepted deviation in the plan (R-1 orders emissive
+        // before counts if wash appears).
     }
 
     #[test]
@@ -351,7 +616,13 @@ mod tests {
             assert!(dist <= node.virial_radius_mpc + 0.01, "dist {dist}");
             per_node[idx] += 1;
             assert_eq!(misc[2], 0.0);
-            assert_eq!(misc[1], 0.9);
+            assert_eq!(misc[1], 0.95);
+            // Size band 1.5–2.5 px (Goal 2).
+            assert!(
+                (1.5 - 1e-6..=2.5 + 1e-6).contains(&misc[0]),
+                "member size out of band: {}",
+                misc[0]
+            );
         }
         assert_eq!(per_node, expected);
     }
@@ -406,13 +677,40 @@ mod tests {
             assert_eq!(p.1, q.1);
             assert_eq!(p.2, q.2);
         }
+        // Impostor pin/cores/beads are translation-invariant; suffusion
+        // (kind 1) is origin-dependent by design (FR3: emits only where
+        // r_vir projects ≥ 12 px from the build origin), so filter it
+        // before the shift check. Far origins omit suffusion on both
+        // sides — positions shift exactly there.
         let c = hub_impostors(&web, DVec3::ZERO);
         let d = hub_impostors(&web, shift);
-        assert_eq!(c.len(), d.len());
-        for (p, q) in c.iter().zip(d.iter()) {
+        let no_suff = |v: &Vec<([f32; 3], [f32; 3], [f32; 3])>| {
+            v.iter()
+                .filter(|(_, _, m)| m[2] != 1.0)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (cf, df) = (no_suff(&c), no_suff(&d));
+        assert_eq!(cf.len(), df.len());
+        for (p, q) in cf.iter().zip(df.iter()) {
             for axis in 0..3 {
                 let moved = p.0[axis] - q.0[axis];
                 assert!((moved - shift.to_array()[axis] as f32).abs() < 0.02);
+            }
+            assert_eq!(p.1, q.1);
+            assert_eq!(p.2, q.2);
+        }
+        let far_a = DVec3::new(1.0e6, 0.0, 0.0);
+        let far_b = DVec3::new(1.0e6 + 100.0, -50.0, 25.0);
+        let fa = hub_impostors(&web, far_a);
+        let fb = hub_impostors(&web, far_b);
+        assert_eq!(fa.len(), fb.len());
+        // p (far_a) − q (far_b) = far_b − far_a = (100, −50, 25).
+        let expect = (far_b - far_a).to_array();
+        for (p, q) in fa.iter().zip(fb.iter()) {
+            for (axis, e) in expect.iter().enumerate() {
+                let moved = p.0[axis] - q.0[axis];
+                assert!((moved - *e as f32).abs() < 0.02);
             }
             assert_eq!(p.1, q.1);
             assert_eq!(p.2, q.2);

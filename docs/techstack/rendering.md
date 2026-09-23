@@ -569,20 +569,29 @@ home depth. Measured: voids dark (≥ 10 distinct in
 splat shot (window off = identity), slab keeps 12 % of listed
 cells (8.3× fill relief, `slab_relief` headless line).
 
-Hub hierarchy (`cosmic-hub-hierarchy`, shipped 2026-09-20): hubs
-tiered by mass rank (A = top 1 %, B = next 10 %, C = rest) into the
-glow `PointList` — A: white-hot pin + `kind`-2 core with an
-in-sprite radial ramp (white-yellow → orange) + world-sized
-pink-amber halo, plus a member-galaxy scatter (NFW-like `r ∝ u²`
-under `cosmic_web/members`, 60 % pink-red / 30 % orange / 10 %
-white, ≤ 40k); B: `kind`-2 core + small halo + members; C: one warm
-2 px bead below the bloom threshold. Bloom inputs tiered by
-construction (A pins/cores ≥ 3.0, B cores ≈ 1.5, C beads ≤ 0.9);
-Tier A/B impostors take the 0.25 fog floor. The 3-per-node
-`node_impostors` (+ `mass_level`/`node_color`/`node_size_px`/
-`node_point_cloud`) are retired. Nominal headless: 6720 impostors +
-20 512 members; spawn goal Tier C (pinned — highlight ring carries
-it, vista frames Tier A).
+Hub hierarchy (`cosmic-hub-hierarchy`, shipped 2026-09-20; compacted
+by `cosmic-hub-compact-cores`, shipped 2026-09-23): hubs tiered by
+mass rank (A = top 1 %, B = next 10 %, C = rest) into the glow
+`PointList` — A: white-hot pin (`kind` 2, ≤ 4 px) + `kind`-3 core
+with an in-sprite radial ramp (white-yellow → orange, ≤ 10 px) +
+conditional suffusion (`kind` 1, `1.0·r_vir`, α 0.04, only where
+`r_vir` projects ≥ 12 px at the nominal demo scale, so never a disc
+from afar), plus a member-galaxy scatter (NFW-like `r ∝ u²` under
+`cosmic_web/members`, 60 % pink-red / 30 % orange / 10 % white,
+`150 + 250·l` per A, `30 + 40·l` per B, ≤ 100k, emissive `2 + 2·l`,
+α 0.95, 1.5–2.5 px); B: `kind`-4 core (≤ 6 px) + suffusion +
+members; C: one warm 2 px bead below the bloom threshold. Cores are
+pixel-capped in `GLOW_VERT` after the perspective scale (CPU mirror
+`hub_px_cap`/`clamp_hub_px`); the world-sized `kind`-1 halos are
+retired. Bloom inputs tiered by construction (A pins/cores ≥ 3.0, B
+cores ≈ 1.5, C beads ≤ 0.9; members 2–4, blooming individually —
+FR4's ≤ 0.9 line recorded as deviation, R-1 orders emissive before
+counts); Tier A/B impostors take the 0.25 fog floor. Nominal
+headless: 5030 impostors + 38 795 members; spawn goal Tier C
+(pinned — highlight ring carries it, vista frames Tier A). Slab
+grade (UHD 620, seed 1337): largest core 8 px, blazing A hubs 5/49
+(CPU in-slice), halo 7 px vs core 6 px (1.17×) on the in-slice hub,
+95 discrete dots frame-wide with 5/20 Tier A crops holding ≥3 dots.
 
 Gas veil (`cosmic-gas-veil-v2`, shipped 2026-09-22): the filament
 bodies are the `WebField` 128³ grid itself — filament/sheet/node

@@ -417,12 +417,23 @@ layout(location = 2) out float v_kind;
 void main() {
     vec4 clip = pc.mvp * vec4(map_pos, 1.0);
     gl_Position = clip;
-    // `kind` 1 = world-unit size (halo impostors), scaled by
-    // `px_scale` over the perspective divide — the shared map-shader
-    // convention; `kind` 0 = fixed pixel size (cores, grain, glow);
-    // `kind` 2 = hub core with an in-sprite radial ramp
-    // (`cosmic-hub-hierarchy`).
-    float px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
+    // `kind` 1 = world-unit size (veil cell sprites, hub suffusion),
+    // scaled by `px_scale` over the perspective divide — the shared
+    // map-shader convention; `kind` 0 = fixed pixel size (beads,
+    // members); `kind` 2/3/4 = hub pin / Tier A core / Tier B core
+    // with the in-sprite radial ramp (`cosmic-hub-hierarchy`, capped
+    // by `cosmic-hub-compact-cores`).
+    float raw_px = (misc.z < 0.5) ? misc.x : misc.x * pc.px_scale / max(clip.w, 1e-6);
+    // Pixel caps (`cosmic-hub-compact-cores` CHC-001/FR1, Goal 1):
+    // Tier A pin ≤ 4 px, Tier A core ≤ 10 px, Tier B core ≤ 6 px at
+    // any distance beyond `r_vir` — a cluster reads as a point +
+    // swarm, never a disc. CPU mirror:
+    // `cosmic_hubs::{hub_px_cap, clamp_hub_px}` (pinned by
+    // `px_cap_mirror_matches_plan_consts`).
+    float px = raw_px;
+    if (abs(misc.z - 2.0) < 0.01) { px = min(raw_px, 4.0); }
+    else if (abs(misc.z - 3.0) < 0.01) { px = min(raw_px, 10.0); }
+    else if (abs(misc.z - 4.0) < 0.01) { px = min(raw_px, 6.0); }
     gl_PointSize = clamp(px, 1.0, 256.0);
     // Bounded redshift depth: negative view depth clamps to 0 and the
     // exaggerated term caps at 0.5, so both denominators stay >= 1.35
@@ -455,8 +466,9 @@ void main() {
     float t = max(0.0, 1.0 - 4.0 * dot(d, d));
     float fall = t * t;
     vec3 col = v_color;
-    // Hub core (`cosmic-hub-hierarchy`, `kind` 2): white-hot center →
-    // pale yellow → orange rim inside the sprite (arithmetic-only).
+    // Hub cores (`cosmic-hub-hierarchy` `kind` 2, extended by
+    // `cosmic-hub-compact-cores` to 3/4): white-hot center → pale
+    // yellow → orange rim inside the sprite (arithmetic-only).
     float r = length(d) * 2.0;
     vec3 core = mix(vec3(1.0, 0.97, 0.85), vec3(1.0, 0.55, 0.25), smoothstep(0.2, 0.5, r));
     col = (v_kind > 1.5) ? core : col;
@@ -2000,6 +2012,28 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     let mut debug = DebugApp::new();
     if seed != DEFAULT_GALAXY_SEED {
         debug.cosmic.reseed(seed);
+    }
+    // Demo approach (`cosmic-hub-compact-cores` CHC-006/DoD 2): the
+    // `demo` preset IS the spawn Chase pose; optional
+    // `GAME_DEBUG_DEMO_APPROACH_MPC` (Mpc, e.g. "10") holds `W` and
+    // ticks at 60 Hz until the ship has travelled that far (or 10k
+    // ticks) — deterministic per build+seed, no rebase (10 Mpc <
+    // 50 Mpc rebase distance, so the t = 0 buffers stay valid). Serves
+    // the `demo-after-10mpc.png` swarm-resolution shot.
+    if preset.view == game_debug::cosmic_capture::CaptureView::Demo
+        && let Ok(mpc) = std::env::var("GAME_DEBUG_DEMO_APPROACH_MPC")
+        && let Ok(target) = mpc.parse::<f64>()
+        && target > 0.0
+    {
+        let start = debug.cosmic.player.position_mpc();
+        debug.cosmic.held.fwd = true;
+        for _ in 0..10_000 {
+            debug.cosmic.tick(1.0 / 60.0);
+            if (debug.cosmic.player.position_mpc() - start).length() >= target {
+                break;
+            }
+        }
+        debug.cosmic.held.clear();
     }
     // Gas-veil density volume (per seed; the march samples it).
     let veil_volume = upload_veil_volume(
@@ -11049,6 +11083,47 @@ mod tests {
         assert!(
             !resolve.contains("backdrop"),
             "resolve must not add a backdrop term"
+        );
+    }
+
+    #[test]
+    fn hub_px_caps_in_glow_vert() {
+        // `cosmic-hub-compact-cores` CHC-001/FR1 + CHC-003/FR3: the glow
+        // vertex shader clamps hub pin/cores to per-kind px maxima
+        // after the perspective scale (CPU mirror:
+        // `cosmic_hubs::{hub_px_cap, clamp_hub_px}`). String pins —
+        // naga compiles the shape, never the values.
+        use game_debug::cosmic_hubs::{
+            HUB_CORE_A_PX, HUB_CORE_B_PX, HUB_KIND_CORE_A, HUB_KIND_CORE_B, HUB_KIND_PIN,
+            HUB_PIN_PX,
+        };
+        assert_eq!((HUB_PIN_PX, HUB_CORE_A_PX, HUB_CORE_B_PX), (4.0, 10.0, 6.0));
+        assert_eq!(
+            (HUB_KIND_PIN, HUB_KIND_CORE_A, HUB_KIND_CORE_B),
+            (2.0, 3.0, 4.0)
+        );
+        for (literal, what) in [
+            ("abs(misc.z - 2.0) < 0.01", "pin kind branch"),
+            ("abs(misc.z - 3.0) < 0.01", "core-A kind branch"),
+            ("abs(misc.z - 4.0) < 0.01", "core-B kind branch"),
+            ("min(raw_px, 4.0)", "pin 4 px cap"),
+            ("min(raw_px, 10.0)", "core-A 10 px cap"),
+            ("min(raw_px, 6.0)", "core-B 6 px cap"),
+        ] {
+            assert!(
+                GLOW_VERT.contains(literal),
+                "{what} missing from the glow vertex shader"
+            );
+        }
+        // Core ramp covers all three hub kinds (2/3/4); the window
+        // floor still covers every hub kind (≥ 1).
+        assert!(
+            GLOW_FRAG.contains("v_kind > 1.5"),
+            "hub core ramp must cover pin + both cores"
+        );
+        assert!(
+            GLOW_VERT.contains("(kind >= 1)"),
+            "hub fog floor must cover suffusion + pin + cores"
         );
     }
 

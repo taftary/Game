@@ -2,8 +2,10 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
-debug-only, ADR-026 §5)
+`done` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
+debug-only, ADR-026 §5; DEV CHC-001..009 done 2026-09-23; ANALYST
+audit + SECURITY review recorded in `plan.md` DoD table; single
+commit on branch `v0.3.4`)
 
 ## Context
 
