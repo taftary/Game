@@ -2,8 +2,11 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-23; ARCHITECT consulted — hashed path,
-ADR-026 §1)
+`done` (PO sign-off 2026-09-23; ARCHITECT consulted — hashed path,
+ADR-026 §1; scope extension 2026-09-23 — vista dive-exact hub
+shortlist folded in per PO decision, `cosmic-vista-reframe` CVR-004
+dive core; ANALYST audit + SECURITY review recorded in `plan.md` DoD
+table; single commit on branch `v0.3.4`)
 
 ## Context
 

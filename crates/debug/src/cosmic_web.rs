@@ -238,6 +238,19 @@ mod tests {
     }
 
     #[test]
+    fn nominal_links_inside_sphere() {
+        // CSC-005 / FR4: link endpoints are node positions, so both sit
+        // inside the descriptor sphere. Slow (~15 s): nominal generation.
+        let web = web();
+        let params = CosmicWebParams::nominal();
+        let r = params.descriptor_radius_mpc as f32;
+        for p in link_segments(&web, DVec3::ZERO) {
+            let r2 = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
+            assert!(r2 <= r * r, "link endpoint outside sphere: {p:?}");
+        }
+    }
+
+    #[test]
     fn enrichment_layouts_are_finite_and_bounded() {
         // GPU-debug aid (visual-issue round 2): scans every emitted
         // vertex of the nominal web for non-finite or out-of-band

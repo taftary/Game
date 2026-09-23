@@ -17,8 +17,11 @@ pub struct CosmicWebParams {
     pub lattice_cells: u32,
     /// Comoving Mpc per lattice cell.
     pub cell_size_mpc: f64,
-    /// Descriptor sphere radius in Mpc. Must fit inside the lattice box
-    /// with margin: `radius + 2 * cell <= cells * cell_size / 2`.
+    /// Descriptor sphere radius in Mpc: a generation cut (ADR-026 §1,
+    /// v0.3.4 `cosmic-sphere-clip`) — peaks whose refined position lies
+    /// outside are rejected before acceptance, so every emitted node
+    /// satisfies `|position_mpc| ≤ radius`. Must fit inside the lattice
+    /// box with margin: `radius + 2 * cell <= cells * cell_size / 2`.
     pub descriptor_radius_mpc: f64,
     /// Gaussian smoothing scales (in cells) combined into the initial
     /// field, smallest first.

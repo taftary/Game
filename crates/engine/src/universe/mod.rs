@@ -53,6 +53,13 @@ pub use web::{
 /// change; stamped into every descriptor. Version bump = migration or
 /// new game, never silent drift (see `docs/game/universe.md` rules).
 ///
+/// v4 (v0.3.4 `cosmic-sphere-clip`): the descriptor sphere is a
+/// generation cut — peaks whose refined position lies outside
+/// `descriptor_radius_mpc` are rejected before greedy acceptance, so
+/// every emitted node satisfies `|position_mpc| ≤ radius`. Stage 1–2
+/// streams are domain-separated and untouched, so galaxies and systems
+/// replay identically — only their hashes re-roll via the stamp.
+///
 /// v3 (v0.3.2 `cosmic-web-mass-rank-fix`): fixes inverted mass-rank
 /// assignment in the stage-0 cosmic web — densest peak now correctly
 /// receives the rarest (most massive) halo.  Stage 1–2 streams are
@@ -60,4 +67,4 @@ pub use web::{
 /// identically — only their hashes re-roll via the stamp.
 ///
 /// v2 (v0.3.2 `cosmic-scale-player`): adds the stage-0 cosmic web.
-pub const UNIVERSE_VERSION: u32 = 3;
+pub const UNIVERSE_VERSION: u32 = 4;

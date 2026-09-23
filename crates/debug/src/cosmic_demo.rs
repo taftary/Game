@@ -183,12 +183,15 @@ impl CosmicDemoState {
         }
     }
 
-    /// (Re)start the vista: Hold at the Tier-A opening pose, diving to
-    /// the current Chase pose. Boot, reseed, and `V` all funnel here.
+    /// (Re)start the vista: Hold at the composition opening pose,
+    /// diving to the current Chase pose. Boot, reseed, and `V` all
+    /// funnel here.
     pub fn replay_vista(&mut self) {
-        // The chase endpoint must be read before the camera is posed.
+        // The chase endpoint must be read before the camera is posed —
+        // and the opening pose is scored against it (dive-exact hub
+        // shortlist), so it travels in explicitly.
         let chase = self.chase_pose();
-        let from = vista_pose(&self.web);
+        let from = vista_pose(&self.web, self.params.descriptor_radius_mpc, &chase);
         self.vista = VistaState::start(from, chase);
         self.vista_events.push("hold");
         self.apply_vista_pose();

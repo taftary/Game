@@ -86,6 +86,18 @@ UX acceptance rows:
 
 ## Risks & Next steps
 
+- NOTE 2026-09-23 (cross-link from `cosmic-sphere-clip` CSC-009, PO
+  decision): the bounded descriptor broke the 180 Mpc outside vista
+  pose (nominal dive 35.3°/s vs the 30°/s bound), so the dive-safety
+  core landed early in the sphere-clip commit — `interior_window` +
+  focal composition + dive-exact hub shortlist
+  (`vista_pose(web, radius, chase)`, nominal pick rank 1, dive
+  28.4°/s, focal NDC (0.096, 0.000)). This feature keeps CVR-005
+  (presets), CVR-006 (shots), CVR-007 (readings), CVR-008 (UX),
+  CVR-009 (docs), CVR-010 (gates + version close), plus the FR1 16:9
+  shrink fallback and any `VISTA_DOCK_MPC` re-tune the final
+  materials require; CVR-001..003 stand (implemented) and CVR-004's
+  bound runs green.
 - R-1 (no fitting hub): a seed may lack a Tier A hub with `|c| ≤
   0.4·R`; the fallback chain widens to `0.6·R` then to Tier B
   (recorded, tested on the seed set).

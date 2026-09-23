@@ -373,10 +373,52 @@ mod tests {
     fn committed_web_vectors_pin_stage0() {
         // Change-detectors, not oracles: any intentional generation
         // change updates these alongside a UNIVERSE_VERSION bump.
+        // v4 (`cosmic-sphere-clip`): sphere is a generation cut.
         assert_eq!(
             web_hash(&generate_cosmic_web(1234, &CosmicWebParams::nominal())),
-            17_301_221_795_867_311_725
+            5_587_830_784_546_330_281
         );
+    }
+
+    #[test]
+    fn all_nodes_inside_sphere() {
+        // CSC-003 / FR4: every emitted node satisfies
+        // `|position_mpc| ≤ descriptor_radius_mpc` on the nominal
+        // seed set (+ the small-box doc-test params).
+        let seeds = [1234_u64, 1337, 11];
+        let params = [CosmicWebParams::nominal()];
+        for p in &params {
+            let r2max = p.descriptor_radius_mpc * p.descriptor_radius_mpc;
+            for seed in seeds {
+                let web = generate_cosmic_web(seed, p);
+                assert!(!web.nodes.is_empty(), "seed {seed}: no nodes");
+                for node in &web.nodes {
+                    let r2 = node.position_mpc[0] * node.position_mpc[0]
+                        + node.position_mpc[1] * node.position_mpc[1]
+                        + node.position_mpc[2] * node.position_mpc[2];
+                    assert!(
+                        r2 <= r2max,
+                        "seed {seed}: node {} outside sphere: r²={r2} > {r2max}",
+                        node.node_index,
+                    );
+                }
+            }
+        }
+        let small = CosmicWebParams::new(32, 4.0, 50.0).expect("small test params fit");
+        let r2max = small.descriptor_radius_mpc * small.descriptor_radius_mpc;
+        for seed in [1234_u64, 11] {
+            let web = generate_cosmic_web(seed, &small);
+            for node in &web.nodes {
+                let r2 = node.position_mpc[0] * node.position_mpc[0]
+                    + node.position_mpc[1] * node.position_mpc[1]
+                    + node.position_mpc[2] * node.position_mpc[2];
+                assert!(
+                    r2 <= r2max,
+                    "small-box seed {seed}: node {} outside sphere",
+                    node.node_index,
+                );
+            }
+        }
     }
 
     #[test]

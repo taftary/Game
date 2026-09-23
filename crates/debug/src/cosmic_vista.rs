@@ -1,8 +1,11 @@
 //! Vista intro state machine (CVI-002/003): Hold → Dive → Done.
 //!
-//! Pure function of `(seed, t)`: the opening pose frames the nearest
-//! Tier-A hub from outside, then eases to the Chase pose. No window,
-//! no GPU — wiring lives in the binary.
+//! Pure function of `(seed, t)`: the opening pose frames an interior
+//! window of the web (v0.3.4 `cosmic-vista-reframe` FR1–FR3, folded
+//! into `cosmic-sphere-clip` per PO decision 2026-09-23 — the bounded
+//! descriptor broke the 180 Mpc outside pose with a 35°/s dive, and
+//! the re-pose is required for gates green), then eases to the Chase
+//! pose. No window, no GPU — wiring lives in the binary.
 
 use game_engine::handoff::smoothstep;
 use game_engine::universe::WebDescriptor;
@@ -239,12 +242,138 @@ fn is_tier_a(rank: usize, n: usize) -> bool {
     rank < n.div_ceil(100).max(1).min(n.max(1))
 }
 
-/// Opening pose: nearest Tier-A node to home, viewed from 180 Mpc with
-/// home in frame. Fallback chain: nearest Tier A → most massive within
-/// 150 Mpc of home → most massive overall → default axis.
-pub fn vista_pose(web: &WebDescriptor) -> VistaPose {
+/// Interior-window footprint width, Mpc (FR1 starting value).
+pub const VISTA_WINDOW_W_MPC: f64 = 300.0;
+/// Interior-window footprint height, Mpc (FR1 starting value, 16:9).
+pub const VISTA_WINDOW_H_MPC: f64 = 170.0;
+/// Rim safety margin inside the sphere cross-section, Mpc (FR1).
+pub const VISTA_WINDOW_MARGIN_MPC: f64 = 15.0;
+/// Composition weight: bright vs central (FR2 starting value).
+pub const VISTA_HUB_LAMBDA: f64 = 0.5;
+/// Slab-centre bound as a fraction of R (FR3).
+pub const VISTA_SLAB_CENTER_FRAC: f64 = 0.4;
+/// Focal position of the hub in the frame, width fraction (FR3).
+pub const VISTA_FOCAL_X: f64 = 0.55;
+
+/// Interior-window fit (FR1): with slab thickness `t` and a `w × h`
+/// footprint at distance `|c|` from the sphere centre, the footprint's
+/// half-diagonal plus `t/2` must stay inside the sphere cross-section
+/// at `c` with `margin` to spare. Returns the eye distance `d` at the
+/// 25° vista FOV (`d = (h/2)/tan(12.5°)`), or `None` when the
+/// footprint cannot fit. Pure arithmetic, deterministic.
+pub fn interior_window(r: f64, c: f64, w: f64, h: f64, t: f64, margin: f64) -> Option<(f64, f32)> {
+    if r <= 0.0 || !r.is_finite() || c.abs() >= r {
+        return None;
+    }
+    let cross = (r * r - c * c).sqrt();
+    let need = ((w * 0.5).powi(2) + (h * 0.5).powi(2)).sqrt() + t * 0.5;
+    if need <= cross - margin {
+        let d = (h * 0.5) / (VISTA_FOV_DEG as f64 * 0.5).to_radians().tan();
+        Some((d, VISTA_FOV_DEG))
+    } else {
+        None
+    }
+}
+
+/// Hub choice by composition (FR2): the Tier-A node maximizing
+/// `rank_score − λ·|h|/R` among hubs whose focal footprint fits the
+/// interior window (`rank_score = 1 − rank/(n−1)`, 1 for the most
+/// massive). Returns the node index, or `None` when no Tier-A hub
+/// fits (the caller falls back to the v0.3.3 legacy chain).
+/// Deterministic per descriptor (rank order + exact comparisons).
+///
+/// NOTE: superseded for the opening pose by the dive-exact shortlist
+/// in [`vista_pose`] (PO-directed 2026-09-23) — kept as the documented
+/// composition-score definition the shortlist ranks by.
+pub fn vista_hub_composition_score(rank: usize, n: usize, hub_r_mpc: f64, radius_mpc: f64) -> f64 {
+    let rank_score = 1.0 - rank as f64 / (n - 1).max(1) as f64;
+    rank_score - VISTA_HUB_LAMBDA * hub_r_mpc / radius_mpc
+}
+
+/// Focal footprint centre for a hub (FR3): the look target such that
+/// the hub sits at [`VISTA_FOCAL_X`] of the frame width. The look axis
+/// is radial (slab plane ⊥ radius); screen-right for a Y-up camera
+/// looking along −n̂ is (−n̂)×Y = −(n̂×Y), so the target sits +15 Mpc
+/// along `right = n̂×Y` to frame the hub right of centre.
+fn focal_footprint_center(hub: DVec3) -> DVec3 {
+    let n_hat = hub.try_normalize().unwrap_or(DVec3::Z);
+    let mut right = n_hat.cross(DVec3::Y);
+    if right.length_squared() < 1e-12 {
+        right = n_hat.cross(DVec3::X);
+    }
+    let right = right.normalize();
+    hub + right * ((VISTA_FOCAL_X - 0.5) * VISTA_WINDOW_W_MPC)
+}
+
+/// Dive peak for a candidate opening pose against the Chase endpoint:
+/// the UX-2 bound measured exactly the way the audit test measures
+/// it (60 Hz sampling over [`VISTA_DIVE_S`]). Pure arithmetic over the
+/// two endpoint poses — the selection below evaluates it per Tier-A
+/// candidate (tens of candidates × 480 steps of unit math: trivial
+/// next to a 128³ generation).
+fn dive_peak_deg_per_s(from: &VistaPose, to: &VistaPose) -> f32 {
+    let dt = 1.0 / 60.0;
+    let mut peak = 0.0f32;
+    let mut prev_dir = from.target - from.eye;
+    for k in 1..=(VISTA_DIVE_S / dt) as usize {
+        let p = vista_interpolate(from, to, smoothstep01(k as f64 * dt / VISTA_DIVE_S));
+        let dir = p.target - p.eye;
+        peak = peak.max(look_angular_velocity_deg_per_s(prev_dir, dir, dt));
+        prev_dir = dir;
+    }
+    peak
+}
+
+/// Composition opening pose for one hub (FR3): focal footprint
+/// centre as the look target, eye on the radial axis at the
+/// interior-window distance, slab plane through the bounded slab
+/// centre.
+fn composition_pose_for_hub(hub: DVec3, radius_mpc: f64) -> VistaPose {
+    let h_len = hub.length();
+    let c_vec = if h_len > 1e-6 {
+        hub * (VISTA_SLAB_CENTER_FRAC * radius_mpc / h_len).min(1.0)
+    } else {
+        DVec3::ZERO
+    };
+    let f = focal_footprint_center(hub);
+    let (d, fov) = interior_window(
+        radius_mpc,
+        f.length(),
+        VISTA_WINDOW_W_MPC,
+        VISTA_WINDOW_H_MPC,
+        f64::from(VISTA_SLAB_MPC),
+        VISTA_WINDOW_MARGIN_MPC,
+    )
+    .expect("hub passed the feasibility filter");
+    let n_hat = hub.try_normalize().unwrap_or(DVec3::Z);
+    let eye = f + n_hat * d;
+    // Slab plane through the slab centre: depth measured from the eye
+    // along the look axis.
+    let slab_center = (eye - c_vec).dot(n_hat).max(1.0) as f32;
+    VistaPose {
+        eye,
+        target: f,
+        fov_y_deg: fov,
+        slab_half_mpc: VISTA_SLAB_MPC * 0.5,
+        slab_center_mpc: slab_center,
+        inv_fog_l: 0.0,
+    }
+}
+
+/// Opening pose: interior window on the composition hub (FR3), with
+/// the v0.3.3 legacy chain as the degenerate fallback.
+///
+/// Hub choice (FR2, PO-directed 2026-09-23): among Tier-A hubs whose
+/// focal footprint fits the window, the dive against `chase` is
+/// scored exactly; hubs within the [`VISTA_MAX_ANGULAR_DEG_PER_S`]
+/// bound compete on composition (`rank_score − λ·|h|/R`), ties go to
+/// the lowest index (mass-ranked, so the brightest). When no fitting
+/// hub stays within the bound, the gentlest dive wins outright. The
+/// pose is still a pure function of seed-derived inputs (`web` is
+/// seed-derived; `chase` derives from the seed-derived spawn).
+pub fn vista_pose(web: &WebDescriptor, radius_mpc: f64, chase: &VistaPose) -> VistaPose {
     let n = web.nodes.len();
-    let home_pos = if n == 0 {
+    if n == 0 {
         return VistaPose {
             eye: DVec3::new(0.0, 0.0, VISTA_DISTANCE_MPC),
             target: DVec3::ZERO,
@@ -253,10 +382,119 @@ pub fn vista_pose(web: &WebDescriptor) -> VistaPose {
             slab_center_mpc: VISTA_DISTANCE_MPC as f32,
             inv_fog_l: 0.0,
         };
-    } else {
-        let h = web.home();
-        DVec3::new(h.position_mpc[0], h.position_mpc[1], h.position_mpc[2])
-    };
+    }
+    // Feasible Tier-A hubs with composition scores.
+    let mut feasible: Vec<(u32, DVec3, f64)> = Vec::new();
+    for (rank, node) in web.nodes.iter().enumerate() {
+        if !is_tier_a(rank, n) {
+            continue;
+        }
+        let h = DVec3::new(
+            node.position_mpc[0],
+            node.position_mpc[1],
+            node.position_mpc[2],
+        );
+        if vista_hub_fits(h, radius_mpc) {
+            let comp = vista_hub_composition_score(rank, n, h.length(), radius_mpc);
+            feasible.push((node.node_index, h, comp));
+        }
+    }
+    if !feasible.is_empty() {
+        // Dive-exact shortlist: within the bound, composition decides;
+        // otherwise the gentlest dive wins (best effort, still
+        // deterministic). Ties → lowest index (brightest first).
+        let picked = pick_dive_safe_hub(&feasible, radius_mpc, chase);
+        return composition_pose_for_hub(picked, radius_mpc);
+    }
+    // (2–4) Legacy chain (v0.3.3, kept for degenerate seeds): nearest
+    // Tier A to home → most massive within 150 Mpc of home → most
+    // massive overall, viewed from 180 Mpc with home ~6° off-axis.
+    legacy_vista_pose(web)
+}
+
+/// Picked hub position for an opening pose (test seam): the hub the
+/// dive-exact shortlist in [`vista_pose`] selects, or `None` when the
+/// legacy fallback owns the pose.
+pub fn vista_pose_hub(web: &WebDescriptor, radius_mpc: f64, chase: &VistaPose) -> Option<DVec3> {
+    let n = web.nodes.len();
+    if n == 0 {
+        return None;
+    }
+    let mut feasible: Vec<(u32, DVec3, f64)> = Vec::new();
+    for (rank, node) in web.nodes.iter().enumerate() {
+        if !is_tier_a(rank, n) {
+            continue;
+        }
+        let h = DVec3::new(
+            node.position_mpc[0],
+            node.position_mpc[1],
+            node.position_mpc[2],
+        );
+        if vista_hub_fits(h, radius_mpc) {
+            let comp = vista_hub_composition_score(rank, n, h.length(), radius_mpc);
+            feasible.push((node.node_index, h, comp));
+        }
+    }
+    if feasible.is_empty() {
+        return None;
+    }
+    Some(pick_dive_safe_hub(&feasible, radius_mpc, chase))
+}
+
+/// Dive-exact shortlist over feasible `(index, hub, composition)`
+/// candidates: within the angular-velocity bound, composition decides;
+/// otherwise the gentlest dive wins. Ties → lowest index.
+fn pick_dive_safe_hub(feasible: &[(u32, DVec3, f64)], radius_mpc: f64, chase: &VistaPose) -> DVec3 {
+    let mut best_in_bound: Option<(f64, u32, DVec3)> = None;
+    let mut best_effort: Option<(f32, u32, DVec3)> = None;
+    for (index, h, comp) in feasible {
+        let pose = composition_pose_for_hub(*h, radius_mpc);
+        let peak = dive_peak_deg_per_s(&pose, chase);
+        if peak <= VISTA_MAX_ANGULAR_DEG_PER_S {
+            let replace = match best_in_bound {
+                None => true,
+                Some((b, bi, _)) => *comp > b || (*comp == b && *index < bi),
+            };
+            if replace {
+                best_in_bound = Some((*comp, *index, *h));
+            }
+        }
+        let replace = match best_effort {
+            None => true,
+            Some((b, bi, _)) => peak < b || (peak == b && *index < bi),
+        };
+        if replace {
+            best_effort = Some((peak, *index, *h));
+        }
+    }
+    best_in_bound
+        .map(|(_, _, h)| h)
+        .or_else(|| best_effort.map(|(_, _, h)| h))
+        .expect("feasible is non-empty")
+}
+
+/// Focal-footprint feasibility for one hub: the interior window fits
+/// at the hub's focal footprint centre.
+fn vista_hub_fits(hub: DVec3, radius_mpc: f64) -> bool {
+    let f = focal_footprint_center(hub);
+    interior_window(
+        radius_mpc,
+        f.length(),
+        VISTA_WINDOW_W_MPC,
+        VISTA_WINDOW_H_MPC,
+        f64::from(VISTA_SLAB_MPC),
+        VISTA_WINDOW_MARGIN_MPC,
+    )
+    .is_some()
+}
+
+/// Legacy opening pose (v0.3.3 `cosmic-vista-intro`): nearest Tier-A
+/// node to home, viewed from 180 Mpc with home ~6° off-axis. Kept as
+/// the degenerate-seed fallback for the composition pose above.
+fn legacy_vista_pose(web: &WebDescriptor) -> VistaPose {
+    let n = web.nodes.len();
+    let h = web.home();
+    let home_pos = DVec3::new(h.position_mpc[0], h.position_mpc[1], h.position_mpc[2]);
     let dist2 = |p: [f64; 3]| {
         let dx = p[0] - home_pos.x;
         let dy = p[1] - home_pos.y;
@@ -337,7 +575,7 @@ pub fn look_angular_velocity_deg_per_s(prev_dir: DVec3, next_dir: DVec3, dt: f64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_engine::universe::{WebLink, WebNode, generate_cosmic_web};
+    use game_engine::universe::{WebLink, WebNode};
 
     fn node(i: u32, pos: [f64; 3], mass: f64) -> WebNode {
         WebNode {
@@ -390,14 +628,31 @@ mod tests {
     #[test]
     fn empty_web_falls_back_to_default_axis() {
         let web = web_of(Vec::new(), 0);
-        let p = vista_pose(&web);
+        let p = vista_pose(&web, 250.0, &chase());
         assert_eq!(p.target, DVec3::ZERO);
-        assert!((p.eye - DVec3::new(0.0, 0.0, 180.0)).length() < 1e-9);
+        assert!((p.eye - DVec3::new(0.0, 0.0, VISTA_DISTANCE_MPC)).length() < 1e-9);
     }
 
     #[test]
-    fn pose_frames_nearest_tier_a_with_home_in_frame() {
-        // 200 nodes: ranks 0,1 are Tier A. Home = index 150.
+    fn interior_window_fits_nominal_and_rejects_rim() {
+        // FR1: 300×170 + 40-slab fits at the centre with margin;
+        // the rim cross-section rejects it (None).
+        let (d, fov) =
+            interior_window(250.0, 0.0, 300.0, 170.0, 40.0, 15.0).expect("nominal centre must fit");
+        assert_eq!(fov, VISTA_FOV_DEG);
+        assert!((d - 383.4).abs() < 0.5, "eye distance {d}");
+        assert!(interior_window(250.0, 240.0, 300.0, 170.0, 40.0, 15.0).is_none());
+        assert!(interior_window(250.0, 250.0, 300.0, 170.0, 40.0, 15.0).is_none());
+        // A smaller 16:9 footprint fits deeper (the FR1 fallback).
+        assert!(interior_window(250.0, 100.0, 150.0, 85.0, 40.0, 15.0).is_some());
+    }
+
+    #[test]
+    fn composition_pose_targets_a_fitting_tier_a_hub() {
+        // 200 nodes: ranks 0,1 are Tier A at (0,0,0) and (100,0,0).
+        // Home = index 150. The pose must target the focal footprint
+        // centre of a fitting Tier-A hub at the window distance —
+        // never the legacy 180 Mpc outside framing.
         let mut nodes: Vec<WebNode> = (0..200)
             .map(|i| node(i, [i as f64, 0.0, 0.0], 1.0e13))
             .collect();
@@ -405,11 +660,26 @@ mod tests {
         nodes[1].position_mpc = [100.0, 0.0, 0.0];
         nodes[150].position_mpc = [90.0, 10.0, 0.0];
         let web = web_of(nodes, 150);
-        let p = vista_pose(&web);
-        // Nearest Tier A to home (90,10,0) is rank 1 at (100,0,0).
-        assert!((p.target - DVec3::new(100.0, 0.0, 0.0)).length() < 1e-9);
-        assert!((p.eye.distance(p.target) - VISTA_DISTANCE_MPC).abs() < 1e-6);
+        let to = chase();
+        let p = vista_pose(&web, 250.0, &to);
         assert_eq!(p.fov_y_deg, VISTA_FOV_DEG);
+        assert_eq!(p.slab_half_mpc, 20.0);
+        // Target sits exactly one focal offset (15 Mpc) from a Tier-A
+        // node, and the eye rides the window distance for |target|.
+        let near_tier_a = web.nodes.iter().enumerate().any(|(rank, nd)| {
+            is_tier_a(rank, 200)
+                && (DVec3::from(nd.position_mpc) - p.target).length() <= 15.0 + 1e-6
+        });
+        assert!(near_tier_a, "target must focal-frame a Tier-A hub");
+        let (d, _) = interior_window(250.0, p.target.length(), 300.0, 170.0, 40.0, 15.0)
+            .expect("pose target must fit the window");
+        assert!((p.eye.distance(p.target) - d).abs() < 1e-6);
+        // Deterministic pick.
+        let q = vista_pose(&web, 250.0, &to);
+        assert_eq!(p, q);
+        // The hub seam agrees with the pose target.
+        let hub = vista_pose_hub(&web, 250.0, &to).expect("a hub must be picked");
+        assert!((hub - p.target).length() <= 15.0 + 1e-6);
     }
 
     #[test]
@@ -498,32 +768,36 @@ mod tests {
 
     #[test]
     fn nominal_pose_frames_tier_a_with_home_in_frame() {
-        // CVI-002/DoD 1: on the nominal seed the opening pose targets a
-        // Tier-A hub with home inside the 25° frame at capture aspect
-        // (the headline-shot contract — home must be findable, the hub
-        // dominant). "In frame" = inside NDC (wide aspect buys
-        // horizontal room; a raw off-axis angle would be too strict).
-        use game_engine::universe::CosmicWebParams;
+        // Composition headline contract on the nominal seed: the
+        // opening pose frames a Tier-A hub at the focal position
+        // ((0.55 ± 0.05, 0.5 ± 0.05) of the frame — DoD 2) with home
+        // inside the 25° frame at capture aspect (home must stay
+        // findable). Single demo build: the web, chase, and pose all
+        // come from one deterministic boot.
+        use super::super::cosmic_demo::CosmicDemoState;
         use glam::camera::rh::proj::directx::perspective;
         use glam::camera::rh::view::look_at_mat4;
         use glam::{Mat4, Vec3, Vec4};
-        let web = generate_cosmic_web(1337, &CosmicWebParams::nominal());
-        let pose = vista_pose(&web);
+        let demo = CosmicDemoState::new(1337);
+        let web = &demo.web;
+        let chase = demo.chase_pose();
+        let pose = vista_pose(web, demo.params.descriptor_radius_mpc, &chase);
         let n = web.nodes.len();
+        let hub = vista_pose_hub(web, demo.params.descriptor_radius_mpc, &chase)
+            .expect("a hub must be picked on the nominal seed");
         let hub_idx = web
             .nodes
             .iter()
             .position(|nd| {
-                DVec3::new(nd.position_mpc[0], nd.position_mpc[1], nd.position_mpc[2])
-                    == pose.target
+                DVec3::new(nd.position_mpc[0], nd.position_mpc[1], nd.position_mpc[2]) == hub
             })
-            .expect("pose must target a web node");
+            .expect("picked hub must be a web node");
         eprintln!("nominal vista hub: rank {hub_idx}/{n}");
         assert!(
             is_tier_a(hub_idx, n),
             "vista hub rank {hub_idx} is not Tier A"
         );
-        // Project home through the real vista camera (25°, 1408×768).
+        // Project hub + home through the real vista camera (25°).
         let eye = Vec3::new(pose.eye.x as f32, pose.eye.y as f32, pose.eye.z as f32);
         let target = Vec3::new(
             pose.target.x as f32,
@@ -532,22 +806,31 @@ mod tests {
         );
         let view: Mat4 = look_at_mat4(eye, target, Vec3::Y);
         let proj: Mat4 = perspective(VISTA_FOV_DEG.to_radians(), 1408.0 / 768.0, 1.0, 2000.0);
-        let h = web.home();
-        let home = Vec4::new(
-            h.position_mpc[0] as f32,
-            h.position_mpc[1] as f32,
-            h.position_mpc[2] as f32,
-            1.0,
-        );
-        let clip = proj * view * home;
-        assert!(clip.w > 0.0, "home behind the vista camera");
-        let ndc = Vec3::new(clip.x, clip.y, clip.z) / clip.w;
-        eprintln!("nominal home NDC: ({:.3}, {:.3})", ndc.x, ndc.y);
+        let ndc_of = |p: DVec3| {
+            let clip = proj * view * Vec4::new(p.x as f32, p.y as f32, p.z as f32, 1.0);
+            assert!(clip.w > 0.0, "point behind the vista camera");
+            Vec3::new(clip.x, clip.y, clip.z) / clip.w
+        };
+        let hub_ndc = ndc_of(hub);
+        eprintln!("nominal hub NDC: ({:.3}, {:.3})", hub_ndc.x, hub_ndc.y);
         assert!(
-            ndc.x.abs() <= 1.0 && ndc.y.abs() <= 1.0,
+            (0.0..=0.2).contains(&hub_ndc.x) && (-0.1..=0.1).contains(&hub_ndc.y),
+            "hub off the focal mark: ({:.3}, {:.3})",
+            hub_ndc.x,
+            hub_ndc.y
+        );
+        let h = web.home();
+        let home_ndc = ndc_of(DVec3::new(
+            h.position_mpc[0],
+            h.position_mpc[1],
+            h.position_mpc[2],
+        ));
+        eprintln!("nominal home NDC: ({:.3}, {:.3})", home_ndc.x, home_ndc.y);
+        assert!(
+            home_ndc.x.abs() <= 1.0 && home_ndc.y.abs() <= 1.0,
             "home outside the vista frame: ({:.3}, {:.3})",
-            ndc.x,
-            ndc.y
+            home_ndc.x,
+            home_ndc.y
         );
     }
 
@@ -573,12 +856,14 @@ mod tests {
         // (The UI dot itself is windowed-chrome; the capture harness
         // is 3D-only, so projection + the shared draw path is the
         // evidence, pinned here.)
-        use game_engine::universe::CosmicWebParams;
+        use super::super::cosmic_demo::CosmicDemoState;
         use glam::camera::rh::proj::directx::perspective;
         use glam::camera::rh::view::look_at_mat4;
         use glam::{Mat4, Vec3, Vec4};
-        let web = generate_cosmic_web(1337, &CosmicWebParams::nominal());
-        let from = vista_pose(&web);
+        let demo = CosmicDemoState::new(1337);
+        let web = &demo.web;
+        let chase = demo.chase_pose();
+        let from = vista_pose(web, demo.params.descriptor_radius_mpc, &chase);
         let h = web.home();
         let home = Vec4::new(
             h.position_mpc[0] as f32,

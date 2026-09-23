@@ -1178,7 +1178,12 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
 /// CVI-008 test seam): external pose + 25° FOV from `vista_pose` at
 /// t = 0 exactly — the same pose the live boot holds.
 fn pose_demo_camera_for_vista_capture(debug: &mut DebugApp) {
-    let pose = game_debug::cosmic_vista::vista_pose(&debug.cosmic.web);
+    let chase = debug.cosmic.chase_pose();
+    let pose = game_debug::cosmic_vista::vista_pose(
+        &debug.cosmic.web,
+        debug.cosmic.params.descriptor_radius_mpc,
+        &chase,
+    );
     debug
         .cosmic
         .camera
@@ -1813,7 +1818,14 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
                 debug.cosmic.tick(1.0 / 60.0);
             }
         }
-        Some(game_debug::cosmic_vista::vista_pose(&debug.cosmic.web))
+        Some({
+            let chase = debug.cosmic.chase_pose();
+            game_debug::cosmic_vista::vista_pose(
+                &debug.cosmic.web,
+                debug.cosmic.params.descriptor_radius_mpc,
+                &chase,
+            )
+        })
     } else {
         None
     };
@@ -10008,7 +10020,12 @@ mod tests {
         use game_debug::cosmic_vista::{VISTA_FOV_DEG, vista_pose};
         let mut debug = DebugApp::new();
         pose_demo_camera_for_vista_capture(&mut debug);
-        let want = vista_pose(&debug.cosmic.web);
+        let chase = debug.cosmic.chase_pose();
+        let want = vista_pose(
+            &debug.cosmic.web,
+            debug.cosmic.params.descriptor_radius_mpc,
+            &chase,
+        );
         let eye = debug.cosmic.camera.eye_world();
         assert!((eye - want.eye).length() < 1e-9);
         assert!((debug.cosmic.camera.fov_y() - VISTA_FOV_DEG.to_radians()).abs() < 1e-6);

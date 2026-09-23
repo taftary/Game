@@ -105,7 +105,7 @@ on every platform.
 |-----------|---------|------|
 | `lattice_cells` | 128 | Grid resolution per axis |
 | `cell_size_mpc` | 4.0 | Mpc per cell |
-| `descriptor_radius_mpc` | 250.0 | Camera extent + validation (not a generation cut) |
+| `descriptor_radius_mpc` | 250.0 | Generation cut (v0.3.4 `cosmic-sphere-clip`, ADR-026 §1): peaks outside rejected before acceptance |
 | `growth_factor` | 3.0 | Zel'dovich displacement strength |
 | `web_threshold` | 0.06 | T-web eigenvalue collapse cutoff |
 | `void_density_ratio` | 0.1 | Void definition (< 10% mean density) |

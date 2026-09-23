@@ -6,7 +6,10 @@ Deterministic, versioned, staged:
    seeded Zel'dovich pipeline — Gaussian initial field → displacement
    → T-web classification + Press–Schechter masses → descriptor (halo
     nodes, filament links, dwarf glow, tagged home node). Explicitly
-    procedural (no literal catalog). v0.3.3 (ADR-025,
+    procedural (no literal catalog). Every node satisfies
+    `|position_mpc| ≤ descriptor_radius_mpc` (250 Mpc nominal): the
+    sphere is a generation cut (v0.3.4 `cosmic-sphere-clip`, ADR-026
+    §1), not a camera extent. v0.3.3 (ADR-025,
     `web-field-export`, shipped) adds an optional **render sidecar**
     from the same run — the displaced tracers and the classified
     density grid — that is never hashed, saved, or read by gameplay;

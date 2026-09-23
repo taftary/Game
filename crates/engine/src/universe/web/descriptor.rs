@@ -21,6 +21,9 @@ pub struct WebNode {
     /// Index into the parent descriptor's node list (fly-to + inspector key).
     pub node_index: u32,
     /// Comoving Mpc relative to the descriptor center (f64: flight truth).
+    /// Bounded by `descriptor_radius_mpc`: the sphere is a generation cut
+    /// (ADR-026 §1, v0.3.4 `cosmic-sphere-clip`), so every emitted node
+    /// satisfies `|position_mpc| ≤ radius`.
     pub position_mpc: [f64; 3],
     /// Halo mass in solar masses (Press–Schechter rank-mapped).
     pub mass_msun: f64,
@@ -157,7 +160,9 @@ fn ihalf3(rng: &mut SeededRng) -> f64 {
 }
 
 /// Assemble the descriptor from the classified web (densest-first
-/// peaks inside).
+/// peaks inside the descriptor sphere — ADR-026 §1: the sphere is a
+/// generation cut, so peaks whose refined position lies outside
+/// `descriptor_radius_mpc` are rejected before greedy acceptance).
 #[allow(clippy::too_many_lines)]
 pub fn assemble(
     seed: u64,
@@ -179,8 +184,21 @@ pub fn assemble(
         ];
         refine(base, euler, [x, y, z], n)
     };
-    // Node acceptance (densest-first, greedy separation).
-    let accepted = accept_peaks(peaks, params, to_mpc);
+    // Node acceptance (densest-first, greedy separation). ADR-026 §1:
+    // the descriptor sphere is a generation cut — reject refined peak
+    // positions with `r² > R²` (f64, no sqrt) before acceptance so the
+    // `target_node_count` cap applies to in-sphere peaks only.
+    let radius = params.descriptor_radius_mpc;
+    let radius2 = radius * radius;
+    let in_sphere: Vec<_> = peaks
+        .iter()
+        .copied()
+        .filter(|peak| {
+            let p = to_mpc(peak.cell);
+            p[0] * p[0] + p[1] * p[1] + p[2] * p[2] <= radius2
+        })
+        .collect();
+    let accepted = accept_peaks(&in_sphere, params, to_mpc);
     // Masses by rank through the Press–Schechter quantile table.
     let table = PsMassTable::new(params.mass_min_msun / params.mass_star_msun, 40.0, 4096);
     let count = accepted.len();

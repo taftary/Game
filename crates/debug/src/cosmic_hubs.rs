@@ -431,6 +431,30 @@ mod tests {
         assert_eq!(nearest_tier_a_to_home(&empty), None);
     }
 
+    #[test]
+    fn nominal_hubs_inside_sphere() {
+        // CSC-005 / FR4: impostor sprites sit on nodes (≤ R); members
+        // scatter inside `r_vir` of their node, so ≤ R + max r_vir.
+        // Slow (~15 s): full 128³ generation.
+        use game_engine::universe::{CosmicWebParams, generate_cosmic_web};
+        let params = CosmicWebParams::nominal();
+        let web = generate_cosmic_web(1234, &params);
+        let r = params.descriptor_radius_mpc as f32;
+        let max_vir = web
+            .nodes
+            .iter()
+            .map(|n| n.virial_radius_mpc as f32)
+            .fold(0.0_f32, f32::max);
+        for (pos, _, _) in hub_impostors(&web, DVec3::ZERO) {
+            let r2 = pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2];
+            assert!(r2 <= r * r, "impostor outside sphere: {pos:?}");
+        }
+        for (pos, _, _) in hub_members(&web, 1234, DVec3::ZERO) {
+            let d = (pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]).sqrt();
+            assert!(d <= r + max_vir + 0.01, "member outside R + r_vir: {pos:?}");
+        }
+    }
+
     /// Spawn-goal tier (FR6): the demo's first fly-to candidate (far
     /// node of the home's strongest link) is Tier C on the nominal
     /// seed — the Local-Group analog's brightest departure leads to
