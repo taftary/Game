@@ -1,10 +1,11 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.50.0 (2026-09-23, v0.3.4 `cosmic-gpu-tracers`
-  in-review: procedural GPU tracers — displacement grid + cell list
-  replace the stored tracer list, rebase job glow-only, slab
-  ridge-scan + parity + UHD 620 captures green, full gates green;
-  ANALYST audit + SECURITY review pending; `cosmic-rebase-async`
+- **Version:** 0.51.0 (2026-09-23, v0.3.4 `cosmic-void-contrast`
+  in-progress: shared transfer snippet + CPU mirror across proc
+  splats / march / sprite colours, `emissive_scale` retired, HDR
+  clear deep indigo, MAP splat gain 0.2 → 0.25, UHD 620 slab /
+  inspector / demo captures + CPU scan tests green, full gates
+  green; ANALYST audit + SECURITY review pending; `cosmic-rebase-async`
   reference-HW upload measure + UX hands-on still pending)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)

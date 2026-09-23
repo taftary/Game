@@ -523,9 +523,11 @@ list + fixed sub-cell offset (`0.25 + 0.5·corner-bit`, ≤ ¼-cell
 `fract` dither) → trilinear displacement fetch (explicit LOD 0)
 → Eulerian position, sphere-clipped; density from the R8 veil
 volume at the Eulerian cell (same packing the march inverts).
-Kernel, ramp, emissive, window, near-eye fade, and redshift match
+Kernel, ramp, transfer weight, window, near-eye fade, and redshift match
 the retired per-tracer path (`h0 = 2.0` kept — graded CGT-008:
-k8/k1 slab mean ratio 1.20, parity dice 0.81); no class tint or
+k8/k1 slab mean ratio 1.20, parity dice 0.81); brightness is the
+transfer weight (`cosmic-void-contrast`: band × knots × rim — the old
+`emissive_scale` growth gated by the sub-mean floor), no class tint or
 B flag (hubs read through the glow members + impostors). Same
 pass, same blend, shared `SPLAT_FRAG` (arithmetic-only) — no new
 pass or draw. Sub-samples per cell are a draw count per tier
@@ -592,7 +594,7 @@ cell; alpha `min(0.006·√(1+δ), 0.05)`; hash jitter ≤ 0.25 cell, no
 RNG). Medium/High march the grid instead: one `R8_UNORM` 128³ upload
 per seed (2 MB), one quarter-res fullscreen pass (`MARCH_FRAG`:
 ray–sphere clip, 32/48 steps, ordered dither, fog + slab applied
-in-march, 2-cell near-eye ramp, emission `a = 0.002·max(0, δ−0.5)`
+in-march, 2-cell near-eye ramp, emission `a = 0.002·transfer`
 accumulated as a vis-weighted MEAN — grade round 2: a column integral
 graded at the slab washed full-depth views, the mean keeps one grade
 correct on every view),
@@ -613,6 +615,25 @@ in code). Measured: UHD 620 `slab`/`demo` captures clean both modes
 (byte-deterministic per build+seed); Low ≈ 168k sprites ≈ 6.0 MB;
 march ≈ 4.1M (Medium) / 6.2M (High) texture fetches per 1080p frame
 + ≈ 1 MB quarter-res HDR target.
+
+Void contrast (`cosmic-void-contrast`, in-progress 2026-09-23,
+ADR-026 §4): one shared transfer snippet
+(`cosmic_transfer(log2od, r, R) = smoothstep(0, 2.5, log2od) ×
+(1 + max(0, log2od − 1.5)) × (1 − smoothstep(R−30, R, r))` —
+single authority `debug::cosmic_veil::COSMIC_TRANSFER_GLSL`, pinned
+byte-identical in `SPLAT_PROC_VERT` + `MARCH_FRAG`; veil sprites take
+the same weight on colour via the CPU `transfer` mirror, alpha stays
+`veil_alpha`) replaces the five-stop colour grading and the retired
+`emissive_scale`: colour carries density hue, the weight carries
+brightness — below-mean gas emits exactly nothing, dense knots run
+past 1 into bloom, the rim fades over the last 30 Mpc. HDR clear is
+the report's deep indigo `(0.02, 0.02, 0.06)` linear; the resolve
+adds no backdrop term (pinned). Graded on the UHD 620 (seed 1337,
+1408×768): floor 0, band top 2.5, MAP splat gain 0.2 → 0.25;
+`slab-after.png` void floor 1.00× backdrop, knot-peak ridge 8.0×,
+faint-wall sheet 1.55×; `inspector-after.png` worst 10 px radial
+step 0.145 (r ≥ 60 px); `demo-after.png` hot 0.0011, dark cells
+0.062. Shots + CPU scan tests committed with the feature.
 
 `plans/v0.0.1/debug-sphere-viewer` status (2026-09-14): implemented against
 the M1 `engine::render` APIs (`OrbitCamera`, `PlanetVertex`,

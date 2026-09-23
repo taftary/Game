@@ -52,10 +52,10 @@ pub fn ramp_color(log2od: f32) -> [f32; 3] {
     stops[stops.len() - 1].1
 }
 
-/// Emissive boost so dense cores cross the bloom threshold.
-pub fn emissive_scale(log2od: f32) -> f32 {
-    1.0 + 0.5 * (0.0_f32.max(log2od - 1.5))
-}
+// Retired by `cosmic-void-contrast` (CVC-002): brightness is the
+// transfer weight now (`cosmic_veil::transfer`), not a per-density
+// growth factor (`emissive_scale` removed — the transfer tests pin
+// the replacement).
 
 /// Retired vertex packing (CTS-003) kept as the tested quantization
 /// mirror: bits 0–15 hold `log2(1+δ)` over `[-8, +8)` (step 2.4e-4),
@@ -168,10 +168,9 @@ mod tests {
             let want = (DENSITY_RAMP_STOPS[1].1[a] + DENSITY_RAMP_STOPS[2].1[a]) * 0.5;
             assert!((m - want).abs() < 1e-6, "mid band off axis {a}");
         }
-        // Emissive scale pins.
-        assert_eq!(emissive_scale(0.0), 1.0);
-        assert_eq!(emissive_scale(1.5), 1.0);
-        assert!((emissive_scale(3.0) - 1.75).abs() < 1e-6);
+        // (`cosmic-void-contrast` retired `emissive_scale` here: the
+        // transfer weight in `cosmic_veil::transfer` carries brightness
+        // now — no per-density growth factor remains.)
     }
 
     #[test]

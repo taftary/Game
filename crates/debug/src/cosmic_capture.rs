@@ -393,4 +393,171 @@ mod tests {
             "white flash: {frac:.3} of demo-after.png pixels are bright"
         );
     }
+
+    /// Load a committed RGBA8 shot (top-first) for CPU scans.
+    #[cfg(test)]
+    fn load_shot_rgba8(name: &str) -> (u32, u32, Vec<u8>) {
+        let path = format!(
+            "{}/../../plans/v0.3.4/cosmic-void-contrast/shots/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).expect("committed shot must exist");
+        let decoder = png::Decoder::new(bytes.as_slice());
+        let mut reader = decoder.read_info().expect("png header");
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        let (w, h) = (reader.info().width, reader.info().height);
+        let mut pixels = vec![0u8; reader.output_buffer_size()];
+        reader.next_frame(&mut pixels).expect("png frame");
+        assert_eq!(pixels.len(), w as usize * h as usize * 4);
+        (w, h, pixels)
+    }
+
+    /// Rec.709 luminance per pixel (0–255).
+    #[cfg(test)]
+    fn shot_luminance(pixels: &[u8]) -> Vec<f64> {
+        pixels
+            .chunks_exact(4)
+            .map(|px| {
+                0.2126 * f64::from(px[0]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[2])
+            })
+            .collect()
+    }
+
+    /// Void-contrast grade (`cosmic-void-contrast` DoD 1): the
+    /// committed `slab-after.png` (seed 1337, 1408×768, High) holds
+    /// dark voids against bright threads — void floor ≤ 1.15× the
+    /// clear backdrop (corner blocks, outside the slice), knot-peak
+    /// ridge ≥ 6× the floor, faint-wall sheet ≥ 1.5×. Bands, not
+    /// hand-picked pixels: floor = mean of the darkest 5 % (pure
+    /// backdrop where the slice is empty), ridge = mean above p99.9
+    /// (~1080 px over dozens of beads — the beaded crests, not
+    /// inter-knot thread), sheet = p90 (voids dominate to the median;
+    /// walls emerge past p75). CPU-only over the committed shot; the
+    /// numbers print for the plan record.
+    #[test]
+    fn slab_after_void_contrast_targets() {
+        let (w, h, pixels) = load_shot_rgba8("slab-after.png");
+        assert_eq!((w, h), (1408, 768));
+        let lum = shot_luminance(&pixels);
+        // Backdrop: four 8×8 corner blocks (outside the slab slice —
+        // pure clear colour through the resolve).
+        let mut backdrop = Vec::new();
+        for (cx, cy) in [(0, 0), (w - 8, 0), (0, h - 8), (w - 8, h - 8)] {
+            for dy in 0..8 {
+                for dx in 0..8 {
+                    backdrop.push(lum[((cy + dy) * w + (cx + dx)) as usize]);
+                }
+            }
+        }
+        let backdrop_mean = backdrop.iter().sum::<f64>() / backdrop.len() as f64;
+        let mut sorted = lum.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let n = sorted.len();
+        let floor: f64 = sorted[..n / 20].iter().sum::<f64>() / (n / 20) as f64;
+        // Ridge = knot peaks: mean above p99.9 (~1080 px over dozens of
+        // beads — the beaded crests the reference grades, not
+        // inter-knot thread). Sheet = p90 (voids dominate to the
+        // median; walls emerge past p75).
+        let peaks: Vec<f64> = sorted[n - n / 1000..].to_vec();
+        let ridge: f64 = peaks.iter().sum::<f64>() / peaks.len() as f64;
+        let sheet = sorted[n * 90 / 100];
+        let context: f64 = sorted[n - n / 200..].iter().sum::<f64>() / (n / 200) as f64;
+        eprintln!(
+            "slab backdrop={backdrop_mean:.3} floor={floor:.3} sheet(p90)={sheet:.3} ridge(peaks)={ridge:.3} thread(top-0.5%)={context:.3}"
+        );
+        eprintln!(
+            "slab ratios floor/backdrop={:.3} ridge/floor={:.3} sheet/floor={:.3}",
+            floor / backdrop_mean,
+            ridge / floor.max(1e-6),
+            sheet / floor.max(1e-6)
+        );
+        assert!(
+            floor <= 1.15 * backdrop_mean,
+            "void floor {floor:.3} exceeds 1.15x backdrop {backdrop_mean:.3}"
+        );
+        assert!(
+            ridge / floor.max(1e-6) >= 6.0,
+            "ridge/floor contrast too low: {ridge:.3}/{floor:.3}"
+        );
+        assert!(
+            sheet / floor.max(1e-6) >= 1.5,
+            "sheet/floor contrast too low: {sheet:.3}/{floor:.3}"
+        );
+    }
+
+    /// Rim-fade pin (`cosmic-void-contrast` DoD 2): radial luminance
+    /// profile of the committed `inspector-after.png` outside the
+    /// central hub complex (r ≥ 60 px — the centre holds the goal hub
+    /// and its point-source steps are navigation content, not a limb)
+    /// — no radial step over 20 % within any 10 px span (the transfer
+    /// rim fades the last 30 Mpc, so the former sphere limb must not
+    /// read as an edge).
+    #[test]
+    fn inspector_after_shows_no_limb() {
+        let (w, h, pixels) = load_shot_rgba8("inspector-after.png");
+        assert_eq!((w, h), (1408, 768));
+        let lum = shot_luminance(&pixels);
+        let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+        let max_r = cx.min(cy) as usize;
+        // Ring means every 2 px.
+        let mut rings = Vec::new();
+        let mut r = 0usize;
+        while r < max_r {
+            let (mut sum, mut count) = (0.0, 0usize);
+            for y in 0..h as usize {
+                for x in (0..w as usize).step_by(2) {
+                    let d = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
+                    if (d - r as f64).abs() < 1.0 {
+                        sum += lum[y * w as usize + x];
+                        count += 1;
+                    }
+                }
+            }
+            assert!(count > 0, "empty ring at r={r}");
+            rings.push(sum / count as f64);
+            r += 2;
+        }
+        // Max relative step over any 10 px span (5 ring steps), past
+        // the central hub complex (first 30 rings).
+        let mut worst: f64 = 0.0;
+        for i in 30..rings.len().saturating_sub(5) {
+            let step = (rings[i + 5] - rings[i]).abs() / rings[i].max(1.0);
+            worst = worst.max(step);
+        }
+        eprintln!(
+            "inspector radial rings={} worst 10px step r>=60px={worst:.3}",
+            rings.len()
+        );
+        assert!(worst <= 0.20, "limb step detected: {worst:.3} over 10 px");
+    }
+
+    /// Filament-interior read (`cosmic-void-contrast` DoD 3): the
+    /// committed `demo-after.png` (boot framing inside a filament)
+    /// stays below the hot bar (≤ 50 % bright — the CGV-015 wash
+    /// measure) while keeping dark cells around the ship (≥ 5 % of
+    /// pixels within 1.5× of the slab void floor: voids visible,
+    /// never a wash).
+    #[test]
+    fn demo_after_hot_fraction_and_dark_cells() {
+        let (w, h, pixels) = load_shot_rgba8("demo-after.png");
+        assert_eq!((w, h), (1408, 768));
+        let hot = bright_fraction_rgba8(&pixels, 200);
+        // Dark = within 1.5× of the slab void floor (24.744 — the
+        // sibling scan's measured backdrop; the boot backdrop is out
+        // of frame in the demo view).
+        let dark = shot_luminance(&pixels)
+            .iter()
+            .filter(|l| **l < 1.5 * 24.744)
+            .count() as f64
+            / (w as usize * h as usize) as f64;
+        eprintln!("demo hot(>=200)={hot:.4} dark(<1.5x void)={dark:.4}");
+        assert!(
+            hot <= 0.5,
+            "filament interior washed: hot fraction {hot:.3}"
+        );
+        assert!(
+            dark >= 0.05,
+            "no dark cells around the ship: dark fraction {dark:.4}"
+        );
+    }
 }

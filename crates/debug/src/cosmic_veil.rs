@@ -36,6 +36,62 @@ pub const COSMIC_DENSITY_RAMP_GLSL: &str = r#"vec3 cosmic_density_ramp(float log
     return col;
 }"#;
 
+/// Transfer-floor density: at or below the mean density nothing emits
+/// (`cosmic-void-contrast` CVC-001, ADR-026 §4). Below the mean is void;
+/// the indigo backdrop comes from the clear colour, never from additive
+/// light. Graded from shots (starting value — see CVC-005).
+pub const TRANSFER_FLOOR: f32 = 0.0;
+/// Top of the filament contrast band (`log2(1+δ)`). The band
+/// `[FLOOR, BAND_HI]` maps through a `smoothstep` S-curve; above the
+/// top the band saturates and only the knots tail grows. Graded
+/// (CVC-005): 3.0 left faint walls dim; 2.5 puts the wall band on the
+/// steep part of the curve.
+pub const TRANSFER_BAND_HI: f32 = 2.5;
+/// Rim-fade depth in Mpc: the last `RIM_FADE_MPC` of the descriptor
+/// sphere fade to zero so no preset shows a hard limb (CVC-004).
+/// Starting value, graded (CVC-005).
+pub const RIM_FADE_MPC: f32 = 30.0;
+
+/// Shared transfer-function GLSL (`cosmic-void-contrast` CVC-001):
+/// brightness weight from log-density and sphere radius. `smoothstep` /
+/// `mix` / `clamp` / FMA only — no `exp` / `pow` (fragment
+/// arithmetic-only rule, A-1). The authority is this const — pasted
+/// verbatim into `SPLAT_PROC_VERT` and `MARCH_FRAG` (pinned
+/// byte-identical by `cosmic_transfer_shared` in the binary); the veil
+/// sprites take the same weight on their colour through the CPU
+/// [`transfer`] mirror (their pipeline carries no density channel —
+/// see the pin; alpha stays `veil_alpha`, so the Low alpha cap and
+/// overdraw budget are untouched).
+pub const COSMIC_TRANSFER_GLSL: &str = r#"float cosmic_transfer(float log2od, float r_mpc, float radius_mpc) {
+    float band = smoothstep(0.0, 2.5, log2od);
+    float knots = 1.0 + max(0.0, log2od - 1.5);
+    float rim = 1.0 - smoothstep(radius_mpc - 30.0, radius_mpc, r_mpc);
+    return band * knots * rim;
+}"#;
+
+/// CPU mirror of [`COSMIC_TRANSFER_GLSL`] (CVC-001, FR2): identical
+/// `smoothstep` semantics in `f32`, so tests pin the curve without a
+/// GPU. `log2od` is `log2(1+δ)`, `r_mpc` the emission radius from the
+/// sphere centre, `radius_mpc` the descriptor radius.
+///
+/// Shape (graded CVC-005): the `band` S-curve gates everything below
+/// the mean to exactly zero and saturates at the band top; the `knots`
+/// tail (the retired `emissive_scale` law steepened, now gated by the
+/// floor instead of applying everywhere) lets dense knots — and only
+/// knots — run past 1 into the bloom threshold.
+pub fn transfer(log2od: f32, r_mpc: f32, radius_mpc: f32) -> f32 {
+    let band = smoothstep(TRANSFER_FLOOR, TRANSFER_BAND_HI, log2od);
+    let knots = 1.0 + (log2od - 1.5).max(0.0);
+    let rim = 1.0 - smoothstep(radius_mpc - RIM_FADE_MPC, radius_mpc, r_mpc);
+    band * knots * rim
+}
+
+/// GLSL `smoothstep` in `f32` (edge0 < edge1; `t*t*(3-2t)` gain).
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Veil body mode: cell sprites (Low) or quarter-res raymarch (Med/High).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VeilMode {
@@ -146,14 +202,14 @@ pub fn veil_sprites(field: &WebField, origin: DVec3) -> Vec<([f32; 3], [f32; 3],
             continue;
         }
         let (x, y, z) = (i % n, (i / n) % n, i / (n * n));
-        // Sphere cut on the un-jittered cell center (box-centered frame).
-        if bounded {
-            let cx = ox + (x as f64 + 0.5) * cell;
-            let cy = oy + (y as f64 + 0.5) * cell;
-            let cz = oz + (z as f64 + 0.5) * cell;
-            if cx * cx + cy * cy + cz * cz > r2_max {
-                continue;
-            }
+        // Un-jittered cell center (box-centered frame): the sphere cut
+        // and the transfer rim share it.
+        let cx = ox + (x as f64 + 0.5) * cell;
+        let cy = oy + (y as f64 + 0.5) * cell;
+        let cz = oz + (z as f64 + 0.5) * cell;
+        // Sphere cut on the un-jittered cell center.
+        if bounded && cx * cx + cy * cy + cz * cz > r2_max {
+            continue;
         }
         let jx = f64::from(jitter_cell(i, 0));
         let jy = f64::from(jitter_cell(i, 1));
@@ -164,7 +220,25 @@ pub fn veil_sprites(field: &WebField, origin: DVec3) -> Vec<([f32; 3], [f32; 3],
             (oz + (z as f64 + 0.5 + jz) * cell - origin.z) as f32,
         ];
         let ramp = veil_ramp_cpu(od.log2());
-        let color = [ramp[0] * tint[0], ramp[1] * tint[1], ramp[2] * tint[2]];
+        // Transfer weight (`cosmic-void-contrast` CVC-002): brightness
+        // lives on the colour now, not in the ramp — below-mean cells
+        // emit nothing and the rim fades over the last 30 Mpc. Alpha
+        // stays `veil_alpha` (colour 0 contributes 0 through the
+        // additive blend, so the Low alpha cap and overdraw budget are
+        // untouched). Hubs are unaffected (they are glow members +
+        // impostors, never these sprites). Unbounded test fields sit
+        // at the centre (rim 1).
+        let r = if bounded {
+            (cx * cx + cy * cy + cz * cz).sqrt() as f32
+        } else {
+            0.0
+        };
+        let w = transfer(od.log2(), r, field.sphere_radius_mpc as f32);
+        let color = [
+            ramp[0] * tint[0] * w,
+            ramp[1] * tint[1] * w,
+            ramp[2] * tint[2] * w,
+        ];
         let misc = [(diam_mul * cell) as f32, veil_alpha(od), 1.0];
         out.push((pos, color, misc));
     }
@@ -283,6 +357,91 @@ mod tests {
         assert!(g.contains("mix(") && g.contains("clamp("));
         for banned in ["exp(", "pow(", "texture("] {
             assert!(!g.contains(banned), "march loop bans {banned}");
+        }
+    }
+
+    #[test]
+    fn transfer_bands_floor_rim_and_monotone() {
+        // CVC-001 band pins (FR2/FR3): below the floor emits nothing,
+        // the band rises monotonically, the knots tail passes the old
+        // knee at 1 and the rim fades to 0 at R. Well inside the
+        // sphere (r = 0) so the rim is exactly 1.
+        assert_eq!(transfer(-2.0, 0.0, 250.0), 0.0);
+        assert_eq!(transfer(-0.5, 0.0, 250.0), 0.0);
+        assert_eq!(transfer(0.0, 0.0, 250.0), 0.0);
+        assert_eq!(transfer(TRANSFER_FLOOR, 0.0, 250.0), 0.0);
+        // Band top: smoothstep saturates at 1, knots tail carries the
+        // gated emissive law (1 + (2.5 − 1.5) = 2.0 at the top).
+        assert!((transfer(TRANSFER_BAND_HI, 0.0, 250.0) - 2.0).abs() < 1e-6);
+        assert!((transfer(4.5, 0.0, 250.0) - 4.0).abs() < 1e-6);
+        // Band shaping: smoothstep(0, 2.5, 1.5) = 0.648, tail still 1.
+        assert!((transfer(1.5, 0.0, 250.0) - 0.648).abs() < 1e-6);
+        // Monotone across and above the band.
+        let mut prev = 0.0;
+        let mut x = 0.0;
+        while x <= 6.0 {
+            let w = transfer(x, 0.0, 250.0);
+            assert!(w >= prev, "transfer not monotone at {x}: {w} < {prev}");
+            prev = w;
+            x += 0.25;
+        }
+        // Rim: full weight a cell inside the fade, zero at the edge
+        // (values at the gated-emissive scale: band 1 × knots 2.5).
+        assert_eq!(transfer(3.0, 100.0, 250.0), 2.5);
+        assert_eq!(transfer(3.0, 219.0, 250.0), 2.5);
+        let mid = transfer(3.0, 235.0, 250.0);
+        assert!(
+            (0.0..2.5).contains(&mid),
+            "rim mid-fade must be partial: {mid}"
+        );
+        assert_eq!(transfer(3.0, 250.0, 250.0), 0.0);
+        assert_eq!(transfer(3.0, 300.0, 250.0), 0.0);
+        // Constants are the graded values (CVC-005).
+        assert_eq!(TRANSFER_FLOOR, 0.0);
+        assert_eq!(TRANSFER_BAND_HI, 2.5);
+        assert_eq!(RIM_FADE_MPC, 30.0);
+    }
+
+    #[test]
+    fn transfer_weights_sprites() {
+        // CVC-002 sprite path: a below-mean sheet cell contributes
+        // nothing (zero colour — which is zero emission through the
+        // additive blend) while a dense node keeps its colour weight;
+        // alpha stays `veil_alpha` in both cases (Low cap untouched).
+        // q=22 unquantizes to od≈0.70 (below the mean); q=63 to od=64.
+        let field = synth_field(2, &[(SHEET, 22), (NODE, 63)]);
+        let out = veil_sprites(&field, DVec3::ZERO);
+        assert_eq!(out.len(), 2);
+        // Nearest-center mapping (jitter < half a cell, unambiguous).
+        let sheet = out
+            .iter()
+            .find(|(pos, _, _)| pos[0] < -1.0)
+            .expect("sheet sprite must emit");
+        let node = out
+            .iter()
+            .find(|(pos, _, _)| pos[0] > -1.0)
+            .expect("node sprite must emit");
+        assert_eq!(sheet.1, [0.0, 0.0, 0.0]);
+        assert!(node.1.iter().all(|c| *c > 0.0));
+        let sheet_od = field.overdensity_at(0);
+        assert!((sheet.2[1] - veil_alpha(sheet_od)).abs() < 1e-9);
+        let node_od = field.overdensity_at(1);
+        assert!((node.2[1] - veil_alpha(node_od)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transfer_glsl_is_arithmetic_only() {
+        // A-1: the shared snippet stays `smoothstep`/`mix`/FMA — the
+        // binary pastes it into a fragment shader (`MARCH_FRAG`), so
+        // `exp` / `pow` / `log` / `sin` / `cos` / texture fetches are
+        // banned here (pins the paste, not just the mirror).
+        let g = COSMIC_TRANSFER_GLSL;
+        assert!(g.contains("float cosmic_transfer(float log2od, float r_mpc, float radius_mpc)"));
+        for lit in ["smoothstep(0.0, 2.5, log2od)", "radius_mpc - 30.0"] {
+            assert!(g.contains(lit), "transfer GLSL drifted: {lit} missing");
+        }
+        for banned in ["exp(", "pow(", "log(", "sin(", "cos(", "tan(", "texture"] {
+            assert!(!g.contains(banned), "transfer snippet bans {banned}");
         }
     }
 

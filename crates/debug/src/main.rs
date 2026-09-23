@@ -516,6 +516,17 @@ layout(push_constant) uniform PushConstants {
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out float v_alpha;
 layout(location = 2) out float v_b;
+// Shared transfer function (`cosmic-void-contrast` CVC-001): the
+// authority is `game_debug::cosmic_veil::COSMIC_TRANSFER_GLSL` —
+// pasted verbatim (pinned byte-identical by `cosmic_transfer_shared`;
+// `concat!` cannot take consts, so paste + pin instead of
+// composition).
+float cosmic_transfer(float log2od, float r_mpc, float radius_mpc) {
+    float band = smoothstep(0.0, 2.5, log2od);
+    float knots = 1.0 + max(0.0, log2od - 1.5);
+    float rim = 1.0 - smoothstep(radius_mpc - 30.0, radius_mpc, r_mpc);
+    return band * knots * rim;
+}
 // Shared density ramp (`cosmic-gas-veil-v2` CGV-001): the authority is
 // `game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL` — pasted verbatim
 // (pinned byte-identical by `cosmic_density_ramp_shared`; `concat!`
@@ -618,13 +629,15 @@ void main() {
     float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
     vec3 hubble = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
     float dim = 1.0 / (1.0 + 0.45 * z);
-    // Density ramp + emissive (dense cores cross the bloom threshold).
-    // No per-tracer class tint: the cell list carries no hub-proximity
-    // word (hubs read through the glow members + impostors instead —
-    // grading input for CGT-008).
+    // Density ramp × transfer weight (`cosmic-void-contrast`
+    // CVC-002): colour carries the density hue, the transfer weight
+    // carries the brightness — voids add nothing, dense cores saturate
+    // the band instead of growing without bound (the retired
+    // `emissive_scale` lesson). `box_pos` is already the
+    // sphere-centred frame, so its length is the rim radius.
     vec3 ramp = cosmic_density_ramp(log2od);
-    float emissive = 1.0 + 0.5 * max(0.0, log2od - 1.5);
-    v_color = ramp * emissive * hubble * dim;
+    float transfer_w = cosmic_transfer(log2od, length(box_pos), radius);
+    v_color = ramp * transfer_w * hubble * dim;
     v_alpha = alpha;
     v_b = 0.0;
 }";
@@ -637,8 +650,14 @@ const SPLAT_H0: f32 = 2.0;
 /// map runs 0.2 while the immersive demo keeps 1.0. `cosmic-depth-
 /// window` fog replaces this knob with a real depth term.
 const SPLAT_ALPHA_K_DEMO: f32 = 1.0;
-/// See [`SPLAT_ALPHA_K_DEMO`].
-const SPLAT_ALPHA_K_MAP: f32 = 0.2;
+/// See [`SPLAT_ALPHA_K_DEMO`]. Map value graded by
+/// `cosmic-void-contrast` (CVC-005, 2026-09-23, UHD 620): 0.2 left the
+/// slab ridge at 5.1× the void floor (DoD wants ≥ 6×); 0.25 lifts
+/// dense threads into the target band with voids pinned at the
+/// backdrop by the transfer floor (floor pixels scale by ~0, so the
+/// gain costs no haze). Inspector highlights stay inside the ACES
+/// rolloff (re-verified limb scan + captures).
+const SPLAT_ALPHA_K_MAP: f32 = 0.25;
 
 // Cosmic gas-veil raymarch (`cosmic-gas-veil-v2`, Medium/High):
 // quarter-res fullscreen emission-only march of the 128³ density
@@ -661,6 +680,15 @@ layout(push_constant) uniform PushConstants {
 } pc;
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 f_color;
+// Shared transfer function (`cosmic-void-contrast` CVC-001): the
+// authority is `game_debug::cosmic_veil::COSMIC_TRANSFER_GLSL` —
+// pasted verbatim (pinned byte-identical by `cosmic_transfer_shared`).
+float cosmic_transfer(float log2od, float r_mpc, float radius_mpc) {
+    float band = smoothstep(0.0, 2.5, log2od);
+    float knots = 1.0 + max(0.0, log2od - 1.5);
+    float rim = 1.0 - smoothstep(radius_mpc - 30.0, radius_mpc, r_mpc);
+    return band * knots * rim;
+}
 // Shared density ramp (`cosmic-gas-veil-v2` CGV-001): the authority is
 // `game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL` — pasted verbatim
 // (pinned byte-identical by `cosmic_density_ramp_shared`).
@@ -738,8 +766,14 @@ void main() {
         }
         float q = texture(sampler3D(grid_tex, grid_sampler), guv).r;
         float log2od = q * 10.0 - 4.0;
-        float od = exp2(log2od);
-        float a = 0.002 * max(0.0, od - 0.5);
+        // Transfer-weighted emission (`cosmic-void-contrast` CVC-002):
+        // the band floor replaces the old `od − 0.5` threshold and the
+        // rim fades the last 30 Mpc before the ray–sphere cut below.
+        // No `exp2` here anymore: the transfer works in log space, so
+        // the march loop is transcendental-free (see
+        // `march_loop_stays_narrow`).
+        float r_march = length(p - center);
+        float a = 0.002 * cosmic_transfer(log2od, r_march, radius);
         float vis = cosmic_window_vis(t, fog_l, slab_center, slab_half, 0);
         // Near-eye ramp (same rule as splats): never an opaque wash.
         float near_w = smoothstep(0.0, 2.0 * cell, t);
@@ -751,8 +785,10 @@ void main() {
     f_color = vec4(mean * gain, 1.0);
 }";
 
-/// March emission constant: `a = k·max(0, od − 0.5)` (grade round 1,
-/// 2026-09-21 — matches the Low sprite body at the slab framing).
+/// March emission constant: `a = k·transfer(log2od, r, R)`
+/// (`cosmic-void-contrast` CVC-002 — replaces the grade-round-1 linear
+/// law `k·max(0, od − 0.5)`; the band floor subsumes the old 0.5
+/// threshold and the transfer carries the 30 Mpc rim fade).
 /// Baked into `MARCH_FRAG` as the `0.002` literal (GLSL has no Rust
 /// consts; the value is pinned by `march_emission_matches_grade`).
 /// Test-only anchor in non-test builds.
@@ -1035,7 +1071,11 @@ fn additive_blend() -> AttachmentBlend {
 /// Deep-indigo clear color for the cosmic views (near-black violet —
 /// voids read as negative space against additive filaments). Deepened
 /// in update-2026-09-19-1933 so faint links can sink below it.
-const COSMIC_BACKDROP: [f32; 4] = [0.008, 0.005, 0.024, 1.0];
+/// Deep-indigo HDR clear colour (`cosmic-void-contrast` CVC-003): the
+/// reference backdrop in linear (`≈ (0.02, 0.02, 0.06)` — the field is
+/// read against it, so voids are negative space, never additive haze).
+/// Voids measure within 1.15× of this at `slab` (graded CVC-005).
+const COSMIC_BACKDROP: [f32; 4] = [0.02, 0.02, 0.06, 1.0];
 
 /// Cosmic grade knobs (update-2026-09-19-1933), split per surface:
 /// the immersive Game Demo stacks a few sprites per pixel while the
@@ -10928,6 +10968,91 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_transfer_shared() {
+        // CVC-001/A-3: one `COSMIC_TRANSFER_GLSL` source of truth,
+        // byte-identical in the proc splat vertex shader and the veil
+        // march fragment shader (the lib const is the authority — the
+        // binary pastes it verbatim). Veil sprites take the same weight
+        // through the CPU `transfer` mirror (`veil_sprites`): their
+        // pipeline (`GLOW_VERT`) carries no density channel and shares
+        // the draw with hub members + impostors, which must stay
+        // unaffected — so the snippet is deliberately absent there
+        // (pinned below, not an omission).
+        use game_debug::cosmic_veil::COSMIC_TRANSFER_GLSL;
+        for (source, what) in [(SPLAT_PROC_VERT, "proc splat"), (MARCH_FRAG, "march")] {
+            assert!(
+                source.contains(COSMIC_TRANSFER_GLSL),
+                "{what} shader drifted from the shared transfer snippet"
+            );
+        }
+        assert!(
+            !GLOW_VERT.contains("cosmic_transfer"),
+            "glow must not carry the transfer: sprites weight on the CPU, hubs stay unaffected"
+        );
+        // Transfer literals track the graded starting constants
+        // (`TRANSFER_FLOOR`, `TRANSFER_BAND_HI`, `RIM_FADE_MPC`) plus
+        // the knots tail (the floor-gated emissive law).
+        use game_debug::cosmic_veil::{RIM_FADE_MPC, TRANSFER_BAND_HI, TRANSFER_FLOOR};
+        assert_eq!(
+            (TRANSFER_FLOOR, TRANSFER_BAND_HI, RIM_FADE_MPC),
+            (0.0, 2.5, 30.0)
+        );
+        for (source, what) in [(SPLAT_PROC_VERT, "proc splat"), (MARCH_FRAG, "march")] {
+            assert!(
+                source.contains("smoothstep(0.0, 2.5, log2od)"),
+                "{what} band drifted from TRANSFER_FLOOR/BAND_HI"
+            );
+            assert!(
+                source.contains("1.0 + max(0.0, log2od - 1.5)"),
+                "{what} knots tail drifted from the gated emissive law"
+            );
+            assert!(
+                source.contains("radius_mpc - 30.0"),
+                "{what} rim drifted from RIM_FADE_MPC"
+            );
+        }
+        // Call sites: the splat weights its length from the
+        // sphere-centred `box_pos`; the march from its ray point.
+        assert!(
+            SPLAT_PROC_VERT.contains("cosmic_transfer(log2od, length(box_pos), radius)"),
+            "splat transfer call drifted"
+        );
+        assert!(
+            MARCH_FRAG.contains("cosmic_transfer(log2od, r_march, radius)"),
+            "march transfer call drifted"
+        );
+    }
+
+    #[test]
+    fn cosmic_backdrop_is_report_indigo() {
+        // CVC-003: the HDR clear is the report's deep indigo in linear
+        // — voids read against it, never against additive haze. The
+        // windowed pass, the offscreen capture pass, and the LDR
+        // fallback all clear from this one const (by construction —
+        // each names `COSMIC_BACKDROP`), so pinning the value pins all
+        // three.
+        assert_eq!(COSMIC_BACKDROP, [0.02, 0.02, 0.06, 1.0]);
+    }
+
+    #[test]
+    fn resolve_adds_no_backdrop() {
+        // CVC-003/FR4: the resolve composites sampled targets only
+        // (`scene + bloom·i + march·e` through the ACES fit) — no
+        // backdrop term may re-lift the voids the transfer darkened.
+        let resolve = resolve_frag_bloom_march();
+        assert!(
+            resolve.contains(
+                "aces_fit(hdr * pc.exposure + bloom * pc.intensity + texture(sampler2D(march_tex, march_sampler), v_uv).rgb * pc.march_gain)"
+            ),
+            "resolve composition drifted"
+        );
+        assert!(
+            !resolve.contains("backdrop"),
+            "resolve must not add a backdrop term"
+        );
+    }
+
+    #[test]
     fn splat_proc_shader_pins() {
         // `cosmic-gpu-tracers` CGT-007 / FR7 string pins: the proc
         // vertex shader's CPU-mirrored constants must not drift
@@ -11002,30 +11127,30 @@ mod tests {
 
     #[test]
     fn march_emission_matches_grade() {
-        // CGV grade knob: the GLSL emission literal tracks
-        // `VEIL_MARCH_K` (`a = k·max(0, od − 0.5)`).
+        // `cosmic-void-contrast` grade knob: the GLSL emission literal
+        // tracks `VEIL_MARCH_K` (`a = k·transfer(log2od, r, R)` — the
+        // band floor subsumes the old `od − 0.5` threshold).
         assert!(
-            MARCH_FRAG.contains(&format!("{VEIL_MARCH_K} * max(0.0, od - 0.5)")),
+            MARCH_FRAG.contains(&format!(
+                "{VEIL_MARCH_K} * cosmic_transfer(log2od, r_march, radius)"
+            )),
             "march emission drifted from VEIL_MARCH_K"
         );
     }
 
     #[test]
     fn march_loop_stays_narrow() {
-        // CGV-005/A-3: the march loop is texture fetch + mix/FMA with
-        // one scoped `exp2` (log-density → overdensity; the march never
-        // runs on Low). Everything else transcendental stays out.
-        for banned in ["pow(", "log(", "sin(", "cos(", "tan("] {
+        // CGV-005/A-3 as amended by `cosmic-void-contrast`: the march
+        // loop is texture fetch + mix/FMA with NO transcendentals — the
+        // transfer works in log space, so the one scoped `exp2`
+        // (log-density → overdensity) retired with the linear emission
+        // law (the march never runs on Low). Everything else stays out.
+        for banned in ["pow(", "log(", "sin(", "cos(", "tan(", "exp2("] {
             assert!(
                 !MARCH_FRAG.contains(banned),
                 "march loop must stay narrow: {banned}"
             );
         }
-        assert_eq!(
-            MARCH_FRAG.matches("exp2(").count(),
-            1,
-            "exactly one scoped exp2 in the march loop"
-        );
         // Ray setup mirrors `cosmic_veil::march_ray` (CGV-007): same
         // quadratic tokens on both sides.
         for token in ["dot(oc, dir)", "dot(oc, oc) - radius * radius", "b * b - c"] {
