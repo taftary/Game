@@ -246,9 +246,7 @@ pub fn march_ray(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_engine::universe::{
-        CosmicWebParams, WebFieldBudget, WebTracer, generate_cosmic_web_with_field,
-    };
+    use game_engine::universe::{CosmicWebParams, generate_cosmic_web_with_field};
 
     fn synth_field(n: u32, cells: &[(u8, u8)]) -> WebField {
         let mut grid = vec![0u8; n as usize * n as usize * n as usize];
@@ -256,7 +254,6 @@ mod tests {
             grid[i] = (class << 6) | (q & 0x3F);
         }
         WebField {
-            tracers: Vec::new(),
             displacement: Vec::new(),
             grid,
             grid_cells: n,
@@ -419,7 +416,7 @@ mod tests {
     #[test]
     fn sprites_small_box_structure_and_determinism() {
         let p = CosmicWebParams::new(32, 4.0, 50.0).expect("small test params fit");
-        let (_, field) = generate_cosmic_web_with_field(11, &p, WebFieldBudget::Full);
+        let (_, field) = generate_cosmic_web_with_field(11, &p);
         let out = veil_sprites(&field, DVec3::ZERO);
         eprintln!("small-box veil count: {}", out.len());
         assert!(!out.is_empty() && out.len() <= 32 * 32 * 32);
@@ -448,7 +445,7 @@ mod tests {
         // 120–180k was an estimate; the band pins the measurement.
         // Low draws a stride-2 subset (~168k ≤ 200k budget) at upload.
         let p = CosmicWebParams::nominal();
-        let (_, field) = generate_cosmic_web_with_field(1234, &p, WebFieldBudget::Full);
+        let (_, field) = generate_cosmic_web_with_field(1234, &p);
         let out = veil_sprites(&field, DVec3::ZERO);
         eprintln!("nominal veil count: {}", out.len());
         assert!(
@@ -460,7 +457,6 @@ mod tests {
     #[test]
     fn empty_field_emits_nothing() {
         let field = WebField {
-            tracers: Vec::new(),
             displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
@@ -473,10 +469,6 @@ mod tests {
         // Void-only grid emits nothing either.
         let void = synth_field(2, &[(0, 0)]);
         assert!(veil_sprites(&void, DVec3::ZERO).is_empty());
-        let _ = WebTracer {
-            pos_mpc: [0.0; 3],
-            overdensity: 1.0,
-        };
     }
 
     #[test]
@@ -489,7 +481,6 @@ mod tests {
         assert_eq!(&bytes[3..], &[0; 5]);
         // Degenerate fields build no texture.
         let empty = WebField {
-            tracers: Vec::new(),
             displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,

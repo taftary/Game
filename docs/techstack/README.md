@@ -1,10 +1,11 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.49.0 (2026-09-23, v0.3.4 `cosmic-rebase-async`
-  in-progress: rebase never blocks the frame — split seed/rebase
-  rebuilds, off-thread demo-buffer worker with latest-wins + join on
-  drop, headless timed traverse green; reference-HW upload measure +
-  UX hands-on pending)
+- **Version:** 0.50.0 (2026-09-23, v0.3.4 `cosmic-gpu-tracers`
+  in-review: procedural GPU tracers — displacement grid + cell list
+  replace the stored tracer list, rebase job glow-only, slab
+  ridge-scan + parity + UHD 620 captures green, full gates green;
+  ANALYST audit + SECURITY review pending; `cosmic-rebase-async`
+  reference-HW upload measure + UX hands-on still pending)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

@@ -1,12 +1,11 @@
-//! Field export: non-hashed render sidecar (ADR-025, `web-field-export`).
+//! Field export: non-hashed render sidecar (ADR-025, `web-field-export`,
+//! reshaped by ADR-026 `cosmic-gpu-tracers`).
 //!
-//! Stage B displaces one Zel'dovich tracer per lattice cell and deposits
-//! it with NGP, then discards the continuous position; stage C keeps only
-//! node peaks. Illustris-style renders splat exactly the discarded data,
-//! so this module re-runs the displacement in a **second loop** that feeds
-//! nothing hashed: export-only Lagrangian jitter (own stream), the same
-//! central-difference `∇Ψ` stencil as [`super::displace`], a 3³-smoothed
-//! overdensity per tracer, and the 128³ class + log-density grid packing.
+//! The sidecar carries what the procedural splat shader fetches: the
+//! growth-scaled Zel'dovich displacement grid `D₊·∇Ψ` (quantized,
+//! [`DISP_QUANT_RANGE_CELLS`]) plus the 128³ class + log-density grid
+//! packing. The v0.3.3 displaced-vertex list (budget tiers and the
+//! refinement helper) retired in CGT-010 — sub-samples are a draw count now, never stored vertices.
 //!
 //! [`generate_cosmic_web_with_field`](super::generate_cosmic_web_with_field)
 //! is the single entry point; [`super::generate_cosmic_web`] delegates to
@@ -16,16 +15,6 @@ use super::classify::ClassifiedWeb;
 use super::displace::EulerianField;
 use super::field::index;
 use super::params::CosmicWebParams;
-use crate::core::SeededRng;
-
-/// One exported tracer: displaced position + smoothed local overdensity.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WebTracer {
-    /// Box-centered Mpc position (same frame as `WebNode::position_mpc`).
-    pub pos_mpc: [f32; 3],
-    /// Smoothed overdensity `(1+δ)` at the landing cell (≥ 0, finite).
-    pub overdensity: f32,
-}
 
 /// SNORM quantization range for the displacement export (CGT-001): the
 /// growth-scaled displacement `D₊·∇Ψ` is stored in cell units over
@@ -46,18 +35,15 @@ pub fn dequantize_disp(q: i16) -> f64 {
     f64::from(q) / f64::from(i16::MAX) * DISP_QUANT_RANGE_CELLS
 }
 
-/// Render sidecar: displaced tracers + packed grid. Never hashed, never
+/// Render sidecar: displacement grid + packed grid. Never hashed, never
 /// saved, never read by gameplay (ADR-025 §1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct WebField {
-    /// Tracers inside the descriptor sphere (nominal ≈ 1.0–1.1M).
-    /// Kept until CGT-010 retires it in favour of `displacement`.
-    pub tracers: Vec<WebTracer>,
     /// Growth-scaled Zel'dovich displacement `D₊·∇Ψ` per lattice cell
     /// (Lagrangian order, x fastest), quantized with [`quantize_disp`]
     /// over `±DISP_QUANT_RANGE_CELLS` (CGT-001). Length is `grid_cells³`.
-    /// The splat vertex shader (CGT-005) fetches this instead of reading
-    /// `tracers`; [`displace_sample`] is its exact CPU mirror.
+    /// The splat vertex shader (CGT-005) fetches this; [`displace_sample`]
+    /// is its exact CPU mirror.
     pub displacement: Vec<[i16; 3]>,
     /// `grid_cells³` packed bytes: `(class << 6) | quant(log2(1+δ))`.
     pub grid: Vec<u8>,
@@ -69,19 +55,9 @@ pub struct WebField {
     pub mean_density: f64,
     /// Box origin in Mpc (`[-half, -half, -half]`).
     pub origin_mpc: [f64; 3],
-    /// Descriptor sphere radius in Mpc (tracers + veil cut to it;
+    /// Descriptor sphere radius in Mpc (cell list + veil cut to it;
     /// sphere center is the box center `[0, 0, 0]`).
     pub sphere_radius_mpc: f64,
-}
-
-/// Tracer budget: full export, or every 2nd tracer on Low (`Half` keeps
-/// even `(x+y+z)` parity cells — deterministic stride, no RNG).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WebFieldBudget {
-    /// All lattice tracers inside the sphere.
-    Full,
-    /// Even-parity lattice cells only (≈ ½ the tracers).
-    Half,
 }
 
 impl WebField {
@@ -94,91 +70,6 @@ impl WebField {
     /// from the 6-bit `log2` packing).
     pub fn overdensity_at(&self, i: usize) -> f32 {
         unquantize_log2(self.grid[i] & 0x3F)
-    }
-
-    /// Optional High-tier refinement (factor 2): 8 sub-tracers per
-    /// lattice tracer via trilinear `∇Ψ` interpolation. Off by default,
-    /// never on Low/Medium, never hashed.
-    ///
-    /// `potential` is the stage-A initial field the parent call already
-    /// holds in memory; callers pass it back in. Positions stay inside
-    /// the descriptor sphere only if the parent field was built with the
-    /// same `params` and `radius`; out-of-sphere children are dropped.
-    pub fn refine(&self, potential: &[f64], params: &CosmicWebParams, factor: u32) -> WebField {
-        if factor != 2 {
-            return self.clone();
-        }
-        let n = params.lattice_cells as usize;
-        let half = params.half_width_mpc();
-        let cell = params.cell_size_mpc;
-        let radius = params.descriptor_radius_mpc;
-        let grad = build_gradient(potential, params);
-        let mut rng = SeededRng::stream(0, "cosmic_web/tracer");
-        // Advance the parent stream past the parent export order is not
-        // needed: refinement jitter (if any) must be independent — use a
-        // dedicated sub-stream so parent replay is unaffected.
-        let _ = &mut rng;
-        let mut tracers = Vec::with_capacity(self.tracers.len().saturating_mul(8));
-        // Re-derive sub-tracers from the lattice (not from parent
-        // tracers) so the count is exactly 8× surviving children.
-        let smooth = smooth3_of(&euler_from_potential(potential, params), params);
-        for z in 0..n {
-            for y in 0..n {
-                for x in 0..n {
-                    if !WebFieldBudget::Full.keeps(x, y, z) {
-                        continue;
-                    }
-                    for sz in 0..2 {
-                        for sy in 0..2 {
-                            for sx in 0..2 {
-                                let qx = x as f64 + 0.25 + 0.5 * sx as f64;
-                                let qy = y as f64 + 0.25 + 0.5 * sy as f64;
-                                let qz = z as f64 + 0.25 + 0.5 * sz as f64;
-                                let (gx, gy, gz) = trilinear_grad(&grad, n, qx, qy, qz);
-                                let g = params.growth_factor;
-                                let xd = (qx - g * gx).rem_euclid(n as f64);
-                                let yd = (qy - g * gy).rem_euclid(n as f64);
-                                let zd = (qz - g * gz).rem_euclid(n as f64);
-                                let pos = [
-                                    (xd * cell - half) as f32,
-                                    (yd * cell - half) as f32,
-                                    (zd * cell - half) as f32,
-                                ];
-                                let r2 = f64::from(pos[0]) * f64::from(pos[0])
-                                    + f64::from(pos[1]) * f64::from(pos[1])
-                                    + f64::from(pos[2]) * f64::from(pos[2]);
-                                if r2 > radius * radius {
-                                    continue;
-                                }
-                                let li = super::field::index(
-                                    n,
-                                    (xd.floor() as usize).min(n - 1),
-                                    (yd.floor() as usize).min(n - 1),
-                                    (zd.floor() as usize).min(n - 1),
-                                );
-                                let od = (smooth[li] / params_mean(&smooth)) as f32;
-                                if od.is_finite() && od >= 0.0 {
-                                    tracers.push(WebTracer {
-                                        pos_mpc: pos,
-                                        overdensity: od,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        WebField {
-            tracers,
-            displacement: self.displacement.clone(),
-            grid: self.grid.clone(),
-            grid_cells: self.grid_cells,
-            cell_size_mpc: self.cell_size_mpc,
-            mean_density: self.mean_density,
-            origin_mpc: self.origin_mpc,
-            sphere_radius_mpc: self.sphere_radius_mpc,
-        }
     }
 }
 
@@ -240,6 +131,113 @@ pub fn displace_sample(field: &WebField, q: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// Centre-sample fast path for [`cell_list`] (CGT-009, NFR3): the exact
+/// arithmetic of [`displace_sample`] at a cell centre (`fx = fy = fz =
+/// 0.5`), minus the per-call overhead the general path pays — no
+/// `floor`, no float `rem_euclid` on the way in (integer centres are
+/// already in `[0, n)`), one conditional wrap on the way out (exact:
+/// `e ∈ [−8, n + 8)` with `n ≥ 16`, so a single add/sub equals
+/// `rem_euclid`), same corner indices, same dequantization, same
+/// lerp-tree order with `0.5` literals. Bit-identical to
+/// `displace_sample([x + 0.5, y + 0.5, z + 0.5])` — pinned by
+/// `centre_sample_matches_general_path` — so the list, its count band,
+/// and the determinism pins are untouched; only the wall time drops
+/// (dev 873 ms → release target ≤ 50 ms nominal).
+pub fn displace_sample_centre(field: &WebField, x: usize, y: usize, z: usize) -> [f64; 3] {
+    let n = field.grid_cells as usize;
+    debug_assert!(n > 0, "centre sample needs a built field");
+    let n_f = n as f64;
+    // Next-corner wrap without float modulo (`n ≥ 16` per params).
+    let x1 = if x + 1 < n { x + 1 } else { 0 };
+    let y1 = if y + 1 < n { y + 1 } else { 0 };
+    let z1 = if z + 1 < n { z + 1 } else { 0 };
+    let at = |cx: usize, cy: usize, cz: usize| {
+        let d = field.displacement[super::field::index(n, cx, cy, cz)];
+        [
+            dequantize_disp(d[0]),
+            dequantize_disp(d[1]),
+            dequantize_disp(d[2]),
+        ]
+    };
+    let c000 = at(x, y, z);
+    let c100 = at(x1, y, z);
+    let c010 = at(x, y1, z);
+    let c110 = at(x1, y1, z);
+    let c001 = at(x, y, z1);
+    let c101 = at(x1, y, z1);
+    let c011 = at(x, y1, z1);
+    let c111 = at(x1, y1, z1);
+    let mut d = [0.0; 3];
+    for axis in 0..3 {
+        let c00 = c000[axis] * 0.5 + c100[axis] * 0.5;
+        let c10 = c010[axis] * 0.5 + c110[axis] * 0.5;
+        let c01 = c001[axis] * 0.5 + c101[axis] * 0.5;
+        let c11 = c011[axis] * 0.5 + c111[axis] * 0.5;
+        let c0 = c00 * 0.5 + c10 * 0.5;
+        let c1 = c01 * 0.5 + c11 * 0.5;
+        d[axis] = c0 * 0.5 + c1 * 0.5;
+    }
+    let wrap = |v: f64| {
+        if v < 0.0 {
+            v + n_f
+        } else if v >= n_f {
+            v - n_f
+        } else {
+            v
+        }
+    };
+    [
+        wrap(x as f64 + 0.5 - d[0]),
+        wrap(y as f64 + 0.5 - d[1]),
+        wrap(z as f64 + 0.5 - d[2]),
+    ]
+}
+/// Memoized centre evaluation over a pre-dequantized grid (CGT-009
+/// NFR3): identical arithmetic to [`displace_sample_centre` — same
+/// corner values, same lerp-tree order — but the caller dequantizes
+/// each lattice cell once instead of 8× (every cell corners 8
+/// stencils). Bit-identity with the oracle follows value-for-value;
+/// pinned by `centre_sample_matches_general_path_bit_exact`.
+fn centre_from_memo(dq: &[[f64; 3]], n: usize, x: usize, y: usize, z: usize) -> [f64; 3] {
+    debug_assert!(n > 0, "centre sample needs a built field");
+    let n_f = n as f64;
+    let x1 = if x + 1 < n { x + 1 } else { 0 };
+    let y1 = if y + 1 < n { y + 1 } else { 0 };
+    let z1 = if z + 1 < n { z + 1 } else { 0 };
+    let at = |cx: usize, cy: usize, cz: usize| dq[cx + n * (cy + n * cz)];
+    let c000 = at(x, y, z);
+    let c100 = at(x1, y, z);
+    let c010 = at(x, y1, z);
+    let c110 = at(x1, y1, z);
+    let c001 = at(x, y, z1);
+    let c101 = at(x1, y, z1);
+    let c011 = at(x, y1, z1);
+    let c111 = at(x1, y1, z1);
+    let mut d = [0.0; 3];
+    for axis in 0..3 {
+        let c00 = c000[axis] * 0.5 + c100[axis] * 0.5;
+        let c10 = c010[axis] * 0.5 + c110[axis] * 0.5;
+        let c01 = c001[axis] * 0.5 + c101[axis] * 0.5;
+        let c11 = c011[axis] * 0.5 + c111[axis] * 0.5;
+        let c0 = c00 * 0.5 + c10 * 0.5;
+        let c1 = c01 * 0.5 + c11 * 0.5;
+        d[axis] = c0 * 0.5 + c1 * 0.5;
+    }
+    let wrap = |v: f64| {
+        if v < 0.0 {
+            v + n_f
+        } else if v >= n_f {
+            v - n_f
+        } else {
+            v
+        }
+    };
+    [
+        wrap(x as f64 + 0.5 - d[0]),
+        wrap(y as f64 + 0.5 - d[1]),
+        wrap(z as f64 + 0.5 - d[2]),
+    ]
+}
 /// Compact Lagrangian cell list driving the procedural splat draw
 /// (CGT-003, ADR-026 §2): indices (x fastest) of cells whose displaced
 /// centre lands within `sphere_radius_mpc + cell_size_mpc`, via
@@ -250,11 +248,37 @@ pub fn cell_list(field: &WebField) -> Vec<u32> {
     let n = field.grid_cells as usize;
     let half = n as f64 * field.cell_size_mpc * 0.5;
     let bound = field.sphere_radius_mpc + field.cell_size_mpc;
+    // Dequantize once per lattice cell (CGT-009 NFR3): the inline path
+    // re-derives each corner value 8× (every cell corners 8 stencils).
+    // Transient `n³ × 24 B` (50 MB nominal), freed on return; the
+    // resident sidecar (NFR2) is unchanged.
+    let dq: Vec<[f64; 3]> = field.displacement[..n * n * n]
+        .iter()
+        .map(|d| {
+            [
+                dequantize_disp(d[0]),
+                dequantize_disp(d[1]),
+                dequantize_disp(d[2]),
+            ]
+        })
+        .collect();
+    // Conservative Lagrangian pre-filter (exact: skips only cells whose
+    // displaced centre provably lands outside — dequantized displacement
+    // is bounded by ±8 cells per axis, so a centre farther than
+    // `bound + 8√3·cell` cannot come back; kept cells evaluate
+    // identically, so the list is bit-for-bit the unfiltered one).
+    let reach = bound + 8.0 * 3.0_f64.sqrt() * field.cell_size_mpc;
     let mut out = Vec::new();
     for z in 0..n {
         for y in 0..n {
             for x in 0..n {
-                let e = displace_sample(field, [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5]);
+                let qx = (x as f64 + 0.5) * field.cell_size_mpc - half;
+                let qy = (y as f64 + 0.5) * field.cell_size_mpc - half;
+                let qz = (z as f64 + 0.5) * field.cell_size_mpc - half;
+                if qx * qx + qy * qy + qz * qz > reach * reach {
+                    continue;
+                }
+                let e = centre_from_memo(&dq, n, x, y, z);
                 let px = e[0] * field.cell_size_mpc - half;
                 let py = e[1] * field.cell_size_mpc - half;
                 let pz = e[2] * field.cell_size_mpc - half;
@@ -267,16 +291,6 @@ pub fn cell_list(field: &WebField) -> Vec<u32> {
     out
 }
 
-impl WebFieldBudget {
-    /// Deterministic keep rule for the lattice cell `(x, y, z)`.
-    pub fn keeps(self, x: usize, y: usize, z: usize) -> bool {
-        match self {
-            WebFieldBudget::Full => true,
-            WebFieldBudget::Half => (x + y + z).is_multiple_of(2),
-        }
-    }
-}
-
 /// Quantize `log2(1+δ)` over `[-4, +6]` to 6 bits.
 pub fn quantize_log2(v: f64) -> u8 {
     ((v + 4.0) / 10.0 * 63.0).round().clamp(0.0, 63.0) as u8
@@ -285,10 +299,6 @@ pub fn quantize_log2(v: f64) -> u8 {
 /// Inverse of [`quantize_log2`].
 pub fn unquantize_log2(q: u8) -> f32 {
     2.0_f32.powf(-4.0 + f32::from(q & 0x3F) / 63.0 * 10.0)
-}
-
-fn params_mean(smooth: &[f64]) -> f64 {
-    smooth.iter().sum::<f64>() / smooth.len() as f64
 }
 
 /// Periodic 3³ box mean over NGP counts, separable (three 3-tap
@@ -334,16 +344,6 @@ pub fn smooth3(density: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
-fn smooth3_of(euler: &EulerianField, _params: &CosmicWebParams) -> Vec<f64> {
-    smooth3(&euler.density, euler.n)
-}
-
-/// Re-run the NGP deposit (un-jittered, identical to stage B) for the
-/// `refine` scaffold path, which only receives the potential.
-fn euler_from_potential(potential: &[f64], params: &CosmicWebParams) -> EulerianField {
-    super::displace::displace_to_eulerian(potential, params)
-}
-
 /// Per-cell central-difference gradient (cell units), periodic.
 fn build_gradient(potential: &[f64], params: &CosmicWebParams) -> Vec<[f64; 3]> {
     let n = params.lattice_cells as usize;
@@ -371,38 +371,6 @@ fn build_gradient(potential: &[f64], params: &CosmicWebParams) -> Vec<[f64; 3]> 
     grad
 }
 
-/// Trilinear sample of the gradient field at fractional lattice coords.
-fn trilinear_grad(grad: &[[f64; 3]], n: usize, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-    let w = |v: f64| v.rem_euclid(n as f64);
-    let (x, y, z) = (w(x), w(y), w(z));
-    let (x0, y0, z0) = (
-        x.floor() as usize % n,
-        y.floor() as usize % n,
-        z.floor() as usize % n,
-    );
-    let (x1, y1, z1) = ((x0 + 1) % n, (y0 + 1) % n, (z0 + 1) % n);
-    let (fx, fy, fz) = (x - x.floor(), y - y.floor(), z - z.floor());
-    let mut out = [0.0; 3];
-    for axis in 0..3 {
-        let c000 = grad[index(n, x0, y0, z0)][axis];
-        let c100 = grad[index(n, x1, y0, z0)][axis];
-        let c010 = grad[index(n, x0, y1, z0)][axis];
-        let c110 = grad[index(n, x1, y1, z0)][axis];
-        let c001 = grad[index(n, x0, y0, z1)][axis];
-        let c101 = grad[index(n, x1, y0, z1)][axis];
-        let c011 = grad[index(n, x0, y1, z1)][axis];
-        let c111 = grad[index(n, x1, y1, z1)][axis];
-        let c00 = c000 * (1.0 - fx) + c100 * fx;
-        let c10 = c010 * (1.0 - fx) + c110 * fx;
-        let c01 = c001 * (1.0 - fx) + c101 * fx;
-        let c11 = c011 * (1.0 - fx) + c111 * fx;
-        let c0 = c00 * (1.0 - fy) + c10 * fy;
-        let c1 = c01 * (1.0 - fy) + c11 * fy;
-        out[axis] = c0 * (1.0 - fz) + c1 * fz;
-    }
-    (out[0], out[1], out[2])
-}
-
 /// Staging bytes for the displacement 3D image (CGT-004, ADR-026 §2):
 /// `displacement` (`[i16; 3]`, x fastest) as RGBA16_SNORM little-endian
 /// (alpha 0 — the format has no RGB-only 3D variant). `128³ × 8 B ≈
@@ -421,24 +389,16 @@ pub fn displacement_image_bytes(field: &WebField) -> Vec<u8> {
     out
 }
 
-/// Irwin–Hall-3 centered jitter (`σ = 0.5`), scaled to `σ ≈ 0.3` cell.
-fn jitter3(rng: &mut SeededRng) -> (f64, f64, f64) {
-    let mut one = || (rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 1.5) * 0.6;
-    (one(), one(), one())
-}
-
 /// Build the sidecar from the already-computed stage products.
 ///
 /// `potential` is the stage-A field (re-read, never regenerated).
-/// Domain-separated stream `"cosmic_web/tracer"` consumed in canonical
-/// lattice order (x fastest) — replay-identical per `(seed, params)`.
+/// No RNG, no budget: every lattice cell exports its displacement;
+/// the draw count (`k`) lives in the shader, not here.
 pub fn export_field(
-    seed: u64,
     potential: &[f64],
     euler: &EulerianField,
     classified: &ClassifiedWeb,
     params: &CosmicWebParams,
-    budget: WebFieldBudget,
 ) -> WebField {
     let n = params.lattice_cells as usize;
     let half = params.half_width_mpc();
@@ -446,62 +406,6 @@ pub fn export_field(
     let radius = params.descriptor_radius_mpc;
     let smooth = smooth3(&euler.density, n);
     let mean = euler.mean;
-    // Central-difference ∇Ψ read inline (same stencil as stage B —
-    // no retained gradient allocation on the boot path).
-    let pot_at = |x: i64, y: i64, z: i64| {
-        let w = |v: i64| v.rem_euclid(n as i64) as usize;
-        potential[index(n, w(x), w(y), w(z))]
-    };
-    let mut rng = SeededRng::stream(seed, "cosmic_web/tracer");
-    let mut tracers = Vec::new();
-    for z in 0..n {
-        for y in 0..n {
-            for x in 0..n {
-                let (jx, jy, jz) = jitter3(&mut rng);
-                let keep = budget.keeps(x, y, z);
-                // Displacement always consumes the stream in canonical
-                // order (replay pin A-5); budget only drops the record.
-                let qx = x as f64 + 0.5 + jx;
-                let qy = y as f64 + 0.5 + jy;
-                let qz = z as f64 + 0.5 + jz;
-                if !keep {
-                    continue;
-                }
-                let (xi, yi, zi) = (x as i64, y as i64, z as i64);
-                let gx = (pot_at(xi + 1, yi, zi) - pot_at(xi - 1, yi, zi)) * 0.5;
-                let gy = (pot_at(xi, yi + 1, zi) - pot_at(xi, yi - 1, zi)) * 0.5;
-                let gz = (pot_at(xi, yi, zi + 1) - pot_at(xi, yi, zi - 1)) * 0.5;
-                let growth = params.growth_factor;
-                let xd = (qx - growth * gx).rem_euclid(n as f64);
-                let yd = (qy - growth * gy).rem_euclid(n as f64);
-                let zd = (qz - growth * gz).rem_euclid(n as f64);
-                let pos = [
-                    (xd * cell - half) as f32,
-                    (yd * cell - half) as f32,
-                    (zd * cell - half) as f32,
-                ];
-                let r2 = f64::from(pos[0]) * f64::from(pos[0])
-                    + f64::from(pos[1]) * f64::from(pos[1])
-                    + f64::from(pos[2]) * f64::from(pos[2]);
-                if r2 > radius * radius {
-                    continue;
-                }
-                let li = index(
-                    n,
-                    (xd.floor() as usize).min(n - 1),
-                    (yd.floor() as usize).min(n - 1),
-                    (zd.floor() as usize).min(n - 1),
-                );
-                let od = (smooth[li] / mean) as f32;
-                if od.is_finite() && od >= 0.0 {
-                    tracers.push(WebTracer {
-                        pos_mpc: pos,
-                        overdensity: od,
-                    });
-                }
-            }
-        }
-    }
     // Grid export: class + 6-bit log2(1+δ_smooth).
     let mut grid = vec![0u8; n * n * n];
     for i in 0..n * n * n {
@@ -511,9 +415,8 @@ pub fn export_field(
         grid[i] = (class << 6) | quantize_log2(log2od);
     }
     // Displacement export (CGT-001): growth-scaled `D₊·∇Ψ` per cell from
-    // the same central-difference stencil stage B uses (`build_gradient`
-    // shares the stencil — no second math, just the stored grid the old
-    // tracer loop re-derived inline). Quantized SNORM over ±8 cells.
+    // the same central-difference stencil stage B uses. Quantized SNORM
+    // over ±8 cells.
     let growth = params.growth_factor;
     let displacement = build_gradient(potential, params)
         .iter()
@@ -526,7 +429,6 @@ pub fn export_field(
         })
         .collect();
     WebField {
-        tracers,
         displacement,
         grid,
         grid_cells: params.lattice_cells,
@@ -560,14 +462,7 @@ mod tests {
     #[test]
     fn grid_packing_round_trips_within_one_step() {
         let (potential, euler, classified, p) = small_products();
-        let field = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
+        let field = export_field(&potential, &euler, &classified, &p);
         let n = p.lattice_cells as usize;
         let smooth = smooth3(&euler.density, n);
         for i in (0..n * n * n).step_by(977) {
@@ -589,126 +484,15 @@ mod tests {
     }
 
     #[test]
-    fn tracer_densities_are_normalized() {
+    fn sphere_cut_holds_for_grid_densities() {
+        // The packed grid covers the whole lattice (no cut), but every
+        // density decodes finite — the sphere cut lives in `cell_list`.
         let (potential, euler, classified, p) = small_products();
-        let field = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
-        assert!(!field.tracers.is_empty());
-        for t in &field.tracers {
-            assert!(t.overdensity.is_finite() && t.overdensity >= 0.0);
-        }
-        // Volume mean is 1 by construction (smooth preserves the total).
+        let field = export_field(&potential, &euler, &classified, &p);
         let n = p.lattice_cells as usize;
-        let smooth = smooth3(&euler.density, n);
-        let vol_mean: f64 = smooth.iter().sum::<f64>() / smooth.len() as f64 / euler.mean;
-        assert!(
-            (vol_mean - 1.0).abs() < 1e-9,
-            "volume mean drifted: {vol_mean}"
-        );
-        // Tracer (mass-weighted) mean sits above 1: tracers flowed into
-        // dense cells, so they sample high densities preferentially.
-        let mean: f64 = field
-            .tracers
-            .iter()
-            .map(|t| f64::from(t.overdensity))
-            .sum::<f64>()
-            / field.tracers.len() as f64;
-        assert!(
-            (1.0..=3.0).contains(&mean),
-            "tracer density mean out of band: {mean}"
-        );
-    }
-
-    #[test]
-    fn sphere_cut_holds() {
-        let (potential, euler, classified, p) = small_products();
-        let field = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
-        for t in &field.tracers {
-            let r2 = f64::from(t.pos_mpc[0]).powi(2)
-                + f64::from(t.pos_mpc[1]).powi(2)
-                + f64::from(t.pos_mpc[2]).powi(2);
-            assert!(r2 <= p.descriptor_radius_mpc * p.descriptor_radius_mpc + 1e-6);
-        }
-    }
-
-    #[test]
-    fn half_budget_is_a_strict_subset() {
-        let (potential, euler, classified, p) = small_products();
-        let full = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
-        let half = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Half,
-        );
-        assert!(half.tracers.len() < full.tracers.len());
-        assert!((half.tracers.len() as f64) > full.tracers.len() as f64 * 0.35);
-    }
-
-    #[test]
-    fn nominal_tracer_count_band() {
-        // FR6 band at nominal (128³, 4 Mpc, 250 Mpc sphere): sphere/box
-        // volume ≈ 0.49 → ~1.0M of 2.1M tracers. Slow (~1 min); same
-        // cost class as the existing nominal pins.
-        let p = CosmicWebParams::nominal();
-        let potential = initial_field(1234, &p);
-        let euler = displace_to_eulerian(&potential, &p);
-        let classified = classify(&potential, &euler, &p);
-        let field = export_field(
-            1234,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
-        assert!(
-            (900_000..=1_200_000).contains(&field.tracers.len()),
-            "nominal tracer count out of band: {}",
-            field.tracers.len()
-        );
-        // Memory: 16 B × tracers + 2 MB grid ≤ 20 MB.
-        let bytes = field.tracers.len() * size_of::<WebTracer>() + field.grid.len();
-        assert!(bytes <= 20 * 1024 * 1024, "sidecar over budget: {bytes} B");
-    }
-
-    #[test]
-    fn refine_two_emits_eight_children_on_small_box() {
-        let p = small_params();
-        let potential = initial_field(5, &p);
-        let euler = displace_to_eulerian(&potential, &p);
-        let classified = classify(&potential, &euler, &p);
-        let field = export_field(5, &potential, &euler, &classified, &p, WebFieldBudget::Full);
-        let refined = field.refine(&potential, &p, 2);
-        assert!(refined.tracers.len() > field.tracers.len());
-        for t in &refined.tracers {
-            assert!(t.overdensity.is_finite() && t.overdensity >= 0.0);
-            let r2 = f64::from(t.pos_mpc[0]).powi(2)
-                + f64::from(t.pos_mpc[1]).powi(2)
-                + f64::from(t.pos_mpc[2]).powi(2);
-            assert!(r2 <= p.descriptor_radius_mpc * p.descriptor_radius_mpc + 1e-6);
+        for i in (0..n * n * n).step_by(977) {
+            let od = field.overdensity_at(i);
+            assert!(od.is_finite() && od >= 0.0);
         }
     }
 
@@ -720,14 +504,7 @@ mod tests {
         // (quantum = 8/32767 cells). Integer points only — at
         // half-integer centres trilinear blends neighbours by design.
         let (potential, euler, classified, p) = small_products();
-        let field = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
+        let field = export_field(&potential, &euler, &classified, &p);
         assert_eq!(field.displacement.len(), 32 * 32 * 32);
         let n = p.lattice_cells as usize;
         let grad = build_gradient(&potential, &p);
@@ -768,14 +545,7 @@ mod tests {
         // CGT-004: RGBA16_SNORM LE staging — xyz echo the quantized
         // grid, alpha is 0, length is n³ × 8.
         let (potential, euler, classified, p) = small_products();
-        let field = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
+        let field = export_field(&potential, &euler, &classified, &p);
         let n = p.lattice_cells as usize;
         let bytes = displacement_image_bytes(&field);
         assert_eq!(bytes.len(), n * n * n * 8);
@@ -794,7 +564,6 @@ mod tests {
         }
         // Degenerate fields build no texture.
         let empty = WebField {
-            tracers: Vec::new(),
             displacement: Vec::new(),
             grid: Vec::new(),
             grid_cells: 0,
@@ -811,14 +580,7 @@ mod tests {
         // CGT-003 pins: determinism, ascending order, every listed cell's
         // displaced centre inside R + cell.
         let (potential, euler, classified, p) = small_products();
-        let field = export_field(
-            11,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
+        let field = export_field(&potential, &euler, &classified, &p);
         let a = cell_list(&field);
         let b = cell_list(&field);
         assert_eq!(a, b, "cell_list not deterministic");
@@ -848,23 +610,52 @@ mod tests {
     }
 
     #[test]
+    fn centre_sample_matches_general_path_bit_exact() {
+        // CGT-009: the NFR3 fast path must be bit-identical to the
+        // `displace_sample` oracle on every cell of the small box, so
+        // the list, its count band, and determinism are untouched.
+        let (potential, euler, classified, p) = small_products();
+        let field = export_field(&potential, &euler, &classified, &p);
+        let n = p.lattice_cells as usize;
+        let dq: Vec<[f64; 3]> = field.displacement[..n * n * n]
+            .iter()
+            .map(|d| {
+                [
+                    dequantize_disp(d[0]),
+                    dequantize_disp(d[1]),
+                    dequantize_disp(d[2]),
+                ]
+            })
+            .collect();
+        for z in 0..n {
+            for y in 0..n {
+                for x in 0..n {
+                    assert_eq!(
+                        displace_sample_centre(&field, x, y, z),
+                        displace_sample(&field, [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5]),
+                        "centre/general mismatch at ({x},{y},{z})"
+                    );
+                    assert_eq!(
+                        centre_from_memo(&dq, n, x, y, z),
+                        displace_sample(&field, [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5]),
+                        "memo/general mismatch at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cell_list_nominal_count_band() {
         // CGT-003 count band at nominal (128³, seed 1234): displaced
-        // centres inside R + cell ≈ sphere shell volume ≈ tracer band
-        // widened by the +cell margin (~5 %). Slow (~1 min + ≤ 50 ms
-        // list); same cost class as `nominal_tracer_count_band`.
+        // centres inside R + cell ≈ 51 % of the lattice (sphere shell
+        // volume plus the +cell margin). Slow (~1 min); same cost class
+        // as the other nominal pins.
         let p = CosmicWebParams::nominal();
         let potential = initial_field(1234, &p);
         let euler = displace_to_eulerian(&potential, &p);
         let classified = classify(&potential, &euler, &p);
-        let field = export_field(
-            1234,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            WebFieldBudget::Full,
-        );
+        let field = export_field(&potential, &euler, &classified, &p);
         let cells = cell_list(&field);
         eprintln!("nominal cell count: {}", cells.len());
         // No SNORM clamp on nominal: the shader would silently fold larger

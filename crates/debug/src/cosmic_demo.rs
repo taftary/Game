@@ -20,7 +20,7 @@ use game::hud::Hud;
 use game_engine::flight::{FlyToExec, Target, plan_fly_to};
 use game_engine::frames::FrameId;
 use game_engine::universe::{
-    CosmicWebParams, WebDescriptor, WebField, WebFieldBudget, generate_cosmic_web_with_field,
+    CosmicWebParams, WebDescriptor, WebField, generate_cosmic_web_with_field,
 };
 use glam::{DQuat, DVec3};
 
@@ -113,7 +113,7 @@ impl CosmicDemoState {
     /// Generate the web (+ render sidecar) and spawn the player (boot path).
     pub fn new(seed: u64) -> Self {
         let params = CosmicWebParams::nominal();
-        let (web, field) = generate_cosmic_web_with_field(seed, &params, WebFieldBudget::Full);
+        let (web, field) = generate_cosmic_web_with_field(seed, &params);
         let player = CosmicPlayerState::spawn(&web);
         let mut camera = CosmicCamera::new(params.descriptor_radius_mpc as f32);
         camera.track(player.position_mpc(), player.facing());

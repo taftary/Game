@@ -458,12 +458,14 @@ of puffs per pixel where the immersive demo stacks a few, so one
 grade cannot serve both. Engine `BloomParams::spec_defaults()`
 (threshold, blur σ) stays untouched.
 
-**v0.3.3 direction (ADR-025 — `web-field-export` shipped 2026-09-20:
+**v0.3.3 direction (ADR-025 — `web-field-export` shipped 2026-09-20,
+reshaped by ADR-026 `cosmic-gpu-tracers` 2026-09-23:
 `engine::universe::web` exports the non-hashed `WebField` sidecar
-(≈ 1M Zel'dovich tracers with smoothed overdensity + the 128³ T-web
-class/density grid; measured nominal: 1 023 317 tracers, 17 MB, +0 ms
-dev-profile delta); the paragraphs below stay as written until the
-feature named in each rewrites them).** The v0.3.2 cosmic renderer decorates the link
+(the growth-scaled displacement grid `D₊·∇Ψ` quantized SNORM ±8
+cells + the 128³ T-web class/density grid; measured nominal:
+16.8 MB grid + 2 MB packed grid + ≈ 4.3 MB cell list; the v0.3.3
+displaced-tracer list retired); the paragraphs below stay as written
+until the feature named in each rewrites them).** The v0.3.2 cosmic renderer decorates the link
 graph (straight `a↔b` segments → smoke quads, grain, beads, 3-per-node
 impostors) and cannot produce the reference's curved/branching gas
 bodies, walls, dark voids, or hub hierarchy
@@ -513,26 +515,39 @@ plus `GAME_DEBUG_VISTA_T` pre-roll for timed poses).
 Windowed `F12` (Settings › Controls `Save PNG capture`) writes the
 current cosmic surface to `captures/` for exploration only.
 
-Tracer splats (`cosmic-tracer-splat`, shipped 2026-09-20): one
-additive point sprite per `WebField` tracer through a pipeline
-variant of the glow `PointList` (same pass, same blend — no new pass
-or draw). Vertex: world kernel `h = 2·(1+δ)^(-1/3)` clamped
-`[0.5, 4]` Mpc → `[1.5, 64]` px, constant-energy alpha (`k/px²`,
-per-surface `k`: demo 1.0, map 0.2 — grade round 1, 2026-09-20: the
-inspector stacks the full depth column and needed 5× less energy
-than the immersive view; fog replaces the knob), 5-stop density
-ramp (indigo → lavender → white → yellow → pink-red) with emissive
-`1+0.5·max(0, log2(1+δ)−1.5)`, class-B warm core lobe + class-C hub
-tint from the packed vertex word (`pos[3] + u32`: 16 B, Low 300k =
-4.8 MB), `smoothstep(h, 2h, dist)` near-eye fade, bounded Hubble
-tint. Fragment: rim-zero `(1−4d²)²` + warm core, arithmetic-only.
+Tracer splats (`cosmic-tracer-splat`, shipped 2026-09-20;
+procedural since `cosmic-gpu-tracers`, shipped 2026-09-23): no vertex
+input — `gl_VertexIndex` drives `cells × k` invocations
+(`SPLAT_PROC_VERT`): Lagrangian cell from the per-seed `u32` cell
+list + fixed sub-cell offset (`0.25 + 0.5·corner-bit`, ≤ ¼-cell
+`fract` dither) → trilinear displacement fetch (explicit LOD 0)
+→ Eulerian position, sphere-clipped; density from the R8 veil
+volume at the Eulerian cell (same packing the march inverts).
+Kernel, ramp, emissive, window, near-eye fade, and redshift match
+the retired per-tracer path (`h0 = 2.0` kept — graded CGT-008:
+k8/k1 slab mean ratio 1.20, parity dice 0.81); no class tint or
+B flag (hubs read through the glow members + impostors). Same
+pass, same blend, shared `SPLAT_FRAG` (arithmetic-only) — no new
+pass or draw. Sub-samples per cell are a draw count per tier
+(`SplatK`: Low 1 / Medium 2 / High 8; `GAME_DEBUG_COSMIC_K`
+overrides `1..=8`); origin rides a push constant, so tracers never
+rebuild on rebase and the rebase job carries glow only. Vertex-stage
+texture fetch is a recorded device requirement (universal on
+Vulkan 1.0; mobile guards check it) — outside the mobile fill-rate
+rule, which governs the fragment. CPU vertex memory for tracers is
+zero (−16 MB vs v0.3.3 High); per-seed uploads: 16.8 MB
+displacement image + ≈ 4.3 MB cell list; cell-list build 46.6 ms
+release nominal (NFR3 ≤ 50 ms).
 Grain + bead clouds, constants, streams, and tests are gone
 (`rg grain_cloud|bead_cloud` = 0); smoke, braid, spine, strand, and
 fray helpers followed in `cosmic-gas-veil-v2`
 (`rg smoke_puffs|glow_point_cloud|braid_point|spine_subsegments` = 0
-in code). Nominal headless:
-`splatsL255900 splatsM511800 splatsH1023599
-impostors18000 overdrawL2.0`.
+in code); the CPU tracer path followed in `cosmic-gpu-tracers`
+(`rg splat_records|SplatVertex|SplatRecord|WebFieldBudget|fn refine`
+= 0 in `crates/` — the stage-C peak helper is `peak_refine`, out
+of the pin's scope by name). Nominal headless:
+`splatsL1072958 splatsM2145916 splatsH8583664
+impostors5574 members17070`.
 
 Depth window (`cosmic-depth-window`, shipped 2026-09-20): one shared
 GLSL term (`cosmic_window_vis`: fog `1/(1+(d/L)²)` × slab window
@@ -549,8 +564,8 @@ depth, 20° near-ortho with framing kept, `Shift+wheel` scrolls,
 `[`/`]` resize). The `slab` capture preset is that framing at the
 home depth. Measured: voids dark (≥ 10 distinct in
 `slab-after.png`), `inspector-after.png` byte-identical to the
-splat shot (window off = identity), slab keeps 12 % of Low splats
-(8.3× fill relief).
+splat shot (window off = identity), slab keeps 12 % of listed
+cells (8.3× fill relief, `slab_relief` headless line).
 
 Hub hierarchy (`cosmic-hub-hierarchy`, shipped 2026-09-20): hubs
 tiered by mass rank (A = top 1 %, B = next 10 %, C = rest) into the
@@ -587,7 +602,7 @@ window) — the march row lives in the
 `bloom-mip-chain` pass description, so `assert_write_once` covers it.
 One density ramp across splats, sprites, and march (single
 authority: `debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL`, pinned
-byte-identical in `SPLAT_VERT` + `MARCH_FRAG`; sprites take
+byte-identical in `SPLAT_PROC_VERT` + `MARCH_FRAG`; sprites take
 CPU-computed colors from the same stops). `VeilMode::for_tier`
 (Sprites / March 32 / March 48) + `GAME_DEBUG_COSMIC_VEIL`
 override (`sprites|march|march:<8..=64>`); headless

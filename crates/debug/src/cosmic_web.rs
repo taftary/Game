@@ -319,9 +319,9 @@ mod tests {
         // test now pins the veil sprite contrast instead (dense cells
         // outshine faint ones, faint alpha stays tiny).
         use super::super::cosmic_veil::{veil_alpha, veil_sprites};
-        use game_engine::universe::{WebFieldBudget, generate_cosmic_web_with_field};
+        use game_engine::universe::generate_cosmic_web_with_field;
         let params = CosmicWebParams::nominal();
-        let (_, field) = generate_cosmic_web_with_field(1234, &params, WebFieldBudget::Full);
+        let (_, field) = generate_cosmic_web_with_field(1234, &params);
         let sprites = veil_sprites(&field, DVec3::ZERO);
         assert!(!sprites.is_empty());
         let dense_a: f64 = sprites

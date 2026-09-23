@@ -11,9 +11,11 @@ Deterministic, versioned, staged:
     sphere is a generation cut (v0.3.4 `cosmic-sphere-clip`, ADR-026
     §1), not a camera extent. v0.3.3 (ADR-025,
     `web-field-export`, shipped) adds an optional **render sidecar**
-    from the same run — the displaced tracers and the classified
-    density grid — that is never hashed, saved, or read by gameplay;
-    the descriptor and its version stay the only authority.
+    from the same run — the growth-scaled displacement grid plus the
+    classified density grid (procedural since v0.3.4
+    `cosmic-gpu-tracers`, ADR-026 §2) — that is never hashed, saved,
+    or read by gameplay; the descriptor and its version stay the only
+    authority.
 1. **Galaxy seed → star systems:** position, spectral class, companion count.
 2. **System seed → planets:** count, orbits, type (rocky / desert / ice / volcanic / toxic / oceanic), gravity, atmosphere density/color, resource bias, companions (moons/rings, visual-only in v1 — [`journey.md`](journey.md) Level 4).
 3. **Planet seed → surface:** elevation, biomes, water table, POIs, colony site candidates, robot-relevant resources.

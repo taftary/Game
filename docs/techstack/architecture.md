@@ -50,8 +50,10 @@ crates/engine/   # game_engine lib: renderer, universe gen, sim, assets, input, 
      universe/    # seeds, web/nodes (stage 0, v0.3.2) + galaxy/system/planet
                   # generation (M5 shipped stages 1–2: descriptors + hashes;
                   # stage 3 lands with descent/surface); web/field_export.rs
-                  # (v0.3.3, ADR-025) adds the non-hashed render sidecar
-                  # (tracers + packed grid) — engine stays render-free
+                  # (v0.3.3, ADR-025; displacement-grid shape since v0.3.4
+                  # ADR-026 `cosmic-gpu-tracers`) adds the non-hashed
+                  # render sidecar (displacement grid + packed grid) —
+                  # engine stays render-free
      hexsphere/   # hex-dominant geodesic sphere mesh, base for planets/stars/moons;
                   # cell-chunk identity (`ChunkId` = cell index, ADR-010)
     sim/         # colonies, robots, resources, tick

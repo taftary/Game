@@ -45,8 +45,8 @@ pub use generate::{
 pub use hash::{galaxy_hash, planet_hash, system_hash, web_hash};
 pub use ids::{GalaxyId, PlanetId, SystemId};
 pub use web::{
-    CosmicWebParams, WebDescriptor, WebField, WebFieldBudget, WebLink, WebNode, WebTracer,
-    export_field, generate_cosmic_web, generate_cosmic_web_with_field,
+    CosmicWebParams, WebDescriptor, WebField, WebLink, WebNode, export_field, generate_cosmic_web,
+    generate_cosmic_web_with_field,
 };
 
 /// Universe format version. Bumped only with an intentional generation

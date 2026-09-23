@@ -1,5 +1,9 @@
 //! Cosmic rebase worker (v0.3.4 `cosmic-rebase-async`, ADR-026 §3):
-//! non-blocking origin rebase for the Game Demo buffers.
+//! non-blocking origin rebase for the Game Demo glow buffer.
+//!
+//! `cosmic-gpu-tracers` CGT-010 shrank the job to glow only: tracers
+//! never need a rebase rebuild (origin rides a push constant), so the
+//! worker rebuilds the hub/member glow list and nothing else.
 //!
 //! Window- and GPU-free: the worker owns `Arc` clones of the immutable
 //! inputs (`WebDescriptor` / `WebField`) and produces plain `Vec`s; it
@@ -10,7 +14,6 @@
 //! `std::thread` + `mpsc`, generation-tagged requests, latest-wins
 //! coalescing, `try_recv` per frame, join on drop. No async runtime.
 
-use super::cosmic_splat::{SplatRecord, SplatTier, splat_records};
 use super::cosmic_veil::{VeilMode, veil_sprites};
 use game_engine::universe::{WebDescriptor, WebField};
 use glam::DVec3;
@@ -45,14 +48,7 @@ pub fn build_demo_glow(
     out
 }
 
-/// Build the demo splat records (shared synchronous path + worker):
-/// the High-tier stride over the field tracers. Pure function of its
-/// inputs — the FR7 bit-identity pin.
-pub fn build_demo_splats(field: &WebField, web: &WebDescriptor, origin: DVec3) -> Vec<SplatRecord> {
-    splat_records(field, web, origin, SplatTier::High)
-}
-
-/// Rebase request: rebuild the demo buffers relative to `origin`.
+/// Rebase request: rebuild the demo glow buffer relative to `origin`.
 #[derive(Clone, Copy, Debug)]
 pub struct RebaseJob {
     /// Buffer upload origin the result is relative to (ship position
@@ -72,8 +68,6 @@ pub struct RebaseResult {
     pub origin: DVec3,
     /// Glow points in draw order (see [`build_demo_glow`]).
     pub glow: Vec<GlowPoint>,
-    /// Splat records (see [`build_demo_splats`]).
-    pub splats: Vec<SplatRecord>,
 }
 
 /// Outstanding-request bookkeeping (frame-thread side): at most one
@@ -89,7 +83,7 @@ pub struct RebasePending {
     pub request_frame: u64,
 }
 
-/// Rebase worker: one background thread rebuilding demo buffers
+/// Rebase worker: one background thread rebuilding the demo glow buffer
 /// off-frame. Latest-wins: a newer request supersedes everything still
 /// queued — the worker drains its inbox before computing.
 pub struct RebaseWorker {
@@ -172,7 +166,6 @@ fn rebase_loop(
             generation: job.generation,
             origin: job.origin,
             glow: build_demo_glow(web, field, seed, job.origin, veil_mode),
-            splats: build_demo_splats(field, web, job.origin),
         };
         if results.send(result).is_err() {
             break;
@@ -183,11 +176,11 @@ fn rebase_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_engine::universe::{WebLink, WebNode, WebTracer};
+    use game_engine::universe::{WebLink, WebNode};
 
-    /// Small deterministic fixture: 10 nodes (top-1 % hub + members),
-    /// a few tracers, and a 2³ grid with one max-quant NODE cell so the
-    /// veil-sprite branch is covered.
+    /// Small deterministic fixture: 10 nodes (top-1 % hub + members)
+    /// and a 2³ grid with one max-quant NODE cell so the veil-sprite
+    /// branch is covered.
     fn small_fixture() -> (WebDescriptor, WebField) {
         let nodes = (0..10)
             .map(|i| WebNode {
@@ -198,19 +191,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let web = WebDescriptor::new(7, nodes, Vec::<WebLink>::new(), Vec::new(), 0, 0.0);
-        let tracers = (0..32)
-            .map(|i| WebTracer {
-                pos_mpc: [i as f32, 0.0, 0.0],
-                overdensity: 1.0 + (i % 4) as f32,
-            })
-            .collect();
         // Grid byte 0: NODE class (2) at max quant — overdensity 64,
         // above the 0.5 veil floor; rest void.
         let mut grid = vec![0u8; 8];
         grid[0] = (2 << 6) | 63;
         let field = WebField {
-            tracers,
-            displacement: Vec::new(),
+            displacement: vec![[0, 0, 0]; 8],
             grid,
             grid_cells: 2,
             cell_size_mpc: 4.0,
@@ -241,7 +227,7 @@ mod tests {
     #[test]
     fn worker_result_matches_synchronous_build() {
         // FR7 bit-identity: one rebase via the worker vs the shared
-        // synchronous functions — identical glow/splat bytes.
+        // synchronous function — identical glow bytes.
         let (web, field) = small_fixture();
         let origin = DVec3::new(100.0, -50.0, 25.0);
         let worker = RebaseWorker::try_spawn(
@@ -258,9 +244,7 @@ mod tests {
             result.glow,
             build_demo_glow(&web, &field, 7, origin, VeilMode::Sprites)
         );
-        assert_eq!(result.splats, build_demo_splats(&field, &web, origin));
         assert!(!result.glow.is_empty(), "fixture must emit glow");
-        assert!(!result.splats.is_empty(), "fixture must emit splats");
         // March mode drops the veil sprites but keeps hubs: same hubs,
         // fewer points.
         let march_glow = build_demo_glow(&web, &field, 7, origin, VeilMode::March { steps: 48 });
@@ -349,13 +333,6 @@ mod tests {
             }
             assert_eq!(p.1, q.1);
             assert_eq!(p.2, q.2);
-        }
-        let c = build_demo_splats(&field, &web, DVec3::ZERO);
-        let d = build_demo_splats(&field, &web, shift);
-        assert_eq!(c.len(), d.len());
-        for (p, q) in c.iter().zip(d.iter()) {
-            assert_eq!(p.overdensity, q.overdensity);
-            assert_eq!(p.class_tint, q.class_tint);
         }
     }
 }

@@ -380,7 +380,7 @@ void main() {
 // shaders above stay byte-identical for galaxy/system/planet/sky.
 /// Shared depth-window GLSL (`cosmic-depth-window`): the authority is
 /// `game_debug::cosmic_window::COSMIC_WINDOW_GLSL` — pasted verbatim
-/// into `GLOW_VERT`, `SPLAT_VERT`, and `MARCH_FRAG` below (pinned
+/// into `GLOW_VERT`, `SPLAT_PROC_VERT`, and `MARCH_FRAG` below (pinned
 /// byte-identical by `cosmic_window_snippet_shared` +
 /// `march_loop_stays_narrow`; `concat!` cannot
 /// take consts, so paste + pin instead of composition).
@@ -461,94 +461,6 @@ void main() {
     vec3 core = mix(vec3(1.0, 0.97, 0.85), vec3(1.0, 0.55, 0.25), smoothstep(0.2, 0.5, r));
     col = (v_kind > 1.5) ? core : col;
     f_color = vec4(col * v_alpha * fall, 1.0);
-}";
-
-// Cosmic tracer splats (`cosmic-tracer-splat`, ADR-025): one additive
-// point sprite per Zel'dovich tracer, kernel size + color from local
-// density (the Illustris particle-splat look). The vertex stage may use
-// `exp2`/`log2` (per-vertex, not per-pixel); the fragment stays
-// arithmetic-only (mobile fill-rate rule). Density ramp stops match
-// `cosmic_splat::DENSITY_RAMP_STOPS` (pinned by
-// `cosmic_shader_safety_pins`); the vertex unpack mirrors
-// `cosmic_splat::splat_pack` bit-for-bit.
-const SPLAT_VERT: &str = r"#version 450
-layout(location = 0) in vec3 pos;
-layout(location = 1) in uint packed;
-layout(push_constant) uniform PushConstants {
-    mat4 mvp;
-    vec4 eye;
-    float px_scale;
-    float exposure;
-    float redshift;
-    float h0;
-    float alpha_k;
-    float fog_l;
-    float slab_center;
-    float slab_half;
-} pc;
-layout(location = 0) out vec3 v_color;
-layout(location = 1) out float v_alpha;
-layout(location = 2) out float v_b;
-// Shared density ramp (`cosmic-gas-veil-v2` CGV-001): the authority is
-// `game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL` — pasted verbatim
-// (pinned byte-identical by `cosmic_density_ramp_shared`; `concat!`
-// cannot take consts, so paste + pin instead of composition).
-vec3 cosmic_density_ramp(float log2od) {
-    vec3 c0 = vec3(0.10, 0.08, 0.35);
-    vec3 c1 = vec3(0.35, 0.32, 0.80);
-    vec3 c2 = vec3(0.85, 0.85, 1.00);
-    vec3 c3 = vec3(1.00, 0.92, 0.60);
-    vec3 c4 = vec3(1.00, 0.45, 0.40);
-    vec3 col = c0;
-    col = mix(col, c1, clamp((log2od - (-2.0)) / (0.0 - (-2.0)), 0.0, 1.0));
-    col = mix(col, c2, clamp((log2od - 0.0) / (1.5 - 0.0), 0.0, 1.0));
-    col = mix(col, c3, clamp((log2od - 1.5) / (3.0 - 1.5), 0.0, 1.0));
-    col = mix(col, c4, clamp((log2od - 3.0) / (4.5 - 3.0), 0.0, 1.0));
-    return col;
-}
-
-float cosmic_window_vis(float clip_w, float fog_l, float slab_center, float slab_half, int kind) {
-    float fog = (fog_l <= 0.0) ? 1.0 : 1.0 / (1.0 + (clip_w / fog_l) * (clip_w / fog_l));
-    float slab = (slab_half <= 0.0) ? 1.0 : 1.0 - smoothstep(slab_half - 5.0, slab_half + 5.0, abs(clip_w - slab_center));
-    float vis = fog * slab;
-    vis = (kind >= 1) ? max(vis, 0.25) : vis;
-    return vis;
-}
-
-void main() {
-    uint q = packed & 65535u;
-    float log2od = float(q) / 65535.0 * 16.0 - 8.0;
-    uint tint = (packed >> 16u) & 3u;
-    uint b = (packed >> 18u) & 1u;
-    float od = exp2(log2od);
-    // Adaptive kernel h = h0 * (1+d)^(-1/3), clamped [0.5, 4] Mpc.
-    float h = clamp(pc.h0 * exp2(-log2(max(od, 1e-3)) / 3.0), 0.5, 4.0);
-    vec4 clip = pc.mvp * vec4(pos, 1.0);
-    gl_Position = clip;
-    float px = clamp(h * pc.px_scale / max(clip.w, 1e-6), 1.5, 64.0);
-    gl_PointSize = px;
-    // Constant energy per splat: dense clumps are bright because they
-    // hold many particles, not because each is bigger.
-    float alpha = pc.alpha_k / max(px * px, 1.0) * pc.exposure;
-    // Depth window (`cosmic-depth-window`): splats never take the hub
-    // floor (kind 0) — fully fogged or out-of-slab vertices add zero.
-    alpha *= cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, 0);
-    // Near-eye fade (the v0.3.2 white-flash lesson): kernels closer
-    // than 2h dissolve instead of filling the screen.
-    float dist = length(pos - pc.eye.xyz);
-    alpha *= smoothstep(h, 2.0 * h, dist);
-    // Bounded redshift depth (the glow-shader treatment, same clamps).
-    float z = min(pc.redshift * max(clip.w, 0.0), 0.5);
-    vec3 hubble = vec3(1.0 + 0.75 * z, 1.0, 1.0 / (1.0 + 0.7 * z));
-    float dim = 1.0 / (1.0 + 0.45 * z);
-    // Density ramp + emissive (dense cores cross the bloom threshold)
-    // + class-C hub tint toward pink-red.
-    vec3 ramp = cosmic_density_ramp(log2od);
-    float emissive = 1.0 + 0.5 * max(0.0, log2od - 1.5);
-    vec3 tinted = mix(ramp, vec3(1.0, 0.5, 0.55), float(tint) / 3.0 * 0.6);
-    v_color = tinted * emissive * hubble * dim;
-    v_alpha = alpha;
-    v_b = float(b);
 }";
 
 const SPLAT_FRAG: &str = r"#version 450
@@ -982,18 +894,6 @@ struct GlowPush {
     slab_half: f32,
 }
 
-/// Cosmic tracer-splat vertex (`cosmic-tracer-splat`): origin-relative
-/// Mpc position + packed density/class word (see
-/// `cosmic_splat::splat_pack`). 16 B — Low holds 300k in 4.8 MB.
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-struct SplatVertex {
-    #[format(R32G32B32_SFLOAT)]
-    pos: [f32; 3],
-    #[format(R32_UINT)]
-    packed: u32,
-}
-
 /// Cosmic splat push constants: MVP + buffer-frame eye (near-eye
 /// fade) + pixel scale + exposure + redshift + kernel scale +
 /// constant-energy numerator + depth-window terms
@@ -1069,10 +969,10 @@ struct CosmicFrame {
     is_demo: bool,
     eye: [f32; 3],
     glow: Subbuffer<[MapVertex]>,
-    splats: Subbuffer<[SplatVertex]>,
-    /// Procedural-tracer draw (`cosmic-gpu-tracers` CGT-005): `None`
-    /// → the recording falls back to the legacy `splats` path (R-3
-    /// fallback / empty cell list).
+    /// Procedural-tracer draw (`cosmic-gpu-tracers`): `None` (empty
+    /// cell list / unsupported displacement format) skips the field
+    /// splats for the frame — there is no legacy vertex path anymore
+    /// (CGT-010).
     proc_draw: Option<ProcFrame>,
     fog_l: f32,
     slab_center: f32,
@@ -1452,22 +1352,22 @@ fn run_headless(seed: Option<u64>) -> i32 {
         "cosmic_hubs=impostors{} members{} goal_tier{:?} ok",
         hub_impostors, hub_members, goal_tier
     );
-    // Splat counts per tier + Low overdraw estimate (CTS-006/008):
-    // stride subsets of the same field, so Low ⊂ Medium ⊂ High.
-    // Veil mode line (CGV-006/008): sprites count or march steps.
-    let (splats_low, splats_med, splats_high, overdraw_low, veil_info) = {
-        use game_debug::cosmic_splat::{SplatTier, overdraw_estimate, splat_records};
+    // Splat counts per tier + veil mode line (`cosmic-gpu-tracers`
+    // CGT-010): draws are `cells × k`, so Low ⊂ Medium ⊂ High by
+    // construction. Veil mode line (CGV-006/008): sprites count or
+    // march steps.
+    let (splats_low, splats_med, splats_high, veil_info) = {
+        use game_debug::cosmic_splat::{SplatK, SplatTier};
         use game_debug::cosmic_veil::{VeilMode, veil_sprites};
-        let web = &debug_app.cosmic.web;
+        use game_engine::universe::web::cell_list;
         let field = &debug_app.cosmic.field;
-        let low = splat_records(field, web, layout_origin, SplatTier::Low);
-        let med = splat_records(field, web, layout_origin, SplatTier::Medium);
-        let high = splat_records(field, web, layout_origin, SplatTier::High);
-        assert!(!high.is_empty(), "splats must emit points");
-        assert!(low.len() < med.len() && med.len() <= high.len());
-        // Inspector framing at 1080p: px_scale / 430 Mpc depth.
-        let px_per_mpc = debug_app.cosmic_inspector.camera.px_scale(1080.0) / 430.0;
-        let overdraw = overdraw_estimate(&low, px_per_mpc, (1920, 1080));
+        let cells = cell_list(field);
+        assert!(!cells.is_empty(), "cell list must emit cells");
+        let n = cells.len();
+        let low = n * usize::from(SplatK::for_tier(SplatTier::Low).0);
+        let med = n * usize::from(SplatK::for_tier(SplatTier::Medium).0);
+        let high = n * usize::from(SplatK::for_tier(SplatTier::High).0);
+        assert!(low < med && med <= high);
         let veil = match veil_mode() {
             VeilMode::Sprites => {
                 let sprites = veil_sprites(field, layout_origin);
@@ -1480,11 +1380,11 @@ fn run_headless(seed: Option<u64>) -> i32 {
                 format!("march{steps}")
             }
         };
-        (low.len(), med.len(), high.len(), overdraw, veil)
+        (low, med, high, veil)
     };
     println!(
-        "cosmic_layout=splatsL{} splatsM{} splatsH{} hubs{} members{} veil{} overdrawL{:.1} ok",
-        splats_low, splats_med, splats_high, hub_impostors, hub_members, veil_info, overdraw_low
+        "cosmic_layout=splatsL{} splatsM{} splatsH{} hubs{} members{} veil{} ok",
+        splats_low, splats_med, splats_high, hub_impostors, hub_members, veil_info
     );
     // Procedural-tracer layout (`cosmic-gpu-tracers` FR5): the cell
     // list behind the `gl_VertexIndex` draw + the tier draw counts.
@@ -1492,7 +1392,9 @@ fn run_headless(seed: Option<u64>) -> i32 {
     {
         use game_debug::cosmic_splat::{SplatK, SplatTier};
         use game_engine::universe::web::cell_list;
+        let t0 = std::time::Instant::now();
         let cells = cell_list(&debug_app.cosmic.field);
+        let cells_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let (kl, km, kh) = (
             SplatK::for_tier(SplatTier::Low).0,
             SplatK::for_tier(SplatTier::Medium).0,
@@ -1500,25 +1402,28 @@ fn run_headless(seed: Option<u64>) -> i32 {
         );
         assert!(!cells.is_empty(), "cell list must emit cells");
         println!(
-            "cosmic_proc=cells{} kL{} kM{} kH{} vertsH{} ok",
+            "cosmic_proc=cells{} cells_ms{:.1} kL{} kM{} kH{} vertsH{} ok",
             cells.len(),
+            cells_ms,
             kl,
             km,
             kh,
             cells.len() * usize::from(kh),
         );
     }
-    // Slab relief (`cosmic-depth-window` NFR5): fraction of Low splats
+    // Slab relief (`cosmic-depth-window` NFR5, `cosmic-gpu-tracers`
+    // CGT-010): fraction of listed cells whose displaced centre falls
     // inside the nominal slab window (30 Mpc at the home depth under
     // the 20° slab camera) — the draws that survive; the rest add ~0
-    // through the window term. Separate line so the CTS layout pin
-    // above stays byte-stable.
+    // through the window term.
     {
-        use game_debug::cosmic_splat::{SplatTier, splat_records};
         use game_debug::cosmic_window::SlabState;
+        use game_engine::universe::web::{cell_list, displace_sample};
         let web = &debug_app.cosmic.web;
         let field = &debug_app.cosmic.field;
-        let low = splat_records(field, web, glam::DVec3::ZERO, SplatTier::Low);
+        let n = field.grid_cells as usize;
+        let half = n as f64 * field.cell_size_mpc * 0.5;
+        let cells = cell_list(field);
         let mut cam = debug_app.cosmic_inspector.camera.clone();
         cam.set_fov_keep_framing(20.0);
         let eye = cam.eye();
@@ -1529,53 +1434,62 @@ fn run_headless(seed: Option<u64>) -> i32 {
             + (home[2] as f32 - eye.z) * fwd.z)
             .max(0.0);
         let slab = SlabState::default_on();
-        let half = slab.thickness_mpc * 0.5 + 5.0;
+        let half_win = slab.thickness_mpc * 0.5 + 5.0;
         let mut keep = 0usize;
-        for r in &low {
-            let depth = ((r.pos[0] - eye.x) * fwd.x
-                + (r.pos[1] - eye.y) * fwd.y
-                + (r.pos[2] - eye.z) * fwd.z)
-                .max(0.0);
-            if (depth - home_depth).abs() <= half {
+        for &i in &cells {
+            let x = (i as usize) % n;
+            let y = ((i as usize) / n) % n;
+            let z = (i as usize) / (n * n);
+            let e = displace_sample(field, [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5]);
+            let px = (e[0] * field.cell_size_mpc - half) as f32;
+            let py = (e[1] * field.cell_size_mpc - half) as f32;
+            let pz = (e[2] * field.cell_size_mpc - half) as f32;
+            let depth =
+                ((px - eye.x) * fwd.x + (py - eye.y) * fwd.y + (pz - eye.z) * fwd.z).max(0.0);
+            if (depth - home_depth).abs() <= half_win {
                 keep += 1;
             }
         }
         println!(
             "slab_relief=keep{} total{} frac{:.2} ok",
             keep,
-            low.len(),
-            keep as f64 / low.len().max(1) as f64
+            cells.len(),
+            keep as f64 / cells.len().max(1) as f64
         );
     }
-    // Field sidecar self-check (`web-field-export`, ADR-025): the export
-    // entry point returns the identical descriptor, the tracer band
-    // holds, and the sidecar fits its memory budget. Timings print for
-    // the plan.md record (the +120 ms NFR3 budget is a release-desktop
-    // number; dev-profile absolutes are recorded, not gated).
+    // Field sidecar self-check (`web-field-export`, ADR-025, reshaped
+    // by `cosmic-gpu-tracers` CGT-010): the export entry point returns
+    // the identical descriptor, the displacement grid is complete, and
+    // the sidecar fits its memory budget (NFR2: 16.8 MB grid + 2 MB
+    // class/density + ~4.4 MB cell list). Timings print for the plan.md
+    // record (dev-profile absolutes are recorded, not gated).
     {
+        use game_engine::universe::web::cell_list;
         use game_engine::universe::{
-            CosmicWebParams, WebFieldBudget, generate_cosmic_web, generate_cosmic_web_with_field,
+            CosmicWebParams, generate_cosmic_web, generate_cosmic_web_with_field,
         };
         let params = CosmicWebParams::nominal();
+        let n = params.lattice_cells as usize;
         let t0 = Instant::now();
         let plain = generate_cosmic_web(1337, &params);
         let plain_ms = t0.elapsed();
         let t1 = Instant::now();
-        let (via_field, field) =
-            generate_cosmic_web_with_field(1337, &params, WebFieldBudget::Full);
+        let (via_field, field) = generate_cosmic_web_with_field(1337, &params);
         let field_ms = t1.elapsed();
         assert_eq!(plain, via_field, "export must not move the descriptor");
-        assert!(
-            (900_000..=1_200_000).contains(&field.tracers.len()),
-            "nominal tracer band broken: {}",
-            field.tracers.len()
+        assert_eq!(
+            field.displacement.len(),
+            n * n * n,
+            "displacement grid must cover the lattice"
         );
-        let bytes =
-            field.tracers.len() * size_of::<game_engine::universe::WebTracer>() + field.grid.len();
-        assert!(bytes <= 20 * 1024 * 1024, "sidecar over budget: {bytes} B");
+        let cells = cell_list(&field);
+        let bytes = field.displacement.len() * size_of::<[i16; 3]>()
+            + field.grid.len()
+            + cells.len() * size_of::<u32>();
+        assert!(bytes <= 24 * 1024 * 1024, "sidecar over budget: {bytes} B");
         println!(
-            "web_field=tracers{} plain_ms{} field_ms{} delta_ms{} mb{} ok",
-            field.tracers.len(),
+            "web_field=cells{} plain_ms{} field_ms{} delta_ms{} mb{} ok",
+            cells.len(),
             plain_ms.as_millis(),
             field_ms.as_millis(),
             field_ms.as_millis().saturating_sub(plain_ms.as_millis()),
@@ -1596,17 +1510,18 @@ fn run_headless(seed: Option<u64>) -> i32 {
         "headless cruise must move Mpc-scale, moved {cruise_moved}"
     );
     println!("cruise_selftest=moved{cruise_moved:.2}Mpc ok");
-    // Rebase traverse (`cosmic-rebase-async` CRA-007/FR6): scripted
-    // max-pace thrust across ≥ 500 Mpc with ≥ 10 rebases (50 Mpc
-    // rebase distance). Two clocks: per-tick time is the FRAME-cost
-    // analog (tick + poll-equivalent bookkeeping — the only work a
-    // windowed frame ever does for a rebase), while the build time is
-    // the WORKER cost (off-frame by design, informational here). The
-    // windowed main thread additionally uploads + swaps the two
-    // buffers on the swap frame only (CRA-008, reference hardware).
+    // Rebase traverse (`cosmic-rebase-async` CRA-007/FR6, glow-only
+    // since `cosmic-gpu-tracers` CGT-010): scripted max-pace thrust
+    // across ≥ 500 Mpc with ≥ 10 rebases (50 Mpc rebase distance). Two
+    // clocks: per-tick time is the FRAME-cost analog (tick +
+    // poll-equivalent bookkeeping — the only work a windowed frame ever
+    // does for a rebase), while the build time is the WORKER cost
+    // (off-frame by design, informational here). The windowed main
+    // thread additionally uploads + swaps the glow buffer on the swap
+    // frame only (CRA-008, reference hardware).
     {
         use game_debug::cosmic_player::CRUISE_T_CROSS_MIN_S;
-        use game_debug::cosmic_rebase::{build_demo_glow, build_demo_splats};
+        use game_debug::cosmic_rebase::build_demo_glow;
         debug_app.cosmic.player.cruise.t_cross_s = CRUISE_T_CROSS_MIN_S;
         debug_app.cosmic.held.fwd = true;
         let start = debug_app.cosmic.player.position_mpc();
@@ -1630,14 +1545,9 @@ fn run_headless(seed: Option<u64>) -> i32 {
                     origin,
                     veil_mode(),
                 );
-                let splats =
-                    build_demo_splats(&debug_app.cosmic.field, &debug_app.cosmic.web, origin);
                 max_build_ms = max_build_ms.max(built.elapsed().as_secs_f64() * 1000.0);
                 rebases += 1;
-                assert!(
-                    !glow.is_empty() && !splats.is_empty(),
-                    "rebase build must emit points"
-                );
+                assert!(!glow.is_empty(), "rebase build must emit points");
                 debug_app.cosmic.rebased();
             }
             travelled = (debug_app.cosmic.player.position_mpc() - start).length();
@@ -2002,10 +1912,8 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         ui: build_ui_pipeline(&device, &shaders, &render_pass),
         map: build_map_pipeline(&device, &shaders, &render_pass),
         map_glow: build_glow_pipeline(&device, &shaders, &render_pass),
-        splat: build_splat_pipeline(&device, &shaders, &render_pass),
         splat_proc: build_splat_proc_pipeline(&device, &shaders, &render_pass),
         glow_scene: build_glow_pipeline(&device, &shaders, &scene_pass),
-        splat_scene: build_splat_pipeline(&device, &shaders, &scene_pass),
         splat_proc_scene: build_splat_proc_pipeline(&device, &shaders, &scene_pass),
         prefilter: build_post_pipeline(
             &device,
@@ -2158,12 +2066,6 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         origin,
         veil_mode,
     );
-    let splats = upload_cosmic_splats(
-        &memory_allocator,
-        &debug.cosmic.field,
-        &debug.cosmic.web,
-        origin,
-    );
     // Procedural-tracer resources (CGT-004): displacement volume +
     // cell list on the capture device (same seed path as windowed).
     let disp_volume = upload_displacement_volume(
@@ -2232,7 +2134,6 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         is_demo,
         eye,
         glow,
-        splats,
         proc_draw,
         fog_l,
         slab_center,
@@ -4980,7 +4881,6 @@ struct ShaderSet {
     map_frag: Arc<ShaderModule>,
     glow_vert: Arc<ShaderModule>,
     glow_frag: Arc<ShaderModule>,
-    splat_vert: Arc<ShaderModule>,
     splat_frag: Arc<ShaderModule>,
     splat_proc_vert: Arc<ShaderModule>,
     post_vert: Arc<ShaderModule>,
@@ -5004,7 +4904,6 @@ impl ShaderSet {
             map_frag: compile_shader(device, ShaderKind::Fragment, MAP_FRAG, "map fragment"),
             glow_vert: compile_shader(device, ShaderKind::Vertex, GLOW_VERT, "glow vertex"),
             glow_frag: compile_shader(device, ShaderKind::Fragment, GLOW_FRAG, "glow fragment"),
-            splat_vert: compile_shader(device, ShaderKind::Vertex, SPLAT_VERT, "splat vertex"),
             splat_frag: compile_shader(device, ShaderKind::Fragment, SPLAT_FRAG, "splat fragment"),
             splat_proc_vert: compile_shader(
                 device,
@@ -5334,71 +5233,11 @@ fn build_glow_pipeline(
     .expect("glow graphics pipeline must create")
 }
 
-/// Cosmic tracer-splat pipeline (`cosmic-tracer-splat`): `PointList`
-/// over [`SplatVertex`] records, premultiplied-additive, no depth
-/// write — a pipeline *variant* of the glow path (same pass, same
-/// blend), not a new pass or draw.
-fn build_splat_pipeline(
-    device: &Arc<Device>,
-    shaders: &ShaderSet,
-    render_pass: &Arc<RenderPass>,
-) -> Arc<GraphicsPipeline> {
-    let vs = shaders
-        .splat_vert
-        .entry_point("main")
-        .expect("vertex entry point");
-    let fs = shaders
-        .splat_frag
-        .entry_point("main")
-        .expect("fragment entry point");
-    let vertex_input_state = SplatVertex::per_vertex()
-        .definition(&vs)
-        .expect("splat vertex layout must match shader");
-    let (layout, stages) = pipeline_layout_for(device, vs, fs);
-    let subpass = Subpass::from(render_pass.clone(), 0).expect("subpass 0 must exist");
-    GraphicsPipeline::new(
-        device.clone(),
-        None,
-        GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState {
-                topology: PrimitiveTopology::PointList,
-                ..Default::default()
-            }),
-            viewport_state: Some(ViewportState::default()),
-            rasterization_state: Some(RasterizationState {
-                cull_mode: CullMode::None,
-                ..Default::default()
-            }),
-            multisample_state: Some(MultisampleState::default()),
-            color_blend_state: Some(ColorBlendState::with_attachment_states(
-                subpass.num_color_attachments(),
-                ColorBlendAttachmentState {
-                    blend: Some(additive_blend()),
-                    ..Default::default()
-                },
-            )),
-            depth_stencil_state: Some(DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: false,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            subpass: Some(subpass.into()),
-            ..GraphicsPipelineCreateInfo::layout(layout)
-        },
-    )
-    .expect("splat graphics pipeline must create")
-}
-
 /// Procedural-tracer splat pipeline (`cosmic-gpu-tracers`, CGT-005):
 /// `PointList` over `gl_VertexIndex` (no vertex input — the post-pipeline
 /// precedent: explicit empty state, not `None`), same pass and
-/// premultiplied-additive blend as the legacy splat path, not a new
-/// pass or draw. Shares `SPLAT_FRAG` with the legacy pipeline.
+/// premultiplied-additive blend as the glow path, not a new
+/// pass or draw. Shares `SPLAT_FRAG` for the point sprites.
 fn build_splat_proc_pipeline(
     device: &Arc<Device>,
     shaders: &ShaderSet,
@@ -5869,47 +5708,6 @@ fn upload_glow_points(
     .expect("cosmic glow vertex buffer upload must succeed")
 }
 
-/// Map shared splat records to vertices (one helper for the reseed
-/// path and the rebase swap path — identical bytes by construction,
-/// the `cosmic-rebase-async` FR7 pin).
-fn upload_splat_records(
-    allocator: &Arc<StandardMemoryAllocator>,
-    records: &[game_debug::cosmic_splat::SplatRecord],
-) -> Subbuffer<[SplatVertex]> {
-    use game_debug::cosmic_splat::splat_pack;
-    let mut verts: Vec<SplatVertex> = records
-        .iter()
-        .map(|r| {
-            let tint = r.class_tint >> 1;
-            let b = r.class_tint & 1 == 1;
-            SplatVertex {
-                pos: r.pos,
-                packed: splat_pack(r.overdensity.log2(), tint, b),
-            }
-        })
-        .collect();
-    if verts.is_empty() {
-        verts.push(SplatVertex {
-            pos: [0.0, 0.0, -900.0],
-            packed: game_debug::cosmic_splat::splat_pack(-8.0, 0, false),
-        });
-    }
-    Buffer::from_iter(
-        allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        },
-        verts,
-    )
-    .expect("cosmic splat vertex buffer upload must succeed")
-}
-
 /// Upload the cosmic glow point buffer (update-2026-09-18-2328):
 /// particulate grain, then descriptor dwarf glow, then node impostors
 /// (core + halo), laid out by the shared [`cosmic_web`] helpers (one
@@ -5937,24 +5735,6 @@ fn upload_cosmic_glow(
     upload_glow_points(allocator, &points)
 }
 
-/// Upload the cosmic tracer splats (`cosmic-tracer-splat`): one
-/// 16 B [`SplatVertex`] per tracer at High (all tracers; Low/Medium
-/// stride subsets are the tier constants in `cosmic_splat`, drawn by
-/// device profiles — the windowed viewer has no tier switch). A
-/// degenerate empty set uploads one guard point (vulkano rejects
-/// zero-length vertex buffers).
-fn upload_cosmic_splats(
-    allocator: &Arc<StandardMemoryAllocator>,
-    field: &WebField,
-    web: &WebDescriptor,
-    origin: glam::DVec3,
-) -> Subbuffer<[SplatVertex]> {
-    // The CPU build lives in `cosmic_rebase` (shared with the rebase
-    // worker — bit-identity pinned there).
-    let records = game_debug::cosmic_rebase::build_demo_splats(field, web, origin);
-    upload_splat_records(allocator, &records)
-}
-
 /// Sub-samples per cell for this run (CGT-006): `GAME_DEBUG_COSMIC_K`
 /// strict `1..=8`, else the High default 8 (the windowed binary has no
 /// tier switch — windowed and capture both run full density unless
@@ -5977,8 +5757,8 @@ fn splat_k_default() -> u8 {
 /// staging copy + fence wait (the atlas-upload shape). Created on the
 /// seed path only, never on rebase (tracers never rebuild per travel —
 /// ADR-026 §2). Returns image + view; the sampler is the shared linear
-/// post sampler. `None` when the field is degenerate or the device
-/// lacks the format (R-3 fallback: the legacy splat path stays live).
+/// post sampler. `None` skips the field splats for the seed (no legacy
+/// vertex path anymore — CGT-010).
 fn upload_displacement_volume(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     command_buffer_allocator: &Arc<StandardCommandBufferAllocator>,
@@ -6241,14 +6021,13 @@ fn veil_mode() -> game_debug::cosmic_veil::VeilMode {
 }
 
 /// One splat draw inside an open scene/subpass (`cosmic-gpu-tracers`
-/// CGT-005): the procedural path when the frame carries proc resources
-/// (descriptor set built here against the proc pipeline's own layout),
-/// else the legacy vertex-buffer path. Same push constants, same
-/// blend — only the vertex source differs.
-#[allow(clippy::too_many_arguments)] // one draw, two sources; explicit resources are the pin
+/// CGT-005, legacy retired CGT-010): the procedural path when the frame
+/// carries proc resources (descriptor set built here against the proc
+/// pipeline's own layout); without them the field splats are skipped
+/// for the frame. Same push constants, same blend as the glow draw.
+#[allow(clippy::too_many_arguments)] // one draw; explicit resources are the pin
 fn record_splat_draw(
     builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-    pipeline: &Arc<GraphicsPipeline>,
     proc_pipeline: &Arc<GraphicsPipeline>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
@@ -6282,17 +6061,6 @@ fn record_splat_draw(
         // SAFETY: the proc draw has no vertex input — `count = cells ×
         // k` unbuffered invocations are the whole draw.
         unsafe { builder.draw(proc.count, 1, 0, 0) }.expect("proc splat draw must record");
-    } else {
-        builder
-            .bind_pipeline_graphics(pipeline.clone())
-            .expect("pipeline must bind")
-            .bind_vertex_buffers(0, frame.splats.clone())
-            .expect("vertex buffer must bind")
-            .push_constants(pipeline.layout().clone(), 0, push)
-            .expect("splat push constants must upload");
-        // SAFETY: same PointList contract as the glow draw.
-        unsafe { builder.draw(frame.splats.len() as u32, 1, 0, 0) }
-            .expect("HDR scene splat draw must record");
     }
 }
 
@@ -6353,12 +6121,11 @@ fn record_cosmic_hdr_prepass(
     // SAFETY: same PointList contract as the galaxy map.
     unsafe { builder.draw(frame.glow.len() as u32, 1, 0, 0) }
         .expect("HDR scene glow draw must record");
-    // Tracer splats (`cosmic-tracer-splat` + `cosmic-gpu-tracers`): the
-    // field render rides the same scene pass through the splat
-    // pipeline (legacy) or the proc pipeline (no vertex input).
+    // Procedural field splats (`cosmic-gpu-tracers`): the field render
+    // rides the same scene pass through the proc pipeline (no vertex
+    // input).
     record_splat_draw(
         builder,
-        &pipes.splat_scene,
         &pipes.splat_proc_scene,
         descriptor_set_allocator,
         memory_allocator,
@@ -6695,12 +6462,10 @@ fn record_cosmic_view_arm(
             .expect("glow push constants must upload");
         // SAFETY: same PointList contract as the galaxy map.
         unsafe { builder.draw(glow_len as u32, 1, 0, 0) }.expect("cosmic glow draw must record");
-        // Tracer splats (`cosmic-tracer-splat` + `cosmic-gpu-tracers`):
-        // same LDR bypass path through the splat pipeline (legacy) or
-        // the proc pipeline (no vertex input).
+        // Procedural field splats (`cosmic-gpu-tracers`): same LDR
+        // bypass path through the proc pipeline (no vertex input).
         record_splat_draw(
             builder,
-            &pipes.splat,
             &pipes.splat_proc,
             descriptor_set_allocator,
             memory_allocator,
@@ -6970,9 +6735,6 @@ struct ViewerApp {
     /// members + impostors always; `cosmic-gas-veil-v2`): uploaded
     /// relative to the demo upload origin, rebuilt on reseed + rebase.
     cosmic_glow: Subbuffer<[MapVertex]>,
-    /// Cosmic tracer splats (16 B vertices, same origin frame;
-    /// `cosmic-tracer-splat`).
-    cosmic_splats: Subbuffer<[SplatVertex]>,
     /// Rebase worker (`cosmic-rebase-async`, ADR-026 §3): off-thread
     /// demo-buffer rebuilds over `Arc` clones of the seed's immutable
     /// inputs. Recreated on reseed; `None` only when the spawn fails
@@ -6989,8 +6751,6 @@ struct ViewerApp {
     /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
     cosmic_tab_glow: Subbuffer<[MapVertex]>,
-    /// Inspector tracer splats (fixed web-center origin).
-    cosmic_tab_splats: Subbuffer<[SplatVertex]>,
     /// Gas-veil density volume (`cosmic-gas-veil-v2`): R8 3D texture
     /// uploaded once per seed from the field grid + view. Rebuilt on
     /// reseed (never on rebase — rebase rides the march push origin).
@@ -6998,12 +6758,11 @@ struct ViewerApp {
     veil_volume: Option<(Arc<Image>, Arc<ImageView>)>,
     /// Procedural-tracer displacement volume (`cosmic-gpu-tracers`
     /// CGT-004): SNORM 3D texture from the field displacement grid +
-    /// view. Per seed, never on rebase. `None` when the format is
-    /// unsupported (the legacy splat path stays live — R-3 fallback).
+    /// view. Per seed, never on rebase. `None` skips the field splats.
     disp_volume: Option<(Arc<Image>, Arc<ImageView>)>,
     /// Procedural-tracer cell list (`cosmic-gpu-tracers` CGT-004):
     /// storage buffer over the Lagrangian cells, per seed, never on
-    /// rebase. `None` when empty (the legacy splat path covers it).
+    /// rebase. `None` skips the field splats.
     cell_list: Option<Subbuffer<[u32]>>,
     /// Cell count behind `cell_list` (the proc draw is `cells × k`).
     cell_count: usize,
@@ -7228,13 +6987,7 @@ impl ViewerApp {
             cosmic_origin,
             veil_mode,
         );
-        let cosmic_splats = upload_cosmic_splats(
-            &memory_allocator,
-            &debug.cosmic.field,
-            &debug.cosmic.web,
-            cosmic_origin,
-        );
-        // Inspector buffers at the fixed web-center origin (WS5).
+        // Inspector glow buffer at the fixed web-center origin (WS5).
         let cosmic_tab_glow = upload_cosmic_glow(
             &memory_allocator,
             &debug.cosmic.web,
@@ -7242,12 +6995,6 @@ impl ViewerApp {
             cosmic_seed,
             glam::DVec3::ZERO,
             veil_mode,
-        );
-        let cosmic_tab_splats = upload_cosmic_splats(
-            &memory_allocator,
-            &debug.cosmic.field,
-            &debug.cosmic.web,
-            glam::DVec3::ZERO,
         );
         let cosmic_tab_player = upload_cosmic_player_point(&memory_allocator, [0.0, 0.0, 0.0]);
         // Gas-veil density volume (per seed; the march samples it).
@@ -7324,13 +7071,11 @@ impl ViewerApp {
             system_points,
             system_lines,
             cosmic_glow,
-            cosmic_splats,
             rebase_worker,
             rebase_generation: 0,
             rebase_pending: None,
             tick_count: 0,
             cosmic_tab_glow,
-            cosmic_tab_splats,
             cosmic_tab_player,
             veil_volume,
             disp_volume,
@@ -7403,16 +7148,15 @@ impl ViewerApp {
                 }
             }
         }
-        // Per-frame poll: upload + swap BOTH buffers in the same frame,
-        // then move the origin with them (never one without the other —
-        // A-2). Stale generations drop here silently.
+        // Per-frame poll: upload + swap the glow buffer, then move the
+        // origin with it (A-2). Stale generations drop here silently.
+        // (Splats ride the proc draw now — no vertex swap on rebase.)
         if let Some(pending) = self.rebase_pending {
             let result = self.rebase_worker.as_ref().and_then(|worker| worker.poll());
             if let Some(result) = result
                 && result.generation == pending.generation
             {
                 self.cosmic_glow = upload_glow_points(&self.memory_allocator, &result.glow);
-                self.cosmic_splats = upload_splat_records(&self.memory_allocator, &result.splats);
                 self.debug.cosmic.rebased_to(result.origin);
                 let frames = self.tick_count - pending.request_frame;
                 self.debug.console.push(format!(
@@ -7529,12 +7273,6 @@ impl ViewerApp {
             origin,
             veil_mode,
         );
-        self.cosmic_splats = upload_cosmic_splats(
-            &self.memory_allocator,
-            &self.debug.cosmic.field,
-            &self.debug.cosmic.web,
-            origin,
-        );
         self.cosmic_tab_glow = upload_cosmic_glow(
             &self.memory_allocator,
             &self.debug.cosmic.web,
@@ -7542,12 +7280,6 @@ impl ViewerApp {
             seed,
             glam::DVec3::ZERO,
             veil_mode,
-        );
-        self.cosmic_tab_splats = upload_cosmic_splats(
-            &self.memory_allocator,
-            &self.debug.cosmic.field,
-            &self.debug.cosmic.web,
-            glam::DVec3::ZERO,
         );
         tracing::info!(
             seed = self.debug.cosmic.seed,
@@ -7558,11 +7290,11 @@ impl ViewerApp {
         self.reset_rebase_worker();
     }
 
-    /// Synchronously rebuild the demo glow + splat buffers at `origin`
+    /// Synchronously rebuild the demo glow buffer at `origin`
     /// (rebase fallback + the shared build behind the worker — the
     /// worker result and this path produce identical bytes via
-    /// `upload_glow_points` / `upload_splat_records`). Veil volume,
-    /// HDR chain and inspector buffers are untouched here by
+    /// `upload_glow_points`). Veil volume, HDR chain, proc resources
+    /// and inspector buffers are untouched here by
     /// construction (DoD 2).
     fn rebuild_demo_buffers(&mut self, origin: glam::DVec3) {
         let seed = self.debug.cosmic.seed;
@@ -7574,12 +7306,6 @@ impl ViewerApp {
             seed,
             origin,
             veil_mode,
-        );
-        self.cosmic_splats = upload_cosmic_splats(
-            &self.memory_allocator,
-            &self.debug.cosmic.field,
-            &self.debug.cosmic.web,
-            origin,
         );
     }
 
@@ -7669,10 +7395,10 @@ impl ViewerApp {
                     slab_half,
                 )
             };
-        let (glow, splats) = if is_demo {
-            (self.cosmic_glow.clone(), self.cosmic_splats.clone())
+        let glow = if is_demo {
+            self.cosmic_glow.clone()
         } else {
-            (self.cosmic_tab_glow.clone(), self.cosmic_tab_splats.clone())
+            self.cosmic_tab_glow.clone()
         };
         if !is_demo {
             let ship = self.debug.cosmic.player.position_mpc();
@@ -7740,7 +7466,6 @@ impl ViewerApp {
             is_demo,
             eye,
             glow,
-            splats,
             proc_draw,
             fog_l,
             slab_center,
@@ -8048,10 +7773,8 @@ impl ViewerApp {
             ui: build_ui_pipeline(&self.device, &self.shaders, &render_pass),
             map: build_map_pipeline(&self.device, &self.shaders, &render_pass),
             map_glow: build_glow_pipeline(&self.device, &self.shaders, &render_pass),
-            splat: build_splat_pipeline(&self.device, &self.shaders, &render_pass),
             splat_proc: build_splat_proc_pipeline(&self.device, &self.shaders, &render_pass),
             glow_scene: build_glow_pipeline(&self.device, &self.shaders, &scene_pass),
-            splat_scene: build_splat_pipeline(&self.device, &self.shaders, &scene_pass),
             splat_proc_scene: build_splat_proc_pipeline(&self.device, &self.shaders, &scene_pass),
             prefilter: build_post_pipeline(
                 &self.device,
@@ -8291,13 +8014,10 @@ struct Pipelines {
     map: Arc<GraphicsPipeline>,
     /// Cosmic glow sprites (additive, update-2026-09-18-2328).
     map_glow: Arc<GraphicsPipeline>,
-    /// Cosmic tracer splats (additive variant, `cosmic-tracer-splat`).
-    splat: Arc<GraphicsPipeline>,
     /// Procedural GPU tracers (no vertex input, `cosmic-gpu-tracers`).
     splat_proc: Arc<GraphicsPipeline>,
     /// Scene-pass variants of the cosmic pipelines (HDR mode).
     glow_scene: Arc<GraphicsPipeline>,
-    splat_scene: Arc<GraphicsPipeline>,
     splat_proc_scene: Arc<GraphicsPipeline>,
     /// Mip-bloom prefilter (scene → down[0], post pass).
     prefilter: Arc<GraphicsPipeline>,
@@ -10946,7 +10666,6 @@ mod tests {
             (ShaderKind::Fragment, MAP_FRAG, "map frag"),
             (ShaderKind::Vertex, GLOW_VERT, "glow vert"),
             (ShaderKind::Fragment, GLOW_FRAG, "glow frag"),
-            (ShaderKind::Vertex, SPLAT_VERT, "splat vert"),
             (ShaderKind::Fragment, SPLAT_FRAG, "splat frag"),
             (ShaderKind::Vertex, SPLAT_PROC_VERT, "proc splat vert"),
             (ShaderKind::Fragment, MARCH_FRAG, "march frag"),
@@ -10964,31 +10683,32 @@ mod tests {
         // vertex-struct fields BY NAME at pipeline creation — naga
         // compilation cannot catch a mismatch, and there is no
         // GPU-free way to run the real check, so the names are pinned
-        // here. `MapVertex { map_pos, color, misc }`,
-        // `SplatVertex { pos, packed }`.
+        // here. `MapVertex { map_pos, color, misc }` feeds the glow
+        // draw; the splat draw has no vertex input (CGT-010).
         for (source, name, what) in [
             (GLOW_VERT, "in vec3 map_pos;", "glow map_pos"),
             (GLOW_VERT, "in vec3 color;", "glow color"),
             (GLOW_VERT, "in vec3 misc;", "glow misc"),
-            (SPLAT_VERT, "in vec3 pos;", "splat pos"),
-            (SPLAT_VERT, "in uint packed;", "splat packed"),
         ] {
             assert!(
                 source.contains(name),
                 "{what} input missing from its vertex shader"
             );
         }
-        // 16 B vertex: the Low buffer budget (300k × 16 B = 4.8 MB)
-        // depends on it.
-        assert_eq!(std::mem::size_of::<SplatVertex>(), 16);
+        // The proc splat vertex shader takes no vertex input.
+        assert!(
+            !SPLAT_PROC_VERT.contains("layout(location = 0) in "),
+            "proc splat vertex must stay input-free"
+        );
     }
 
     #[test]
     fn rebase_path_touches_demo_buffers_only() {
-        // `cosmic-rebase-async` CRA-002 / DoD 2 source pin: the
-        // frame-loop rebase path rebuilds only the demo glow + splat
-        // buffers — veil volume, HDR chain and inspector buffers are
-        // unreachable from it (they rebuild on the seed path only).
+        // `cosmic-rebase-async` CRA-002 / DoD 2 source pin, glow-only
+        // since `cosmic-gpu-tracers` CGT-010: the frame-loop rebase path
+        // rebuilds only the demo glow buffer — veil volume, HDR chain,
+        // proc resources and inspector buffers are unreachable from it
+        // (they rebuild on the seed path only).
         // String pins: no GPU-free way to observe `Subbuffer` identity.
         let source = include_str!("main.rs");
         let tick = viewer_method_body(source, "tick_cosmic");
@@ -11017,12 +10737,7 @@ mod tests {
             );
         }
         let seed = viewer_method_body(source, "refresh_cosmic_seed");
-        for required in [
-            "upload_veil_volume",
-            "build_hdr_chain",
-            "cosmic_tab_glow",
-            "cosmic_tab_splats",
-        ] {
+        for required in ["upload_veil_volume", "build_hdr_chain", "cosmic_tab_glow"] {
             assert!(
                 seed.contains(required),
                 "refresh_cosmic_seed must contain {required:?}"
@@ -11149,17 +10864,16 @@ mod tests {
                 "1.0 - 4.0 * dot(d, d)",
                 "splat rim-zero falloff",
             ),
-            (SPLAT_VERT, "max(clip.w, 0.0)", "splat depth clamp"),
-            (SPLAT_VERT, "65535.0 * 16.0 - 8.0", "splat unpack mirror"),
+            (SPLAT_PROC_VERT, "max(clip.w, 0.0)", "splat depth clamp"),
             (
-                SPLAT_VERT,
+                SPLAT_PROC_VERT,
                 "smoothstep(h, 2.0 * h, dist)",
                 "splat near-eye fade",
             ),
         ] {
             assert!(source.contains(literal), "{what} missing from its shader");
         }
-        for source in [GLOW_VERT, SPLAT_VERT] {
+        for source in [GLOW_VERT, SPLAT_PROC_VERT] {
             assert!(
                 source.contains(", 0.5)"),
                 "redshift cap missing from a cosmic vertex shader"
@@ -11176,7 +10890,7 @@ mod tests {
         // Splat density ramp shares the CPU stop table end-to-end.
         for literal in ["vec3(0.10, 0.08, 0.35)", "vec3(1.00, 0.45, 0.40)"] {
             assert!(
-                SPLAT_VERT.contains(literal),
+                SPLAT_PROC_VERT.contains(literal),
                 "splat ramp drifted from DENSITY_RAMP_STOPS: {literal}"
             );
         }
@@ -11188,11 +10902,7 @@ mod tests {
         // byte-identical in every cosmic vertex shader (the lib const
         // is the authority — the binary pastes it verbatim).
         use game_debug::cosmic_window::COSMIC_WINDOW_GLSL;
-        for (source, what) in [
-            (GLOW_VERT, "glow"),
-            (SPLAT_VERT, "splat"),
-            (SPLAT_PROC_VERT, "proc splat"),
-        ] {
+        for (source, what) in [(GLOW_VERT, "glow"), (SPLAT_PROC_VERT, "proc splat")] {
             assert!(
                 source.contains(COSMIC_WINDOW_GLSL),
                 "{what} shader drifted from the shared window snippet"
@@ -11209,11 +10919,7 @@ mod tests {
         // CPU-computed colors (`veil_ramp_cpu`, pinned against
         // `VEIL_RAMP_STOPS` in `cosmic_veil` tests).
         use game_debug::cosmic_veil::COSMIC_DENSITY_RAMP_GLSL;
-        for (source, what) in [
-            (SPLAT_VERT, "splat"),
-            (SPLAT_PROC_VERT, "proc splat"),
-            (MARCH_FRAG, "march"),
-        ] {
+        for (source, what) in [(SPLAT_PROC_VERT, "proc splat"), (MARCH_FRAG, "march")] {
             assert!(
                 source.contains(COSMIC_DENSITY_RAMP_GLSL),
                 "{what} shader drifted from the shared density-ramp snippet"

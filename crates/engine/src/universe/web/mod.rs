@@ -27,8 +27,7 @@ pub mod params;
 pub use classify::{FILAMENT, NODE, SHEET, VOID};
 pub use descriptor::{WebDescriptor, WebLink, WebNode};
 pub use field_export::{
-    WebField, WebFieldBudget, WebTracer, cell_list, displace_sample, displacement_image_bytes,
-    export_field,
+    WebField, cell_list, displace_sample, displacement_image_bytes, export_field,
 };
 pub use params::CosmicWebParams;
 
@@ -57,7 +56,7 @@ use field::initial_field;
 /// assert!((1.0e12..=1.0e13).contains(&home.mass_msun));
 /// ```
 pub fn generate_cosmic_web(seed: u64, params: &CosmicWebParams) -> WebDescriptor {
-    generate_cosmic_web_with_field(seed, params, field_export::WebFieldBudget::Full).0
+    generate_cosmic_web_with_field(seed, params).0
 }
 
 /// Generate the stage-0 cosmic web **plus** the non-hashed render sidecar.
@@ -68,24 +67,22 @@ pub fn generate_cosmic_web(seed: u64, params: &CosmicWebParams) -> WebDescriptor
 /// sidecar: never hashed, never saved, never read by gameplay.
 ///
 /// ```
-/// use game_engine::universe::{CosmicWebParams, WebFieldBudget, generate_cosmic_web, generate_cosmic_web_with_field};
+/// use game_engine::universe::{CosmicWebParams, generate_cosmic_web, generate_cosmic_web_with_field};
 ///
 /// let params = CosmicWebParams::new(32, 4.0, 50.0).expect("test params fit");
-/// let (desc, field) = generate_cosmic_web_with_field(1234, &params, WebFieldBudget::Full);
+/// let (desc, field) = generate_cosmic_web_with_field(1234, &params);
 /// assert_eq!(desc, generate_cosmic_web(1234, &params));
-/// assert!(!field.tracers.is_empty());
 /// assert_eq!(field.grid.len(), 32 * 32 * 32);
 /// assert_eq!(field.displacement.len(), 32 * 32 * 32);
 /// ```
 pub fn generate_cosmic_web_with_field(
     seed: u64,
     params: &CosmicWebParams,
-    budget: field_export::WebFieldBudget,
 ) -> (WebDescriptor, field_export::WebField) {
     let field = initial_field(seed, params);
     let euler = displace_to_eulerian(&field, params);
     let classified = classify(&field, &euler, params);
-    let sidecar = field_export::export_field(seed, &field, &euler, &classified, params, budget);
+    let sidecar = field_export::export_field(&field, &euler, &classified, params);
     let descriptor = assemble(seed, &euler, &classified, params);
     (descriptor, sidecar)
 }
@@ -430,16 +427,15 @@ mod tests {
         // ADR-025 A-1/A-2: the export path must not move the descriptor.
         let p = CosmicWebParams::new(32, 4.0, 50.0).expect("test params fit");
         let plain = generate_cosmic_web(1234, &p);
-        let (via_field, _) =
-            generate_cosmic_web_with_field(1234, &p, crate::universe::WebFieldBudget::Full);
+        let (via_field, _) = generate_cosmic_web_with_field(1234, &p);
         assert_eq!(plain, via_field);
         assert_eq!(web_hash(&plain), web_hash(&via_field));
     }
 
     #[test]
     fn export_leaves_density_and_descriptor_untouched() {
-        // Jitter is export-only: rebuilding the Eulerian grid after the
-        // export must replay bit-identically.
+        // The export re-reads stage products: rebuilding the Eulerian
+        // grid after the export must replay bit-identically.
         use super::displace::displace_to_eulerian;
         use super::field::initial_field;
         let p = CosmicWebParams::new(32, 4.0, 50.0).expect("test params fit");
@@ -447,30 +443,27 @@ mod tests {
         let before = displace_to_eulerian(&potential, &p);
         let euler = displace_to_eulerian(&potential, &p);
         let classified = classify(&potential, &euler, &p);
-        let _ = super::field_export::export_field(
-            77,
-            &potential,
-            &euler,
-            &classified,
-            &p,
-            crate::universe::WebFieldBudget::Full,
-        );
+        let _ = super::field_export::export_field(&potential, &euler, &classified, &p);
         let after = displace_to_eulerian(&potential, &p);
         assert_eq!(before.density, after.density);
         assert_eq!(generate_cosmic_web(77, &p), generate_cosmic_web(77, &p));
     }
 
     #[test]
-    fn tracer_count_band_and_node_proximity_on_small_box() {
-        // Structure asserts (not nominal bands): every tracer is inside
-        // the sphere, and dense nodes have a nearby tracer.
+    fn cell_list_covers_interior_nodes_on_small_box() {
+        // Structure asserts (not nominal bands): the list is non-empty
+        // within the grid, and dense interior nodes sit within a cell of
+        // a listed cell's displaced centre.
+        use super::field_export::{cell_list, displace_sample};
         let p = CosmicWebParams::new(32, 4.0, 50.0).expect("test params fit");
-        let (desc, field) =
-            generate_cosmic_web_with_field(1234, &p, crate::universe::WebFieldBudget::Full);
-        assert!(!field.tracers.is_empty());
-        assert!(field.tracers.len() <= 32 * 32 * 32);
+        let (desc, field) = generate_cosmic_web_with_field(1234, &p);
+        let n = p.lattice_cells as usize;
+        let cells = cell_list(&field);
+        assert!(!cells.is_empty());
+        assert!(cells.len() <= n * n * n);
+        let half = n as f64 * p.cell_size_mpc * 0.5;
         let cell = p.cell_size_mpc;
-        // Only interior nodes can have exported neighbors: tracers are
+        // Only interior nodes can have exported neighbors: the list is
         // cut to the descriptor sphere while peaks span the box.
         let interior: Vec<[f64; 3]> = desc
             .nodes
@@ -487,16 +480,20 @@ mod tests {
         assert!(!interior.is_empty(), "no interior dense node to check");
         for node in interior {
             let mut found = false;
-            for t in &field.tracers {
-                let dx = f64::from(t.pos_mpc[0]) - node[0];
-                let dy = f64::from(t.pos_mpc[1]) - node[1];
-                let dz = f64::from(t.pos_mpc[2]) - node[2];
+            for &i in &cells {
+                let x = (i as usize) % n;
+                let y = ((i as usize) / n) % n;
+                let z = (i as usize) / (n * n);
+                let e = displace_sample(&field, [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5]);
+                let dx = e[0] * cell - half - node[0];
+                let dy = e[1] * cell - half - node[1];
+                let dz = e[2] * cell - half - node[2];
                 if dx * dx + dy * dy + dz * dz <= cell * cell * 4.0 {
                     found = true;
                     break;
                 }
             }
-            assert!(found, "dense node at {node:?} has no nearby tracer");
+            assert!(found, "dense node at {node:?} has no nearby listed cell");
         }
     }
 }

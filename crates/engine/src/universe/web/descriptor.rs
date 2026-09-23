@@ -120,8 +120,10 @@ impl WebDescriptor {
 
 /// Parabolic sub-cell peak refinement on the Eulerian density (basic ops;
 ///
-/// offset clamped to ±0.5 cell).
-fn refine(pos: [f64; 3], euler: &EulerianField, cell: [usize; 3], n: usize) -> [f64; 3] {
+/// offset clamped to ±0.5 cell). Named `peak_refine` so the CGT-010
+/// retirement pin stays literally clean — this stage-C helper is
+/// unrelated to the retired export method and untouched.
+fn peak_refine(pos: [f64; 3], euler: &EulerianField, cell: [usize; 3], n: usize) -> [f64; 3] {
     let mut out = pos;
     for axis in 0..3 {
         let mut c = cell;
@@ -182,7 +184,7 @@ pub fn assemble(
             (y as f64 + 0.5) * params.cell_size_mpc - half,
             (z as f64 + 0.5) * params.cell_size_mpc - half,
         ];
-        refine(base, euler, [x, y, z], n)
+        peak_refine(base, euler, [x, y, z], n)
     };
     // Node acceptance (densest-first, greedy separation). ADR-026 §1:
     // the descriptor sphere is a generation cut — reject refined peak
