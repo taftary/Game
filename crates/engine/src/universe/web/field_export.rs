@@ -403,6 +403,24 @@ fn trilinear_grad(grad: &[[f64; 3]], n: usize, x: f64, y: f64, z: f64) -> (f64, 
     (out[0], out[1], out[2])
 }
 
+/// Staging bytes for the displacement 3D image (CGT-004, ADR-026 §2):
+/// `displacement` (`[i16; 3]`, x fastest) as RGBA16_SNORM little-endian
+/// (alpha 0 — the format has no RGB-only 3D variant). `128³ × 8 B ≈
+/// 16.8 MB`. Empty for degenerate fields (no texture built).
+pub fn displacement_image_bytes(field: &WebField) -> Vec<u8> {
+    let n = field.grid_cells as usize;
+    if n == 0 || field.displacement.len() < n * n * n {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(n * n * n * 8);
+    for d in &field.displacement[..n * n * n] {
+        for c in [d[0], d[1], d[2], 0] {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Irwin–Hall-3 centered jitter (`σ = 0.5`), scaled to `σ ≈ 0.3` cell.
 fn jitter3(rng: &mut SeededRng) -> (f64, f64, f64) {
     let mut one = || (rng.unit_f64() + rng.unit_f64() + rng.unit_f64() - 1.5) * 0.6;
@@ -743,6 +761,49 @@ mod tests {
             max_abs_cells < DISP_QUANT_RANGE_CELLS,
             "displacement clamps: max {max_abs_cells} cells ≥ 8"
         );
+    }
+
+    #[test]
+    fn displacement_image_bytes_round_trip() {
+        // CGT-004: RGBA16_SNORM LE staging — xyz echo the quantized
+        // grid, alpha is 0, length is n³ × 8.
+        let (potential, euler, classified, p) = small_products();
+        let field = export_field(
+            11,
+            &potential,
+            &euler,
+            &classified,
+            &p,
+            WebFieldBudget::Full,
+        );
+        let n = p.lattice_cells as usize;
+        let bytes = displacement_image_bytes(&field);
+        assert_eq!(bytes.len(), n * n * n * 8);
+        let cell = |i: usize| {
+            let o = i * 8;
+            [
+                i16::from_le_bytes([bytes[o], bytes[o + 1]]),
+                i16::from_le_bytes([bytes[o + 2], bytes[o + 3]]),
+                i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]),
+                i16::from_le_bytes([bytes[o + 6], bytes[o + 7]]),
+            ]
+        };
+        for i in [0, 1, 1000, n * n * n - 1] {
+            assert_eq!(cell(i)[..3], field.displacement[i], "cell {i} drifted");
+            assert_eq!(cell(i)[3], 0, "alpha must be 0 at cell {i}");
+        }
+        // Degenerate fields build no texture.
+        let empty = WebField {
+            tracers: Vec::new(),
+            displacement: Vec::new(),
+            grid: Vec::new(),
+            grid_cells: 0,
+            cell_size_mpc: 4.0,
+            mean_density: 1.0,
+            origin_mpc: [0.0; 3],
+            sphere_radius_mpc: 50.0,
+        };
+        assert!(displacement_image_bytes(&empty).is_empty());
     }
 
     #[test]

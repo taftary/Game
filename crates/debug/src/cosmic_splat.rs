@@ -228,6 +228,62 @@ pub fn splat_records(
     out
 }
 
+/// Sub-samples per Lagrangian cell for the procedural GPU tracer draw
+/// (v0.3.4 `cosmic-gpu-tracers`, ADR-026 §2): a draw count per tier,
+/// not a precompute. Low keeps today's invocation count (1 per cell);
+/// High draws 8 (the retired `refine(2)` density, with none of its
+/// 134 MB vertex cost).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplatK(pub u8);
+
+impl SplatK {
+    /// Tier draw counts: Low 1 / Medium 2 / High 8 (starting values —
+    /// measured on the reference iGPU in CGT-009; cut order recorded
+    /// in the plan).
+    pub fn for_tier(tier: SplatTier) -> Self {
+        Self(match tier {
+            SplatTier::Low => 1,
+            SplatTier::Medium => 2,
+            SplatTier::High => 8,
+        })
+    }
+
+    /// Strict `1..=8` parse of `GAME_DEBUG_COSMIC_K` (the
+    /// `GAME_DEBUG_COSMIC_VEIL` precedent: garbage never silently
+    /// regrades a capture).
+    pub fn parse_override(s: &str) -> Result<Self, String> {
+        match s.parse::<u8>() {
+            Ok(k) if (1..=8).contains(&k) => Ok(Self(k)),
+            _ => Err(format!("bad sub-sample count {s:?}: want an integer 1..=8")),
+        }
+    }
+}
+
+/// Fixed sub-cell offsets for a draw count `k` (CGT-005): the retired
+/// `WebField::refine()` pattern (`0.25 + 0.5·s`) generalized. `k = 1`
+/// is the cell centre; otherwise the first `k` corners of the 8
+/// (x fastest). Deterministic; the `SPLAT_PROC_VERT` table in the
+/// binary mirrors this order bit-for-bit (pinned by the
+/// `splat_proc_offset_table` string test there).
+pub fn splat_sub_offsets(k: u8) -> Vec<[f32; 3]> {
+    let k = k.clamp(1, 8) as usize;
+    if k == 1 {
+        return vec![[0.5, 0.5, 0.5]];
+    }
+    let mut out = Vec::with_capacity(k);
+    for s in 0..8 {
+        if out.len() == k {
+            break;
+        }
+        out.push([
+            0.25 + 0.5 * ((s & 1) as f32),
+            0.25 + 0.5 * (((s >> 1) & 1) as f32),
+            0.25 + 0.5 * (((s >> 2) & 1) as f32),
+        ]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,5 +548,45 @@ mod tests {
         // Single void splat at 10 px/Mpc: h=4 Mpc → 40 px → 1600/area.
         let single = overdraw_estimate(&void[..1], 10.0, (1920, 1080));
         assert!((single - 1600.0 / area as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn splat_k_tier_mapping() {
+        // CGT-006: Low 1 / Medium 2 / High 8 (Low keeps today's count).
+        assert_eq!(SplatK::for_tier(SplatTier::Low), SplatK(1));
+        assert_eq!(SplatK::for_tier(SplatTier::Medium), SplatK(2));
+        assert_eq!(SplatK::for_tier(SplatTier::High), SplatK(8));
+    }
+
+    #[test]
+    fn splat_k_parse_strict() {
+        // CGT-006: strict 1..=8, garbage errors (never a silent grade).
+        for good in ["1", "2", "8"] {
+            assert!(SplatK::parse_override(good).is_ok(), "{good} must parse");
+        }
+        for bad in ["0", "9", "100", "", "high", "4.0", "-1", " 4"] {
+            assert!(
+                SplatK::parse_override(bad).is_err(),
+                "{bad:?} must not parse"
+            );
+        }
+        assert_eq!(SplatK::parse_override("4"), Ok(SplatK(4)));
+    }
+
+    #[test]
+    fn splat_sub_offsets_shape() {
+        // CGT-006: k=1 is the centre; k=8 is the refine() pattern;
+        // other k are its prefix (x fastest).
+        assert_eq!(splat_sub_offsets(1), vec![[0.5, 0.5, 0.5]]);
+        let eight = splat_sub_offsets(8);
+        assert_eq!(eight.len(), 8);
+        assert_eq!(eight[0], [0.25, 0.25, 0.25]);
+        assert_eq!(eight[1], [0.75, 0.25, 0.25]);
+        assert_eq!(eight[7], [0.75, 0.75, 0.75]);
+        assert_eq!(&splat_sub_offsets(2), &eight[..2]);
+        assert_eq!(&splat_sub_offsets(4), &eight[..4]);
+        // Clamp rails (never 0 verts, never > 8).
+        assert_eq!(splat_sub_offsets(0).len(), 1);
+        assert_eq!(splat_sub_offsets(255).len(), 8);
     }
 }

@@ -4,7 +4,8 @@
 
 `in-progress` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
 sidecar shape change + new render primitive, ADR-026 §2; DEV Phase 1
-started 2026-09-23: CGT-001..003 done, CGT-004..012 pending)
+done 2026-09-23: CGT-001..003; DEV Phase 2 done 2026-09-23:
+CGT-004..007, CGT-008..012 pending)
 
 ## Context
 
