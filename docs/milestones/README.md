@@ -129,6 +129,36 @@ nothing hashed changes). Still deferred: LOD/culling hardening
 (measured costs land in F2/F3/F6 DoDs), 2LPT / nested grids, SDSS
 overlay.
 
+## v0.3.4 — Cosmic-web fixes & fidelity (ADR-026)
+
+Work happens on branch `v0.3.4` (cut from `main` at `6169532`); each
+feature lands as exactly one commit when it reaches `done` (workflow
+rule: [`plans/README.md`](../../plans/README.md) § *7. Version
+branch*). Goal: close the three gaps left visible by v0.3.3 — nodes
+drawn outside the descriptor sphere, a frame stall on every 50 Mpc
+origin rebase, and a field render that still reads as blobs instead
+of the reference's threads
+([`../reports/images/target.jpeg`](../reports/images/target.jpeg)) —
+by making the sphere a generation cut, generating tracers on the GPU
+from the exported displacement grid, and moving rebase work off the
+frame ([`../decisions/ADR-026.md`](../decisions/ADR-026.md)). PO
+decisions (2026-09-23): generation-side clip (hash bump accepted),
+no stored/refined tracer list (procedural GPU tracers instead), all
+six features in scope, version named `v0.3.4`.
+
+| # | Feature | Status | Crate(s) | Scope |
+|---|---|---|---|---|
+| F1 | [`cosmic-sphere-clip`](../../plans/v0.3.4/cosmic-sphere-clip/) | planned | engine | peaks outside `descriptor_radius_mpc` rejected before acceptance; links/glow inherit; `UNIVERSE_VERSION` 3→4; pins + bands re-recorded; every node ≤ radius pinned |
+| F2 | [`cosmic-rebase-async`](../../plans/v0.3.4/cosmic-rebase-async/) | planned | debug | rebase rebuilds only origin-dependent buffers; CPU build on a worker thread (`TileLoader` pattern), buffer swap on the frame; veil volume / HDR chain / inspector buffers rebuild on reseed only; no fence wait in the loop |
+| F3 | [`cosmic-gpu-tracers`](../../plans/v0.3.4/cosmic-gpu-tracers/) | planned | engine + debug | `WebField.displacement` grid replaces `tracers`; splat vertex shader generates sub-tracers per cell (tier draw counts 1/2/8); per-seed cell list; retires `splat_records` + `SplatVertex` |
+| F4 | [`cosmic-void-contrast`](../../plans/v0.3.4/cosmic-void-contrast/) | planned | debug | shared transfer function: sub-mean → near-black, filament contrast band, soft rim fade; voids measured ≤ 1.15× backdrop |
+| F5 | [`cosmic-hub-compact-cores`](../../plans/v0.3.4/cosmic-hub-compact-cores/) | planned | debug | pixel-capped cores, members as the visible mass, bloom halo ≤ 3× core; ≤ 10 blazing nodes at slab framing |
+| F6 | [`cosmic-vista-reframe`](../../plans/v0.3.4/cosmic-vista-reframe/) | planned | debug | `vista` + `slab` presets frame an interior window (no sphere limb in frame); hub choice by composition; version headline shot |
+
+Still deferred after this version: anisotropic (quad) splats
+stretched along the collapse axis, LOD/culling hardening, 2LPT /
+nested grids, SDSS overlay.
+
 ## Post-v0.3 (unscheduled)
 
 - **Colony milestones (historical labels):** M2 descent slice, M3 surface

@@ -40,6 +40,9 @@ Current version folders (contents + per-version scope:
 - `v0.3.3/` — Cosmic-web field render (ADR-025: eight features, capture
   harness first, then field export → splats → depth window → hubs →
   bloom → veil → vista intro)
+- `v0.3.4/` — Cosmic-web fixes & fidelity (ADR-026: six features,
+  sphere clip → non-blocking rebase → GPU tracers → void contrast →
+  compact hubs → vista reframe)
 
 ## Role gates
 

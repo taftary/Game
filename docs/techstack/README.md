@@ -1,9 +1,9 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.46.0 (2026-09-22, v0.3.3 `cosmic-vista-intro`
-  done: vista intro boots the demo on the reference composition and
-  dives to Chase; all eight v0.3.3 features done, branch merges to
-  `main`)
+- **Version:** 0.47.0 (2026-09-23, v0.3.4 planned: ADR-026 — sphere
+  becomes a generation cut, procedural GPU tracers replace the stored
+  tracer list, origin rebase moves off the frame; six features on
+  branch `v0.3.4`, none implemented yet)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
