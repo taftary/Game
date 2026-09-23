@@ -756,3 +756,21 @@ naga compile helper, 1.1-floor boot).
   under the 128 B floor): the orbit arrival re-lights the Lit planet
   with the target's atmosphere color and tints the clear color, all
   descriptor-driven, no per-type shader branches.
+
+Frame timing (v0.3.5 `cosmic-frame-timing`, ADR-027): the FPS widget
+tab shows per-pass GPU ms (HDR prepass = scene glow + procedural
+splats, bloom pyramid, veil march, main pass) plus CPU phase ms (UI
+build, `cosmic_frame`, command recording) as rolling avg · max rings
+(`debug::frame_timing`, GPU-free like `fps`). The binary owns one
+timestamp `QueryPool` (5 fencepost queries × 2 frame slots, written
+between render passes, never inside one — the write-once bloom
+description and all pipeline layouts are untouched); the windowed
+loop reads the previous frame's queries without waiting, only while
+the widget is visible, and the offscreen `--capture` path reads its
+own pool after its fence and logs a `cosmic_timing=` line next to
+`cosmic_proc=`. Devices without timestamp support run exactly as
+before with `n/a` rows. Rule going forward: no cosmic grade/perf
+change ships without a per-pass GPU ms line. First light on Intel
+UHD 620 (seed 1337, 1408×768, High): inspector
+prepass ≈ 126–140 / bloom ≈ 2–6 / march ≈ 2–3 / main ≈ 1 ms —
+the prepass (procedural splats) owns ~95% of the GPU frame.

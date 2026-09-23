@@ -1,16 +1,14 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.54.0 (2026-09-23, v0.3.4 `cosmic-vista-reframe`
-  done: interior-window headline — `vista`/`slab` captures pose from
-  the same `vista_pose` eye/target (slab keeps 20° + 30 Mpc at the hub
-  depth), FR1 16:9 shrink fallback before legacy, no limb in frame
-  (radial scans vista 0.181 / slab 0.152 ≤ 0.20); six readings 5 met /
-  1 partial (depth cue partial — thin opening slice); nominal dive
-  28.4°/s, focal NDC (0.096, 0.000), captures byte-identical ×2
-  (vista `450450D9…` 1.52 MB, slab `714E9837…` 0.60 MB);
+- **Version:** 0.55.0 (2026-09-23, v0.3.5 `cosmic-frame-timing`
+  done: per-pass GPU timestamps (prepass/bloom/march/main) + CPU
+  phases in the FPS widget, `cosmic_timing=` capture line, dev-profile
+  opt-level 1 for `game_debug`/`game_engine`; first light on UHD 620
+  (seed 1337, 1408×768 High): prepass ≈ 126–140 ms owns ~95% of the
+  GPU frame (bloom ≈ 2–6, march ≈ 2–3, main ≈ 1); captures
+  byte-identical;
   ANALYST audit + SECURITY review recorded in `plan.md`; single `done`
-  commit on branch `v0.3.4`, version closes (merge `v0.3.4 → main`);
-  prior `cosmic-hub-compact-cores` done)
+  commit on branch `v0.3.5`)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

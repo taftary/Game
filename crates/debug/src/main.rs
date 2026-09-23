@@ -37,6 +37,7 @@ use game_debug::app::{App as DebugApp, ChromeState, Screen, ViewContent, WidgetT
 use game_debug::cosmic_camera::cosmic_tip_world;
 use game_debug::cosmic_player::CRUISE_SPEED_NOTCH;
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
+use game_debug::frame_timing::{CpuPhase, FrameTiming, GpuSlot, ms_from_ticks};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
 use game_debug::loader::{LoadPlan, LoadSource, LoadStep};
 use game_debug::params::{cell_count_hint, parse_radius, parse_subdivisions, subdiv_warning};
@@ -94,12 +95,13 @@ use vulkano::pipeline::{
     DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
+use vulkano::query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
 use vulkano::shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo};
 use vulkano::swapchain::{
     Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image,
 };
-use vulkano::sync::{self, GpuFuture};
+use vulkano::sync::{self, GpuFuture, PipelineStage};
 use vulkano::{Validated, VulkanError, VulkanLibrary};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -2350,6 +2352,16 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         CommandBufferUsage::OneTimeSubmit,
     )
     .expect("capture command buffer builder must create");
+    // Frame timestamps (`cosmic-frame-timing`): one-shot pool, one
+    // frame slot — read after the fence wait below, never waited on
+    // beyond the capture's own fence.
+    let capture_timer = CosmicTimer::create(&device, &queue);
+    let capture_stamp = capture_timer.as_ref().map(CosmicTimer::stamp);
+    if let Some(stamp) = capture_stamp.as_ref() {
+        timer_reset(&mut builder, stamp);
+        timer_write(&mut builder, stamp, 0, true);
+    }
+    let capture_record_start = Instant::now();
     if let Some(chain) = hdr.as_ref() {
         // High-tier pyramid on both paths (windowed + capture stay
         // pixel-identical — the debug binary has no tier switch).
@@ -2367,12 +2379,21 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             &descriptor_set_allocator,
             &memory_allocator,
             &post_sampler,
+            capture_stamp.as_ref(),
         );
         // Gas-veil march (CGV-005/006): pyramid → march → resolve.
         // Skipped in sprites mode (cleared target adds ~0).
         if matches!(veil_mode, game_debug::cosmic_veil::VeilMode::March { .. }) {
             record_veil_march(&mut builder, &pipes, chain, &frame.march);
         }
+        // March end / main start (`cosmic-frame-timing` q3).
+        if let Some(stamp) = capture_stamp.as_ref() {
+            timer_write(&mut builder, stamp, 3, false);
+        }
+    } else if let Some(stamp) = capture_stamp.as_ref() {
+        timer_write(&mut builder, stamp, 1, false);
+        timer_write(&mut builder, stamp, 2, false);
+        timer_write(&mut builder, stamp, 3, false);
     }
     builder
         .begin_render_pass(
@@ -2408,6 +2429,10 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     builder
         .end_render_pass(Default::default())
         .expect("capture pass must end");
+    // Main end (`cosmic-frame-timing` q4).
+    if let Some(stamp) = capture_stamp.as_ref() {
+        timer_write(&mut builder, stamp, 4, false);
+    }
     builder
         .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
             target_image,
@@ -2415,6 +2440,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         ))
         .expect("capture readback copy must record");
     let command_buffer = builder.build().expect("capture command buffer must build");
+    let cpu_record_ms = capture_record_start.elapsed().as_secs_f32() * 1000.0;
     if let Err(error) = sync::now(device.clone())
         .then_execute(queue.clone(), command_buffer)
         .expect("capture submit must succeed")
@@ -2457,6 +2483,45 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         "capture saved: {} (view {view_name}, seed {seed}, {w}x{h})",
         request.path
     );
+    // Frame timing line (`cosmic-frame-timing` FR4): GPU ms per pass
+    // from this frame's own fence-waited pool + the CPU record span.
+    // The fence above already waited, so results are available.
+    match capture_timer.as_ref() {
+        Some(timer) => {
+            let mut ticks = [0u64; TIMER_QUERIES_PER_FRAME as usize];
+            let ready = timer
+                .pool
+                .get_results(
+                    0..TIMER_QUERIES_PER_FRAME,
+                    &mut ticks,
+                    QueryResultFlags::empty(),
+                )
+                .unwrap_or(false);
+            if ready {
+                let mut cells = Vec::with_capacity(GpuSlot::ALL.len());
+                let mut total = 0.0f32;
+                for (i, slot) in GpuSlot::ALL.iter().enumerate() {
+                    let dt = ticks[i + 1].saturating_sub(ticks[i]);
+                    match ms_from_ticks(dt, timer.period_ns) {
+                        Some(ms) => {
+                            total += ms;
+                            cells.push(format!("{}:{ms:.2}", slot.label()));
+                        }
+                        None => cells.push(format!("{}:n/a", slot.label())),
+                    }
+                }
+                println!(
+                    "cosmic_timing={} total:{total:.2} cpu_record:{cpu_record_ms:.2} (ms)",
+                    cells.join(" ")
+                );
+            } else {
+                println!("cosmic_timing=unavailable cpu_record:{cpu_record_ms:.2} (ms)");
+            }
+        }
+        None => {
+            println!("cosmic_timing=n/a (no timestamp support) cpu_record:{cpu_record_ms:.2} (ms)")
+        }
+    }
     0
 }
 
@@ -4745,7 +4810,7 @@ fn fog_slider_track(body: Rect, lh: f32) -> Rect {
 /// Widget FPS body: the frame-health tab, drawn into the widget
 /// body rect (it already lays out into any area).
 fn build_widget_fps(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
-    build_fps_tab(items, lh, &app.fps, body);
+    build_fps_tab(items, lh, &app.fps, &app.timing, body);
 }
 
 /// Widget Console body: the live fly-to event feed (newest last,
@@ -4826,9 +4891,18 @@ fn build_widget_inspector(items: &mut UiItems, lh: f32, app: &DebugApp, body: Re
     );
 }
 
+/// One timing row cell: `avg · max` in ms, or `n/a` before the
+/// first sample (`cosmic-frame-timing`).
+fn timing_cell(avg: Option<f32>, max: Option<f32>) -> String {
+    match (avg, max) {
+        (Some(avg), Some(max)) => format!("{avg:5.1} · {max:5.1}"),
+        _ => "n/a".to_owned(),
+    }
+}
+
 /// Widget FPS body: live numbers + a sparkline of the newest
 /// [`FPS_SPARKLINE`] samples (right = newest, 0–50 ms full height).
-fn build_fps_tab(items: &mut UiItems, lh: f32, fps: &FpsOverlay, area: Rect) {
+fn build_fps_tab(items: &mut UiItems, lh: f32, fps: &FpsOverlay, timing: &FrameTiming, area: Rect) {
     let mut rows = ui::PanelRows::new(area, ui::DOCK_PAD);
     section_bar(items, rows.next(lh + 6.0, 4.0), "FRAME HEALTH");
     for line in [
@@ -4841,6 +4915,46 @@ fn build_fps_tab(items: &mut UiItems, lh: f32, fps: &FpsOverlay, area: Rect) {
         format!("samples:    {}", fps.count()),
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
+    }
+    // Per-pass GPU + CPU timing (`cosmic-frame-timing`, ADR-027):
+    // rolling avg · max per row, `n/a` before the first sample (or
+    // without device timestamp support — NFR4).
+    section_bar(items, rows.next(lh + 6.0, 4.0), "GPU PASSES (avg · max ms)");
+    for slot in GpuSlot::ALL {
+        text_row(
+            items,
+            lh,
+            rows.next(lh, 4.0),
+            format!(
+                "{:<8}{}",
+                slot.label(),
+                timing_cell(timing.gpu_avg_ms(slot), timing.gpu_max_ms(slot))
+            ),
+            C_TEXT,
+        );
+    }
+    if let Some(total) = timing.gpu_total_avg_ms() {
+        text_row(
+            items,
+            lh,
+            rows.next(lh, 4.0),
+            format!("total   {total:5.1} ms avg"),
+            C_DIM,
+        );
+    }
+    section_bar(items, rows.next(lh + 6.0, 4.0), "CPU PHASES (avg · max ms)");
+    for phase in CpuPhase::ALL {
+        text_row(
+            items,
+            lh,
+            rows.next(lh, 4.0),
+            format!(
+                "{:<8}{}",
+                phase.label(),
+                timing_cell(timing.cpu_avg_ms(phase), timing.cpu_max_ms(phase))
+            ),
+            C_TEXT,
+        );
     }
     text_row(
         items,
@@ -5652,6 +5766,151 @@ struct BloomLevel {
     extent: [u32; 2],
 }
 
+/// Frame timestamp geometry (`cosmic-frame-timing`, ADR-027):
+/// fencepost queries per frame — q0 prepass-start, q1
+/// prepass-end/bloom-start, q2 bloom-end/march-start, q3
+/// march-end/main-start, q4 main-end. Two frame slots: the windowed
+/// loop reads the previous frame's queries (never waits); the
+/// offscreen capture path uses one slot and reads after its fence.
+const TIMER_QUERIES_PER_FRAME: u32 = 5;
+const TIMER_FRAME_SLOTS: u32 = 2;
+
+/// One frame's timestamp writes: pool + base query index (`base + 0`
+/// through `base + 4`). `None` (no stamp) records identically minus
+/// the five writes — the offscreen path without timestamp support
+/// and every draw stay byte-identical.
+#[derive(Clone)]
+struct FrameStamp {
+    pool: Arc<QueryPool>,
+    base: u32,
+}
+
+/// Timestamp query pool owner: pool + period + recorded-frame counter
+/// (the counter selects the frame slot). `None` on [`ViewerApp`] when
+/// the device has no timestamp support (NFR4 — runs exactly as before).
+struct CosmicTimer {
+    pool: Arc<QueryPool>,
+    /// Nanoseconds per tick (`timestamp_period`).
+    period_ns: f32,
+    frame: u64,
+}
+
+impl CosmicTimer {
+    /// Create the pool for a device, or `None` without timestamp
+    /// support: the graphics queue family must expose
+    /// `timestamp_valid_bits` and the period must be positive finite.
+    fn create(device: &Arc<Device>, queue: &Arc<Queue>) -> Option<CosmicTimer> {
+        let family = queue.queue_family_index() as usize;
+        let valid = device
+            .physical_device()
+            .queue_family_properties()
+            .get(family)
+            .is_some_and(|props| props.timestamp_valid_bits.is_some());
+        let period = device.physical_device().properties().timestamp_period;
+        if !valid || !period.is_finite() || period <= 0.0 {
+            tracing::info!("frame timing unsupported on this device (no timestamp queries)");
+            return None;
+        }
+        let pool = QueryPool::new(
+            device.clone(),
+            QueryPoolCreateInfo {
+                query_count: TIMER_QUERIES_PER_FRAME * TIMER_FRAME_SLOTS,
+                ..QueryPoolCreateInfo::query_type(QueryType::Timestamp)
+            },
+        )
+        .expect("timestamp query pool must create");
+        tracing::info!(
+            period_ns = period,
+            "frame timing active (timestamp queries)"
+        );
+        Some(CosmicTimer {
+            pool,
+            period_ns: period,
+            frame: 0,
+        })
+    }
+
+    /// This frame's stamp (advances on [`CosmicTimer::advanced`]).
+    fn stamp(&self) -> FrameStamp {
+        FrameStamp {
+            pool: self.pool.clone(),
+            base: (self.frame % u64::from(TIMER_FRAME_SLOTS)) as u32 * TIMER_QUERIES_PER_FRAME,
+        }
+    }
+
+    /// Previous frame's base (the readback target — submitted a full
+    /// frame ago, so results are available without waiting).
+    fn prev_base(&self) -> u32 {
+        ((self.frame + 1) % u64::from(TIMER_FRAME_SLOTS)) as u32 * TIMER_QUERIES_PER_FRAME
+    }
+
+    fn advanced(&mut self) {
+        self.frame += 1;
+    }
+}
+
+/// Reset this frame's queries. Records first in the command buffer —
+/// every [`timer_write`] below is `unsafe` on this having run (the
+/// reset-before-write contract, same command buffer).
+fn timer_reset(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    stamp: &FrameStamp,
+) {
+    // SAFETY: queries `base..base+5` belong to this frame's slot,
+    // written by no other in-flight command buffer (slots alternate
+    // per recorded frame behind `previous_frame_end`).
+    unsafe {
+        builder.reset_query_pool(
+            stamp.pool.clone(),
+            stamp.base..stamp.base + TIMER_QUERIES_PER_FRAME,
+        )
+    }
+    .expect("timestamp pool reset must record");
+}
+
+/// Write one fencepost timestamp (`which` in `0..5`). Starts use
+/// `TopOfPipe`, ends `BottomOfPipe`.
+fn timer_write(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    stamp: &FrameStamp,
+    which: u32,
+    start: bool,
+) {
+    let stage = if start {
+        PipelineStage::TopOfPipe
+    } else {
+        PipelineStage::BottomOfPipe
+    };
+    // SAFETY: reset by `timer_reset` at the top of this command
+    // buffer; each fencepost is written exactly once per frame.
+    unsafe { builder.write_timestamp(stamp.pool.clone(), stamp.base + which, stage) }
+        .expect("timestamp write must record");
+}
+
+/// Feed one frame of fencepost ticks into the widget rings. Returns
+/// false when the results are not ready yet (the frame is skipped —
+/// the rings age out on their own).
+fn timer_feed(timing: &mut FrameTiming, pool: &Arc<QueryPool>, base: u32, period_ns: f32) -> bool {
+    let mut ticks = [0u64; TIMER_QUERIES_PER_FRAME as usize];
+    let ready = pool
+        .get_results(
+            base..base + TIMER_QUERIES_PER_FRAME,
+            &mut ticks,
+            QueryResultFlags::empty(),
+        )
+        .unwrap_or(false);
+    if !ready {
+        return false;
+    }
+    for (i, slot) in GpuSlot::ALL.iter().enumerate() {
+        let dt = ticks[i + 1].saturating_sub(ticks[i]);
+        if let Some(ms) = ms_from_ticks(dt, period_ns) {
+            timing.push_gpu(*slot, ms);
+        }
+    }
+    true
+}
+
 fn upload_fill(
     allocator: &Arc<StandardMemoryAllocator>,
     viewer: &PlanetViewerState,
@@ -6198,6 +6457,7 @@ fn record_cosmic_hdr_prepass(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     sampler: &Arc<Sampler>,
+    stamp: Option<&FrameStamp>,
 ) {
     // Scene: indigo clear, glow then splats (smoke retired CGV-009).
     builder
@@ -6261,10 +6521,18 @@ fn record_cosmic_hdr_prepass(
     builder
         .end_render_pass(Default::default())
         .expect("HDR scene pass must end");
+    // Prepass end / bloom start (`cosmic-frame-timing` q1).
+    if let Some(stamp) = stamp {
+        timer_write(builder, stamp, 1, false);
+    }
     // Mip-bloom pyramid (`bloom-mip-chain`): prefilter + downs +
     // alias-free pass-through + ups, recorded from the same pass
     // description the write-once pin checks.
     record_bloom_chain(builder, pipes, hdr, params, bloom_enabled);
+    // Bloom end / march start (`cosmic-frame-timing` q2).
+    if let Some(stamp) = stamp {
+        timer_write(builder, stamp, 2, false);
+    }
 }
 
 /// Fullscreen-triangle post-pass opener: black clear + viewport at
@@ -6930,6 +7198,10 @@ struct ViewerApp {
     /// Last FPS sample: the frame-rate clock (once per event-loop
     /// iteration on the single window).
     last_fps_tick: Option<Instant>,
+    /// Frame timestamp pool (`cosmic-frame-timing`, ADR-027): `None`
+    /// without device timestamp support (NFR4). The widget rings live
+    /// on `debug.timing` (lib); this owns the Vulkan side.
+    timer: Option<CosmicTimer>,
     main: Option<WindowContext>,
     /// Mouse-held walk direction from a Settings Controls row
     /// (hold-to-press parity for WASD): cleared on mouse release.
@@ -7164,6 +7436,13 @@ impl ViewerApp {
                 None
             }
         };
+        // Frame timestamp pool (`cosmic-frame-timing`, ADR-027): needs
+        // the device + graphics queue; `None` without timestamp
+        // support (the widget then shows `n/a` — NFR4).
+        let timer = CosmicTimer::create(&device, &queue);
+        if timer.is_none() {
+            debug.timing = FrameTiming::unsupported();
+        }
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),
             debug,
@@ -7213,6 +7492,7 @@ impl ViewerApp {
             stream_desired: Vec::new(),
             press_cursor: None,
             last_fps_tick: None,
+            timer,
             main: None,
             mouse_walk: None,
             shift_held: false,
@@ -9878,13 +10158,19 @@ impl ViewerApp {
         // rebuild included): the LDR direct path and the HDR
         // scene/resolve path below share it, so both record identical
         // draws. `None` on non-cosmic tabs.
+        let cpu_cosmic_start = Instant::now();
         let cosmic_frame =
             (content == Some(ViewContent::CosmicWeb)).then(|| self.cosmic_frame(layout.viewport));
+        self.debug.timing.push_cpu(
+            CpuPhase::CosmicFrame,
+            cpu_cosmic_start.elapsed().as_secs_f32() * 1000.0,
+        );
 
         // Build frame UI (atlas insertions happen here) and sync the GPU
         // atlas before recording. The top bar + docks render inside the
         // content builders; overlay chrome (strip, corner, widget)
         // composes on top so it floats over every tab.
+        let cpu_ui_start = Instant::now();
         let mut items = match self.debug.screen {
             Screen::GameDemo => {
                 // v0.3.2 rebuild: the demo mounts only the cosmic player
@@ -9992,6 +10278,10 @@ impl ViewerApp {
             )
         };
         let drop_solid_count = (drop_items.solids.len() * 6) as u32;
+        self.debug.timing.push_cpu(
+            CpuPhase::UiBuild,
+            cpu_ui_start.elapsed().as_secs_f32() * 1000.0,
+        );
 
         let ctx = self.main.as_mut().expect("main window must exist");
         let (image_index, suboptimal, acquire_future) =
@@ -10013,6 +10303,15 @@ impl ViewerApp {
             CommandBufferUsage::OneTimeSubmit,
         )
         .expect("command buffer builder must create");
+        // Frame timestamps (`cosmic-frame-timing` q0): reset this
+        // frame's slot, then the prepass start. `None` without device
+        // support — the frame records identically minus the writes.
+        let stamp = self.timer.as_ref().map(CosmicTimer::stamp);
+        if let Some(stamp) = stamp.as_ref() {
+            timer_reset(&mut builder, stamp);
+            timer_write(&mut builder, stamp, 0, true);
+        }
+        let cpu_record_start = Instant::now();
         // Windowed capture (F12), first half: copy the acquired
         // swapchain image to a host buffer BEFORE the render pass
         // overwrites it. Encode + write happen after the flush below
@@ -10103,6 +10402,7 @@ impl ViewerApp {
                 &self.descriptor_set_allocator,
                 &self.memory_allocator,
                 &self.post_sampler,
+                stamp.as_ref(),
             );
             // Gas-veil march (CGV-005/006): skipped in sprites mode.
             if matches!(
@@ -10111,6 +10411,17 @@ impl ViewerApp {
             ) {
                 record_veil_march(&mut builder, &ctx.pipelines, hdr, &frame.march);
             }
+            // March end / main start (`cosmic-frame-timing` q3).
+            if let Some(stamp) = stamp.as_ref() {
+                timer_write(&mut builder, stamp, 3, false);
+            }
+        } else if let Some(stamp) = stamp.as_ref() {
+            // No HDR prepass this frame (LDR bypass or flat tab):
+            // collapse q1..q3 onto the main-pass start so Main owns
+            // the whole frame while the other slots read ~0.
+            timer_write(&mut builder, stamp, 1, false);
+            timer_write(&mut builder, stamp, 2, false);
+            timer_write(&mut builder, stamp, 3, false);
         }
         builder
             .begin_render_pass(
@@ -10504,7 +10815,15 @@ impl ViewerApp {
         builder
             .end_render_pass(Default::default())
             .expect("render pass must end");
+        // Main end (`cosmic-frame-timing` q4).
+        if let Some(stamp) = stamp.as_ref() {
+            timer_write(&mut builder, stamp, 4, false);
+        }
         let command_buffer = builder.build().expect("command buffer must build");
+        self.debug.timing.push_cpu(
+            CpuPhase::Record,
+            cpu_record_start.elapsed().as_secs_f32() * 1000.0,
+        );
 
         let ctx = self.main.as_mut().expect("main window must exist");
         let future = ctx
@@ -10553,6 +10872,19 @@ impl ViewerApp {
                 ctx.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
             }
             Err(error) => panic!("frame flush failed: {error}"),
+        }
+        // Timing readback (`cosmic-frame-timing` FR5): the previous
+        // frame's queries — submitted a full frame ago, so results are
+        // available without waiting — but only when someone reads them
+        // (FPS widget visible). Timestamp *writes* above always run.
+        if self.debug.widget_visible
+            && let Some(timer) = self.timer.as_ref()
+        {
+            let base = timer.prev_base();
+            timer_feed(&mut self.debug.timing, &timer.pool, base, timer.period_ns);
+        }
+        if let Some(timer) = self.timer.as_mut() {
+            timer.advanced();
         }
     }
 

@@ -18,7 +18,9 @@ use crate::loader::LoadPlan;
 use crate::planet_viewer::PlanetViewerState;
 use crate::system_map::{OrbitArrival, SystemMapView};
 use crate::ui::TextField;
-use crate::{console::LogConsole, fps::FpsOverlay, inspector::StateInspector};
+use crate::{
+    console::LogConsole, fps::FpsOverlay, frame_timing::FrameTiming, inspector::StateInspector,
+};
 use game::journey::{Journey, Layer};
 use game_engine::universe::WebDescriptor;
 use game_engine::waypoints::WaypointId;
@@ -198,6 +200,10 @@ pub struct App {
     pub fx: FxState,
     /// Frame-health recorder (fed once per event-loop iteration).
     pub fps: FpsOverlay,
+    /// Per-pass GPU + CPU timing (fed once per recorded frame by the
+    /// binary; `cosmic-frame-timing`, ADR-027). GPU-free rings — the
+    /// widget reads them like the FPS overlay.
+    pub timing: FrameTiming,
     /// Console log feed (transition events drained per frame).
     pub console: LogConsole,
     /// Backing state for the inspector (journey summary).
@@ -233,6 +239,7 @@ impl App {
             journey: Journey::new(DEFAULT_GALAXY_SEED),
             fx: FxState::default(),
             fps: FpsOverlay::new(),
+            timing: FrameTiming::new(),
             console: LogConsole::new(),
             inspector: StateInspector,
         }

@@ -40,6 +40,13 @@ panic = "abort"
 strip = "symbols"
 
 # Dev: keep heavy deps (vulkano, naga) usable at runtime without
-# paying full release build times on every iteration.
+# paying full release build times on every iteration. First-party
+# crates with per-frame hot paths (`cosmic-frame-timing`, ADR-027)
+# opt in to `opt-level = 1` so `cargo run -p game_debug` measures
+# real CPU costs; budgets are still taken with `--release`.
 [profile.dev.package."*"]
+opt-level = 1
+[profile.dev.package.game_debug]
+opt-level = 1
+[profile.dev.package.game_engine]
 opt-level = 1

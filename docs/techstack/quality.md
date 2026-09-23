@@ -21,6 +21,13 @@
 
 Budgets are enforced by the `tools` renderer smoke + device profiles, not by vibes. Any feature that blows Low tier is cut or tier-gated.
 
+Budget numbers are taken with `--release` (`cargo run --release`;
+`cargo run -p game_debug` builds `game_debug` + `game_engine` at
+`opt-level = 1` since v0.3.5 `cosmic-frame-timing`, but unoptimized
+dev CPU costs still pollute wall-clock FPS — isolate GPU costs with
+the FPS widget's per-pass rows or the `--capture` `cosmic_timing=`
+line, ADR-027).
+
 Note (v0.3.3 `cosmic-gas-veil-v2`, shipped): the v0.2.0
 "Cosmic-web cue raymarch" row described the CPU reference in
 `engine::render::cue` (kept as a CPU test reference only); the GPU

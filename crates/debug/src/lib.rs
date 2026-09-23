@@ -25,6 +25,7 @@ pub mod cosmic_vista;
 pub mod cosmic_web;
 pub mod cosmic_window;
 pub mod fps;
+pub mod frame_timing;
 pub mod fx;
 pub mod galaxy_map;
 pub mod inspector;
