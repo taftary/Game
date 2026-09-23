@@ -105,5 +105,13 @@ plans/           # per-feature notion -> plan -> implementation
 - `engine::hexsphere` is pure + deterministic: same (N, radius, version) → bit-identical mesh (committed hash test). Chunk identity (`ChunkId` = cell index, ADR-010) is stable under the same triple — the key M2 streaming loads against.
 - `tools` may depend on `engine` with a `test-internals`-style feature, but `game` must not need dev-only features to run.
 - Platform code (`#[cfg(target_os = ...)]`) lives in `engine`, behind traits — `game` stays portable.
+- `debug` may own worker threads for GPU-upload preparation
+  (`cosmic-rebase-async`, v0.3.4, ADR-026 §3 — the version's worker
+  precedent): the worker owns `Arc` clones of immutable inputs and
+  produces plain `Vec`s; it never touches Vulkan objects; the main
+  thread owns every upload and swap. No async runtime (`std::thread`
+  + `mpsc`, generation-tagged requests, latest-wins coalescing,
+  `try_recv` per frame, join on drop — the `TileLoader` / sky-planner
+  house pattern).
 
 Existing `test-internals` feature on `game_engine` is reserved for exactly this kind of white-box tooling.

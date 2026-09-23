@@ -1,9 +1,10 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.48.0 (2026-09-23, v0.3.4 `cosmic-sphere-clip`
-  done: descriptor sphere is a generation cut — peaks outside 250 Mpc
-  rejected before acceptance, `UNIVERSE_VERSION` 3 → 4, pins re-recorded;
-  five v0.3.4 features remain planned)
+- **Version:** 0.49.0 (2026-09-23, v0.3.4 `cosmic-rebase-async`
+  in-progress: rebase never blocks the frame — split seed/rebase
+  rebuilds, off-thread demo-buffer worker with latest-wins + join on
+  drop, headless timed traverse green; reference-HW upload measure +
+  UX hands-on pending)
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))

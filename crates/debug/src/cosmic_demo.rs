@@ -460,8 +460,17 @@ impl CosmicDemoState {
     /// Rebuild reference after a buffer re-upload at the ship: origin
     /// follows the ship (buffers are uploaded relative to it).
     pub fn rebased(&mut self) {
-        self.upload_origin = self.player.position_mpc();
-        self.camera.set_render_origin(self.upload_origin);
+        self.rebased_to(self.player.position_mpc());
+    }
+
+    /// Rebuild reference after an off-thread buffer build: origin
+    /// follows the *build* origin, not the live ship — the swapped
+    /// buffers are relative to it. Applied at swap time, never at
+    /// request time, so the frames in between draw the old buffers
+    /// with the old origin (no snap, `cosmic-rebase-async` FR4).
+    pub fn rebased_to(&mut self, origin: DVec3) {
+        self.upload_origin = origin;
+        self.camera.set_render_origin(origin);
     }
 
     /// HUD target label: the selected node's content ID, if any (WS6

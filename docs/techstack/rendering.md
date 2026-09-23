@@ -280,7 +280,15 @@ own orbit/pan/zoom camera, live player point). The Game Demo tab renders the sam
 player-immersive scene (one glow draw + one splat draw per surface +
 the veil march composite on Medium/High,
 buffers relative to an upload origin, camera recentered on the same
-origin with a 50 Mpc rebase). Both cosmic views render through an
+origin with a 50 Mpc rebase). Rebase never blocks the frame
+(`cosmic-rebase-async`, v0.3.4, ADR-026 §3): crossing the rebase
+distance only queues an off-thread rebuild of the demo glow + splat
+buffers (`CosmicRebaseJob`: origin + generation, latest-wins
+coalescing); each frame polls non-blockingly and, on the matching
+generation, uploads + swaps both buffers in the same frame and moves
+the origin with them. Veil volume, HDR chain and inspector buffers
+rebuild on reseed / load / swapchain recreate only — no fence wait
+is reachable from the frame loop. Both cosmic views render through an
 HDR scene target with a real bloom chain (bright extract + 2-scale
 separable blur + ACES resolve composite) on capable devices, LDR
 bypass otherwise. The dev widget

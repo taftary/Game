@@ -2,8 +2,8 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
-threading precedent, ADR-026 §3)
+`in-progress` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
+threading precedent, ADR-026 §3; DEV implementation started 2026-09-23)
 
 ## Context
 

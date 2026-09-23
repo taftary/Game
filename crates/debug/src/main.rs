@@ -1392,6 +1392,69 @@ fn run_headless(seed: Option<u64>) -> i32 {
         "headless cruise must move Mpc-scale, moved {cruise_moved}"
     );
     println!("cruise_selftest=moved{cruise_moved:.2}Mpc ok");
+    // Rebase traverse (`cosmic-rebase-async` CRA-007/FR6): scripted
+    // max-pace thrust across ≥ 500 Mpc with ≥ 10 rebases (50 Mpc
+    // rebase distance). Two clocks: per-tick time is the FRAME-cost
+    // analog (tick + poll-equivalent bookkeeping — the only work a
+    // windowed frame ever does for a rebase), while the build time is
+    // the WORKER cost (off-frame by design, informational here). The
+    // windowed main thread additionally uploads + swaps the two
+    // buffers on the swap frame only (CRA-008, reference hardware).
+    {
+        use game_debug::cosmic_player::CRUISE_T_CROSS_MIN_S;
+        use game_debug::cosmic_rebase::{build_demo_glow, build_demo_splats};
+        debug_app.cosmic.player.cruise.t_cross_s = CRUISE_T_CROSS_MIN_S;
+        debug_app.cosmic.held.fwd = true;
+        let start = debug_app.cosmic.player.position_mpc();
+        let mut rebases = 0u32;
+        let mut max_tick_ms = 0.0f64;
+        let mut max_build_ms = 0.0f64;
+        let mut ticks = 0u32;
+        let mut travelled = 0.0;
+        while (travelled < 500.0 || rebases < 10) && ticks < 120_000 {
+            ticks += 1;
+            let frame = Instant::now();
+            let crossed = debug_app.cosmic.tick(1.0 / 60.0);
+            max_tick_ms = max_tick_ms.max(frame.elapsed().as_secs_f64() * 1000.0);
+            if crossed {
+                let origin = debug_app.cosmic.player.position_mpc();
+                let built = Instant::now();
+                let glow = build_demo_glow(
+                    &debug_app.cosmic.web,
+                    &debug_app.cosmic.field,
+                    debug_app.cosmic.seed,
+                    origin,
+                    veil_mode(),
+                );
+                let splats =
+                    build_demo_splats(&debug_app.cosmic.field, &debug_app.cosmic.web, origin);
+                max_build_ms = max_build_ms.max(built.elapsed().as_secs_f64() * 1000.0);
+                rebases += 1;
+                assert!(
+                    !glow.is_empty() && !splats.is_empty(),
+                    "rebase build must emit points"
+                );
+                debug_app.cosmic.rebased();
+            }
+            travelled = (debug_app.cosmic.player.position_mpc() - start).length();
+        }
+        debug_app.cosmic.held.clear();
+        println!(
+            "rebase_traverse=travelled{travelled:.1}Mpc ticks{ticks} rebases{rebases} max_tick_ms{max_tick_ms:.2} max_build_ms{max_build_ms:.1} ok"
+        );
+        assert!(
+            travelled >= 500.0,
+            "traverse must cover 500 Mpc, covered {travelled:.1}"
+        );
+        assert!(
+            rebases >= 10,
+            "traverse must rebase ≥ 10×, rebased {rebases}×"
+        );
+        assert!(
+            max_tick_ms <= 33.0,
+            "frame work must stay in budget, max tick {max_tick_ms:.2} ms"
+        );
+    }
     // Unified shell smoke: F2 opens Dimensions on the active
     // waypoint, digits pick dropdown entries, F-keys jump the
     // widget to a sub-tab.
@@ -5447,48 +5510,21 @@ fn upload_map(
     .expect("galaxy map vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic glow point buffer (update-2026-09-18-2328):
-/// particulate grain, then descriptor dwarf glow, then node impostors
-/// (core + halo), laid out by the shared [`cosmic_web`] helpers (one
-/// palette for both 3D surfaces). Positions are origin-relative Mpc;
-/// camera motion rides the MVP push, never this buffer. Rebuilt on
-/// reseed and on rebase (the tick moves the upload origin back under
-/// the ship past the rebase distance).
-fn upload_cosmic_glow(
+/// Map shared glow points to vertices (one helper for the reseed
+/// path and the rebase swap path — identical bytes by construction,
+/// the `cosmic-rebase-async` FR7 pin).
+fn upload_glow_points(
     allocator: &Arc<StandardMemoryAllocator>,
-    web: &WebDescriptor,
-    field: &WebField,
-    seed: u64,
-    origin: glam::DVec3,
-    veil_mode: game_debug::cosmic_veil::VeilMode,
+    points: &[game_debug::cosmic_rebase::GlowPoint],
 ) -> Subbuffer<[MapVertex]> {
-    // `cosmic-gas-veil-v2`: the glow buffer holds hub member galaxies
-    // + tiered hub impostors, plus — in sprites mode only — the grid
-    // cell-sprite veil (deterministic stride-2 subset, ~168k ≤ 200k
-    // Low budget; one body, never both). The old descriptor-glow veil
-    // is retired. Upload order is draw order for
-    // the alpha-blended point draw — veil, then members, then
-    // impostors so cores top the scatter.
-    use game_debug::cosmic_veil::{VeilMode, veil_sprites};
-    let to_vertex = |(pos, color, misc): &([f32; 3], [f32; 3], [f32; 3])| MapVertex {
-        map_pos: *pos,
-        color: *color,
-        misc: *misc,
-    };
-    let mut verts: Vec<MapVertex> = Vec::new();
-    if matches!(veil_mode, VeilMode::Sprites) {
-        verts.extend(veil_sprites(field, origin).iter().step_by(2).map(to_vertex));
-    }
-    verts.extend(
-        game_debug::cosmic_hubs::hub_members(web, seed, origin)
-            .iter()
-            .map(to_vertex),
-    );
-    verts.extend(
-        game_debug::cosmic_hubs::hub_impostors(web, origin)
-            .iter()
-            .map(to_vertex),
-    );
+    let mut verts: Vec<MapVertex> = points
+        .iter()
+        .map(|(pos, color, misc)| MapVertex {
+            map_pos: *pos,
+            color: *color,
+            misc: *misc,
+        })
+        .collect();
     if verts.is_empty() {
         // Degenerate params guard (vulkano rejects zero-length vertex
         // buffers): one transparent point, mirroring upload_sky_points.
@@ -5514,20 +5550,15 @@ fn upload_cosmic_glow(
     .expect("cosmic glow vertex buffer upload must succeed")
 }
 
-/// Upload the cosmic tracer splats (`cosmic-tracer-splat`): one
-/// 16 B [`SplatVertex`] per tracer at High (all tracers; Low/Medium
-/// stride subsets are the tier constants in `cosmic_splat`, drawn by
-/// device profiles — the windowed viewer has no tier switch). A
-/// degenerate empty set uploads one guard point (vulkano rejects
-/// zero-length vertex buffers).
-fn upload_cosmic_splats(
+/// Map shared splat records to vertices (one helper for the reseed
+/// path and the rebase swap path — identical bytes by construction,
+/// the `cosmic-rebase-async` FR7 pin).
+fn upload_splat_records(
     allocator: &Arc<StandardMemoryAllocator>,
-    field: &WebField,
-    web: &WebDescriptor,
-    origin: glam::DVec3,
+    records: &[game_debug::cosmic_splat::SplatRecord],
 ) -> Subbuffer<[SplatVertex]> {
-    use game_debug::cosmic_splat::{SplatTier, splat_pack, splat_records};
-    let mut verts: Vec<SplatVertex> = splat_records(field, web, origin, SplatTier::High)
+    use game_debug::cosmic_splat::splat_pack;
+    let mut verts: Vec<SplatVertex> = records
         .iter()
         .map(|r| {
             let tint = r.class_tint >> 1;
@@ -5558,6 +5589,51 @@ fn upload_cosmic_splats(
         verts,
     )
     .expect("cosmic splat vertex buffer upload must succeed")
+}
+
+/// Upload the cosmic glow point buffer (update-2026-09-18-2328):
+/// particulate grain, then descriptor dwarf glow, then node impostors
+/// (core + halo), laid out by the shared [`cosmic_web`] helpers (one
+/// palette for both 3D surfaces). Positions are origin-relative Mpc;
+/// camera motion rides the MVP push, never this buffer. Rebuilt on
+/// reseed and on rebase (the tick moves the upload origin back under
+/// the ship past the rebase distance).
+fn upload_cosmic_glow(
+    allocator: &Arc<StandardMemoryAllocator>,
+    web: &WebDescriptor,
+    field: &WebField,
+    seed: u64,
+    origin: glam::DVec3,
+    veil_mode: game_debug::cosmic_veil::VeilMode,
+) -> Subbuffer<[MapVertex]> {
+    // `cosmic-gas-veil-v2`: the glow buffer holds hub member galaxies
+    // + tiered hub impostors, plus — in sprites mode only — the grid
+    // cell-sprite veil (deterministic stride-2 subset, ~168k ≤ 200k
+    // Low budget; one body, never both). The old descriptor-glow veil
+    // is retired. Upload order is draw order for
+    // the alpha-blended point draw — veil, then members, then
+    // impostors so cores top the scatter. The CPU build lives in
+    // `cosmic_rebase` (shared with the rebase worker).
+    let points = game_debug::cosmic_rebase::build_demo_glow(web, field, seed, origin, veil_mode);
+    upload_glow_points(allocator, &points)
+}
+
+/// Upload the cosmic tracer splats (`cosmic-tracer-splat`): one
+/// 16 B [`SplatVertex`] per tracer at High (all tracers; Low/Medium
+/// stride subsets are the tier constants in `cosmic_splat`, drawn by
+/// device profiles — the windowed viewer has no tier switch). A
+/// degenerate empty set uploads one guard point (vulkano rejects
+/// zero-length vertex buffers).
+fn upload_cosmic_splats(
+    allocator: &Arc<StandardMemoryAllocator>,
+    field: &WebField,
+    web: &WebDescriptor,
+    origin: glam::DVec3,
+) -> Subbuffer<[SplatVertex]> {
+    // The CPU build lives in `cosmic_rebase` (shared with the rebase
+    // worker — bit-identity pinned there).
+    let records = game_debug::cosmic_rebase::build_demo_splats(field, web, origin);
+    upload_splat_records(allocator, &records)
 }
 
 /// Upload the inspector player point: one origin-relative vertex (near-
@@ -6345,6 +6421,19 @@ struct ViewerApp {
     /// Cosmic tracer splats (16 B vertices, same origin frame;
     /// `cosmic-tracer-splat`).
     cosmic_splats: Subbuffer<[SplatVertex]>,
+    /// Rebase worker (`cosmic-rebase-async`, ADR-026 §3): off-thread
+    /// demo-buffer rebuilds over `Arc` clones of the seed's immutable
+    /// inputs. Recreated on reseed; `None` only when the spawn fails
+    /// (the tick then falls back to the synchronous demo rebuild).
+    rebase_worker: Option<game_debug::cosmic_rebase::RebaseWorker>,
+    /// Rebase generation counter: each request takes the next value;
+    /// only the matching result swaps (stale generations drop).
+    rebase_generation: u64,
+    /// Outstanding rebase request, if any (at most one in flight — a
+    /// newer crossing waits for the swap, then re-requests).
+    rebase_pending: Option<game_debug::cosmic_rebase::RebasePending>,
+    /// Frame counter for rebase telemetry (`swapped after F frames`).
+    tick_count: u64,
     /// Inspector glow buffer (fixed web-center origin, rebuilt on
     /// reseed only — the tab never rebases).
     cosmic_tab_glow: Subbuffer<[MapVertex]>,
@@ -6621,6 +6710,20 @@ impl ViewerApp {
         tracing::info!(
             "cosmic visual build r4: illustris-look (stretched sheath quads + frayed strands + gold beads over bifurcation/spine skeleton) + rim-zero aniso falloff + bounded tint + world halos + resolve clamp"
         );
+        // Rebase worker over the boot seed's inputs (off-thread demo
+        // rebuilds from the first crossing; reseed recreates it).
+        let rebase_worker = match game_debug::cosmic_rebase::RebaseWorker::try_spawn(
+            Arc::new(debug.cosmic.web.clone()),
+            Arc::new(debug.cosmic.field.clone()),
+            cosmic_seed,
+            veil_mode,
+        ) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                tracing::warn!(error = %error, "cosmic rebase worker unavailable: synchronous fallback");
+                None
+            }
+        };
         ViewerApp {
             camera: OrbitCamera::framing_planet(viewer.radius),
             debug,
@@ -6643,6 +6746,10 @@ impl ViewerApp {
             system_lines,
             cosmic_glow,
             cosmic_splats,
+            rebase_worker,
+            rebase_generation: 0,
+            rebase_pending: None,
+            tick_count: 0,
             cosmic_tab_glow,
             cosmic_tab_splats,
             cosmic_tab_player,
@@ -6671,18 +6778,66 @@ impl ViewerApp {
     }
 
     /// Cosmic demo tick: cruise from held input intent, track the
-    /// camera, rebase the buffers past 50 Mpc of travel.
-    /// Parked tabs clear stale thrust (keys never stick across
-    /// switches). The dt floor keeps the flight assert (`dt > 0`)
-    /// green on the very first frame.
+    /// camera, and rebase the buffers past 50 Mpc of travel — without
+    /// ever stalling the frame (`cosmic-rebase-async`): a crossing only
+    /// *requests* an off-thread rebuild (once per generation); every
+    /// frame polls for the result and swaps it in. Parked tabs clear
+    /// stale thrust (keys never stick across switches). The dt floor
+    /// keeps the flight assert (`dt > 0`) green on the very first frame.
     fn tick_cosmic(&mut self, dt: f32) {
         if !matches!(self.debug.screen, Screen::GameDemo) {
             self.debug.cosmic.held.clear();
             return;
         }
-        if self.debug.cosmic.tick(dt.max(1e-6) as f64) {
-            self.debug.cosmic.rebased();
-            self.refresh_cosmic();
+        self.tick_count += 1;
+        if self.debug.cosmic.tick(dt.max(1e-6) as f64) && self.rebase_pending.is_none() {
+            // The ship outran the upload origin: queue a rebuild of the
+            // demo buffers only. The old buffers stay live with the old
+            // origin until the swap — no snap (FR4).
+            let origin = self.debug.cosmic.player.position_mpc();
+            self.rebase_generation += 1;
+            let generation = self.rebase_generation;
+            match self.rebase_worker.as_ref() {
+                Some(worker) => {
+                    worker.request(origin, generation);
+                    self.rebase_pending = Some(game_debug::cosmic_rebase::RebasePending {
+                        generation,
+                        origin,
+                        request_frame: self.tick_count,
+                    });
+                    self.debug
+                        .console
+                        .push(format!("rebase: queued gen {generation}"));
+                }
+                None => {
+                    // Spawn-failure fallback (never on a healthy
+                    // machine): synchronous demo-only rebuild.
+                    self.rebuild_demo_buffers(origin);
+                    self.debug.cosmic.rebased();
+                    self.debug.console.push(format!(
+                        "rebase: swapped gen {generation} after 0 frames (sync fallback)"
+                    ));
+                }
+            }
+        }
+        // Per-frame poll: upload + swap BOTH buffers in the same frame,
+        // then move the origin with them (never one without the other —
+        // A-2). Stale generations drop here silently.
+        if let Some(pending) = self.rebase_pending {
+            let result = self.rebase_worker.as_ref().and_then(|worker| worker.poll());
+            if let Some(result) = result
+                && result.generation == pending.generation
+            {
+                self.cosmic_glow = upload_glow_points(&self.memory_allocator, &result.glow);
+                self.cosmic_splats = upload_splat_records(&self.memory_allocator, &result.splats);
+                self.debug.cosmic.rebased_to(result.origin);
+                let frames = self.tick_count - pending.request_frame;
+                self.debug.console.push(format!(
+                    "rebase: swapped gen {} after {frames} frames",
+                    result.generation
+                ));
+                self.rebase_pending = None;
+            }
         }
         // Vista intro (CVI-005/FR5): drain transition events into the
         // Console (`vista: hold/dive/skipped/done`).
@@ -6731,11 +6886,14 @@ impl ViewerApp {
         );
     }
 
-    /// Rebuild the cosmic-web buffers at the demo upload origin (after
-    /// a reseed or a rebase sail-past). Camera motion between rebuilds
-    /// rides the MVP push, never these buffers. The inspector buffers
-    /// (fixed web-center origin) rebuild on reseed only.
-    fn refresh_cosmic(&mut self) {
+    /// Rebuild all cosmic GPU resources for a new seed (boot, reseed,
+    /// staged load): veil volume + HDR chain + inspector buffers + demo
+    /// buffers. NEVER on rebase — the rebase path (`tick_cosmic` →
+    /// worker → swap) rebuilds the demo buffers only, so no fence wait
+    /// is reachable from the frame loop (FR5). Camera motion between
+    /// rebuilds rides the MVP push, never these buffers. The inspector
+    /// buffers (fixed web-center origin) rebuild here only.
+    fn refresh_cosmic_seed(&mut self) {
         let origin = self.debug.cosmic.upload_origin;
         let seed = self.debug.cosmic.seed;
         let veil_mode = self.veil_mode;
@@ -6802,6 +6960,55 @@ impl ViewerApp {
             links = self.debug.cosmic.web.links.len(),
             "cosmic web buffers rebuilt",
         );
+        self.reset_rebase_worker();
+    }
+
+    /// Synchronously rebuild the demo glow + splat buffers at `origin`
+    /// (rebase fallback + the shared build behind the worker — the
+    /// worker result and this path produce identical bytes via
+    /// `upload_glow_points` / `upload_splat_records`). Veil volume,
+    /// HDR chain and inspector buffers are untouched here by
+    /// construction (DoD 2).
+    fn rebuild_demo_buffers(&mut self, origin: glam::DVec3) {
+        let seed = self.debug.cosmic.seed;
+        let veil_mode = self.veil_mode;
+        self.cosmic_glow = upload_cosmic_glow(
+            &self.memory_allocator,
+            &self.debug.cosmic.web,
+            &self.debug.cosmic.field,
+            seed,
+            origin,
+            veil_mode,
+        );
+        self.cosmic_splats = upload_cosmic_splats(
+            &self.memory_allocator,
+            &self.debug.cosmic.field,
+            &self.debug.cosmic.web,
+            origin,
+        );
+    }
+
+    /// Recreate the rebase worker over the current seed's inputs and
+    /// drop any outstanding request (its generation can never match
+    /// again — the swap gate drops it). The old worker joins on drop;
+    /// a spawn failure leaves `None` (synchronous fallback in the
+    /// tick). Called from the seed path only, never from the tick.
+    fn reset_rebase_worker(&mut self) {
+        let seed = self.debug.cosmic.seed;
+        let veil_mode = self.veil_mode;
+        self.rebase_worker = match game_debug::cosmic_rebase::RebaseWorker::try_spawn(
+            Arc::new(self.debug.cosmic.web.clone()),
+            Arc::new(self.debug.cosmic.field.clone()),
+            seed,
+            veil_mode,
+        ) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                tracing::warn!(error = %error, "cosmic rebase worker unavailable: synchronous fallback");
+                None
+            }
+        };
+        self.rebase_pending = None;
     }
 
     /// Precomputed per-frame cosmic draw state (update-2026-09-18-2328):
@@ -6961,7 +7168,7 @@ impl ViewerApp {
     /// its buffers: `R` in the demo, `--seed` / seed-field loads.
     fn reseed_cosmic(&mut self, seed: u64) {
         self.debug.cosmic.reseed(seed);
-        self.refresh_cosmic();
+        self.refresh_cosmic_seed();
         self.debug.fx.trigger_fade();
         self.debug.fx.notify(format!(
             "Cosmic web seed {seed} · {} nodes",
@@ -7049,7 +7256,7 @@ impl ViewerApp {
                 self.transit_acc = 0.0;
                 self.refresh_system();
             }
-            LoadStep::UploadCosmic => self.refresh_cosmic(),
+            LoadStep::UploadCosmic => self.refresh_cosmic_seed(),
             LoadStep::Finalize => {
                 // Stay on the current screen: a load never switches
                 // tabs (the fade + notify announce the swap).
@@ -10136,6 +10343,116 @@ mod tests {
         // 16 B vertex: the Low buffer budget (300k × 16 B = 4.8 MB)
         // depends on it.
         assert_eq!(std::mem::size_of::<SplatVertex>(), 16);
+    }
+
+    #[test]
+    fn rebase_path_touches_demo_buffers_only() {
+        // `cosmic-rebase-async` CRA-002 / DoD 2 source pin: the
+        // frame-loop rebase path rebuilds only the demo glow + splat
+        // buffers — veil volume, HDR chain and inspector buffers are
+        // unreachable from it (they rebuild on the seed path only).
+        // String pins: no GPU-free way to observe `Subbuffer` identity.
+        let source = include_str!("main.rs");
+        let tick = viewer_method_body(source, "tick_cosmic");
+        for banned in [
+            "upload_veil_volume",
+            "build_hdr_chain",
+            "cosmic_tab_",
+            "refresh_cosmic_seed",
+            "wait(",
+        ] {
+            assert!(
+                !tick.contains(banned),
+                "tick_cosmic must not contain {banned:?}"
+            );
+        }
+        for required in [
+            "rebase_worker",
+            "rebase_pending",
+            "rebase: queued",
+            "rebase: swapped",
+            "rebased_to",
+        ] {
+            assert!(
+                tick.contains(required),
+                "tick_cosmic must contain {required:?}"
+            );
+        }
+        let seed = viewer_method_body(source, "refresh_cosmic_seed");
+        for required in [
+            "upload_veil_volume",
+            "build_hdr_chain",
+            "cosmic_tab_glow",
+            "cosmic_tab_splats",
+        ] {
+            assert!(
+                seed.contains(required),
+                "refresh_cosmic_seed must contain {required:?}"
+            );
+        }
+        let demo = viewer_method_body(source, "rebuild_demo_buffers");
+        for banned in [
+            "upload_veil_volume",
+            "build_hdr_chain",
+            "cosmic_tab_",
+            "wait(",
+        ] {
+            assert!(
+                !demo.contains(banned),
+                "rebuild_demo_buffers must not contain {banned:?}"
+            );
+        }
+        // Fence pin (CRA-006 / FR5): the veil upload's blocking wait is
+        // reachable only through the seed path — the veil upload has
+        // exactly four call sites: its definition, the offscreen
+        // capture entry, the boot upload, and refresh_cosmic_seed. The
+        // needle is built at runtime so this pin does not count itself.
+        let needle = ["upload_veil_volume", "("].concat();
+        let sites: Vec<usize> = source
+            .match_indices(needle.as_str())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(sites.len(), 4, "veil upload call sites changed");
+        let mut owners: Vec<&str> = sites.iter().map(|pos| enclosing_fn(source, *pos)).collect();
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            [
+                "new",
+                "refresh_cosmic_seed",
+                "run_capture",
+                "upload_veil_volume"
+            ],
+            "veil upload reached from an unexpected path"
+        );
+    }
+
+    /// Name of the free function or `ViewerApp` method enclosing byte
+    /// `pos` (the rebase pins above).
+    fn enclosing_fn(source: &str, pos: usize) -> &str {
+        let head = &source[..pos];
+        let method = head.rfind("\n    fn ");
+        let free = head.rfind("\nfn ");
+        let start = method.max(free).expect("a fn must precede the call site");
+        let tail = &source[start..];
+        let rest = &tail[tail.find("fn ").expect("fn keyword") + 3..];
+        let end = rest.find(['(', ' ', '\n']).expect("fn name must end");
+        rest[..end].trim()
+    }
+
+    /// Slice the `impl ViewerApp` method `name` out of this file's own
+    /// source (the rebase source pins above — same string-pin
+    /// precedent as `cosmic_shader_safety_pins`).
+    fn viewer_method_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("    fn {name}("))
+            .unwrap_or_else(|| panic!("method {name} missing from main.rs"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n    fn ")
+            .map(|i| start + i)
+            .unwrap_or(source.len());
+        &source[start..end]
     }
 
     #[test]
