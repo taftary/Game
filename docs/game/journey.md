@@ -105,8 +105,10 @@ v0.3.2) then stages 1–2 with quantized cross-platform hashes;
 Game Demo tab (`F1`, default) renders the player flying inside it
 (`ShipState` in `FrameId::Cosmological`, marker + Chase/Orbit/
 FirstPerson camera, scale-relative cruise + click/`E` fly-to, shipping
-HUD with live speed). Since v0.3.3 (`cosmic-vista-intro`) the demo
-boots on a vista intro: the reference composition (nearest Tier-A hub,
+HUD with live speed). Since v0.3.3 (`cosmic-vista-intro`, reframed by
+v0.3.4 `cosmic-vista-reframe` onto an interior window — composition
+hub, no sphere limb in frame) the demo
+boots on a vista intro: the reference composition (composition Tier-A hub,
 25° FOV, 40 Mpc slab) holds 2 s, then dives 8 s to the spawn Chase
 pose — skippable with any input, replayable with `V`.
 while the Cosmic Web dimension tab (`F2` dropdown, digit `1`) inspects

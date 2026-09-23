@@ -1325,6 +1325,31 @@ fn pose_demo_camera_for_vista_capture(debug: &mut DebugApp) {
     debug.cosmic.camera.set_fov_y(pose.fov_y_deg.to_radians());
 }
 
+/// Pose the inspector for a `slab` capture (`cosmic-vista-reframe`
+/// CVR-005 test seam): the interior-window `vista_pose` eye/target on
+/// the inspector orbit camera, then the slab mode as today (20°
+/// near-ortho + 30 Mpc slice). Returns the `vista_pose` so the caller
+/// windows the slice at the hub depth (not the home depth).
+/// Pure per seed (pose is a pure function of the descriptor + chase).
+fn pose_inspector_for_slab_capture(debug: &mut DebugApp) -> game_debug::cosmic_vista::VistaPose {
+    let chase = debug.cosmic.chase_pose();
+    let pose = game_debug::cosmic_vista::vista_pose(
+        &debug.cosmic.web,
+        debug.cosmic.params.descriptor_radius_mpc,
+        &chase,
+    );
+    debug.cosmic_inspector.camera.set_fov_keep_framing(20.0);
+    debug.cosmic_inspector.slab = game_debug::cosmic_window::SlabState::default_on();
+    let eye = glam::Vec3::new(pose.eye.x as f32, pose.eye.y as f32, pose.eye.z as f32);
+    let target = glam::Vec3::new(
+        pose.target.x as f32,
+        pose.target.y as f32,
+        pose.target.z as f32,
+    );
+    debug.cosmic_inspector.camera.set_eye_target(eye, target);
+    pose
+}
+
 /// GPU-free viewer check: build the default mesh through the lib, print
 /// stats, run the pick self-test, exit 0. Never touches
 /// `VulkanLibrary` or `EventLoop`. `seed` overrides the universe the
@@ -2045,14 +2070,17 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     );
     let is_demo = preset.surface_is_demo;
     let aspect = w as f32 / h as f32;
-    // Depth window (`cosmic-depth-window` CDW-007): the `slab` preset
-    // narrows to 20° (framing kept by the distance rescale) and windows
-    // a 30 Mpc slice at the home node's view depth — the target's
-    // composition. `inspector` stays full-depth 60°.
-    if request.view == CaptureView::Slab {
-        debug.cosmic_inspector.camera.set_fov_keep_framing(20.0);
-        debug.cosmic_inspector.slab = game_debug::cosmic_window::SlabState::default_on();
-    }
+    // Depth window (`cosmic-depth-window` CDW-007, reframed by
+    // `cosmic-vista-reframe` CVR-005): the `slab` preset is the
+    // interior-window `vista_pose` eye/target on the inspector orbit
+    // camera (no limb in frame), then the slab mode as today (20°
+    // near-ortho + 30 Mpc slice at the hub depth). `inspector` stays
+    // full-depth 60° at the default framing.
+    let slab_vista_pose = if request.view == CaptureView::Slab {
+        Some(pose_inspector_for_slab_capture(&mut debug))
+    } else {
+        None
+    };
     // Vista intro (`cosmic-vista-intro` CVI-008): the `vista` preset IS
     // the t = 0 vista pose — external pose + 25° FOV on the demo
     // camera, driven per seed by `vista_pose` (the same pose the live
@@ -2107,15 +2135,27 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     } else {
         let inspector = &debug.cosmic_inspector;
         let e = inspector.camera.eye();
-        // Slab center: home-node view depth under the preset camera.
+        // Slab center: the vista hub depth on the reframed preset
+        // (CVR-005 — the slice windows the focal hub, never home);
+        // the plain inspector has no slab.
         let (slab_center, slab_half) = if inspector.slab.on {
-            let home = debug.cosmic.web.home().position_mpc;
-            let fwd = (inspector.camera.target() - e).normalize_or_zero();
-            let depth = ((home[0] as f32 - e.x) * fwd.x
-                + (home[1] as f32 - e.y) * fwd.y
-                + (home[2] as f32 - e.z) * fwd.z)
-                .max(0.0);
-            (depth, inspector.slab.thickness_mpc * 0.5)
+            if let Some(pose) = slab_vista_pose {
+                // Inspector eye == vista eye by the pose seam above, so
+                // the hub depth is the orbit distance.
+                let _ = pose;
+                (
+                    inspector.camera.distance(),
+                    inspector.slab.thickness_mpc * 0.5,
+                )
+            } else {
+                let home = debug.cosmic.web.home().position_mpc;
+                let fwd = (inspector.camera.target() - e).normalize_or_zero();
+                let depth = ((home[0] as f32 - e.x) * fwd.x
+                    + (home[1] as f32 - e.y) * fwd.y
+                    + (home[2] as f32 - e.z) * fwd.z)
+                    .max(0.0);
+                (depth, inspector.slab.thickness_mpc * 0.5)
+            }
         } else {
             (0.0, 0.0)
         };
@@ -10672,6 +10712,65 @@ mod tests {
         assert_eq!(want.inv_fog_l, 0.0);
         // The request routes vista to the demo surface (preset pin).
         assert!(game_debug::cosmic_capture::preset_for(CaptureView::Vista).surface_is_demo);
+    }
+
+    #[test]
+    fn slab_capture_pose_matches_vista_pose() {
+        // CVR-005/FR5: the `slab` preset IS the interior-window
+        // `vista_pose` eye/target on the inspector orbit camera, with
+        // the slab mode as today (20° + 30 Mpc at the hub depth).
+        // Deterministic per seed (pose is pure); the slab slice stays
+        // inside the sphere cross-section (no limb — DoD 1).
+        use game_debug::cosmic_capture::CaptureView;
+        use game_debug::cosmic_vista::{VISTA_WINDOW_H_MPC, VISTA_WINDOW_W_MPC, interior_window};
+        let mut debug = DebugApp::new();
+        let pose = pose_inspector_for_slab_capture(&mut debug);
+        let eye = debug.cosmic_inspector.camera.eye();
+        let target = debug.cosmic_inspector.camera.target();
+        let want_eye = glam::Vec3::new(pose.eye.x as f32, pose.eye.y as f32, pose.eye.z as f32);
+        let want_target = glam::Vec3::new(
+            pose.target.x as f32,
+            pose.target.y as f32,
+            pose.target.z as f32,
+        );
+        assert!((eye - want_eye).length() < 1e-3);
+        assert!((target - want_target).length() < 1e-3);
+        assert!((debug.cosmic_inspector.camera.fov_y() - 20.0_f32.to_radians()).abs() < 1e-6);
+        assert!(debug.cosmic_inspector.slab.on);
+        assert_eq!(debug.cosmic_inspector.slab.thickness_mpc, 30.0);
+        // The hub depth is the orbit distance (slice windows the hub).
+        assert!(
+            (debug.cosmic_inspector.camera.distance() - (want_eye - want_target).length()).abs()
+                < 1e-3
+        );
+        // Interior window still fits at the hub depth with the slab
+        // thickness (30 Mpc is easier than the 40 Mpc the pose was
+        // built on — the exact check is the gate).
+        let c = glam::DVec3::new(
+            want_target.x as f64,
+            want_target.y as f64,
+            want_target.z as f64,
+        )
+        .length();
+        assert!(
+            interior_window(
+                debug.cosmic.params.descriptor_radius_mpc,
+                c,
+                VISTA_WINDOW_W_MPC,
+                VISTA_WINDOW_H_MPC,
+                30.0,
+                game_debug::cosmic_vista::VISTA_WINDOW_MARGIN_MPC,
+            )
+            .is_some(),
+            "slab hub depth must fit the interior window"
+        );
+        // Deterministic: re-pose reproduces the same camera.
+        let mut debug2 = DebugApp::new();
+        let pose2 = pose_inspector_for_slab_capture(&mut debug2);
+        assert_eq!(pose.eye, pose2.eye);
+        assert_eq!(pose.target, pose2.target);
+        // The request routes slab to the inspector surface (preset pin).
+        assert!(!game_debug::cosmic_capture::preset_for(CaptureView::Slab).surface_is_demo);
     }
 
     #[test]

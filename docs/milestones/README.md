@@ -148,12 +148,12 @@ six features in scope, version named `v0.3.4`.
 
 | # | Feature | Status | Crate(s) | Scope |
 |---|---|---|---|---|
-| F1 | [`cosmic-sphere-clip`](../../plans/v0.3.4/cosmic-sphere-clip/) | planned | engine | peaks outside `descriptor_radius_mpc` rejected before acceptance; links/glow inherit; `UNIVERSE_VERSION` 3→4; pins + bands re-recorded; every node ≤ radius pinned |
-| F2 | [`cosmic-rebase-async`](../../plans/v0.3.4/cosmic-rebase-async/) | planned | debug | rebase rebuilds only origin-dependent buffers; CPU build on a worker thread (`TileLoader` pattern), buffer swap on the frame; veil volume / HDR chain / inspector buffers rebuild on reseed only; no fence wait in the loop |
+| F1 | [`cosmic-sphere-clip`](../../plans/v0.3.4/cosmic-sphere-clip/) | done | engine | peaks outside `descriptor_radius_mpc` rejected before acceptance; links/glow inherit; `UNIVERSE_VERSION` 3→4; pins + bands re-recorded; every node ≤ radius pinned |
+| F2 | [`cosmic-rebase-async`](../../plans/v0.3.4/cosmic-rebase-async/) | done | debug | rebase rebuilds only origin-dependent buffers; CPU build on a worker thread (`TileLoader` pattern), buffer swap on the frame; veil volume / HDR chain / inspector buffers rebuild on reseed only; no fence wait in the loop |
 | F3 | [`cosmic-gpu-tracers`](../../plans/v0.3.4/cosmic-gpu-tracers/) | done | engine + debug | `WebField.displacement` grid replaces `tracers`; splat vertex shader generates sub-tracers per cell (tier draw counts 1/2/8); per-seed cell list; retires `splat_records` + `SplatVertex` |
-| F4 | [`cosmic-void-contrast`](../../plans/v0.3.4/cosmic-void-contrast/) | planned | debug | shared transfer function: sub-mean → near-black, filament contrast band, soft rim fade; voids measured ≤ 1.15× backdrop |
-| F5 | [`cosmic-hub-compact-cores`](../../plans/v0.3.4/cosmic-hub-compact-cores/) | planned | debug | pixel-capped cores, members as the visible mass, bloom halo ≤ 3× core; ≤ 10 blazing nodes at slab framing |
-| F6 | [`cosmic-vista-reframe`](../../plans/v0.3.4/cosmic-vista-reframe/) | planned | debug | `vista` + `slab` presets frame an interior window (no sphere limb in frame); hub choice by composition; version headline shot |
+| F4 | [`cosmic-void-contrast`](../../plans/v0.3.4/cosmic-void-contrast/) | done | debug | shared transfer function: sub-mean → near-black, filament contrast band, soft rim fade; voids measured ≤ 1.15× backdrop |
+| F5 | [`cosmic-hub-compact-cores`](../../plans/v0.3.4/cosmic-hub-compact-cores/) | done | debug | pixel-capped cores, members as the visible mass, bloom halo ≤ 3× core; ≤ 10 blazing nodes at slab framing |
+| F6 | [`cosmic-vista-reframe`](../../plans/v0.3.4/cosmic-vista-reframe/) | done | debug | `vista` + `slab` presets frame an interior window (no sphere limb in frame); hub choice by composition; version headline shot |
 
 Still deferred after this version: anisotropic (quad) splats
 stretched along the collapse axis, LOD/culling hardening, 2LPT /

@@ -275,6 +275,50 @@ pub fn interior_window(r: f64, c: f64, w: f64, h: f64, t: f64, margin: f64) -> O
     }
 }
 
+/// 16:9 shrink fallback for [`interior_window`] (FR1): when the full
+/// `w × h` footprint cannot fit at `|c|`, return the largest fitting
+/// footprint keeping the exact 16:9 ratio (`h = 9·w/16`) with its eye
+/// distance at the 25° vista FOV. Returns the full footprint unchanged
+/// when it already fits; `None` when even a degenerate footprint
+/// cannot fit (no cross-section left after `margin + t/2`).
+/// Pure arithmetic, deterministic.
+pub fn interior_window_shrink(
+    r: f64,
+    c: f64,
+    w: f64,
+    h: f64,
+    t: f64,
+    margin: f64,
+) -> Option<(f64, f32, f64, f64)> {
+    if interior_window(r, c, w, h, t, margin).is_some() {
+        let (d, fov) = interior_window(r, c, w, h, t, margin).expect("checked fit");
+        return Some((d, fov, w, h));
+    }
+    if r <= 0.0 || !r.is_finite() || c.abs() >= r {
+        return None;
+    }
+    let cross = (r * r - c * c).sqrt();
+    let allowed = cross - margin - t * 0.5;
+    if !allowed.is_finite() || allowed <= 0.0 {
+        return None;
+    }
+    // 16:9 half-diagonal factor: sqrt((1/2)² + (9/32)²).
+    let half_diag_per_w = ((0.5_f64).powi(2) + (9.0 / 32.0_f64).powi(2)).sqrt();
+    let mut w_fit = allowed / half_diag_per_w;
+    if !w_fit.is_finite() || w_fit <= 0.0 {
+        return None;
+    }
+    w_fit = w_fit.min(w);
+    let h_fit = w_fit * 9.0 / 16.0;
+    if !h_fit.is_finite() || h_fit <= 0.0 {
+        return None;
+    }
+    // The shrunk footprint fits by construction; verify through the
+    // exact check so the ratio rounding can never lie.
+    let (d, fov) = interior_window(r, c, w_fit, h_fit, t, margin)?;
+    Some((d, fov, w_fit, h_fit))
+}
+
 /// Hub choice by composition (FR2): the Tier-A node maximizing
 /// `rank_score − λ·|h|/R` among hubs whose focal footprint fits the
 /// interior window (`rank_score = 1 − rank/(n−1)`, 1 for the most
@@ -327,8 +371,9 @@ fn dive_peak_deg_per_s(from: &VistaPose, to: &VistaPose) -> f32 {
 /// Composition opening pose for one hub (FR3): focal footprint
 /// centre as the look target, eye on the radial axis at the
 /// interior-window distance, slab plane through the bounded slab
-/// centre.
-fn composition_pose_for_hub(hub: DVec3, radius_mpc: f64) -> VistaPose {
+/// centre. `w × h` are the footprint dims the hub was filtered on
+/// (full window, or the FR1 16:9 shrunk dims on the fallback path).
+fn composition_pose_for_hub(hub: DVec3, radius_mpc: f64, w: f64, h: f64) -> VistaPose {
     let h_len = hub.length();
     let c_vec = if h_len > 1e-6 {
         hub * (VISTA_SLAB_CENTER_FRAC * radius_mpc / h_len).min(1.0)
@@ -339,8 +384,8 @@ fn composition_pose_for_hub(hub: DVec3, radius_mpc: f64) -> VistaPose {
     let (d, fov) = interior_window(
         radius_mpc,
         f.length(),
-        VISTA_WINDOW_W_MPC,
-        VISTA_WINDOW_H_MPC,
+        w,
+        h,
         f64::from(VISTA_SLAB_MPC),
         VISTA_WINDOW_MARGIN_MPC,
     )
@@ -404,17 +449,55 @@ pub fn vista_pose(web: &WebDescriptor, radius_mpc: f64, chase: &VistaPose) -> Vi
         // otherwise the gentlest dive wins (best effort, still
         // deterministic). Ties → lowest index (brightest first).
         let picked = pick_dive_safe_hub(&feasible, radius_mpc, chase);
-        return composition_pose_for_hub(picked, radius_mpc);
+        return composition_pose_for_hub(
+            picked,
+            radius_mpc,
+            VISTA_WINDOW_W_MPC,
+            VISTA_WINDOW_H_MPC,
+        );
     }
-    // (2–4) Legacy chain (v0.3.3, kept for degenerate seeds): nearest
+    // (2) FR1 16:9 shrink fallback: no full-window Tier-A hub fits —
+    // keep the interior-window rule on the largest fitting footprint
+    // instead of falling straight to the outside legacy framing.
+    // Each candidate carries its own shrunk dims; the dive-exact
+    // shortlist runs on the shrunk poses.
+    let mut shrunk: Vec<(u32, DVec3, f64, f64, f64)> = Vec::new();
+    for (rank, node) in web.nodes.iter().enumerate() {
+        if !is_tier_a(rank, n) {
+            continue;
+        }
+        let h = DVec3::new(
+            node.position_mpc[0],
+            node.position_mpc[1],
+            node.position_mpc[2],
+        );
+        let f = focal_footprint_center(h);
+        if let Some((_, _, w_fit, h_fit)) = interior_window_shrink(
+            radius_mpc,
+            f.length(),
+            VISTA_WINDOW_W_MPC,
+            VISTA_WINDOW_H_MPC,
+            f64::from(VISTA_SLAB_MPC),
+            VISTA_WINDOW_MARGIN_MPC,
+        ) {
+            let comp = vista_hub_composition_score(rank, n, h.length(), radius_mpc);
+            shrunk.push((node.node_index, h, comp, w_fit, h_fit));
+        }
+    }
+    if !shrunk.is_empty() {
+        let picked = pick_dive_safe_hub_shrunk(&shrunk, radius_mpc, chase);
+        return composition_pose_for_hub(picked.0, radius_mpc, picked.1, picked.2);
+    }
+    // (3–5) Legacy chain (v0.3.3, kept for degenerate seeds): nearest
     // Tier A to home → most massive within 150 Mpc of home → most
     // massive overall, viewed from 180 Mpc with home ~6° off-axis.
     legacy_vista_pose(web)
 }
 
 /// Picked hub position for an opening pose (test seam): the hub the
-/// dive-exact shortlist in [`vista_pose`] selects, or `None` when the
-/// legacy fallback owns the pose.
+/// dive-exact shortlist in [`vista_pose`] selects (full window, then
+/// the FR1 16:9 shrink fallback), or `None` when the legacy fallback
+/// owns the pose.
 pub fn vista_pose_hub(web: &WebDescriptor, radius_mpc: f64, chase: &VistaPose) -> Option<DVec3> {
     let n = web.nodes.len();
     if n == 0 {
@@ -435,10 +518,36 @@ pub fn vista_pose_hub(web: &WebDescriptor, radius_mpc: f64, chase: &VistaPose) -
             feasible.push((node.node_index, h, comp));
         }
     }
-    if feasible.is_empty() {
+    if !feasible.is_empty() {
+        return Some(pick_dive_safe_hub(&feasible, radius_mpc, chase));
+    }
+    let mut shrunk: Vec<(u32, DVec3, f64, f64, f64)> = Vec::new();
+    for (rank, node) in web.nodes.iter().enumerate() {
+        if !is_tier_a(rank, n) {
+            continue;
+        }
+        let h = DVec3::new(
+            node.position_mpc[0],
+            node.position_mpc[1],
+            node.position_mpc[2],
+        );
+        let f = focal_footprint_center(h);
+        if let Some((_, _, w_fit, h_fit)) = interior_window_shrink(
+            radius_mpc,
+            f.length(),
+            VISTA_WINDOW_W_MPC,
+            VISTA_WINDOW_H_MPC,
+            f64::from(VISTA_SLAB_MPC),
+            VISTA_WINDOW_MARGIN_MPC,
+        ) {
+            let comp = vista_hub_composition_score(rank, n, h.length(), radius_mpc);
+            shrunk.push((node.node_index, h, comp, w_fit, h_fit));
+        }
+    }
+    if shrunk.is_empty() {
         return None;
     }
-    Some(pick_dive_safe_hub(&feasible, radius_mpc, chase))
+    Some(pick_dive_safe_hub_shrunk(&shrunk, radius_mpc, chase).0)
 }
 
 /// Dive-exact shortlist over feasible `(index, hub, composition)`
@@ -448,7 +557,7 @@ fn pick_dive_safe_hub(feasible: &[(u32, DVec3, f64)], radius_mpc: f64, chase: &V
     let mut best_in_bound: Option<(f64, u32, DVec3)> = None;
     let mut best_effort: Option<(f32, u32, DVec3)> = None;
     for (index, h, comp) in feasible {
-        let pose = composition_pose_for_hub(*h, radius_mpc);
+        let pose = composition_pose_for_hub(*h, radius_mpc, VISTA_WINDOW_W_MPC, VISTA_WINDOW_H_MPC);
         let peak = dive_peak_deg_per_s(&pose, chase);
         if peak <= VISTA_MAX_ANGULAR_DEG_PER_S {
             let replace = match best_in_bound {
@@ -471,6 +580,42 @@ fn pick_dive_safe_hub(feasible: &[(u32, DVec3, f64)], radius_mpc: f64, chase: &V
         .map(|(_, _, h)| h)
         .or_else(|| best_effort.map(|(_, _, h)| h))
         .expect("feasible is non-empty")
+}
+
+/// Dive-exact shortlist over FR1-shrunk `(index, hub, composition,
+/// w, h)` candidates: same rule as [`pick_dive_safe_hub`] on the
+/// per-hub shrunk poses. Returns `(hub, w, h)` for the pose call.
+fn pick_dive_safe_hub_shrunk(
+    shrunk: &[(u32, DVec3, f64, f64, f64)],
+    radius_mpc: f64,
+    chase: &VistaPose,
+) -> (DVec3, f64, f64) {
+    let mut best_in_bound: Option<(f64, u32, DVec3, f64, f64)> = None;
+    let mut best_effort: Option<(f32, u32, DVec3, f64, f64)> = None;
+    for (index, h, comp, w, hh) in shrunk {
+        let pose = composition_pose_for_hub(*h, radius_mpc, *w, *hh);
+        let peak = dive_peak_deg_per_s(&pose, chase);
+        if peak <= VISTA_MAX_ANGULAR_DEG_PER_S {
+            let replace = match best_in_bound {
+                None => true,
+                Some((b, bi, _, _, _)) => *comp > b || (*comp == b && *index < bi),
+            };
+            if replace {
+                best_in_bound = Some((*comp, *index, *h, *w, *hh));
+            }
+        }
+        let replace = match best_effort {
+            None => true,
+            Some((b, bi, _, _, _)) => peak < b || (peak == b && *index < bi),
+        };
+        if replace {
+            best_effort = Some((peak, *index, *h, *w, *hh));
+        }
+    }
+    best_in_bound
+        .map(|(_, _, h, w, hh)| (h, w, hh))
+        .or_else(|| best_effort.map(|(_, _, h, w, hh)| (h, w, hh)))
+        .expect("shrunk is non-empty")
 }
 
 /// Focal-footprint feasibility for one hub: the interior window fits
@@ -645,6 +790,32 @@ mod tests {
         assert!(interior_window(250.0, 250.0, 300.0, 170.0, 40.0, 15.0).is_none());
         // A smaller 16:9 footprint fits deeper (the FR1 fallback).
         assert!(interior_window(250.0, 100.0, 150.0, 85.0, 40.0, 15.0).is_some());
+    }
+
+    #[test]
+    fn interior_window_shrink_keeps_16_9_and_fits() {
+        // FR1 fallback: full 300×170 fits at the centre (returned
+        // unchanged); at |c| = 200 the full window rejects but the
+        // shrunk 16:9 footprint fits; at the rim nothing fits.
+        let full =
+            interior_window_shrink(250.0, 0.0, 300.0, 170.0, 40.0, 15.0).expect("centre must fit");
+        assert!((full.2 - 300.0).abs() < 1e-9);
+        assert!((full.3 - 170.0).abs() < 1e-9);
+        assert!(interior_window(250.0, 200.0, 300.0, 170.0, 40.0, 15.0).is_none());
+        let (d, fov, w_fit, h_fit) = interior_window_shrink(250.0, 200.0, 300.0, 170.0, 40.0, 15.0)
+            .expect("shrink must fit at |c|=200");
+        assert_eq!(fov, VISTA_FOV_DEG);
+        assert!((h_fit - w_fit * 9.0 / 16.0).abs() < 1e-9, "must keep 16:9");
+        assert!(w_fit < 300.0, "must shrink, got {w_fit}");
+        // The shrunk footprint fits by the exact check, at the shrunk
+        // eye distance.
+        let (d_check, _) = interior_window(250.0, 200.0, w_fit, h_fit, 40.0, 15.0)
+            .expect("shrunk must pass the exact check");
+        assert!((d - d_check).abs() < 1e-9);
+        // Rim: no cross-section left → None (not a degenerate window).
+        assert!(interior_window_shrink(250.0, 240.0, 300.0, 170.0, 40.0, 15.0).is_some());
+        assert!(interior_window_shrink(250.0, 250.0, 300.0, 170.0, 40.0, 15.0).is_none());
+        assert!(interior_window_shrink(0.0, 0.0, 300.0, 170.0, 40.0, 15.0).is_none());
     }
 
     #[test]

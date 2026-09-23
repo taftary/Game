@@ -235,6 +235,43 @@ impl MapOrbitCamera {
         }
     }
 
+    /// Point the orbit camera along an explicit eye→target axis
+    /// (`cosmic-vista-reframe` FR5): the slab capture poses the
+    /// inspector from the interior-window `vista_pose` eye/target.
+    /// Yaw/pitch derive from the offset (`yaw = atan2(z, x)`,
+    /// `pitch = asin(y/d)`), distance clamps to the zoom band;
+    /// degenerate (non-finite, zero-length, polar) inputs keep the
+    /// current tilt. Pure math, deterministic.
+    pub fn set_eye_target(&mut self, eye: Vec3, target: Vec3) {
+        if !eye.is_finite() || !target.is_finite() {
+            return;
+        }
+        let off = eye - target;
+        let dist = off.length();
+        if !dist.is_finite() || dist <= 1e-6 {
+            return;
+        }
+        let pitch = (off.y / dist).clamp(-1.0, 1.0).asin();
+        if !pitch.is_finite() {
+            return;
+        }
+        let cp = pitch.cos();
+        let mut yaw = self.yaw;
+        if cp.abs() > 1e-6 {
+            let y = (off.z / dist) / cp;
+            let x = (off.x / dist) / cp;
+            let computed = y.atan2(x);
+            if computed.is_finite() {
+                yaw = computed;
+            }
+        }
+        let pitch_clamped = pitch.clamp(-MAP_MAX_PITCH, MAP_MAX_PITCH);
+        self.target = target;
+        self.yaw = yaw;
+        self.pitch = pitch_clamped;
+        self.distance = dist.clamp(self.min_distance, self.max_distance);
+    }
+
     /// Current distance (post-clamp).
     pub fn distance(&self) -> f32 {
         self.distance
@@ -497,5 +534,36 @@ mod tests {
                 "projection must stay directx at {fov}°"
             );
         }
+    }
+
+    #[test]
+    fn set_eye_target_round_trips_off_axis_poses() {
+        // FR5: the slab capture poses the inspector from the
+        // interior-window eye/target — the orbit must reproduce the
+        // axis (target centres, eye at the window distance).
+        let mut cam = MapOrbitCamera::new(
+            Vec3::ZERO,
+            430.0,
+            DEFAULT_YAW,
+            DEFAULT_PITCH,
+            10.0,
+            2000.0,
+            250.0,
+        );
+        let eye = Vec3::new(120.0, 60.0, 390.0);
+        let target = Vec3::new(15.0, -10.0, 40.0);
+        cam.set_eye_target(eye, target);
+        assert!((cam.target() - target).length() < 1e-4);
+        assert!((cam.eye() - eye).length() < 1e-3, "eye {:?}", cam.eye());
+        assert!((cam.eye() - cam.target()).length() - (eye - target).length() < 1e-3);
+        // Degenerate inputs are no-ops (tilt + target preserved).
+        let (t0, y0, p0, d0) = (cam.target(), cam.yaw(), cam.pitch(), cam.distance());
+        cam.set_eye_target(eye, eye);
+        assert_eq!(cam.target(), t0);
+        assert_eq!(cam.yaw(), y0);
+        assert_eq!(cam.pitch(), p0);
+        assert_eq!(cam.distance(), d0);
+        cam.set_eye_target(Vec3::NAN, target);
+        assert_eq!(cam.target(), t0);
     }
 }

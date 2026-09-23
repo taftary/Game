@@ -58,7 +58,12 @@ pub const INSPECTOR_PRESET: CapturePreset = CapturePreset {
 };
 
 /// Target framing (inspector basis + 30 Mpc slab); the binary narrows
-/// to the 20° slab camera at capture time.
+/// to the 20° slab camera at capture time. Since `cosmic-vista-reframe`
+/// (CVR-005/FR5) the `slab` capture poses the inspector from the
+/// interior-window `vista_pose` eye/target (no limb in frame) and
+/// windows the slice at the hub depth — the static offsets below only
+/// mirror the inspector basis for the unit tests, like the vista
+/// mirrors the demo basis.
 pub const SLAB_PRESET: CapturePreset = CapturePreset {
     view: CaptureView::Slab,
     surface_is_demo: false,
@@ -82,8 +87,10 @@ pub const DEMO_PRESET: CapturePreset = CapturePreset {
     height: CAPTURE_DEFAULT_SIZE.1,
 };
 
-/// Opening shot (`cosmic-vista-intro` CVI-008): the t = 0 vista pose —
-/// 25° FOV, 40 Mpc slab, fog off — computed per seed by
+/// Opening shot (`cosmic-vista-intro` CVI-008, reframed by
+/// `cosmic-vista-reframe` CVR-005/FR3): the t = 0 vista pose —
+/// interior-window eye/target on the composition hub (no limb in
+/// frame), 25° FOV, 40 Mpc slab, fog off — computed per seed by
 /// `cosmic_vista::vista_pose` (the binary poses the demo camera from
 /// it; the static offsets below mirror the demo basis framing like
 /// the slab mirrors the inspector).
@@ -577,6 +584,55 @@ mod tests {
         reader.next_frame(&mut pixels).expect("png frame");
         assert_eq!(pixels.len(), w as usize * h as usize * 4);
         (w, h, pixels)
+    }
+
+    /// Load a committed RGBA8 shot from the vista-reframe feature folder.
+    #[cfg(test)]
+    fn load_reframe_shot_rgba8(name: &str) -> (u32, u32, Vec<u8>) {
+        let path = format!(
+            "{}/../../plans/v0.3.4/cosmic-vista-reframe/shots/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).expect("vista-reframe shot must exist");
+        let decoder = png::Decoder::new(bytes.as_slice());
+        let mut reader = decoder.read_info().expect("png header");
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        let (w, h) = (reader.info().width, reader.info().height);
+        let mut pixels = vec![0u8; reader.output_buffer_size()];
+        reader.next_frame(&mut pixels).expect("png frame");
+        assert_eq!(pixels.len(), w as usize * h as usize * 4);
+        (w, h, pixels)
+    }
+
+    /// Worst radial luminance step over any 10 px span past the central
+    /// hub complex (r ≥ 60 px), shared by the reframe limb pins.
+    #[cfg(test)]
+    fn worst_radial_step_10px(w: u32, h: u32, lum: &[f64]) -> f64 {
+        let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+        let max_r = cx.min(cy) as usize;
+        let mut rings = Vec::new();
+        let mut r = 0usize;
+        while r < max_r {
+            let (mut sum, mut count) = (0.0, 0usize);
+            for y in 0..h as usize {
+                for x in (0..w as usize).step_by(2) {
+                    let d = ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
+                    if (d - r as f64).abs() < 1.0 {
+                        sum += lum[y * w as usize + x];
+                        count += 1;
+                    }
+                }
+            }
+            assert!(count > 0, "empty ring at r={r}");
+            rings.push(sum / count as f64);
+            r += 2;
+        }
+        let mut worst: f64 = 0.0;
+        for i in 30..rings.len().saturating_sub(5) {
+            let step = (rings[i + 5] - rings[i]).abs() / rings[i].max(1.0);
+            worst = worst.max(step);
+        }
+        worst
     }
 
     /// Connected bright components (4-connectivity) above `threshold`
@@ -1100,5 +1156,36 @@ mod tests {
         // Byte-inequality: the approach shot differs from spawn (the
         // ship moved 10 Mpc).
         assert_ne!(spawn, approach, "approach shot must differ from spawn");
+    }
+
+    /// Interior-window limb pin (`cosmic-vista-reframe` DoD 1): the
+    /// reframed `vista-after.png` (seed 1337, 1408×768, High) frames an
+    /// interior window, so no sphere limb may read as an edge — same
+    /// radial gate as the void-contrast inspector pin (no step over
+    /// 20 % within any 10 px span past the central hub complex).
+    /// CPU-only over the committed shot; the number prints for the
+    /// plan record.
+    #[test]
+    fn vista_reframed_shows_no_limb() {
+        let (w, h, pixels) = load_reframe_shot_rgba8("vista-after.png");
+        assert_eq!((w, h), (1408, 768));
+        let lum = shot_luminance(&pixels);
+        let worst = worst_radial_step_10px(w, h, &lum);
+        eprintln!("vista-reframe worst 10px step r>=60px={worst:.3}");
+        assert!(worst <= 0.20, "limb step detected: {worst:.3} over 10 px");
+    }
+
+    /// Interior-window limb pin (`cosmic-vista-reframe` DoD 1): the
+    /// reframed `slab-after.png` (inspector posed from the same
+    /// `vista_pose` eye/target + 30 Mpc slice at the hub depth) shows
+    /// no limb either — same radial gate.
+    #[test]
+    fn slab_reframed_shows_no_limb() {
+        let (w, h, pixels) = load_reframe_shot_rgba8("slab-after.png");
+        assert_eq!((w, h), (1408, 768));
+        let lum = shot_luminance(&pixels);
+        let worst = worst_radial_step_10px(w, h, &lum);
+        eprintln!("slab-reframe worst 10px step r>=60px={worst:.3}");
+        assert!(worst <= 0.20, "limb step detected: {worst:.3} over 10 px");
     }
 }

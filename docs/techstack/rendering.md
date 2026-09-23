@@ -308,11 +308,19 @@ camera carries an instance `fov_y` (default 60°) plus an optional
 external `(eye, target)` pose that bypasses the ship anchor —
 projection, `px_scale`, eye, and target all honour them (pinned at
 25° and 60°; clearing the pose restores ship tracking byte-identically).
-The vista intro boots the demo on the reference composition (nearest
-Tier-A hub, 25° FOV, 40 Mpc slab, fog off; `vista` capture preset),
+The vista intro boots the demo on the reference composition
+(interior-window `vista_pose` on the composition hub — brightest and
+central Tier-A pick that stays within the dive bound, 25° FOV, 40 Mpc
+slab, fog off; `vista` capture preset; v0.3.4 `cosmic-vista-reframe`,
+ADR-026 §5: the pose is a pure function of seed-derived inputs with
+an FR1 16:9 shrink fallback before the legacy outside framing, and
+the `slab` capture poses the inspector from the same eye/target with
+the slab mode as today — 20° near-ortho + 30 Mpc slice at the hub
+depth — so no preset shows the sphere limb),
 holds 2 s, then dives 8 s to the spawn Chase pose (Bézier eye docked
 along the Chase look axis, look target front-loaded hub→marker, fog
-`off → 90 Mpc`, slab widening off; peak 26.5°/s nominal); the cosmic player marker goes through
+`off → 90 Mpc`, slab widening off; peak 28.4°/s nominal on the
+bounded descriptor); the cosmic player marker goes through
 `world_to_pixels` + the shared dot/arrow/`YOU` path pin-for-pin with
 the sphere marker (FirstPerson hides it by construction — eye-plane
 `w ≤ 0`); the inspector player point is map content (one-vertex

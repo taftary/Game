@@ -2,8 +2,13 @@
 
 ## Status
 
-`planned` (PO sign-off 2026-09-23; UX consulted; ARCHITECT consulted —
-camera-contract reuse, ADR-026 §5)
+`done` (PO sign-off 2026-09-23; UX consulted — UX-1/UX-2 judged off
+the reframed captures + projection/dive pins, limitation L-1 in
+`plan.md` (no interactive session drivable; static-shot review only);
+ARCHITECT consulted — camera-contract reuse, ADR-026 §5; DEV
+CVR-001..010 done 2026-09-23; ANALYST audit + SECURITY review
+recorded in `plan.md` DoD table; single commit on branch `v0.3.4`;
+version closes with this feature — merge `v0.3.4 → main`)
 
 ## Context
 
