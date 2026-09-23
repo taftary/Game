@@ -43,6 +43,9 @@ Current version folders (contents + per-version scope:
 - `v0.3.4/` — Cosmic-web fixes & fidelity (ADR-026: six features,
   sphere clip → non-blocking rebase → GPU tracers → void contrast →
   compact hubs → vista reframe)
+- `v0.3.5/` — Cosmic performance (ADR-027: two features,
+  frame timing → device tier; culling/bricks/fill follow-ups deferred,
+  gated on measured numbers)
 
 ## Role gates
 

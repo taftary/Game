@@ -159,6 +159,30 @@ Still deferred after this version: anisotropic (quad) splats
 stretched along the collapse axis, LOD/culling hardening, 2LPT /
 nested grids, SDSS overlay.
 
+## v0.3.5 — Cosmic performance (ADR-027)
+
+Work happens on branch `v0.3.5` (cut from `main` at the v0.3.4 merge);
+each feature lands as exactly one commit when it reaches `done`
+(workflow rule: [`plans/README.md`](../../plans/README.md) § *7.
+Version branch*). Goal: stop tuning the cosmic path blind — timestamp
+every pass, fix the dev-profile CPU tax — then run each GPU at its
+specified tier instead of hard-coded High
+([`../decisions/ADR-027.md`](../decisions/ADR-027.md)). PO decisions
+(2026-09-23): instrument first, tier second; Low auto-selects on
+`Cpu`/`VirtualGpu`, Medium on `IntegratedGpu`/`Other`, High on
+`DiscreteGpu`; captures pin `--tier` (default High) so existing shot
+hashes hold.
+
+| # | Feature | Status | Crate(s) | Scope |
+|---|---|---|---|---|
+| F1 | [`cosmic-frame-timing`](../../plans/v0.3.5/cosmic-frame-timing/) | planned | debug | timestamp query pool per pass (scene+splats, bloom, march, main) + CPU phase timers in the FPS widget + `--capture` log line; dev-profile opt-level 1 for `game_debug`/`game_engine`; UHD 620 baseline recorded |
+| F2 | [`cosmic-device-tier`](../../plans/v0.3.5/cosmic-device-tier/) | planned | debug | boot tier from device type with `GAME_DEBUG_TIER` override; drives `splat_k`, `VeilMode`, bloom levels; runtime cycle; `--tier` capture pin |
+
+Still deferred after this version: splat frustum culling + sub-sample
+LOD (`cosmic-splat-culling`), bricked indirect draws
+(`cosmic-splat-bricks`), fill levers (`cosmic-fill-levers`) — all
+gated on F1's measured numbers.
+
 ## Post-v0.3 (unscheduled)
 
 - **Colony milestones (historical labels):** M2 descent slice, M3 surface
