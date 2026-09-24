@@ -19,7 +19,8 @@ use crate::planet_viewer::PlanetViewerState;
 use crate::system_map::{OrbitArrival, SystemMapView};
 use crate::ui::TextField;
 use crate::{
-    console::LogConsole, fps::FpsOverlay, frame_timing::FrameTiming, inspector::StateInspector,
+    console::LogConsole, cosmic_tier::CosmicTier, fps::FpsOverlay, frame_timing::FrameTiming,
+    inspector::StateInspector,
 };
 use game::journey::{Journey, Layer};
 use game_engine::universe::WebDescriptor;
@@ -204,6 +205,10 @@ pub struct App {
     /// binary; `cosmic-frame-timing`, ADR-027). GPU-free rings — the
     /// widget reads them like the FPS overlay.
     pub timing: FrameTiming,
+    /// Active cosmic tier + source (`cosmic-device-tier`, ADR-027):
+    /// set by the binary at boot (device/env) and on `F4` cycles; the
+    /// FPS widget reads it. Boot default is High (pre-tier behavior).
+    pub cosmic_tier: CosmicTier,
     /// Console log feed (transition events drained per frame).
     pub console: LogConsole,
     /// Backing state for the inspector (journey summary).
@@ -240,6 +245,7 @@ impl App {
             fx: FxState::default(),
             fps: FpsOverlay::new(),
             timing: FrameTiming::new(),
+            cosmic_tier: CosmicTier::boot_default(),
             console: LogConsole::new(),
             inspector: StateInspector,
         }

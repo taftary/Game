@@ -7,7 +7,7 @@
 //! would read and write.
 //!
 //! Chrome keys never shadow content (game) keys: chrome lives on
-//! `F1`–`F3`, backquote, `F6`–`F8`, `F9`–`F10`, `F12`, dropdown-captured
+//! `F1`–`F4`, backquote, `F6`–`F8`, `F9`–`F10`, `F12`, dropdown-captured
 //! digits and `Esc`. Content keys (`WASD`/arrows, `U`, `P`, `E`,
 //! `T`, `Q`, `F`, `R`, `G`/`B`, `Home`, `1`–`6` shader modes, `F5`
 //! twilight) are reserved for the tab content. `E` is context-dependent
@@ -93,6 +93,9 @@ pub enum Action {
     ShowWidgetInspector,
     UnwindUi,
     CaptureScreenshot,
+    /// Cycle the cosmic quality tier Low → Medium → High
+    /// (`cosmic-device-tier`, ADR-027): shell chrome, never content.
+    CycleTier,
     // Navigation (F1–F3, dropdown-captured digits).
     NavGameDemo,
     NavDimensions,
@@ -143,6 +146,7 @@ impl Action {
             Action::ShowWidgetInspector => "F8",
             Action::UnwindUi => "Esc",
             Action::CaptureScreenshot => "F12",
+            Action::CycleTier => "F4",
             Action::NavGameDemo => "F1",
             Action::NavDimensions => "F2",
             Action::NavSettings => "F3",
@@ -185,6 +189,7 @@ impl Action {
             Action::ShowWidgetInspector => "Widget: Inspector",
             Action::UnwindUi => "Close menus / unfocus",
             Action::CaptureScreenshot => "Save PNG capture",
+            Action::CycleTier => "Cycle cosmic tier",
             Action::NavGameDemo => "Game Demo tab",
             Action::NavDimensions => "Dimensions menu",
             Action::NavSettings => "Settings tab",
@@ -226,7 +231,8 @@ impl Action {
             | Action::ShowWidgetConsole
             | Action::ShowWidgetInspector
             | Action::UnwindUi
-            | Action::CaptureScreenshot => ActionGroup::Chrome,
+            | Action::CaptureScreenshot
+            | Action::CycleTier => ActionGroup::Chrome,
             Action::NavGameDemo
             | Action::NavDimensions
             | Action::NavSettings
@@ -282,7 +288,7 @@ impl Action {
 
     /// Every static (non-parameterized) action, for the Controls list
     /// and the parity test.
-    pub const ALL_STATIC: [Action; 35] = [
+    pub const ALL_STATIC: [Action; 36] = [
         Action::ToggleLeftDock,
         Action::ToggleRightDock,
         Action::ToggleDevWidget,
@@ -291,6 +297,7 @@ impl Action {
         Action::ShowWidgetInspector,
         Action::UnwindUi,
         Action::CaptureScreenshot,
+        Action::CycleTier,
         Action::NavGameDemo,
         Action::NavDimensions,
         Action::NavSettings,
@@ -369,8 +376,8 @@ mod tests {
 
     #[test]
     fn registry_size_is_pinned() {
-        // 35 static + 10 dimensions + 6 shader modes.
-        assert_eq!(all_actions().len(), 51);
+        // 36 static + 10 dimensions + 6 shader modes.
+        assert_eq!(all_actions().len(), 52);
     }
 
     #[test]

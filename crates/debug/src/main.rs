@@ -36,6 +36,7 @@ use game_debug::actions::{Action, ActionGroup, DROPDOWN_ORDER, digit_for_dimensi
 use game_debug::app::{App as DebugApp, ChromeState, Screen, ViewContent, WidgetTab};
 use game_debug::cosmic_camera::cosmic_tip_world;
 use game_debug::cosmic_player::CRUISE_SPEED_NOTCH;
+use game_debug::cosmic_tier::{CosmicTier, TierSource, auto_tier, next_tier};
 use game_debug::fps::{FPS_SPARKLINE, FpsOverlay};
 use game_debug::frame_timing::{CpuPhase, FrameTiming, GpuSlot, ms_from_ticks};
 use game_debug::galaxy_map::{DEFAULT_GALAXY_SEED, GalaxyMapView, spectral_color, star_world};
@@ -1109,11 +1110,13 @@ const COSMIC_MAP_EXPOSURE: f32 = 0.85;
 const COSMIC_DEMO_BLOOM_INTENSITY: f32 = 1.0;
 const COSMIC_MAP_BLOOM_INTENSITY: f32 = 0.85;
 
-/// Mip-bloom pyramid depth (`bloom-mip-chain`): 5 levels (High —
-/// the windowed viewer and the capture path have no tier switch, so
-/// both run the full pyramid and stay pixel-identical). Matches
-/// `MipBloomParams::for_tier(High)`.
-const BLOOM_LEVELS: u8 = 5;
+/// Mip-bloom pyramid depth (`bloom-mip-chain`, `cosmic-device-tier`):
+/// the active tier's level count via `MipBloomParams::for_tier`
+/// (3 Low / 4 Medium / 5 High) — `BLOOM_LEVELS` is retired, levels
+/// flow from the tier at every `build_hdr_chain` call site.
+fn bloom_levels_for(tier: QualityTier) -> u8 {
+    MipBloomParams::for_tier(tier).levels
+}
 
 /// Twilight demo stages (F5 cycles): sky-luminance keys at day + the
 /// mid of each twilight band, so Planet-View captures step through the
@@ -1198,7 +1201,7 @@ const STREAM_SYNC_MS: u64 = 100;
 // ---------------------------------------------------------------------------
 
 fn usage() -> &'static str {
-    "usage: game_debug [--headless] [--seed N] [--capture OUT.png --view inspector|slab|demo|vista --size WxH]"
+    "usage: game_debug [--headless] [--seed N] [--capture OUT.png --view inspector|slab|demo|vista --size WxH --tier low|medium|high]"
 }
 
 /// Offscreen capture request (`--capture`, `cosmic-capture-harness`):
@@ -1214,6 +1217,10 @@ struct CaptureRequest {
     width: u32,
     /// Output size, px.
     height: u32,
+    /// Cosmic tier for the offscreen path (`cosmic-device-tier`):
+    /// explicit pin, default High (pre-tier captures stay
+    /// byte-identical without passing it).
+    tier: QualityTier,
 }
 
 /// Parsed CLI: `--headless` runs the GPU-free checks; `--seed N`
@@ -1233,6 +1240,7 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
     let mut capture_path: Option<String> = None;
     let mut capture_view = None;
     let mut capture_size = CAPTURE_DEFAULT_SIZE;
+    let mut capture_tier = QualityTier::High;
     let mut rest = argv.iter().skip(1);
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -1283,6 +1291,17 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
                     ));
                 }
             },
+            "--tier" => match rest.next() {
+                Some(value) => match value.parse::<QualityTier>() {
+                    Ok(tier) => capture_tier = tier,
+                    Err(error) => {
+                        return Err(format!("{error}\n{usage}", usage = usage()));
+                    }
+                },
+                None => {
+                    return Err(format!("--tier needs a tier\n{usage}", usage = usage()));
+                }
+            },
             other => {
                 return Err(format!(
                     "unknown argument {other:?}\n{usage}",
@@ -1296,6 +1315,7 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
         view: capture_view.unwrap_or(game_debug::cosmic_capture::CaptureView::Inspector),
         width: capture_size.0,
         height: capture_size.1,
+        tier: capture_tier,
     });
     if capture.is_some() && headless {
         return Err(format!(
@@ -1447,7 +1467,7 @@ fn run_headless(seed: Option<u64>) -> i32 {
         let med = n * usize::from(SplatK::for_tier(SplatTier::Medium).0);
         let high = n * usize::from(SplatK::for_tier(SplatTier::High).0);
         assert!(low < med && med <= high);
-        let veil = match veil_mode() {
+        let veil = match veil_for_selected(QualityTier::High) {
             VeilMode::Sprites => {
                 let sprites = veil_sprites(field, layout_origin);
                 assert!(!sprites.is_empty(), "veil must emit sprites");
@@ -1622,7 +1642,7 @@ fn run_headless(seed: Option<u64>) -> i32 {
                     &debug_app.cosmic.field,
                     debug_app.cosmic.seed,
                     origin,
-                    veil_mode(),
+                    veil_for_selected(QualityTier::High),
                 );
                 max_build_ms = max_build_ms.max(built.elapsed().as_secs_f64() * 1000.0);
                 rebases += 1;
@@ -2172,8 +2192,10 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         )
     };
     let extent = [w, h];
-    // Veil mode first (the glow upload branches on it).
-    let veil_mode = veil_mode();
+    // Veil mode first (the glow upload branches on it): the capture
+    // `--tier` pin, default High (pre-tier captures stay
+    // byte-identical without passing it).
+    let veil_mode = veil_for_selected(request.tier);
     let glow = upload_cosmic_glow(
         &memory_allocator,
         &debug.cosmic.web,
@@ -2193,7 +2215,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     );
     let capture_cells = game_engine::universe::web::cell_list(&debug.cosmic.field);
     let capture_cell_list = upload_cell_list(&memory_allocator, &capture_cells);
-    let capture_k = splat_k_default();
+    let capture_k = splat_k_for_selected(request.tier);
     let proc_draw = match (
         disp_volume.as_ref().map(|(_, view)| view.clone()),
         veil_volume.as_ref().map(|(_, view)| view.clone()),
@@ -2274,6 +2296,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             &post_pass,
             &pipes,
             veil_view.as_ref().expect("veil volume must upload"),
+            bloom_levels_for(request.tier),
         )
     });
     // Offscreen target: capture-format color (+TRANSFER_SRC for the
@@ -2363,9 +2386,10 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
     }
     let capture_record_start = Instant::now();
     if let Some(chain) = hdr.as_ref() {
-        // High-tier pyramid on both paths (windowed + capture stay
-        // pixel-identical — the debug binary has no tier switch).
-        let bloom_params = MipBloomParams::for_tier(QualityTier::High);
+        // Tier pyramid on both paths (the `--tier` pin; windowed uses
+        // the boot/cycled tier, default High keeps old captures
+        // byte-identical).
+        let bloom_params = MipBloomParams::for_tier(request.tier);
         record_cosmic_hdr_prepass(
             &mut builder,
             &pipes,
@@ -2480,8 +2504,9 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         CaptureView::Vista => "vista",
     };
     println!(
-        "capture saved: {} (view {view_name}, seed {seed}, {w}x{h})",
-        request.path
+        "capture saved: {} (view {view_name}, seed {seed}, {w}x{h}, tier {})",
+        request.path,
+        request.tier.name(),
     );
     // Frame timing line (`cosmic-frame-timing` FR4): GPU ms per pass
     // from this frame's own fence-waited pool + the CPU record span.
@@ -4810,7 +4835,7 @@ fn fog_slider_track(body: Rect, lh: f32) -> Rect {
 /// Widget FPS body: the frame-health tab, drawn into the widget
 /// body rect (it already lays out into any area).
 fn build_widget_fps(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
-    build_fps_tab(items, lh, &app.fps, &app.timing, body);
+    build_fps_tab(items, lh, &app.fps, &app.timing, app.cosmic_tier, body);
 }
 
 /// Widget Console body: the live fly-to event feed (newest last,
@@ -4902,7 +4927,14 @@ fn timing_cell(avg: Option<f32>, max: Option<f32>) -> String {
 
 /// Widget FPS body: live numbers + a sparkline of the newest
 /// [`FPS_SPARKLINE`] samples (right = newest, 0–50 ms full height).
-fn build_fps_tab(items: &mut UiItems, lh: f32, fps: &FpsOverlay, timing: &FrameTiming, area: Rect) {
+fn build_fps_tab(
+    items: &mut UiItems,
+    lh: f32,
+    fps: &FpsOverlay,
+    timing: &FrameTiming,
+    tier: CosmicTier,
+    area: Rect,
+) {
     let mut rows = ui::PanelRows::new(area, ui::DOCK_PAD);
     section_bar(items, rows.next(lh + 6.0, 4.0), "FRAME HEALTH");
     for line in [
@@ -4913,6 +4945,13 @@ fn build_fps_tab(items: &mut UiItems, lh: f32, fps: &FpsOverlay, timing: &FrameT
             fps.max_ms()
         ),
         format!("samples:    {}", fps.count()),
+        // Active cosmic tier (`cosmic-device-tier` FR5): boot
+        // mapping / env pin / F4 session cycle.
+        format!(
+            "tier:      {} ({}) [F4]",
+            tier.tier.name(),
+            tier.source.name()
+        ),
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
     }
@@ -6108,20 +6147,52 @@ fn upload_cosmic_glow(
     upload_glow_points(allocator, &points)
 }
 
-/// Sub-samples per cell for this run (CGT-006): `GAME_DEBUG_COSMIC_K`
-/// strict `1..=8`, else the High default 8 (the windowed binary has no
-/// tier switch — windowed and capture both run full density unless
-/// bisected, the splat-tier precedent).
-fn splat_k_default() -> u8 {
+/// Sub-samples per cell for a tier (`cosmic-device-tier`, ADR-027):
+/// `GAME_DEBUG_COSMIC_K` strict `1..=8` wins per knob (CGT-006),
+/// else the tier contract (`SplatK::for_tier`: 1/2/8).
+fn splat_k_for_selected(tier: QualityTier) -> u8 {
     match std::env::var("GAME_DEBUG_COSMIC_K") {
         Ok(value) => match game_debug::cosmic_splat::SplatK::parse_override(&value) {
             Ok(k) => k.0,
             Err(error) => {
-                eprintln!("bad GAME_DEBUG_COSMIC_K={value:?}: {error}; using 8");
-                8
+                eprintln!("bad GAME_DEBUG_COSMIC_K={value:?}: {error}; using tier default");
+                game_debug::cosmic_tier::splat_k_for(tier)
             }
         },
-        Err(_) => 8,
+        Err(_) => game_debug::cosmic_tier::splat_k_for(tier),
+    }
+}
+
+/// Cosmic tier for this run (`cosmic-device-tier`, ADR-027):
+/// `GAME_DEBUG_TIER` (engine `QualityTier::from_str`) wins, else the
+/// device mapping (`Cpu`/`VirtualGpu` → Low, `IntegratedGpu` →
+/// Medium, `DiscreteGpu` → High, anything else → Medium). Garbage
+/// warns and falls back to auto — never a silent regrade.
+fn select_cosmic_tier(device: &Arc<Device>) -> CosmicTier {
+    if let Ok(value) = std::env::var("GAME_DEBUG_TIER") {
+        match value.parse::<QualityTier>() {
+            Ok(tier) => {
+                tracing::info!(tier = tier.name(), "cosmic tier selected (env)");
+                return CosmicTier {
+                    tier,
+                    source: TierSource::Env,
+                };
+            }
+            Err(error) => {
+                eprintln!("bad GAME_DEBUG_TIER={value:?}: {error}; using device default");
+            }
+        }
+    }
+    let device_type = device.physical_device().properties().device_type;
+    let tier = auto_tier(device_type);
+    tracing::info!(
+        tier = tier.name(),
+        device_type = ?device_type,
+        "cosmic tier selected (auto)"
+    );
+    CosmicTier {
+        tier,
+        source: TierSource::Auto,
     }
 }
 
@@ -6378,18 +6449,17 @@ fn upload_veil_volume(
     Some((image, view))
 }
 
-/// Veil body mode for this run: `GAME_DEBUG_COSMIC_VEIL` override, or
-/// High-tier march (the debug binary has no tier switch — windowed
-/// and capture both run the full march and stay pixel-identical, the
-/// splat-tier precedent).
-fn veil_mode() -> game_debug::cosmic_veil::VeilMode {
+/// Veil body mode for a tier (`cosmic-device-tier`, ADR-027):
+/// `GAME_DEBUG_COSMIC_VEIL` override wins per knob, else the tier
+/// contract (Sprites / March 32 / March 48).
+fn veil_for_selected(tier: QualityTier) -> game_debug::cosmic_veil::VeilMode {
     use game_debug::cosmic_veil::VeilMode;
     match std::env::var("GAME_DEBUG_COSMIC_VEIL") {
         Ok(value) => VeilMode::parse_override(&value).unwrap_or_else(|error| {
-            eprintln!("bad GAME_DEBUG_COSMIC_VEIL={value:?}: {error}; using march");
-            VeilMode::for_tier_high()
+            eprintln!("bad GAME_DEBUG_COSMIC_VEIL={value:?}: {error}; using tier default");
+            game_debug::cosmic_tier::veil_for(tier)
         }),
-        Err(_) => VeilMode::for_tier_high(),
+        Err(_) => game_debug::cosmic_tier::veil_for(tier),
     }
 }
 
@@ -7361,10 +7431,15 @@ impl ViewerApp {
         let map_vertices = upload_map(&memory_allocator, &debug.galaxy);
         let system_points = upload_system_points(&memory_allocator, &debug.system);
         let system_lines = upload_system_lines(&memory_allocator, &debug.system);
+        // Cosmic tier for this run (`cosmic-device-tier`, ADR-027):
+        // `GAME_DEBUG_TIER` wins, else the device mapping. The knobs
+        // below all derive from it (per-knob envs still win per knob).
+        let cosmic_tier = select_cosmic_tier(&device);
+        debug.cosmic_tier = cosmic_tier;
         // Cosmic web for the demo tab (same master seed as the maps).
         let cosmic_origin = debug.cosmic.upload_origin;
         let cosmic_seed = debug.cosmic.seed;
-        let veil_mode = veil_mode();
+        let veil_mode = veil_for_selected(cosmic_tier.tier);
         let cosmic_glow = upload_cosmic_glow(
             &memory_allocator,
             &debug.cosmic.web,
@@ -7403,7 +7478,7 @@ impl ViewerApp {
         let cells = game_engine::universe::web::cell_list(&debug.cosmic.field);
         let cell_count = cells.len();
         let cell_list = upload_cell_list(&memory_allocator, &cells);
-        let splat_k = splat_k_default();
+        let splat_k = splat_k_for_selected(cosmic_tier.tier);
         // manifest ⇒ procedural fallback sky (model-only, logged). The
         // sky shares the universe seed so fallback content is stable
         // per seed.
@@ -7607,6 +7682,28 @@ impl ViewerApp {
         );
     }
 
+    /// Cycle the cosmic tier Low → Medium → High (`cosmic-device-tier`
+    /// FR4 — `F4` key + Settings Controls): knobs recompute (per-knob
+    /// envs still win), then the full cosmic rebuild — veil volume,
+    /// HDR chain at the new level count, glow buffers, rebase worker —
+    /// through the tested seed path, so every surface stays
+    /// consistent. Manual hitch on a debug key, never in the travel
+    /// loop.
+    fn cycle_cosmic_tier(&mut self) {
+        let next = next_tier(self.debug.cosmic_tier.tier);
+        self.debug.cosmic_tier = CosmicTier {
+            tier: next,
+            source: TierSource::Manual,
+        };
+        self.veil_mode = veil_for_selected(next);
+        self.splat_k = splat_k_for_selected(next);
+        self.refresh_cosmic_seed();
+        self.debug.console.push(format!(
+            "tier: {} (manual — F4 cycles, GAME_DEBUG_TIER pins at boot)",
+            next.name()
+        ));
+    }
+
     /// Rebuild all cosmic GPU resources for a new seed (boot, reseed,
     /// staged load): veil volume + HDR chain + inspector buffers + demo
     /// buffers. NEVER on rebase — the rebase path (`tick_cosmic` →
@@ -7656,6 +7753,7 @@ impl ViewerApp {
                         .as_ref()
                         .expect("veil volume must upload with the field")
                         .1,
+                    bloom_levels_for(self.debug.cosmic_tier.tier),
                 )
             });
         }
@@ -8242,8 +8340,8 @@ impl ViewerApp {
         post_pass: &Arc<RenderPass>,
         pipes: &Pipelines,
         march_volume: &Arc<ImageView>,
+        levels: u8,
     ) -> HdrChain {
-        let levels = BLOOM_LEVELS;
         let scene_view = create_post_view(memory_allocator, extent, format, "HDR scene");
         let scene_depth = create_depth_view(memory_allocator, extent);
         let scene_fb = Framebuffer::new(
@@ -8523,6 +8621,7 @@ impl ViewerApp {
                     .as_ref()
                     .expect("veil volume must upload at boot")
                     .1,
+                bloom_levels_for(self.debug.cosmic_tier.tier),
             )
         });
         if let Some(chain) = ctx.hdr.as_ref() {
@@ -9313,6 +9412,12 @@ impl ViewerApp {
                         let (_, name) = twilight_key(self.twilight_stage);
                         self.debug.fx.notify(format!("Twilight {name}"));
                     }
+                    PhysicalKey::Code(KeyCode::F4) => {
+                        // Cosmic tier cycle (`cosmic-device-tier`
+                        // FR4): Low → Medium → High with buffer +
+                        // chain rebuilds.
+                        self.cycle_cosmic_tier();
+                    }
                     PhysicalKey::Code(KeyCode::F12) => {
                         // Windowed PNG capture
                         // (`cosmic-capture-harness`, exploration only —
@@ -9777,6 +9882,11 @@ impl ViewerApp {
             Action::TwilightCycle => {
                 self.twilight_stage = (self.twilight_stage + 1) % 4;
             }
+            Action::CycleTier => {
+                // Settings Controls parity for F4 (no tab gate: the
+                // tier is shell chrome, like twilight).
+                self.cycle_cosmic_tier();
+            }
             Action::SlabToggle => {
                 // Settings Controls parity for S (same tab gate).
                 if self.debug.screen_content() == Some(ViewContent::CosmicWeb)
@@ -10145,6 +10255,7 @@ impl ViewerApp {
                             .as_ref()
                             .expect("veil volume must upload at boot")
                             .1,
+                        bloom_levels_for(self.debug.cosmic_tier.tier),
                     )
                 });
                 ctx.recreate_swapchain = false;
@@ -10388,7 +10499,7 @@ impl ViewerApp {
             } else {
                 SPLAT_ALPHA_K_MAP
             };
-            let bloom_params = MipBloomParams::for_tier(QualityTier::High);
+            let bloom_params = MipBloomParams::for_tier(self.debug.cosmic_tier.tier);
             record_cosmic_hdr_prepass(
                 &mut builder,
                 &ctx.pipelines,
@@ -11015,6 +11126,37 @@ mod tests {
             vec!["game_debug", "--seed", "abc"],
             vec!["game_debug", "--seed", "-1"],
             vec!["game_debug", "--nope"],
+        ] {
+            let err = parse_args(&argv(&bad)).expect_err("must reject");
+            assert!(err.contains("usage:"), "error lacks usage: {err}");
+        }
+    }
+
+    #[test]
+    fn cli_tier_pin_parsing() {
+        // `cosmic-device-tier` CDT-004: `--tier` pins the offscreen
+        // path, default High (pre-tier captures stay byte-identical
+        // without passing it).
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let args = parse_args(&argv(&[
+            "game_debug",
+            "--capture",
+            "out.png",
+            "--tier",
+            "medium",
+        ]))
+        .expect("tier must parse");
+        let capture = args.capture.expect("capture request");
+        assert_eq!(capture.tier, QualityTier::Medium);
+        let args = parse_args(&argv(&["game_debug", "--capture", "out.png"]))
+            .expect("bare capture must parse");
+        assert_eq!(
+            args.capture.expect("capture request").tier,
+            QualityTier::High
+        );
+        for bad in [
+            vec!["game_debug", "--capture", "out.png", "--tier"],
+            vec!["game_debug", "--capture", "out.png", "--tier", "ultra"],
         ] {
             let err = parse_args(&argv(&bad)).expect_err("must reject");
             assert!(err.contains("usage:"), "error lacks usage: {err}");

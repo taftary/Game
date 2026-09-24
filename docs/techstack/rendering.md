@@ -221,6 +221,13 @@ log; neither is linked into the release `game` binary.
 
 Features must run on Low to ship. High-only effects are never load-bearing.
 Enforced by the `tools` renderer smoke + device profiles (see [`quality.md`](quality.md)).
+Since v0.3.5 (`cosmic-device-tier`, ADR-027) the debug shell boots
+its cosmic path at the device tier (`Cpu`/`VirtualGpu` → Low,
+`IntegratedGpu` → Medium, `DiscreteGpu` → High, `GAME_DEBUG_TIER`
+pins, `F4` cycles Low → Medium → High with buffer + chain rebuilds,
+`--tier` pins offscreen captures at High by default): splat count
+(1/2/8), veil body (sprites / 32-step / 48-step march) and bloom
+depth (3/4/5) all follow the one tier.
 
 ## Renderer smoke (`tools`)
 

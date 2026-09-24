@@ -20,6 +20,7 @@ pub mod cosmic_hubs;
 pub mod cosmic_player;
 pub mod cosmic_rebase;
 pub mod cosmic_splat;
+pub mod cosmic_tier;
 pub mod cosmic_veil;
 pub mod cosmic_vista;
 pub mod cosmic_web;
