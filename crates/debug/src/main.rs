@@ -455,6 +455,21 @@ void main() {
     float vis = cosmic_window_vis(clip.w, pc.fog_l, pc.slab_center, pc.slab_half, int(misc.z + 0.5));
     v_alpha = misc.y * pc.exposure * vis;
     v_kind = misc.z;
+    // Exact-zero cull (issue-2026-09-24-0944): a zero-alpha point adds
+    // exactly 0.0 through the additive chain — emit the degenerate
+    // position + zero size (the sphere-cull contract in
+    // SPLAT_PROC_VERT) so the GPU clips it for free instead of
+    // rasterizing a full quad. Hub kinds keep the 0.25 floor above,
+    // so the navigation goal never takes this branch; fog never
+    // reaches exactly zero, so the grade is untouched.
+    if (v_alpha <= 0.0) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        v_color = vec3(0.0);
+        v_alpha = 0.0;
+        v_kind = misc.z;
+        return;
+    }
 }";
 
 const GLOW_FRAG: &str = r"#version 450
@@ -655,6 +670,20 @@ void main() {
     v_color = ramp * transfer_w * hubble * dim;
     v_alpha = alpha;
     v_b = 0.0;
+    // Exact-zero cull (issue-2026-09-24-0944): slab-out, near-eye
+    // dissolved, and below-mean (`transfer_w == 0`) splats all add
+    // exactly 0.0 through the additive chain — emit the degenerate
+    // position + zero size (the sphere-cull contract above) so the
+    // GPU clips them for free. Fog never reaches exactly zero, so
+    // the grade is untouched.
+    if (alpha <= 0.0 || transfer_w <= 0.0) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        v_color = vec3(0.0);
+        v_alpha = 0.0;
+        v_b = 0.0;
+        return;
+    }
 }";
 
 /// World-space kernel scale: `h = h0 * (1+d)^(-1/3)` Mpc.
@@ -1012,8 +1041,8 @@ struct ProcFrame {
 /// surface's buffer frame. Depth-window terms (`cosmic-depth-window`):
 /// `fog_l` (Mpc, ≤ 0 = off), `slab_center`/`slab_half` (Mpc view
 /// depth, `slab_half` ≤ 0 = off). `march` carries the veil raymarch
-/// push (`cosmic-gas-veil-v2`; stale in sprites mode — the pass is
-/// skipped there).
+/// push (`cosmic-gas-veil-v2`; unused in sprites mode — a black
+/// clear takes the march pass's place there).
 struct CosmicFrame {
     mvp: [[f32; 4]; 4],
     px_scale: f32,
@@ -2249,8 +2278,9 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         &memory_allocator,
         [ship.x as f32, ship.y as f32, ship.z as f32],
     );
-    // Veil march push (CGV-005): steps from the mode above; skipped
-    // at record time in sprites mode.
+    // Veil march push (CGV-005): steps from the mode above; the
+    // draw is replaced by a black clear at record time in sprites
+    // mode (issue-2026-09-24-0856).
     let march_steps = match veil_mode {
         game_debug::cosmic_veil::VeilMode::Sprites => 0,
         game_debug::cosmic_veil::VeilMode::March { steps } => steps,
@@ -2405,11 +2435,11 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
             &post_sampler,
             capture_stamp.as_ref(),
         );
-        // Gas-veil march (CGV-005/006): pyramid → march → resolve.
-        // Skipped in sprites mode (cleared target adds ~0).
-        if matches!(veil_mode, game_debug::cosmic_veil::VeilMode::March { .. }) {
-            record_veil_march(&mut builder, &pipes, chain, &frame.march);
-        }
+        // Gas-veil march (CGV-005/006): pyramid → march/clear →
+        // resolve. Sprites mode records a black clear
+        // (issue-2026-09-24-0856) so the fresh chain's march target
+        // is defined before the resolve reads it.
+        record_veil_march_or_clear(&mut builder, &pipes, chain, &frame.march, veil_mode);
         // March end / main start (`cosmic-frame-timing` q3).
         if let Some(stamp) = capture_stamp.as_ref() {
             timer_write(&mut builder, stamp, 3, false);
@@ -2444,7 +2474,7 @@ fn run_capture(request: CaptureRequest, seed: Option<u64>) -> i32 {
         bloom_intensity,
         redshift,
         splat_alpha_k,
-        VEIL_MARCH_RESOLVE_GAIN,
+        march_gain_for(veil_mode),
         player_point,
         &descriptor_set_allocator,
         &memory_allocator,
@@ -5893,7 +5923,8 @@ struct HdrChain {
     up_set: Vec<Arc<DescriptorSet>>,
     /// March target (quarter-res HDR, `cosmic-gas-veil-v2`): written
     /// once by the march pass, read only at the resolve. In sprites
-    /// mode the pass is skipped and the cleared target adds ~0.
+    /// mode a black clear takes the march pass's place
+    /// (issue-2026-09-24-0856) and the cleared target adds ~0.
     march_fb: Arc<Framebuffer>,
     /// March target extent (quarter of the scene extent).
     march_extent: [u32; 2],
@@ -6905,8 +6936,11 @@ fn record_bloom_chain(
 /// Execute the gas-veil march (`cosmic-gas-veil-v2` CGV-005/006):
 /// one fullscreen pass into the quarter-res march target (the
 /// `March` row of the veil pass description — write-once pinned).
-/// Call between the bloom pyramid and the view arm; skipped in
-/// sprites mode (the cleared target then adds ~0 at the resolve).
+/// Call between the bloom pyramid and the view arm; in sprites mode
+/// call [`clear_veil_march`] instead so the target is still written
+/// once per frame (black clear) before the resolve reads it
+/// (issue-2026-09-24-0856: skipping the pass left a recycled march
+/// image under the resolve on High → Low cycles).
 fn record_veil_march(
     builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
     pipes: &Pipelines,
@@ -6930,6 +6964,59 @@ fn record_veil_march(
     builder
         .end_render_pass(Default::default())
         .expect("veil march pass must end");
+}
+
+/// Whether the veil march target gets a real march draw this frame
+/// (issue-2026-09-24-0856): true in `March` mode, false in `Sprites`
+/// mode (where [`clear_veil_march`] performs the once-per-frame write
+/// instead). Pure branch selector so the Sprites `else` is pinned by
+/// unit tests, not by inspection.
+fn veil_march_draws(mode: game_debug::cosmic_veil::VeilMode) -> bool {
+    matches!(mode, game_debug::cosmic_veil::VeilMode::March { .. })
+}
+
+/// Clear the veil-march target to black (issue-2026-09-24-0856): an
+/// empty post pass — `begin_post_pass` clears, no draw — so the
+/// resolve's `march * gain` term adds exactly 0 in Sprites mode and
+/// the target never carries recycled pages across tier cycles.
+fn clear_veil_march(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    hdr: &HdrChain,
+) {
+    begin_post_pass(builder, hdr.march_fb.clone(), hdr.march_extent);
+    builder
+        .end_render_pass(Default::default())
+        .expect("veil march clear pass must end");
+}
+
+/// March draw or black clear from the veil mode (issue-2026-09-24-0856):
+/// the single choke point both recording paths (windowed + capture)
+/// must route through, so the march target is written exactly once per
+/// frame in every tier and the write-once description holds.
+fn record_veil_march_or_clear(
+    builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+    pipes: &Pipelines,
+    hdr: &HdrChain,
+    march: &MarchPush,
+    mode: game_debug::cosmic_veil::VeilMode,
+) {
+    if veil_march_draws(mode) {
+        record_veil_march(builder, pipes, hdr, march);
+    } else {
+        clear_veil_march(builder, hdr);
+    }
+}
+
+/// Resolve composite gain for the march target (issue-2026-09-24-0856):
+/// the full `VEIL_MARCH_RESOLVE_GAIN` grade in March mode, exactly 0
+/// in Sprites mode — defense in depth alongside the black clear, so a
+/// future skipped write still resolves as zero.
+fn march_gain_for(mode: game_debug::cosmic_veil::VeilMode) -> f32 {
+    if veil_march_draws(mode) {
+        VEIL_MARCH_RESOLVE_GAIN
+    } else {
+        0.0
+    }
 }
 
 /// Shared cosmic view-arm recording (CAP-001 seam, second half): the
@@ -8570,8 +8657,9 @@ impl ViewerApp {
             };
         // March target (`cosmic-gas-veil-v2`): quarter-res HDR, own
         // framebuffer under the post pass — written once by the march
-        // pass, read only at the resolve. In sprites mode the pass is
-        // skipped and the cleared target adds ~0.
+        // pass, read only at the resolve. In sprites mode a black
+        // clear takes the march pass's place (issue-2026-09-24-0856)
+        // and the cleared target adds ~0.
         let march_extent = [(extent[0] / 4).max(1), (extent[1] / 4).max(1)];
         let march_view = create_post_view(memory_allocator, march_extent, format, "veil march");
         let march_fb = Framebuffer::new(
@@ -10655,13 +10743,17 @@ impl ViewerApp {
                 &self.post_sampler,
                 stamp.as_ref(),
             );
-            // Gas-veil march (CGV-005/006): skipped in sprites mode.
-            if matches!(
+            // Gas-veil march (CGV-005/006): march draw in March
+            // mode, black clear in sprites mode (issue-2026-09-24-0856
+            // — the resolve reads the target in both modes, so the
+            // write must happen in both modes).
+            record_veil_march_or_clear(
+                &mut builder,
+                &ctx.pipelines,
+                hdr,
+                &frame.march,
                 self.veil_mode,
-                game_debug::cosmic_veil::VeilMode::March { .. }
-            ) {
-                record_veil_march(&mut builder, &ctx.pipelines, hdr, &frame.march);
-            }
+            );
             // March end / main start (`cosmic-frame-timing` q3).
             if let Some(stamp) = stamp.as_ref() {
                 timer_write(&mut builder, stamp, 3, false);
@@ -10797,7 +10889,7 @@ impl ViewerApp {
                         bloom_intensity,
                         redshift,
                         splat_alpha_k,
-                        VEIL_MARCH_RESOLVE_GAIN,
+                        march_gain_for(self.veil_mode),
                         self.cosmic_tab_player.clone(),
                         &self.descriptor_set_allocator,
                         &self.memory_allocator,
@@ -11893,6 +11985,42 @@ mod tests {
     }
 
     #[test]
+    fn exact_zero_points_degenerate_before_raster() {
+        // Issue-2026-09-24-0944: points adding exactly 0.0 through the
+        // additive chain must take the degenerate-draw contract
+        // (clip-outside position + zero size + early return — the
+        // sphere-cull precedent), never a full quad. Each culled set
+        // is provably zero in today's output expression
+        // (`col * v_alpha * fall` with a zero factor).
+        for (source, branch, what) in [
+            (GLOW_VERT, "if (v_alpha <= 0.0)", "glow slab-out"),
+            (
+                SPLAT_PROC_VERT,
+                "if (alpha <= 0.0 || transfer_w <= 0.0)",
+                "splat slab-out / dissolved / below-mean",
+            ),
+        ] {
+            assert!(
+                source.contains(branch),
+                "{what} missing its exact-zero cull"
+            );
+            assert!(
+                source.contains("gl_Position = vec4(2.0, 2.0, 2.0, 1.0);"),
+                "{what} cull must emit the degenerate position"
+            );
+        }
+        // The cull consumes locals only: the shared window snippet
+        // stays the single authority (pinned by
+        // `cosmic_window_snippet_shared`), fog stays unbranched (never
+        // exactly zero), and the hub 0.25 floor keeps goal points off
+        // the glow branch.
+        assert!(
+            GLOW_VERT.contains("(kind >= 1) ? max(vis, 0.25) : vis"),
+            "hub fog floor must guard the glow cull"
+        );
+    }
+
+    #[test]
     fn march_gains_stay_decoupled() {
         // Grade-round-2 lesson (CGV-015): the march push gain and the
         // resolve composite gain are DIFFERENT knobs fed from different
@@ -11903,6 +12031,50 @@ mod tests {
         assert_eq!(
             VEIL_MARCH_RESOLVE_GAIN, 30.0,
             "resolve grade carries the 30 Mpc reference window"
+        );
+    }
+
+    #[test]
+    fn sprites_mode_clears_instead_of_skipping_march() {
+        // Issue-2026-09-24-0856: the Sprites branch must still write
+        // the march target once per frame (black clear) — skipping the
+        // pass left a recycled march image under the resolve on
+        // High → Low cycles.
+        use game_debug::cosmic_veil::VeilMode;
+        assert!(
+            veil_march_draws(VeilMode::March { steps: 32 }),
+            "March 32 must draw"
+        );
+        assert!(
+            veil_march_draws(VeilMode::March { steps: 48 }),
+            "March 48 must draw"
+        );
+        assert!(
+            !veil_march_draws(VeilMode::Sprites),
+            "Sprites must clear, never draw"
+        );
+    }
+
+    #[test]
+    fn sprites_resolve_adds_no_march() {
+        // Issue-2026-09-24-0856 defense in depth: the cleared target
+        // must also resolve at gain 0, so even a future skipped write
+        // reads as zero while March keeps the 30 Mpc reference grade.
+        use game_debug::cosmic_veil::VeilMode;
+        assert_eq!(
+            march_gain_for(VeilMode::March { steps: 32 }),
+            VEIL_MARCH_RESOLVE_GAIN,
+            "March keeps the full grade"
+        );
+        assert_eq!(
+            march_gain_for(VeilMode::March { steps: 48 }),
+            VEIL_MARCH_RESOLVE_GAIN,
+            "March keeps the full grade"
+        );
+        assert_eq!(
+            march_gain_for(VeilMode::Sprites),
+            0.0,
+            "Sprites must resolve march at exactly 0"
         );
     }
 
