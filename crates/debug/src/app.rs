@@ -172,6 +172,10 @@ pub struct App {
     pub widget_tab: WidgetTab,
     /// Click-to-focus for the widget (keyboard `Esc` unwinds it).
     pub widget_focused: bool,
+    /// FPS-tab scroll offset, pixels (`fps-widget-scroll`): 0 = top.
+    /// Clamped `0..=max` by [`App::scroll_fps_by`] on every wheel
+    /// event and by [`App::clamp_fps_scroll`] on every build.
+    pub fps_scroll: f32,
     /// Dimensions dropdown open (captures digit keys).
     pub dropdown_open: bool,
     pub viewer: PlanetViewerState,
@@ -233,6 +237,7 @@ impl App {
             widget_visible: false,
             widget_tab: WidgetTab::Fps,
             widget_focused: false,
+            fps_scroll: 0.0,
             dropdown_open: false,
             viewer,
             cosmic: CosmicDemoState::new(DEFAULT_GALAXY_SEED),
@@ -398,6 +403,30 @@ impl App {
         }
     }
 
+    /// Clamp a scroll offset into `0..=max` (NaN-safe: NaN reads 0;
+    /// negative max reads 0 — degenerate windows never scroll).
+    /// (`fps-widget-scroll`: the UI pass has no scissor, so the FPS
+    /// builder culls by non-emission against this offset.)
+    pub fn clamp_scroll_offset(offset: f32, max: f32) -> f32 {
+        if !offset.is_finite() {
+            return 0.0;
+        }
+        offset.clamp(0.0, max.max(0.0))
+    }
+
+    /// Move the FPS-tab scroll offset by `delta_px` (positive = down),
+    /// clamped into `0..=max_scroll_px`.
+    pub fn scroll_fps_by(&mut self, delta_px: f32, max_scroll_px: f32) {
+        let delta = if delta_px.is_finite() { delta_px } else { 0.0 };
+        self.fps_scroll = Self::clamp_scroll_offset(self.fps_scroll + delta, max_scroll_px);
+    }
+
+    /// Re-clamp the FPS-tab offset after a resize/rebuild (body height
+    /// changed under a stored offset).
+    pub fn clamp_fps_scroll(&mut self, max_scroll_px: f32) {
+        self.fps_scroll = Self::clamp_scroll_offset(self.fps_scroll, max_scroll_px);
+    }
+
     /// `Esc` unwind: close the dropdown first, then unfocus the
     /// widget. Returns true when something changed (never quits).
     pub fn esc_unwind(&mut self) -> bool {
@@ -508,6 +537,28 @@ mod tests {
         assert_eq!(WidgetTab::Fps.fkey(), 6);
         assert_eq!(WidgetTab::Console.fkey(), 7);
         assert_eq!(WidgetTab::Inspector.fkey(), 8);
+    }
+
+    #[test]
+    fn fps_scroll_clamps_into_range() {
+        // `fps-widget-scroll` FPS-001: offset stays in
+        // `0..=max`, NaN-safe, degenerate max pins to 0.
+        let mut app = App::new();
+        assert_eq!(app.fps_scroll, 0.0);
+        app.scroll_fps_by(100.0, 60.0);
+        assert_eq!(app.fps_scroll, 60.0);
+        app.scroll_fps_by(-200.0, 60.0);
+        assert_eq!(app.fps_scroll, 0.0);
+        app.scroll_fps_by(f32::NAN, 60.0);
+        assert_eq!(app.fps_scroll, 0.0);
+        app.scroll_fps_by(10.0, -5.0);
+        assert_eq!(app.fps_scroll, 0.0);
+        app.fps_scroll = 999.0;
+        app.clamp_fps_scroll(60.0);
+        assert_eq!(app.fps_scroll, 60.0);
+        app.fps_scroll = f32::NAN;
+        app.clamp_fps_scroll(60.0);
+        assert_eq!(app.fps_scroll, 0.0);
     }
 
     #[test]

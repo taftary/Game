@@ -4835,7 +4835,35 @@ fn fog_slider_track(body: Rect, lh: f32) -> Rect {
 /// Widget FPS body: the frame-health tab, drawn into the widget
 /// body rect (it already lays out into any area).
 fn build_widget_fps(items: &mut UiItems, lh: f32, app: &DebugApp, body: Rect) {
-    build_fps_tab(items, lh, &app.fps, &app.timing, app.cosmic_tier, body);
+    build_fps_tab(
+        items,
+        lh,
+        &app.fps,
+        &app.timing,
+        app.cosmic_tier,
+        app.fps_scroll,
+        body,
+    );
+}
+
+/// Intersect two rects (`None` when empty). The UI pass has no
+/// scissor, so partially visible scroll items clip by intersection
+/// and fully hidden ones are never emitted at all.
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    if x1 > x0 && y1 > y0 {
+        Some(Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        })
+    } else {
+        None
+    }
 }
 
 /// Widget Console body: the live fly-to event feed (newest last,
@@ -4925,16 +4953,27 @@ fn timing_cell(avg: Option<f32>, max: Option<f32>) -> String {
     }
 }
 
-/// Widget FPS body: live numbers + a sparkline of the newest
-/// [`FPS_SPARKLINE`] samples (right = newest, 0–50 ms full height).
+/// Widget FPS body (`fps-widget-scroll`): sticky glance header
+/// (frame health + tier + GPU total, always visible) over a
+/// wheel-scrollable detail column with the GPU passes, CPU phases,
+/// footer, and sparkline. The sparkline keeps the newest
+/// [`FPS_SPARKLINE`] samples (right = newest, 0–50 ms full height)
+/// at [`ui::FPS_PLOT_H`] draw height.
+///
+/// The UI pass has no scissor, so the scroll region culls by
+/// non-emission: a row is pushed iff it intersects the visible
+/// region, the plot background and each bar clip by intersection.
+/// Row sequence must mirror [`ui::fps_scroll_content_height`] (R-1).
 fn build_fps_tab(
     items: &mut UiItems,
     lh: f32,
     fps: &FpsOverlay,
     timing: &FrameTiming,
     tier: CosmicTier,
+    app_scroll: f32,
     area: Rect,
 ) {
+    // ---- Sticky glance header (never scrolls) ----
     let mut rows = ui::PanelRows::new(area, ui::DOCK_PAD);
     section_bar(items, rows.next(lh + 6.0, 4.0), "FRAME HEALTH");
     for line in [
@@ -4955,90 +4994,162 @@ fn build_fps_tab(
     ] {
         text_row(items, lh, rows.next(lh, 4.0), line, C_TEXT);
     }
-    // Per-pass GPU + CPU timing (`cosmic-frame-timing`, ADR-027):
-    // rolling avg · max per row, `n/a` before the first sample (or
-    // without device timestamp support — NFR4).
-    section_bar(items, rows.next(lh + 6.0, 4.0), "GPU PASSES (avg · max ms)");
-    for slot in GpuSlot::ALL {
-        text_row(
-            items,
-            lh,
-            rows.next(lh, 4.0),
-            format!(
-                "{:<8}{}",
-                slot.label(),
-                timing_cell(timing.gpu_avg_ms(slot), timing.gpu_max_ms(slot))
-            ),
-            C_TEXT,
-        );
-    }
-    if let Some(total) = timing.gpu_total_avg_ms() {
-        text_row(
+    // GPU total lives in the header so the frame cost is glanceable
+    // at scroll 0; per-pass detail scrolls below.
+    match timing.gpu_total_avg_ms() {
+        Some(total) => text_row(
             items,
             lh,
             rows.next(lh, 4.0),
             format!("total   {total:5.1} ms avg"),
             C_DIM,
-        );
-    }
-    section_bar(items, rows.next(lh + 6.0, 4.0), "CPU PHASES (avg · max ms)");
-    for phase in CpuPhase::ALL {
-        text_row(
+        ),
+        None => text_row(
             items,
             lh,
             rows.next(lh, 4.0),
-            format!(
-                "{:<8}{}",
-                phase.label(),
-                timing_cell(timing.cpu_avg_ms(phase), timing.cpu_max_ms(phase))
-            ),
-            C_TEXT,
+            "total   n/a".to_owned(),
+            C_DIM,
+        ),
+    }
+    // ---- Scrollable detail column ----
+    let region = Rect {
+        x: area.x,
+        y: rows.cursor_y(),
+        w: area.w,
+        h: (area.y + area.h - rows.cursor_y()).max(0.0),
+    };
+    let content_h = ui::fps_scroll_content_height(lh);
+    let max = ui::fps_scroll_max(content_h, region.h);
+    let scroll = app_scroll.clamp(0.0, max);
+    let gutter = if max > 0.0 {
+        ui::FPS_SCROLL_GUTTER
+    } else {
+        0.0
+    };
+    let cx = region.x + ui::DOCK_PAD;
+    let cw = (region.w - 2.0 * ui::DOCK_PAD - gutter).max(0.0);
+    // Virtual cursor over the scroll column; a row is emitted iff it
+    // intersects the visible region.
+    let mut y = region.y - scroll;
+    let mut take = |h: f32, gap: f32| -> Option<Rect> {
+        let rect = Rect { x: cx, y, w: cw, h };
+        y += h + gap;
+        if rect.y < region.y + region.h && rect.y + rect.h > region.y {
+            Some(rect)
+        } else {
+            None
+        }
+    };
+    if let Some(row) = take(lh, 4.0) {
+        text_row(
+            items,
+            lh,
+            row,
+            "wheel: scroll · GPU/CPU detail".to_owned(),
+            C_DIM,
         );
     }
-    text_row(
-        items,
-        lh,
-        rows.next(lh, 4.0),
-        "last 120 frames (right = newest)".to_owned(),
-        C_DIM,
-    );
-    let plot = rows.next(120.0, 4.0);
-    let plot = Rect {
-        x: plot.x,
-        y: plot.y,
-        w: plot.w,
-        h: 120.0,
-    };
-    items.solid(plot, C_FIELD_BG);
-    // Oldest left, newest right; fixed slots so the trace doesn't
-    // rescale while samples accumulate. At least one slot so the trace
-    // never vanishes on an empty window.
-    let mut samples = fps.recent_ms(FPS_SPARKLINE);
-    samples.reverse();
-    let shown = samples
-        .len()
-        .clamp(1, FPS_SPARKLINE)
-        .min(plot.w.max(1.0) as usize);
-    let start = samples.len().saturating_sub(shown);
-    let slot = plot.w / FPS_SPARKLINE as f32;
-    for (i, ms) in samples[start..].iter().enumerate() {
-        let h = (ms / 50.0).clamp(0.0, 1.0) * plot.h;
-        let color = if *ms < 20.0 {
-            C_FPS_OK
-        } else if *ms < 34.0 {
-            C_FPS_WARN
-        } else {
-            C_FPS_HITCH
-        };
-        items.solid(
-            Rect {
+    // Per-pass GPU + CPU timing (`cosmic-frame-timing`, ADR-027):
+    // rolling avg · max per row, `n/a` before the first sample (or
+    // without device timestamp support — NFR4).
+    if let Some(row) = take(lh + 6.0, 4.0) {
+        section_bar(items, row, "GPU PASSES (avg · max ms)");
+    }
+    for slot in GpuSlot::ALL {
+        if let Some(row) = take(lh, 4.0) {
+            text_row(
+                items,
+                lh,
+                row,
+                format!(
+                    "{:<8}{}",
+                    slot.label(),
+                    timing_cell(timing.gpu_avg_ms(slot), timing.gpu_max_ms(slot))
+                ),
+                C_TEXT,
+            );
+        }
+    }
+    if let Some(row) = take(lh + 6.0, 4.0) {
+        section_bar(items, row, "CPU PHASES (avg · max ms)");
+    }
+    for phase in CpuPhase::ALL {
+        if let Some(row) = take(lh, 4.0) {
+            text_row(
+                items,
+                lh,
+                row,
+                format!(
+                    "{:<8}{}",
+                    phase.label(),
+                    timing_cell(timing.cpu_avg_ms(phase), timing.cpu_max_ms(phase))
+                ),
+                C_TEXT,
+            );
+        }
+    }
+    if let Some(row) = take(lh, 4.0) {
+        text_row(
+            items,
+            lh,
+            row,
+            "last 120 frames (right = newest)".to_owned(),
+            C_DIM,
+        );
+    }
+    if let Some(plot) = take(ui::FPS_PLOT_H, 4.0) {
+        if let Some(bg) = intersect_rect(plot, region) {
+            items.solid(bg, C_FIELD_BG);
+        }
+        // Oldest left, newest right; fixed slots so the trace doesn't
+        // rescale while samples accumulate. At least one slot so the trace
+        // never vanishes on an empty window.
+        let mut samples = fps.recent_ms(FPS_SPARKLINE);
+        samples.reverse();
+        let shown = samples
+            .len()
+            .clamp(1, FPS_SPARKLINE)
+            .min(plot.w.max(1.0) as usize);
+        let start = samples.len().saturating_sub(shown);
+        let slot = plot.w / FPS_SPARKLINE as f32;
+        for (i, ms) in samples[start..].iter().enumerate() {
+            let h = (ms / 50.0).clamp(0.0, 1.0) * plot.h;
+            let color = if *ms < 20.0 {
+                C_FPS_OK
+            } else if *ms < 34.0 {
+                C_FPS_WARN
+            } else {
+                C_FPS_HITCH
+            };
+            let bar = Rect {
                 x: plot.x + (FPS_SPARKLINE - shown + i) as f32 * slot,
                 y: plot.y + plot.h - h,
                 w: slot.max(1.0),
                 h,
+            };
+            if let Some(clipped) = intersect_rect(bar, region)
+                && clipped.h > 0.0
+                && clipped.w > 0.0
+            {
+                items.solid(clipped, color);
+            }
+        }
+    }
+    // ---- Scrollbar (only when content overflows) ----
+    if max > 0.0 {
+        items.solid(
+            Rect {
+                x: region.x + region.w - ui::FPS_SCROLLBAR_W,
+                y: region.y,
+                w: ui::FPS_SCROLLBAR_W,
+                h: region.h,
             },
-            color,
+            C_TRACK,
         );
+        if let Some(thumb) = ui::fps_scrollbar(region, content_h, scroll) {
+            items.solid(thumb, C_KNOB);
+        }
     }
 }
 
@@ -9176,6 +9287,35 @@ impl ViewerApp {
                 if self.debug.loading.is_some() {
                     return;
                 }
+                // FPS-widget scroll (`fps-widget-scroll` FR4): wheel
+                // over the widget scrolls the FPS tab instead of
+                // zooming the viewport camera below (Fps tab only —
+                // other tabs keep the viewport behavior).
+                if self.debug.widget_visible
+                    && self.debug.widget_tab == WidgetTab::Fps
+                    && let Some(ctx) = self.main.as_ref()
+                {
+                    let (w, h) = ctx.size();
+                    if let Some((cx, cy)) = ctx.last_cursor {
+                        let widget = ui::widget_rect(w, h);
+                        if widget.contains(cx, cy) {
+                            let lh = self.atlas.line_height();
+                            let body = widget_body_rect(widget);
+                            let max = ui::fps_scroll_max(
+                                ui::fps_scroll_content_height(lh),
+                                ui::fps_scroll_view_height(body.h, lh),
+                            );
+                            let notches = match delta {
+                                MouseScrollDelta::LineDelta(_, y) => y,
+                                MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
+                            };
+                            self.debug
+                                .scroll_fps_by(ui::fps_wheel_delta_px(notches, lh), max);
+                            self.update_hover();
+                            return;
+                        }
+                    }
+                }
                 let in_viewport = self.main.as_ref().is_some_and(|ctx| {
                     let (w, h) = ctx.size();
                     ctx.last_cursor.is_some_and(|(cx, cy)| {
@@ -12451,7 +12591,10 @@ mod tests {
         );
         assert_eq!(drop.solids.len() - before, 1 + 1 + 4 + 9 + 1 + 1);
         app.close_dropdown();
-        // Widget FPS body: live numbers + sparkline label.
+        // Widget FPS body (`fps-widget-scroll`): scroll 0 shows the
+        // sticky glance header + first detail rows; the footer and
+        // sparkline live one scroll down (covered by
+        // `fps_widget_scroll_reaches_tail`).
         app.select_widget_tab(WidgetTab::Fps);
         let mut widget = UiItems::default();
         build_widget(&mut widget, lh, &app, 1280.0, 720.0);
@@ -12465,10 +12608,16 @@ mod tests {
             "60.0",
             "samples:",
             "120",
-            "last 120 frames",
+            "total",
+            "GPU PASSES",
+            "wheel: scroll",
         ] {
             assert!(widget.contains(needle), "widget fps missing {needle}");
         }
+        assert!(
+            !widget.contains("last 120 frames"),
+            "scroll-0 view must cull the tail, not overflow it"
+        );
         // Widget Console body: the real fly-to event feed.
         use game_debug::cosmic_player::CosmicEvent;
 
@@ -12553,6 +12702,136 @@ mod tests {
         let demo = joined(&demo);
         for needle in ["GAME DEMO", "frame:", "time:", "soi:", "target:"] {
             assert!(demo.contains(needle), "demo missing {needle}");
+        }
+    }
+
+    #[test]
+    fn fps_widget_scroll_reaches_tail() {
+        // `fps-widget-scroll` DoD 1+2: scroll 0 keeps the glance
+        // header + first detail rows; max offset reaches every detail
+        // row + footer + sparkline.
+        let atlas = GlyphAtlas::new(UI_PX);
+        let lh = atlas.line_height();
+        let mut app = DebugApp::new();
+        for _ in 0..120 {
+            app.fps.record(1.0 / 60.0);
+        }
+        app.select_widget_tab(WidgetTab::Fps);
+        let text_of = |items: &UiItems| {
+            items
+                .texts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let body = widget_body_rect(ui::widget_rect(1280.0, 720.0));
+        let max = ui::fps_scroll_max(
+            ui::fps_scroll_content_height(lh),
+            ui::fps_scroll_view_height(body.h, lh),
+        );
+        assert!(max > 0.0, "FPS tab must overflow the fixed body");
+        // Scroll 0: header + first detail, tail culled.
+        app.fps_scroll = 0.0;
+        let mut top = UiItems::default();
+        build_widget(&mut top, lh, &app, 1280.0, 720.0);
+        let top_text = text_of(&top);
+        for needle in ["FRAME HEALTH", "fps:", "total", "GPU PASSES", "prepass"] {
+            assert!(top_text.contains(needle), "scroll-0 missing {needle}");
+        }
+        // Sweep 0..=max: every detail section surfaces at least
+        // once, and the sticky header never scrolls away.
+        let mut saw_gpu_row = false;
+        let mut saw_cpu_section = false;
+        let mut saw_footer = false;
+        let steps = (max / lh.max(1.0)).ceil().max(1.0) as usize;
+        for i in 0..=steps {
+            app.fps_scroll = max * i as f32 / steps as f32;
+            let mut items = UiItems::default();
+            build_widget(&mut items, lh, &app, 1280.0, 720.0);
+            let text = text_of(&items);
+            assert!(
+                text.contains("FRAME HEALTH"),
+                "header must stay pinned at step {i}"
+            );
+            saw_gpu_row |= text.contains("prepass");
+            saw_cpu_section |= text.contains("CPU PHASES");
+            saw_footer |= text.contains("last 120 frames");
+        }
+        assert!(saw_gpu_row, "no offset shows the GPU rows");
+        assert!(saw_cpu_section, "no offset shows the CPU section");
+        assert!(saw_footer, "no offset reaches the footer");
+        // Max offset: footer + plot, header still pinned.
+        app.fps_scroll = max;
+        let mut bottom = UiItems::default();
+        build_widget(&mut bottom, lh, &app, 1280.0, 720.0);
+        let bottom_text = text_of(&bottom);
+        for needle in ["FRAME HEALTH", "last 120 frames"] {
+            assert!(
+                bottom_text.contains(needle),
+                "scrolled view missing {needle}"
+            );
+        }
+        // The sparkline background is emitted only once scrolled into
+        // view (cull-by-non-emission, not overdraw).
+        let plot_bg = |items: &UiItems| {
+            items
+                .solids
+                .iter()
+                .any(|(r, _)| (r.h - ui::FPS_PLOT_H).abs() < 1e-3)
+        };
+        assert!(!plot_bg(&top), "scroll-0 must cull the plot");
+        assert!(plot_bg(&bottom), "max scroll must show the plot");
+    }
+
+    #[test]
+    fn fps_widget_scroll_never_bleeds() {
+        // `fps-widget-scroll` DoD 3: every emitted solid stays inside
+        // the widget rect and every text run inside it too, at scroll
+        // 0 / mid / max. The UI pass has no scissor, so any bleed
+        // would paint over the 3D scene.
+        let atlas = GlyphAtlas::new(UI_PX);
+        let lh = atlas.line_height();
+        let mut app = DebugApp::new();
+        for _ in 0..120 {
+            app.fps.record(1.0 / 60.0);
+        }
+        app.select_widget_tab(WidgetTab::Fps);
+        let widget = ui::widget_rect(1280.0, 720.0);
+        let body = widget_body_rect(widget);
+        let max = ui::fps_scroll_max(
+            ui::fps_scroll_content_height(lh),
+            ui::fps_scroll_view_height(body.h, lh),
+        );
+        for scroll in [0.0, max * 0.5, max] {
+            app.fps_scroll = scroll;
+            let mut items = UiItems::default();
+            build_widget(&mut items, lh, &app, 1280.0, 720.0);
+            assert!(
+                !items.solids.is_empty() && !items.texts.is_empty(),
+                "scroll {scroll}: widget must not go blank"
+            );
+            for (rect, _) in &items.solids {
+                assert!(
+                    rect.x >= widget.x - 1e-3
+                        && rect.y >= widget.y - 1e-3
+                        && rect.x + rect.w <= widget.x + widget.w + 1e-3
+                        && rect.y + rect.h <= widget.y + widget.h + 1e-3,
+                    "solid bleeds at scroll {scroll}: {rect:?}"
+                );
+            }
+            for run in &items.texts {
+                assert!(
+                    run.x >= widget.x - 1e-3
+                        && run.x <= widget.x + widget.w + 1e-3
+                        && run.baseline >= widget.y - 1e-3
+                        && run.baseline <= widget.y + widget.h + 1e-3,
+                    "text bleeds at scroll {scroll}: {} @ {},{}",
+                    run.text,
+                    run.x,
+                    run.baseline
+                );
+            }
         }
     }
 

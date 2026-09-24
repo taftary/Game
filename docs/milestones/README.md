@@ -177,6 +177,7 @@ hashes hold.
 |---|---|---|---|---|
 | F1 | [`cosmic-frame-timing`](../../plans/v0.3.5/cosmic-frame-timing/) | done | debug | timestamp query pool per pass (scene+splats, bloom, march, main) + CPU phase timers in the FPS widget + `--capture` log line; dev-profile opt-level 1; UHD 620 baseline: prepass owns ~95% |
 | F2 | [`cosmic-device-tier`](../../plans/v0.3.5/cosmic-device-tier/) | done | debug | boot tier from device type with `GAME_DEBUG_TIER` override; drives `splat_k`, `VeilMode`, bloom levels; runtime cycle; `--tier` capture pin |
+| F3 | [`fps-widget-scroll`](../../plans/v0.3.5/fps-widget-scroll/) | in-progress | debug | sticky glance header (fps/frame/tier/GPU total) + wheel-scrollable GPU/CPU detail + sparkline in the fixed 400×280 widget; cull-by-non-emission (no scissor); scrollbar + hint |
 
 Still deferred after this version: splat frustum culling + sub-sample
 LOD (`cosmic-splat-culling`), bricked indirect draws

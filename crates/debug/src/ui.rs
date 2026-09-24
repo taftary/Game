@@ -213,6 +213,87 @@ pub fn widget_tab_button(widget: Rect, index: usize) -> Rect {
     }
 }
 
+/// FPS-tab scroll geometry (`fps-widget-scroll`): the widget body is
+/// fixed (~244 px) while the FPS tab wants ~430+ px, and the UI pass
+/// has no scissor — so the builder keeps a sticky glance header and
+/// culls a virtual scroll column by non-emission (Console-tab
+/// capacity-clip precedent, extended to partial rows + plot bars).
+/// These helpers own the numbers both the builder and the wheel
+/// router share, so the offset can never disagree with the layout.
+/// Sparkline keeps all 120 samples at a reduced draw height.
+pub const FPS_PLOT_H: f32 = 72.0;
+/// Scrollbar width + gutter reserved inside the scroll region.
+pub const FPS_SCROLLBAR_W: f32 = 6.0;
+pub const FPS_SCROLL_GUTTER: f32 = 10.0;
+
+/// Sticky glance header height (content only, top pad excluded): one
+/// section bar + five rows (fps / frame / samples / tier / GPU
+/// total, the total reading `n/a` before the first sample). Never
+/// scrolls.
+pub fn fps_sticky_height(lh: f32) -> f32 {
+    (lh + 6.0 + 4.0) + 5.0 * (lh + 4.0)
+}
+
+/// Visible scroll-region height for a widget body: whatever the
+/// sticky header (plus its top pad) leaves over. Never negative.
+pub fn fps_scroll_view_height(body_h: f32, lh: f32) -> f32 {
+    (body_h - DOCK_PAD - fps_sticky_height(lh)).max(0.0)
+}
+
+/// Virtual scroll-column height: hint row + GPU section (bar + 4
+/// rows) + CPU section (bar + 3 rows) + footer row + plot
+/// (`FPS_PLOT_H` + gap). Must mirror `build_fps_tab`'s row sequence
+/// exactly (see R-1 in the feature plan).
+pub fn fps_scroll_content_height(lh: f32) -> f32 {
+    let row = lh + 4.0;
+    let section = lh + 6.0 + 4.0;
+    row + // wheel hint
+    section + 4.0 * row + // GPU section + 4 pass rows
+    section + 3.0 * row + // CPU section + 3 phase rows
+    row + // footer ("last 120 frames…")
+    FPS_PLOT_H + 4.0 // sparkline plot + gap
+}
+
+/// Max scroll offset for a content/view pair. Never negative —
+/// degenerate windows simply don't scroll.
+pub fn fps_scroll_max(content_h: f32, view_h: f32) -> f32 {
+    (content_h.max(0.0) - view_h.max(0.0)).max(0.0)
+}
+
+/// Wheel-to-scroll mapping: three rows per notch; wheel-up (positive
+/// notch) moves toward the glance header (negative offset delta).
+/// NaN-safe (a bad delta never jumps the view).
+pub fn fps_wheel_delta_px(notches: f32, lh: f32) -> f32 {
+    if !notches.is_finite() {
+        return 0.0;
+    }
+    -notches * (lh + 4.0) * 3.0
+}
+
+/// Scrollbar thumb for the scroll region: full-height track with a
+/// proportional thumb (min 16 px so it stays grabbable-looking even
+/// when content dwarfs the view). `None` when nothing overflows.
+pub fn fps_scrollbar(region: Rect, content_h: f32, scroll: f32) -> Option<Rect> {
+    let max = fps_scroll_max(content_h, region.h);
+    if max <= 0.0 || region.h <= 0.0 || region.w <= 0.0 {
+        return None;
+    }
+    let track = Rect {
+        x: region.x + region.w - FPS_SCROLLBAR_W,
+        y: region.y,
+        w: FPS_SCROLLBAR_W,
+        h: region.h,
+    };
+    let thumb_h = (region.h * region.h / content_h.max(1.0)).clamp(16.0, region.h);
+    let thumb_y = region.y + (region.h - thumb_h) * (scroll.clamp(0.0, max) / max);
+    Some(Rect {
+        x: track.x,
+        y: thumb_y,
+        w: track.w,
+        h: thumb_h,
+    })
+}
+
 /// Corner strip: chrome toggle buttons living inside the top bar,
 /// right-aligned (always visible because the bar is). Three buttons:
 /// left dock, right dock, dev widget.
@@ -291,6 +372,12 @@ impl PanelRows {
         };
         self.y += h + gap;
         row
+    }
+
+    /// Current cursor y (top of the next row). Used by virtualized
+    /// builders (`fps-widget-scroll`) to split sticky vs scroll areas.
+    pub fn cursor_y(&self) -> f32 {
+        self.y
     }
 }
 
@@ -525,6 +612,56 @@ mod tests {
         assert_eq!(r0.x, l.panel.x + 8.0);
         assert_eq!(r1.y, r0.y + 24.0);
         assert_eq!(r0.w, PANEL_W - 16.0);
+    }
+
+    #[test]
+    fn fps_scroll_geometry_clamps_and_pins_layout() {
+        // `fps-widget-scroll` R-1 pin: the builder's `PanelRows`
+        // cursor after the sticky sequence must agree with the
+        // helper, and sticky + view must exactly cover the body.
+        let lh = 20.0;
+        let area = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 376.0,
+            h: 244.0,
+        };
+        let mut rows = PanelRows::new(area, DOCK_PAD);
+        rows.next(lh + 6.0, 4.0);
+        for _ in 0..5 {
+            rows.next(lh, 4.0);
+        }
+        assert!(
+            (rows.cursor_y() - (area.y + DOCK_PAD + fps_sticky_height(lh))).abs() < 1e-3,
+            "sticky helper drifted from the builder sequence"
+        );
+        assert!(
+            (fps_scroll_view_height(area.h, lh) - (area.y + area.h - rows.cursor_y())).abs() < 1e-3,
+            "sticky + view must cover the body"
+        );
+        // The reference body always overflows; max never negative.
+        let content = fps_scroll_content_height(lh);
+        assert!(content > fps_scroll_view_height(244.0, lh));
+        assert_eq!(fps_scroll_max(10.0, 244.0), 0.0);
+        assert_eq!(fps_scroll_max(-3.0, -5.0), 0.0);
+        // Thumb parks top/bottom at the extremes and stays in-track.
+        let region = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 80.0,
+        };
+        assert!(fps_scrollbar(region, 80.0, 0.0).is_none());
+        assert!(fps_scrollbar(region, 0.0, 0.0).is_none());
+        let top = fps_scrollbar(region, 400.0, 0.0).expect("thumb");
+        let bottom = fps_scrollbar(region, 400.0, 320.0).expect("thumb");
+        assert!((top.y - region.y).abs() < 1e-3);
+        assert!((bottom.y + bottom.h - (region.y + region.h)).abs() < 1e-3);
+        assert!(top.h >= 16.0 && top.h <= region.h);
+        // Wheel mapping: up = toward the header, NaN-safe.
+        assert!(fps_wheel_delta_px(1.0, lh) < 0.0);
+        assert!(fps_wheel_delta_px(-1.0, lh) > 0.0);
+        assert_eq!(fps_wheel_delta_px(f32::NAN, lh), 0.0);
     }
 
     #[test]

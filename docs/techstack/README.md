@@ -1,14 +1,15 @@
 # Tech stack — how PlanetCrafter is built
 
-- **Version:** 0.56.0 (2026-09-23, v0.3.5 `cosmic-device-tier`
-  done: boot tier from device (`IntegratedGpu` → Medium proven live
-  on UHD 620), one tier drives splat_k/veil/bloom, `F4` cycle,
-  `--tier` capture pin (default High, byte-identical `A5AA81…`);
-  measured UHD 620 (seed 1337, 1408×768): inspector High 124.5 →
-  Medium 38.6 ms (3.2×), demo High 195.9 → Medium 59.3 ms (3.3×),
-  Low 44.3 (sprites overdraw ≈ march saving on inspector);
-  ANALYST audit + SECURITY review recorded in `plan.md`; single `done`
-  commit on branch `v0.3.5`; prior `cosmic-frame-timing` done)
+- **Version:** 0.57.0 (2026-09-24, v0.3.5 `fps-widget-scroll`
+  in-progress: sticky glance header + wheel-scrollable GPU/CPU detail
+  + 72 px sparkline in the fixed 400×280 FPS widget, cull-by-non-emission,
+  scrollbar + hint; prior `cosmic-device-tier` done: boot tier from
+  device (`IntegratedGpu` → Medium proven live on UHD 620), one tier
+  drives splat_k/veil/bloom, `F4` cycle, `--tier` capture pin
+  (default High, byte-identical `A5AA81…`); measured UHD 620
+  (seed 1337, 1408×768): inspector High 124.5 → Medium 38.6 ms
+  (3.2×), demo High 195.9 → Medium 59.3 ms (3.3×), Low 44.3
+  (sprites overdraw ≈ march saving on inspector))
 - **Engine decision:** custom Vulkan engine in `crates/engine` (`vulkano`, no `wgpu`)
 - **Graphics API:** Vulkan directly via [`vulkano`](https://crates.io/crates/vulkano)
 - **Main dependencies:** `vulkano` + `winit` + `naga` + `fontdue` + `glam` + `hecs` + `tracing` (see [`stack.md`](stack.md))
